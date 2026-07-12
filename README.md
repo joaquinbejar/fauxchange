@@ -27,6 +27,14 @@ Part of a family of Rust crates for options trading infrastructure:
 [IronCondor](https://github.com/joaquinbejar/IronCondor) ·
 [ChainView](https://github.com/joaquinbejar/ChainView)
 
+## Documentation
+
+The full design documentation (PRD, roadmap, domain model, matching
+architecture, protocol surfaces, market data/replay, microstructure,
+deployment, and ADRs) is maintained locally during the design phase and will
+be published with the first implementation release (v0.1.0). v0.0.1 reserves
+the name and no implementation code exists yet.
+
 ## License
 
 MIT — see [LICENSE](./LICENSE).
