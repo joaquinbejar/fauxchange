@@ -1,0 +1,15 @@
+[package]
+name = "fauxchange"
+version = "0.0.1"
+edition = "2024"
+authors = ["Joaquin Bejar <jb@taunais.com>"]
+description = "Exchange-in-a-box: a local options exchange simulator with realistic matching, FIX/WebSocket/REST APIs and historical replay, for testing trading systems."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/joaquinbejar/fauxchange"
+homepage = "https://github.com/joaquinbejar/fauxchange"
+keywords = ["finance", "exchange", "simulator", "trading", "testing"]
+categories = ["finance", "simulation", "development-tools::testing"]
+include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+
+[dependencies]
