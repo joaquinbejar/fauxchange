@@ -8,8 +8,18 @@
 //!   its casing and integer-cents money intact.
 //! - `ws_message_serde_identity` — every [`WsMessage`] variant round-trips
 //!   through its `type`/`data` framing.
+//! - `venue_envelope_serde_identity` — a generated `venue.v1` [`VenueEvent`]
+//!   (`AddOrder` + captured two-leg fills) round-trips through JSON, schema tag
+//!   and integer cents intact.
+//! - `venue_id_grammar_collision_free` — the composite id grammar is
+//!   deterministic and collision-free across `(lineage, underlying, sequence,
+//!   index)` tuples (colon-free tokens).
 
-use fauxchange::exchange::{Cents, EventTimestamp, Notional, SequenceNumber, SignedCents, Symbol};
+use fauxchange::exchange::{
+    CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as VenueFill, LineageId, Notional,
+    SequenceNumber, SignedCents, Symbol, VenueCommand, VenueEvent, VenueOutcome,
+};
+use fauxchange::exchange::{Hash32, STPMode, Side as SeamSide, TimeInForce as SeamTif};
 use fauxchange::{
     AccountId, ClientOrderId, ExecutionId, LiquidityFlag, Order, OrderStatus, OrderType,
     Permission, Side, TimeInForce, VenueError, VenueOrderId, WsMessage,
@@ -256,5 +266,175 @@ proptest! {
         let back: WsMessage = serde_json::from_str(&json)
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
         prop_assert_eq!(back, msg);
+    }
+
+    /// A generated `venue.v1` [`VenueEvent`] — an `AddOrder` carrying the dropped
+    /// identity (account/owner/TIF/STP) plus a captured two-leg-per-match `Added`
+    /// outcome — round-trips through JSON unchanged, with its mandatory `schema`
+    /// tag and integer-cents money intact. Seam `Side` / `TimeInForce` / `STPMode`
+    /// are the upstream newtypes, so this also pins their round-trip inside the
+    /// envelope.
+    #[test]
+    fn venue_envelope_serde_identity(
+        lineage in "[a-zA-Z0-9_-]{1,16}",
+        underlying in "[A-Z]{1,6}",
+        year in 1970u32..=2099,
+        month in 1u32..=12,
+        day in 1u32..=28,
+        strike in 1u64..=u64::MAX,
+        style in "[CP]",
+        seq in any::<u64>(),
+        side_pick in 0u8..2,
+        tif_pick in 0u8..5,
+        stp_pick in 0u8..4,
+        gtd_ms in any::<u64>(),
+        price in 1u64..=u64::MAX,
+        quantity in 1u64..=u64::MAX,
+        fee in any::<i64>(),
+        n_matches in 0u32..=3,
+        n_stp in 0u32..=2,
+        taker_owner_bytes in proptest::array::uniform32(any::<u8>()),
+        maker_owner_bytes in proptest::array::uniform32(any::<u8>()),
+        has_coid in any::<bool>(),
+        coid in "[a-zA-Z0-9_-]{1,16}",
+    ) {
+        let raw = symbol_string(&underlying, year, month, day, strike, &style);
+        let symbol = match Symbol::parse(&raw) {
+            Ok(s) => s,
+            Err(e) => return Err(TestCaseError::fail(format!("parse failed for {raw}: {e:?}"))),
+        };
+        let lineage_id = LineageId::new(lineage);
+        let sequence = SequenceNumber::new(seq);
+
+        let taker_side = if side_pick == 0 { SeamSide::Buy } else { SeamSide::Sell };
+        let maker_side = if side_pick == 0 { SeamSide::Sell } else { SeamSide::Buy };
+        let tif = match tif_pick {
+            0 => SeamTif::Gtc,
+            1 => SeamTif::Ioc,
+            2 => SeamTif::Fok,
+            3 => SeamTif::Gtd(gtd_ms),
+            _ => SeamTif::Day,
+        };
+        let stp = match stp_pick {
+            0 => STPMode::None,
+            1 => STPMode::CancelTaker,
+            2 => STPMode::CancelMaker,
+            _ => STPMode::CancelBoth,
+        };
+        let taker_owner = Hash32(taker_owner_bytes);
+        let maker_owner = Hash32(maker_owner_bytes);
+
+        let order_id = lineage_id.venue_order_id(underlying.as_str(), sequence, 0);
+        let command = VenueCommand::AddOrder {
+            symbol,
+            order_id: order_id.clone(),
+            account: AccountId::new("taker"),
+            owner: taker_owner,
+            client_order_id: has_coid.then(|| ClientOrderId::new(coid)),
+            side: taker_side,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(price)),
+            quantity,
+            time_in_force: tif,
+            stp_mode: stp,
+        };
+
+        // Two linked legs per match, sharing one execution id per match.
+        let mut fills = Vec::new();
+        for fill_index in 0..n_matches {
+            let execution_id = lineage_id.execution_id(underlying.as_str(), sequence, fill_index);
+            fills.push(VenueFill {
+                execution_id: execution_id.clone(),
+                order_id: lineage_id.venue_order_id(
+                    underlying.as_str(),
+                    SequenceNumber::new(1),
+                    fill_index,
+                ),
+                account: AccountId::new("maker"),
+                owner: maker_owner,
+                side: maker_side,
+                liquidity: LiquidityFlag::Maker,
+                price: Cents::new(price),
+                quantity,
+                fee: SignedCents::new(fee),
+            });
+            fills.push(VenueFill {
+                execution_id,
+                order_id: order_id.clone(),
+                account: AccountId::new("taker"),
+                owner: taker_owner,
+                side: taker_side,
+                liquidity: LiquidityFlag::Taker,
+                price: Cents::new(price),
+                quantity,
+                fee: SignedCents::new(fee),
+            });
+        }
+
+        // Resting legs the aggressor removed via STP inside this one add turn.
+        let stp_cancelled = (0..n_stp)
+            .map(|i| CancelledLeg {
+                order_id: lineage_id.venue_order_id(
+                    underlying.as_str(),
+                    SequenceNumber::new(1),
+                    i,
+                ),
+                owner: maker_owner,
+                reason: CancelReason::SelfTradePrevention,
+            })
+            .collect();
+
+        let event = VenueEvent::new(
+            sequence,
+            EventTimestamp::new(seq),
+            command,
+            VenueOutcome::Added { fills, resting_quantity: 0, stp_cancelled },
+        );
+
+        let json = serde_json::to_string(&event)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        let back: VenueEvent = serde_json::from_str(&json)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        prop_assert_eq!(&back, &event);
+        prop_assert!(back.is_current_schema());
+    }
+
+    /// The composite id grammar is **deterministic** (same tuple ⇒ identical id)
+    /// and **collision-free** over `(lineage, underlying, sequence, index)`:
+    /// distinct tuples mint distinct ids because the colon-delimited grammar is
+    /// injective over the colon-free lineage / underlying alphabets (so `BTC`
+    /// sequence 1 and `ETH` sequence 1 never collide).
+    #[test]
+    fn venue_id_grammar_collision_free(
+        lin_a in "[a-zA-Z0-9_-]{1,16}",
+        lin_b in "[a-zA-Z0-9_-]{1,16}",
+        und_a in "[A-Z]{1,6}",
+        und_b in "[A-Z]{1,6}",
+        seq_a in any::<u64>(),
+        seq_b in any::<u64>(),
+        idx_a in any::<u32>(),
+        idx_b in any::<u32>(),
+    ) {
+        let id_a = LineageId::new(lin_a.clone())
+            .venue_order_id(und_a.as_str(), SequenceNumber::new(seq_a), idx_a);
+        let id_b = LineageId::new(lin_b.clone())
+            .venue_order_id(und_b.as_str(), SequenceNumber::new(seq_b), idx_b);
+
+        let same_tuple = lin_a == lin_b && und_a == und_b && seq_a == seq_b && idx_a == idx_b;
+        if same_tuple {
+            prop_assert_eq!(id_a.as_str(), id_b.as_str());
+        } else {
+            prop_assert_ne!(id_a.as_str(), id_b.as_str());
+        }
+
+        // Determinism: rebuilding from the same tuple yields the identical id.
+        let id_a_again = LineageId::new(lin_a)
+            .venue_order_id(und_a.as_str(), SequenceNumber::new(seq_a), idx_a);
+        prop_assert_eq!(id_a.as_str(), id_a_again.as_str());
+
+        // An execution id built from the same tuple shares the grammar exactly.
+        let exec_a = LineageId::new(lin_b)
+            .execution_id(und_b.as_str(), SequenceNumber::new(seq_b), idx_b);
+        prop_assert_eq!(id_b.as_str(), exec_a.as_str());
     }
 }

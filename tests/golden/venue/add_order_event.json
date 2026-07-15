@@ -1,0 +1,50 @@
+{
+  "command": {
+    "AddOrder": {
+      "account": "taker-acct",
+      "client_order_id": "client-42",
+      "limit_price": 50000,
+      "order_id": "run-1:BTC:7:0",
+      "order_type": "limit",
+      "owner": "2222222222222222222222222222222222222222222222222222222222222222",
+      "quantity": 2,
+      "side": "BUY",
+      "stp_mode": "None",
+      "symbol": "BTC-20240329-50000-C",
+      "time_in_force": "GTC"
+    }
+  },
+  "outcome": {
+    "Added": {
+      "fills": [
+        {
+          "account": "maker-acct",
+          "execution_id": "run-1:BTC:7:0",
+          "fee": -10,
+          "liquidity": "maker",
+          "order_id": "run-1:BTC:1:0",
+          "owner": "1111111111111111111111111111111111111111111111111111111111111111",
+          "price": 50000,
+          "quantity": 2,
+          "side": "SELL"
+        },
+        {
+          "account": "taker-acct",
+          "execution_id": "run-1:BTC:7:0",
+          "fee": 15,
+          "liquidity": "taker",
+          "order_id": "run-1:BTC:7:0",
+          "owner": "2222222222222222222222222222222222222222222222222222222222222222",
+          "price": 50000,
+          "quantity": 2,
+          "side": "BUY"
+        }
+      ],
+      "resting_quantity": 0,
+      "stp_cancelled": []
+    }
+  },
+  "schema": "venue.v1",
+  "underlying_sequence": 7,
+  "venue_ts": 1700000000000
+}
