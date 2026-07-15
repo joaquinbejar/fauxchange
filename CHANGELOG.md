@@ -11,6 +11,21 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- Domain boundary newtypes, integer-cents money, and the symbol grammar (#2)
+  in `src/exchange/`: the `Cents` / `SignedCents` / `Notional` money newtypes
+  (private fields, validated constructors, checked arithmetic returning a typed
+  `MoneyError`, bare-integer wire via `#[serde(transparent)]`); re-exports of
+  the upstream boundary newtypes (`OrderId`, `Side`, `Price`, `Quantity`,
+  `TimeInForce`, `OptionStyle`, `ExpirationDate`, `TimestampMs`, `Hash32`,
+  `InstrumentStatus`) so the venue names them without redefinition; the
+  venue-owned `EventTimestamp` and `SequenceNumber`; a `Symbol` newtype routed
+  through the upstream `SymbolParser` with the `validate_venue_expiry`
+  invariant (`ExpirationDate::Days` refused, non-canonical `23:59:59 UTC`
+  instant rejected as an aliasing error); and the `Instrument` value object.
+  Adds the `option-chain-orderbook`, `optionstratlib`, `serde`, and `thiserror`
+  dependencies (plus `proptest` / `serde_json` dev-deps) and property tests
+  (`cents_never_lossy`, `symbol_roundtrip`) in `tests/property.rs`.
+
 - Crate skeleton (#1): the canonical module tree from
   `docs/00-design-bootstrap.md` §6 as empty, `//!`-documented stubs —
   `config`, `error`, `models`, `state`, `gateway/{rest,ws,fix}`,

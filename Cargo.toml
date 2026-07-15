@@ -13,3 +13,20 @@ categories = ["finance", "simulation", "development-tools::testing"]
 include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 
 [dependencies]
+# Upstream matching stack. `option-chain-orderbook` re-exports the boundary
+# newtypes (`OrderId`, `Side`, `Price`, `Quantity`, `TimeInForce`, `TimestampMs`,
+# `Hash32`, `InstrumentStatus`) and owns the `SymbolParser` grammar. Default
+# features are empty upstream; the `sequencer` feature is deliberately NOT
+# enabled here (it lands with the order path in a later issue).
+option-chain-orderbook = "0.7"
+# Needed directly only to name `OptionStyle` / `ExpirationDate`: upstream
+# `option-chain-orderbook` v0.7.0 does not re-export them, so they must come
+# from `optionstratlib` at the seam. `default-features = false` keeps the build
+# lean (no plotly / async), matching how the upstream crate depends on it.
+optionstratlib = { version = "0.17", default-features = false }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
