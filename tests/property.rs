@@ -19,9 +19,10 @@
 //!   over an arbitrary interleaving of commands across two underlyings.
 
 use fauxchange::exchange::{
-    ActorConfig, CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as VenueFill, FixedClock,
-    InMemoryVenueJournal, JournalHeader, LineageId, NoopFanOut, Notional, PlaceholderExecutor,
-    SequenceNumber, SignedCents, Symbol, UnderlyingActor, VenueCommand, VenueEvent, VenueJournal,
+    ActorConfig, CancelReason, CancelledLeg, Cents, CommandExecutor, EventTimestamp,
+    ExecutionContext, Fill as VenueFill, FixedClock, InMemoryVenueJournal, JournalHeader,
+    LineageId, MatchingExecutor, NoopFanOut, Notional, PlaceholderExecutor, SequenceNumber,
+    SignedCents, Symbol, TopOfBook, UnderlyingActor, VenueCommand, VenueEvent, VenueJournal,
     VenueOutcome,
 };
 use fauxchange::exchange::{Hash32, STPMode, Side as SeamSide, TimeInForce as SeamTif};
@@ -503,5 +504,68 @@ proptest! {
             eth.journal().last_sequence(),
             next_eth.checked_sub(1).map(SequenceNumber::new)
         );
+    }
+
+    /// `journal_replay_reconstructs_book`: an arbitrary stream of limit adds
+    /// (random side / price / quantity against one contract) captured through a
+    /// fresh [`MatchingExecutor`] reconstructs **identical** fills and top-of-book
+    /// when the same stream is replayed on a second fresh instance. This is the
+    /// bounded determinism oracle scoped to per-underlying order state: the
+    /// engine's `Uuid` order ids and wall-clock trade timestamps are excluded, so
+    /// two runs of the same command prefix agree on the captured venue artifacts
+    /// ([02 §5](../docs/02-matching-architecture.md)). The full harness is #017.
+    #[test]
+    fn journal_replay_reconstructs_book(
+        orders in prop::collection::vec((any::<bool>(), 1u64..=1_000_000, 1u64..=20), 1..12)
+    ) {
+        let lineage = LineageId::new("run-1");
+        let symbol = Symbol::parse("BTC-20240329-50000-C")
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+
+        // Build the deterministic command stream: one limit add per element, its
+        // venue order id minted from the id grammar at its sequence.
+        let commands: Vec<VenueCommand> = orders
+            .iter()
+            .enumerate()
+            .map(|(index, &(is_buy, price, quantity))| {
+                let sequence = SequenceNumber::new(index as u64);
+                VenueCommand::AddOrder {
+                    symbol: symbol.clone(),
+                    order_id: lineage.venue_order_id("BTC", sequence, 0),
+                    account: AccountId::new(format!("acct-{index}")),
+                    owner: Hash32([index as u8; 32]),
+                    client_order_id: None,
+                    side: if is_buy { SeamSide::Buy } else { SeamSide::Sell },
+                    order_type: OrderType::Limit,
+                    limit_price: Some(Cents::new(price)),
+                    quantity,
+                    time_in_force: SeamTif::Gtc,
+                    stp_mode: STPMode::None,
+                }
+            })
+            .collect();
+
+        let replay = |lineage: &LineageId| -> (Vec<VenueOutcome>, TopOfBook) {
+            let mut executor = MatchingExecutor::new("BTC");
+            let outcomes = commands
+                .iter()
+                .enumerate()
+                .map(|(index, command)| {
+                    executor.execute(ExecutionContext {
+                        underlying: "BTC",
+                        lineage_id: lineage,
+                        sequence: SequenceNumber::new(index as u64),
+                        venue_ts: EventTimestamp::new(1),
+                        command,
+                    })
+                })
+                .collect();
+            (outcomes, executor.top_of_book(&symbol))
+        };
+
+        let (outcomes_a, top_a) = replay(&lineage);
+        let (outcomes_b, top_b) = replay(&lineage);
+        prop_assert_eq!(outcomes_a, outcomes_b);
+        prop_assert_eq!(top_a, top_b);
     }
 }
