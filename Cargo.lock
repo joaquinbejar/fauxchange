@@ -623,6 +623,7 @@ name = "fauxchange"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "dashmap",
  "option-chain-orderbook",
  "optionstratlib",
  "proptest",

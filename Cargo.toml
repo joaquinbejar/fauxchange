@@ -37,6 +37,14 @@ tokio = { version = "1", default-features = false, features = ["rt", "sync", "ma
 # from `optionstratlib` at the seam. `default-features = false` keeps the build
 # lean (no plotly / async), matching how the upstream crate depends on it.
 optionstratlib = { version = "0.17", default-features = false }
+# Concurrent map for the in-memory executions / positions stores (#008): the
+# `rules/global_rules.md` Concurrency section blesses `DashMap` over
+# `Arc<RwLock<HashMap<>>>` for sharded, lock-free point access. Version `6`
+# (`6.2.1`) is already resolved transitively via the upstream matching stack
+# (`option-chain-orderbook` / `orderbook-rs` / `pricelevel`), so this direct
+# dependency adds NO new version to the tree. MIT/Apache-2.0, maintained by the
+# `xacrimon/dashmap` project.
+dashmap = "6"
 # REST/WS boundary rendering: `IntoResponse` for `VenueError`, `Json` bodies,
 # and the `http` status/header types (re-exported through `axum::http`). Lean
 # feature set — only `json`, no server/runtime features — because #003 renders

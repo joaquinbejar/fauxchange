@@ -17,13 +17,17 @@
 //! - `sequence_monotonic_per_symbol` — the per-underlying single-writer actor
 //!   assigns `0, 1, 2, …` gaplessly in its turn order, independently per symbol,
 //!   over an arbitrary interleaving of commands across two underlyings.
+//! - `position_pnl_stays_consistent_across_fills` — over an arbitrary fill
+//!   sequence, a position's `realized + unrealized` P&L equals the net cash flow
+//!   plus `net_quantity × mark`, exactly, in integer cents
+//!   ([008](../milestones/v0.1-backend-core/008-executions-positions-stores.md)).
 
 use fauxchange::exchange::{
     ActorConfig, CancelReason, CancelledLeg, Cents, CommandExecutor, EventTimestamp,
-    ExecutionContext, Fill as VenueFill, FixedClock, InMemoryVenueJournal, JournalHeader,
-    LineageId, MatchingExecutor, NoopFanOut, Notional, PlaceholderExecutor, SequenceNumber,
-    SignedCents, Symbol, TopOfBook, UnderlyingActor, VenueCommand, VenueEvent, VenueJournal,
-    VenueOutcome,
+    ExecutionContext, Fill as VenueFill, FixedClock, InMemoryPositionsStore, InMemoryVenueJournal,
+    JournalHeader, LineageId, MatchingExecutor, NoopFanOut, Notional, PlaceholderExecutor,
+    PositionLeg, PositionsStore, SequenceNumber, SignedCents, Symbol, TopOfBook, UnderlyingActor,
+    VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
 };
 use fauxchange::exchange::{Hash32, STPMode, Side as SeamSide, TimeInForce as SeamTif};
 use fauxchange::{
@@ -567,5 +571,62 @@ proptest! {
         let (outcomes_b, top_b) = replay(&lineage);
         prop_assert_eq!(outcomes_a, outcomes_b);
         prop_assert_eq!(top_a, top_b);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 512, max_shrink_iters: 50_000, ..ProptestConfig::default() })]
+
+    /// A position's realized + unrealized P&L is exactly the net cash flow plus
+    /// the mark-to-market of the open position, in integer cents, across any fill
+    /// sequence. The store's fold computes both halves from one exact cost basis,
+    /// so the identity holds bit-for-bit (the truncated `avg_price` is never used
+    /// in the P&L). Inputs are bounded so the independent `i128` cross-check
+    /// cannot overflow.
+    #[test]
+    fn position_pnl_stays_consistent_across_fills(
+        legs in proptest::collection::vec(
+            (any::<bool>(), 1u64..1_000, 1u64..1_000_000, -1_000i64..1_000),
+            1..30usize,
+        ),
+        mark in 1u64..1_000_000,
+    ) {
+        let store = InMemoryPositionsStore::new();
+        let account = AccountId::new("acct");
+        let symbol = Symbol::parse("BTC-20240329-50000-C")
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+
+        // Independently accumulate the mark-to-market baseline: net cash flow is
+        // `-Σ(signed_qty × price) - Σ(fee)`, net quantity is `Σ(signed_qty)`.
+        let mut expected_cash: i128 = 0;
+        let mut expected_net: i128 = 0;
+        for (is_buy, quantity, price, fee) in &legs {
+            let dq: i128 = if *is_buy { i128::from(*quantity) } else { -i128::from(*quantity) };
+            expected_net += dq;
+            expected_cash -= dq * i128::from(*price);
+            expected_cash -= i128::from(*fee);
+            store
+                .apply(&PositionLeg {
+                    account: &account,
+                    symbol: &symbol,
+                    underlying: "BTC",
+                    side: if *is_buy { SeamSide::Buy } else { SeamSide::Sell },
+                    quantity: *quantity,
+                    price: Cents::new(*price),
+                    fee: SignedCents::new(*fee),
+                })
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        }
+
+        let position = store
+            .get(&account, &symbol, Some(Cents::new(mark)))
+            .map_err(|e| TestCaseError::fail(e.to_string()))?
+            .ok_or_else(|| TestCaseError::fail("expected a folded position"))?;
+
+        prop_assert_eq!(i128::from(position.net_quantity), expected_net);
+        let realized = i128::from(position.realized_pnl.get());
+        let unrealized = i128::from(position.unrealized_pnl.map(SignedCents::get).unwrap_or(0));
+        let total_mtm = expected_cash + expected_net * i128::from(mark);
+        prop_assert_eq!(realized + unrealized, total_mtm);
     }
 }

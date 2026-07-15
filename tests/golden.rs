@@ -13,10 +13,12 @@
 //! golden` to (re)generate the fixtures after an intentional shape change, then
 //! review the diff.
 
+use fauxchange::exchange::FanOut;
 use fauxchange::exchange::{
-    AddOutcome, CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as VenueFill, Hash32,
-    LineageId, SequenceNumber, Side as SeamSide, SignedCents, Symbol, TimeInForce as SeamTif,
-    VenueCommand, VenueEvent, VenueOutcome,
+    AddOutcome, CancelReason, CancelledLeg, Cents, EventTimestamp, ExecutionsStore,
+    Fill as VenueFill, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore, LineageId,
+    MarkPriceBook, PositionsStore, SequenceNumber, Side as SeamSide, SignedCents, StoreFanOut,
+    Symbol, TimeInForce as SeamTif, VenueCommand, VenueEvent, VenueOutcome,
 };
 use fauxchange::{
     AccountId, BookSide, BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, ClientOrderId,
@@ -28,6 +30,7 @@ use fauxchange::{
     SystemControlResponse, TimeInForce, TokenResponse, VenueError, VenueOrderId, WsMessage,
 };
 use serde::Serialize;
+use std::sync::Arc;
 
 /// Parses a canonical symbol for a fixture, panicking (never `unwrap`) with a
 /// clear message on an unexpected parse failure.
@@ -250,6 +253,155 @@ fn test_golden_rest_executions_list() {
         },
     };
     assert_golden("rest/executions_list.json", &list);
+}
+
+/// Builds one crossing match's `venue.v1` event with two linked fill legs
+/// (maker rebate, taker fee) — the fan-out input the executions/positions store
+/// goldens are projected from.
+fn store_match_event() -> VenueEvent {
+    let lineage = LineageId::new("run-1");
+    let seq = SequenceNumber::new(7);
+    let execution_id = lineage.execution_id("BTC", seq, 0);
+    let taker_id = lineage.venue_order_id("BTC", seq, 0);
+    let maker_id = lineage.venue_order_id("BTC", SequenceNumber::new(1), 0);
+
+    let command = VenueCommand::AddOrder {
+        symbol: sym("BTC-20240329-50000-C"),
+        order_id: taker_id.clone(),
+        account: AccountId::new("taker-acct"),
+        owner: Hash32([0x22; 32]),
+        client_order_id: None,
+        side: SeamSide::Buy,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(50_000)),
+        quantity: 2,
+        time_in_force: SeamTif::Gtc,
+        stp_mode: fauxchange::exchange::STPMode::None,
+    };
+    let outcome = VenueOutcome::Added {
+        fills: vec![
+            VenueFill {
+                execution_id: execution_id.clone(),
+                order_id: maker_id,
+                account: AccountId::new("maker-acct"),
+                owner: Hash32([0x11; 32]),
+                side: SeamSide::Sell,
+                liquidity: LiquidityFlag::Maker,
+                price: Cents::new(50_000),
+                quantity: 2,
+                fee: SignedCents::new(-10),
+            },
+            VenueFill {
+                execution_id,
+                order_id: taker_id,
+                account: AccountId::new("taker-acct"),
+                owner: Hash32([0x22; 32]),
+                side: SeamSide::Buy,
+                liquidity: LiquidityFlag::Taker,
+                price: Cents::new(50_000),
+                quantity: 2,
+                fee: SignedCents::new(15),
+            },
+        ],
+        resting_quantity: 0,
+        stp_cancelled: vec![],
+    };
+    VenueEvent::new(
+        SequenceNumber::new(7),
+        EventTimestamp::new(1_700_000_000_000),
+        command,
+        outcome,
+    )
+}
+
+#[test]
+fn test_golden_rest_execution_report() {
+    // The executions store's projection of both legs of one match — the
+    // authoritative fill log's wire shape: two `ExecutionRecord`s sharing one
+    // `execution_id`, each with its own account, side, liquidity, and fee (a maker
+    // rebate is negative), cents as bare integers. No pricer / latency is wired in
+    // #008, so `theo_value_cents` defaults to the fill price (edge 0) and
+    // `latency_us` is 0.
+    let executions = Arc::new(InMemoryExecutionsStore::new());
+    let mut fan = StoreFanOut::new(
+        Arc::clone(&executions),
+        Arc::new(InMemoryPositionsStore::new()),
+        Arc::new(MarkPriceBook::new()),
+    );
+    fan.emit(&store_match_event());
+
+    let execution_id = ExecutionId::new("run-1:BTC:7:0");
+    let maker = executions
+        .get(&execution_id, &AccountId::new("maker-acct"))
+        .expect("get maker leg")
+        .expect("a recorded maker leg");
+    let taker = executions
+        .get(&execution_id, &AccountId::new("taker-acct"))
+        .expect("get taker leg")
+        .expect("a recorded taker leg");
+    let report = vec![maker, taker];
+
+    assert_golden("rest/execution_report.json", &report);
+    let golden = load_golden("rest/execution_report.json");
+    if let Some(legs) = golden.as_array() {
+        assert_eq!(legs.len(), 2, "both legs of the match are recorded");
+        // The two legs share one execution id but differ in account and fee.
+        assert_eq!(legs[0]["execution_id"], legs[1]["execution_id"]);
+        assert_ne!(legs[0]["account"], legs[1]["account"]);
+        for leg in legs {
+            assert_no_float_money(
+                leg,
+                &["price_cents", "fee_cents", "theo_value_cents", "edge_cents"],
+            );
+        }
+    }
+}
+
+#[test]
+fn test_golden_rest_positions() {
+    // The positions store's fold of both accounts of one match, marked live at a
+    // spot — the `Position` wire shape: signed `net_quantity`, volume-weighted
+    // `avg_price`, and integer-cents realized / unrealized P&L. `delta_exposure`
+    // is 0.0 (Greeks are not wired in #008).
+    let positions = Arc::new(InMemoryPositionsStore::new());
+    let mut fan = StoreFanOut::new(
+        Arc::new(InMemoryExecutionsStore::new()),
+        Arc::clone(&positions),
+        Arc::new(MarkPriceBook::new()),
+    );
+    fan.emit(&store_match_event());
+
+    let symbol = sym("BTC-20240329-50000-C");
+    let mark = Some(Cents::new(50_500));
+    let maker = positions
+        .get(&AccountId::new("maker-acct"), &symbol, mark)
+        .expect("get maker position")
+        .expect("a maker position");
+    let taker = positions
+        .get(&AccountId::new("taker-acct"), &symbol, mark)
+        .expect("get taker position")
+        .expect("a taker position");
+    let report = vec![maker, taker];
+
+    assert_golden("rest/positions.json", &report);
+    let golden = load_golden("rest/positions.json");
+    if let Some(rows) = golden.as_array() {
+        assert_eq!(rows.len(), 2);
+        // The maker is short, the taker is long — opposite signed net quantities.
+        assert_eq!(rows[0]["net_quantity"], serde_json::json!(-2));
+        assert_eq!(rows[1]["net_quantity"], serde_json::json!(2));
+        for row in rows {
+            assert_no_float_money(
+                row,
+                &[
+                    "avg_price",
+                    "current_price",
+                    "realized_pnl",
+                    "unrealized_pnl",
+                ],
+            );
+        }
+    }
 }
 
 #[test]

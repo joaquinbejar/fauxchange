@@ -33,6 +33,13 @@
 //!   `option-chain-orderbook` matching **unchanged** and captures the lossless
 //!   [`VenueOutcome`] (two-leg fills, resting remainder, STP removals), with the
 //!   ergonomic [`spawn_matching_actor`] wiring it into the actor.
+//! - [`stores`] — the in-memory executions and positions stores behind the
+//!   backend-agnostic [`ExecutionsStore`] / [`PositionsStore`] contract, and the
+//!   [`StoreFanOut`] that fills the actor's [`FanOut`] seam: each committed
+//!   [`VenueEvent`] fill leg becomes an authoritative
+//!   [`ExecutionRecord`](crate::ExecutionRecord) and folds into a
+//!   per-`(account, symbol)` [`Position`](crate::Position), marked live-only
+//!   against the upstream [`MarkPriceBook`].
 //!
 //! Snapshot/restore, recovery, and the durable journal store land in later
 //! issues; the envelope types remain **pure data**.
@@ -48,6 +55,7 @@ pub mod identity;
 pub mod instrument;
 pub mod journal;
 pub mod money;
+pub mod stores;
 pub mod symbol;
 
 pub use self::actor::{
@@ -71,4 +79,8 @@ pub use self::journal::{
     InMemoryVenueJournal, JournalCommand, JournalError, JournalRecord, RecordKind, VenueJournal,
 };
 pub use self::money::{Cents, MoneyError, Notional, SignedCents};
+pub use self::stores::{
+    ExecutionFilter, ExecutionsStore, InMemoryExecutionsStore, InMemoryPositionsStore,
+    MarkPriceBook, MarkSource, NoMarks, PositionLeg, PositionsStore, StoreError, StoreFanOut,
+};
 pub use self::symbol::{Symbol, SymbolError, validate_venue_expiry};
