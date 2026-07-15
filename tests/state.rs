@@ -18,9 +18,14 @@ use fauxchange::state::{AppState, AppStateConfig};
 use fauxchange::{AccountId, LiquidityFlag, OrderType, VenueError, VenueOrderId};
 
 fn state(underlyings: &[&str]) -> Arc<AppState> {
-    AppState::new(
+    // Auth defaults to the embedded dev key pair (no accounts) when the config
+    // carries none; construction is fallible only on that auth build.
+    match AppState::new(
         AppStateConfig::new(underlyings.iter().copied()).with_lineage(LineageId::new("run-1")),
-    )
+    ) {
+        Ok(state) => state,
+        Err(error) => panic!("AppState::new must succeed with dev auth: {error}"),
+    }
 }
 
 fn sym(raw: &str) -> Symbol {

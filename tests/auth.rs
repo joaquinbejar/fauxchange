@@ -21,9 +21,11 @@ use proptest::prelude::*;
 use tower::ServiceExt;
 
 use fauxchange::auth::{
-    AuthGuard, AuthService, BootstrapGate, Claims, JwtAuth, RATE_LIMIT_WINDOW_MS, RateLimitClock,
+    AccountProvision, AccountRegistry, AccountStore, Argon2Hasher, AuthGuard, AuthService,
+    BootstrapGate, Claims, FixLoginOutcome, JwtAuth, RATE_LIMIT_WINDOW_MS, RateLimitClock,
     RateLimitKey, RateLimiter, RevocationOracle, auth_middleware,
 };
+use fauxchange::exchange::Hash32;
 use fauxchange::models::{AccountId, Permission};
 
 const BOOTSTRAP_SECRET: &str = "operator-secret";
@@ -232,6 +234,112 @@ proptest! {
         let expected = limit.min(u32::try_from(requests).unwrap_or(u32::MAX));
         prop_assert_eq!(allowed, expected);
     }
+}
+
+// ==========================================================================
+// #012 — account-registry lifecycle through the middleware (REST/WS scope)
+// ==========================================================================
+
+/// Provisions the #012 registry (a `Trade` account that can also log in over FIX,
+/// and a `Read`-only account) at the pinned Argon2id parameters, then wires it
+/// into an `AuthService` as the revocation oracle behind an advanceable clock.
+fn registry_backed_service() -> (Arc<AccountRegistry>, Arc<AuthService<TestClock>>) {
+    let provisions = vec![
+        AccountProvision::new(
+            AccountId::new("trader"),
+            Hash32([0x11; 32]),
+            vec![Permission::Trade],
+        )
+        .with_fix_login("trader-fix", "sw0rdf1sh"),
+        AccountProvision::new(
+            AccountId::new("viewer"),
+            Hash32([0x22; 32]),
+            vec![Permission::Read],
+        ),
+    ];
+    let registry = match AccountRegistry::provision(Argon2Hasher::new(None), provisions) {
+        Ok(registry) => Arc::new(registry),
+        Err(error) => panic!("provisioning must succeed: {error}"),
+    };
+    let service = Arc::new(AuthService::new(
+        dev_auth(),
+        RateLimiter::new(TestClock::new(1_000), 100),
+        Arc::clone(&registry) as Arc<dyn RevocationOracle>,
+    ));
+    (registry, service)
+}
+
+/// The full #012 lifecycle over the REST middleware: provision → account-resolved
+/// mint → a `Read` account is refused order entry (403) → revoke → its tokens are
+/// refused (401). One registry row backs both the mint and the revocation, so the
+/// identity and permissions are the same the JWT path resolves.
+#[tokio::test]
+async fn test_account_registry_lifecycle_mint_refuse_revoke() {
+    let (registry, service) = registry_backed_service();
+    let gate = BootstrapGate::new(Some(BOOTSTRAP_SECRET.to_string()));
+
+    // The FIX username resolves the SAME AccountId as the JWT path (one identity).
+    match registry.account_by_fix_username("trader-fix") {
+        Some(account) => {
+            assert_eq!(account.id, AccountId::new("trader"));
+            assert_eq!(account.permissions, vec![Permission::Trade]);
+        }
+        None => panic!("the FIX username must resolve the trader account"),
+    }
+    // And its Argon2id password verifies (schema-ready FIX login path).
+    assert!(matches!(
+        registry.verify_fix_password("trader-fix", "sw0rdf1sh"),
+        FixLoginOutcome::Authenticated { .. }
+    ));
+
+    // Account-resolved mint for the `viewer` (Read) — a registry AccountId with the
+    // account's REGISTERED permissions, never a fresh subject.
+    let viewer_token = match registry.mint_for_account(
+        service.jwt(),
+        &gate,
+        &AccountId::new("viewer"),
+        BOOTSTRAP_SECRET,
+        now_secs(),
+        3_600,
+    ) {
+        Ok(token) => token,
+        Err(error) => panic!("resolved mint must succeed: {error}"),
+    };
+    // A Read account is refused order entry (a Trade route) → 403.
+    let refused = send(
+        app(Arc::clone(&service), Permission::Trade),
+        request("/api/v1/orders", Some(&viewer_token)),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    // A Trade account IS admitted on the same route → 200.
+    let trader_token = match registry.mint_for_account(
+        service.jwt(),
+        &gate,
+        &AccountId::new("trader"),
+        BOOTSTRAP_SECRET,
+        now_secs(),
+        3_600,
+    ) {
+        Ok(token) => token,
+        Err(error) => panic!("resolved mint must succeed: {error}"),
+    };
+    let admitted = send(
+        app(Arc::clone(&service), Permission::Trade),
+        request("/api/v1/orders", Some(&trader_token)),
+    )
+    .await;
+    assert_eq!(admitted.status(), StatusCode::OK);
+
+    // Revoke the trader: the SAME (now stale) token is refused on the next request.
+    assert_eq!(registry.revoke(&AccountId::new("trader")), Some(1));
+    let after_revoke = send(
+        app(Arc::clone(&service), Permission::Trade),
+        request("/api/v1/orders", Some(&trader_token)),
+    )
+    .await;
+    assert_eq!(after_revoke.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ---- determinism: venue-clock rate-limit decision is replay-stable -------

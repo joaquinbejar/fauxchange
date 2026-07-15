@@ -36,15 +36,20 @@
 //! actor's [`StoreFanOut`] at spawn and retained here; both sides point at the
 //! one store ([02 §6](../docs/02-matching-architecture.md)).
 //!
-//! ## Placeholders (stable shape for #011–#016)
+//! ## Auth (real, from #012) and the remaining placeholders (#014–#016)
 //!
-//! The auth, subscription-manager, market-maker, and simulator services are
-//! **placeholders** here so the wiring compiles and its shape is fixed; each real
-//! implementation slots into its field without reshaping `AppState`:
+//! The auth service is **real** as of #012: [`AppState`] owns the
+//! [`AccountRegistry`] and an [`AuthService`] pinned to the concrete venue
+//! [`FixedClock`] (built from [`JwtAuth`] + [`RateLimiter`] + the registry as the
+//! [`RevocationOracle`]). The subscription-manager, market-maker, and simulator
+//! services are still **placeholders** so the wiring compiles and its shape is
+//! fixed; each real implementation slots into its field without reshaping
+//! `AppState`:
 //!
-//! | Field           | Placeholder                 | Filled by |
+//! | Field           | Type / placeholder          | Filled by |
 //! |-----------------|-----------------------------|-----------|
-//! | `auth`          | [`AuthPlaceholder`]         | #011/#012 |
+//! | `auth`          | [`AuthService`] (real)       | #011/#012 |
+//! | `accounts`      | [`AccountRegistry`] (real)   | #012      |
 //! | `subscriptions` | [`SubscriptionsPlaceholder`]| #014      |
 //! | `market_maker`  | [`MarketMakerPlaceholder`]  | #015      |
 //! | `simulator`     | [`SimulatorPlaceholder`]    | #016      |
@@ -54,6 +59,10 @@ use std::sync::Arc;
 
 use option_chain_orderbook::{InstrumentRegistry, SymbolIndex, SymbolParser};
 
+use crate::auth::{
+    AccountProvision, AccountRegistry, AccountStore, Argon2Hasher, AuthError, AuthService,
+    BootstrapGate, DEFAULT_RATE_LIMIT_PER_WINDOW, JwtAuth, RateLimiter, RevocationOracle,
+};
 use crate::error::VenueError;
 use crate::exchange::{
     ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, FixedClock, InMemoryExecutionsStore,
@@ -61,6 +70,7 @@ use crate::exchange::{
     MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, VenueCommand,
     spawn_matching_actor_with_registry_and_index,
 };
+use crate::models::AccountId;
 
 /// The default bounded mailbox capacity for each per-underlying actor — a DoS
 /// control, never unbounded ([08 §5](../docs/08-threat-model.md)). The real
@@ -79,14 +89,8 @@ pub const DEFAULT_VENUE_CLOCK_MS: u64 = 0;
 pub const DEFAULT_LINEAGE_TOKEN: &str = "fauxchange";
 
 // ============================================================================
-// Service placeholders — stable field types for #011–#016
+// Service placeholders — stable field types for #014–#016
 // ============================================================================
-
-/// Placeholder for the JWT auth service (`JwtAuth`, `Permission`, `RateLimiter`)
-/// — filled by **#011/#012**. A zero-sized stub so [`AppState`]'s shape is fixed;
-/// the real service replaces this field's type without reshaping `AppState`.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct AuthPlaceholder;
 
 /// Placeholder for the WebSocket subscription manager (per-symbol monotonic
 /// sequence, broadcast fan-out) — filled by **#014**.
@@ -105,11 +109,108 @@ pub struct SimulatorPlaceholder;
 // Construction parameters
 // ============================================================================
 
+/// The auth inputs for an [`AppState`]: the RS256 JWT key pair, the
+/// `AUTH_BOOTSTRAP_SECRET` gate, the optional Argon2 pepper, the accounts to
+/// provision, and the rate-limit budget
+/// ([ADR-0007](../docs/adr/0007-fix-credentials-and-account-model.md),
+/// [06 §8](../docs/06-deployment.md#8-auth-bootstrap)).
+///
+/// Built by the caller (`main.rs` in a real deployment, tests locally) so
+/// [`AppState`] can pin a concrete rate-limit clock without a `config.rs`
+/// dependency. `JwtAuth` is not `Clone`, so neither is this; the bootstrap secret
+/// and pepper are secrets — the [`std::fmt::Debug`] impl **redacts** both.
+pub struct AuthConfig {
+    /// The RS256 JWT service ([`JwtAuth::dev`] locally, [`JwtAuth::from_paths`] in
+    /// a real deployment).
+    pub jwt: JwtAuth,
+    /// The `AUTH_BOOTSTRAP_SECRET`; `None` disables token issuance entirely.
+    pub bootstrap_secret: Option<String>,
+    /// The optional Argon2 pepper (`AUTH_PASSWORD_PEPPER`), never persisted with a
+    /// hash.
+    pub pepper: Option<Vec<u8>>,
+    /// The accounts to provision into the registry at construction.
+    pub accounts: Vec<AccountProvision>,
+    /// The per-window rate-limit budget.
+    pub rate_limit_per_window: u32,
+}
+
+impl std::fmt::Debug for AuthConfig {
+    /// Redacts the bootstrap secret and pepper; [`JwtAuth`]'s own `Debug` redacts
+    /// the key material.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("jwt", &self.jwt)
+            .field(
+                "bootstrap_secret",
+                &self.bootstrap_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("pepper", &self.pepper.as_ref().map(|_| "<redacted>"))
+            .field("accounts", &self.accounts.len())
+            .field("rate_limit_per_window", &self.rate_limit_per_window)
+            .finish()
+    }
+}
+
+impl AuthConfig {
+    /// Auth over an explicit RS256 key pair, with issuance disabled, no pepper, no
+    /// accounts, and the default rate-limit budget — the base to build on.
+    #[must_use]
+    pub fn with_jwt(jwt: JwtAuth) -> Self {
+        Self {
+            jwt,
+            bootstrap_secret: None,
+            pepper: None,
+            accounts: Vec::new(),
+            rate_limit_per_window: DEFAULT_RATE_LIMIT_PER_WINDOW,
+        }
+    }
+
+    /// Local dev auth: the embedded, non-secret dev key pair, issuance disabled,
+    /// and no accounts — the default when an [`AppStateConfig`] carries no auth.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::KeyLoad`] only if the embedded dev fixtures fail to parse (a
+    /// build invariant; never in practice).
+    pub fn dev() -> Result<Self, AuthError> {
+        Ok(Self::with_jwt(JwtAuth::dev()?))
+    }
+
+    /// Sets the bootstrap secret that gates token issuance.
+    #[must_use]
+    pub fn with_bootstrap_secret(mut self, secret: impl Into<String>) -> Self {
+        self.bootstrap_secret = Some(secret.into());
+        self
+    }
+
+    /// Sets the optional Argon2 pepper.
+    #[must_use]
+    pub fn with_pepper(mut self, pepper: Vec<u8>) -> Self {
+        self.pepper = Some(pepper);
+        self
+    }
+
+    /// Sets the accounts to provision.
+    #[must_use]
+    pub fn with_accounts(mut self, accounts: Vec<AccountProvision>) -> Self {
+        self.accounts = accounts;
+        self
+    }
+
+    /// Overrides the per-window rate-limit budget.
+    #[must_use]
+    pub fn with_rate_limit(mut self, per_window: u32) -> Self {
+        self.rate_limit_per_window = per_window;
+        self
+    }
+}
+
 /// The construction parameters for an [`AppState`]. Since the venue config
 /// surface (#022) has not landed, the constructor takes an explicit list of
 /// underlyings plus the run lineage, mailbox capacity, and venue-clock instant —
-/// each with a bounded default.
-#[derive(Debug, Clone)]
+/// each with a bounded default — and the optional [`AuthConfig`] (a `None` auth
+/// defaults to local dev auth in [`AppState::new`]).
+#[derive(Debug)]
 pub struct AppStateConfig {
     /// The underlyings to host — one single-writer actor is spawned per entry.
     /// Duplicates are ignored (a second actor is never spawned for the same
@@ -121,12 +222,16 @@ pub struct AppStateConfig {
     pub mailbox_capacity: usize,
     /// The fixed venue-clock instant, in **milliseconds**.
     pub venue_clock_ms: EventTimestamp,
+    /// The auth inputs; `None` defaults to [`AuthConfig::dev`] in
+    /// [`AppState::new`].
+    pub auth: Option<AuthConfig>,
 }
 
 impl AppStateConfig {
     /// Builds a config for `underlyings` with the bounded defaults
     /// ([`DEFAULT_LINEAGE_TOKEN`] / [`DEFAULT_MAILBOX_CAPACITY`] /
-    /// [`DEFAULT_VENUE_CLOCK_MS`]).
+    /// [`DEFAULT_VENUE_CLOCK_MS`]) and **no** explicit auth (local dev auth is
+    /// applied by [`AppState::new`]).
     #[must_use]
     pub fn new(underlyings: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
@@ -134,6 +239,7 @@ impl AppStateConfig {
             lineage_id: LineageId::new(DEFAULT_LINEAGE_TOKEN),
             mailbox_capacity: DEFAULT_MAILBOX_CAPACITY,
             venue_clock_ms: EventTimestamp::new(DEFAULT_VENUE_CLOCK_MS),
+            auth: None,
         }
     }
 
@@ -148,6 +254,14 @@ impl AppStateConfig {
     #[must_use]
     pub fn with_mailbox_capacity(mut self, mailbox_capacity: usize) -> Self {
         self.mailbox_capacity = mailbox_capacity;
+        self
+    }
+
+    /// Sets the explicit auth inputs (JWT key pair, bootstrap secret, pepper,
+    /// provisioned accounts, rate-limit budget).
+    #[must_use]
+    pub fn with_auth(mut self, auth: AuthConfig) -> Self {
+        self.auth = Some(auth);
         self
     }
 }
@@ -172,11 +286,14 @@ impl AppStateConfig {
 ///
 /// ```rust,no_run
 /// use fauxchange::state::{AppState, AppStateConfig};
-///
+/// # fn main() -> Result<(), fauxchange::auth::AuthError> {
 /// // Must be called within a `tokio` runtime — it spawns one actor per underlying.
-/// let state = AppState::new(AppStateConfig::new(["BTC", "ETH"]));
+/// // Auth defaults to the embedded dev key pair when the config carries none.
+/// let state = AppState::new(AppStateConfig::new(["BTC", "ETH"]))?;
 /// assert_eq!(state.underlying_count(), 2);
 /// assert!(state.hosts_underlying("BTC"));
+/// # Ok(())
+/// # }
 /// ```
 pub struct AppState {
     /// The venue-wide instrument registry — shared by every underlying's book so
@@ -199,8 +316,17 @@ pub struct AppState {
     marks: Arc<MarkPriceBook>,
     /// The run lineage namespacing every venue-minted id.
     lineage_id: LineageId,
-    /// The JWT auth service (placeholder until #011/#012).
-    auth: AuthPlaceholder,
+    /// The venue account registry (the #012 [`AccountStore`](crate::auth::AccountStore)
+    /// backend). The same `Arc`, cast to [`RevocationOracle`], is the auth
+    /// service's revocation oracle — so a [`AccountRegistry::revoke`] is visible
+    /// to the middleware on the next request.
+    accounts: Arc<AccountRegistry>,
+    /// The JWT auth service (real as of #012): JWT verification, the rate limiter
+    /// on the venue [`FixedClock`], and the account revocation oracle.
+    auth: AuthService<FixedClock>,
+    /// The operator gate on token issuance (`AUTH_BOOTSTRAP_SECRET`), consulted by
+    /// the registry-resolved mint ([`AppState::mint_token`]).
+    bootstrap_gate: BootstrapGate,
     /// The WebSocket subscription manager (placeholder until #014).
     subscriptions: SubscriptionsPlaceholder,
     /// The market-maker engine handle (placeholder until #015).
@@ -225,19 +351,61 @@ impl AppState {
     /// A duplicate underlying in the config is skipped (with a `WARN`) rather than
     /// spawning a second concurrent writer for the same book.
     ///
+    /// Auth is built **before** any actor is spawned: a `None` [`AppStateConfig::auth`]
+    /// defaults to [`AuthConfig::dev`], the registry is provisioned (hashing each
+    /// account's password with Argon2id — a one-off bootstrap cost, never a
+    /// request-path cost), and the [`AuthService`] is pinned to the venue
+    /// [`FixedClock`], with the registry (as [`RevocationOracle`]) as its oracle.
+    ///
     /// # Panics
     ///
     /// Must be called within a `tokio` runtime — it spawns the actor tasks; the
     /// spawn panics outside a runtime, matching
     /// [`spawn_matching_actor_with_registry_and_index`].
-    #[must_use]
-    pub fn new(config: AppStateConfig) -> Arc<Self> {
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError`] if auth cannot be built: the embedded dev fixtures fail to
+    /// parse ([`AuthError::KeyLoad`]), a provisioned password cannot be hashed
+    /// ([`AuthError::PasswordHash`]), or two accounts collide on an id or FIX
+    /// username ([`AuthError::Provisioning`]).
+    pub fn new(config: AppStateConfig) -> Result<Arc<Self>, AuthError> {
         let AppStateConfig {
             underlyings,
             lineage_id,
             mailbox_capacity,
             venue_clock_ms,
+            auth,
         } = config;
+
+        // A deterministic fixed clock (`venue_ts` is not the journaled order); the
+        // rate limiter and the sequenced path read this SAME venue clock.
+        let clock = FixedClock::new(venue_clock_ms);
+
+        // Build auth FIRST (the only fallible step): a `None` auth defaults to the
+        // embedded dev key pair, then provision the registry and assemble the
+        // service pinned to the venue clock. No actor is spawned until this holds.
+        let AuthConfig {
+            jwt,
+            bootstrap_secret,
+            pepper,
+            accounts,
+            rate_limit_per_window,
+        } = match auth {
+            Some(auth) => auth,
+            None => AuthConfig::dev()?,
+        };
+        let hasher = Argon2Hasher::new(pepper);
+        let account_registry = Arc::new(AccountRegistry::provision(hasher, accounts)?);
+        // Clone the concrete `Arc`, then coerce to the oracle trait object (the
+        // unsizing coercion applies to the cloned value, not through `Arc::clone`).
+        let revocation: Arc<dyn RevocationOracle> = account_registry.clone();
+        let auth_service = AuthService::new(
+            jwt,
+            RateLimiter::new(clock, rate_limit_per_window),
+            revocation,
+        );
+        let bootstrap_gate = BootstrapGate::new(bootstrap_secret);
 
         // Venue-wide instrument services (O(1) cross-underlying lookups).
         let registry = Arc::new(InstrumentRegistry::new());
@@ -248,9 +416,6 @@ impl AppState {
         let executions = Arc::new(InMemoryExecutionsStore::new());
         let positions = Arc::new(InMemoryPositionsStore::new());
         let marks = Arc::new(MarkPriceBook::new());
-
-        // A deterministic fixed clock (`venue_ts` is not the journaled order).
-        let clock = FixedClock::new(venue_clock_ms);
 
         let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::with_capacity(underlyings.len());
         for underlying in underlyings {
@@ -292,10 +457,11 @@ impl AppState {
 
         tracing::info!(
             underlyings = handles.len(),
+            accounts = account_registry.account_count(),
             "AppState assembled; one single-writer actor spawned per underlying"
         );
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             registry,
             symbol_index,
             underlyings: handles,
@@ -303,11 +469,13 @@ impl AppState {
             positions,
             marks,
             lineage_id,
-            auth: AuthPlaceholder,
+            accounts: account_registry,
+            auth: auth_service,
+            bootstrap_gate,
             subscriptions: SubscriptionsPlaceholder,
             market_maker: MarketMakerPlaceholder,
             simulator: SimulatorPlaceholder,
-        })
+        }))
     }
 
     /// Submits a [`VenueCommand`] onto the sequenced order path — the **only** way
@@ -457,11 +625,62 @@ impl AppState {
         tickers
     }
 
-    /// The JWT auth service (placeholder until #011/#012).
+    /// The JWT auth service (real as of #012) — JWT verification, the venue-clock
+    /// rate limiter, and the account revocation oracle behind one handle every
+    /// gateway consults.
     #[must_use]
     #[inline]
-    pub fn auth(&self) -> &AuthPlaceholder {
+    pub fn auth(&self) -> &AuthService<FixedClock> {
         &self.auth
+    }
+
+    /// The venue account registry (the [`AccountStore`] backend) — resolution by
+    /// JWT `sub` / FIX username, Argon2id verification, and revocation.
+    #[must_use]
+    #[inline]
+    pub fn accounts(&self) -> &AccountRegistry {
+        &self.accounts
+    }
+
+    /// The operator gate on token issuance (`AUTH_BOOTSTRAP_SECRET`).
+    #[must_use]
+    #[inline]
+    pub fn bootstrap_gate(&self) -> &BootstrapGate {
+        &self.bootstrap_gate
+    }
+
+    /// The registry-resolved bootstrap mint the token-issuance route (#013) calls:
+    /// authorises `presented_secret`, resolves `account` to its **registered**
+    /// permissions and current revocation epoch, and mints a JWT via #011's
+    /// [`JwtAuth`]. Never fabricates a subject or permissions
+    /// ([ADR-0007](../docs/adr/0007-fix-credentials-and-account-model.md)).
+    ///
+    /// `issued_at_secs` / `ttl_secs` are wall-clock **seconds** (token expiry is a
+    /// credential-plane concern, not the venue clock); the route supplies
+    /// `issued_at_secs` from the wall clock and typically
+    /// [`DEFAULT_TOKEN_TTL_SECS`](crate::auth::DEFAULT_TOKEN_TTL_SECS) for the TTL.
+    ///
+    /// # Errors
+    ///
+    /// The registry-resolved mint errors: [`AuthError::BootstrapDisabled`] /
+    /// [`AuthError::BootstrapMismatch`] (gate, checked before any account lookup),
+    /// [`AuthError::UnknownAccount`], [`AuthError::TokenLifetime`], or
+    /// [`AuthError::Signing`].
+    pub fn mint_token(
+        &self,
+        account: &AccountId,
+        presented_secret: &str,
+        issued_at_secs: u64,
+        ttl_secs: u64,
+    ) -> Result<String, AuthError> {
+        self.accounts.mint_for_account(
+            self.auth.jwt(),
+            &self.bootstrap_gate,
+            account,
+            presented_secret,
+            issued_at_secs,
+            ttl_secs,
+        )
     }
 
     /// The WebSocket subscription manager (placeholder until #014).
@@ -509,6 +728,15 @@ mod tests {
         AppStateConfig::new(underlyings.iter().copied()).with_lineage(LineageId::new("run-1"))
     }
 
+    /// Builds an [`AppState`] from `config`, defaulting to local dev auth (no
+    /// accounts), panicking only if the infallible-in-practice auth build fails.
+    fn new_state(config: AppStateConfig) -> Arc<AppState> {
+        match AppState::new(config) {
+            Ok(state) => state,
+            Err(error) => panic!("AppState::new must succeed with dev auth: {error}"),
+        }
+    }
+
     fn sym(raw: &str) -> Symbol {
         match Symbol::parse(raw) {
             Ok(s) => s,
@@ -553,7 +781,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_new_spawns_one_actor_per_configured_underlying() {
-        let state = AppState::new(config(&["BTC", "ETH", "SOL"]));
+        let state = new_state(config(&["BTC", "ETH", "SOL"]));
         assert_eq!(state.underlying_count(), 3);
         assert!(state.hosts_underlying("BTC"));
         assert!(state.hosts_underlying("ETH"));
@@ -568,7 +796,7 @@ mod tests {
     #[tokio::test]
     async fn test_new_skips_a_duplicate_underlying() {
         // A repeated underlying must not spawn a second concurrent writer.
-        let state = AppState::new(config(&["BTC", "BTC", "ETH"]));
+        let state = new_state(config(&["BTC", "BTC", "ETH"]));
         assert_eq!(state.underlying_count(), 2);
         assert_eq!(state.underlyings(), vec!["BTC", "ETH"]);
     }
@@ -577,7 +805,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_routes_to_the_correct_underlying_and_returns_a_receipt() {
-        let state = AppState::new(config(&["BTC", "ETH"]));
+        let state = new_state(config(&["BTC", "ETH"]));
         // A BTC cancel routes to the BTC actor and returns its receipt at seq 0.
         let receipt = match state.submit(cancel("BTC-20240329-50000-C")).await {
             Ok(r) => r,
@@ -603,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_unknown_underlying_is_not_found() {
-        let state = AppState::new(config(&["BTC"]));
+        let state = new_state(config(&["BTC"]));
         match state.submit(cancel("ETH-20240329-3000-C")).await {
             Err(VenueError::NotFound(detail)) => assert!(detail.contains("ETH")),
             other => panic!("expected NotFound for an unhosted underlying, got {other:?}"),
@@ -612,7 +840,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_venue_global_command_is_not_routable() {
-        let state = AppState::new(config(&["BTC"]));
+        let state = new_state(config(&["BTC"]));
         match state
             .submit(VenueCommand::Clock {
                 now_ms: EventTimestamp::new(1),
@@ -628,7 +856,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_crossing_trade_fill_lands_in_the_shared_executions_store() {
-        let state = AppState::new(config(&["BTC"]));
+        let state = new_state(config(&["BTC"]));
         let symbol = "BTC-20240329-50000-C";
         // Resting maker sell, then a crossing taker buy — both via the ONLY path.
         match state

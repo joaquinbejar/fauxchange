@@ -11,6 +11,54 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The venue account registry — credentials, revocation epoch, and
+  account-resolved bootstrap minting** (#12) in `src/auth.rs`, wired into
+  `src/state.rs` ([ADR-0007](docs/adr/0007-fix-credentials-and-account-model.md),
+  [01 §8](docs/01-domain-model.md), [06 §8](docs/06-deployment.md)). The
+  registry-internal `Account { id (IS the JWT sub), owner: Hash32, permissions,
+  credentials, revocation_epoch }` and `Credentials { fix_username, password_hash
+  (Argon2id PHC, #[serde(skip_serializing)]), fix_comp_ids }` model an account
+  once behind both credential paths; the `CompIdBinding` (SenderCompID,
+  TargetCompID) is **declared now, enforced from v0.4** (ADR-0010). The in-memory
+  `AccountRegistry` (DashMap) provisions from an explicit `Vec<AccountProvision>`
+  (the seed-manifest **format** is #024), indexes accounts by `AccountId` (a
+  direct JWT-`sub` lookup) **and** by FIX `Username (553)`, both resolving one
+  account row + permission set, and implements the #011 `RevocationOracle`
+  (`current_revocation_epoch`) so a `revoke` (which bumps the epoch) refuses the
+  account's outstanding tokens on the next request via the existing
+  `auth_middleware`. **Account-resolved minting** (`AccountRegistry::mint_for_account`,
+  exposed as `AppState::mint_token`) replaces the Backend's ephemeral-subject
+  minting: it authorises `AUTH_BOOTSTRAP_SECRET` **first** (no account
+  enumeration pre-auth), resolves an **existing** `AccountId` to its **registered**
+  permissions + current revocation epoch, and mints via #011's
+  `JwtAuth::mint_token` — never a fresh `Uuid`, never arbitrary requested
+  permissions. Passwords are hashed with **Argon2id** (`Argon2Hasher`) at the
+  pinned OWASP baseline (`m = 19456 KiB`, `t = 2`, `p = 1`) with an optional
+  `AUTH_PASSWORD_PEPPER` (an Argon2 secret, never written into the PHC string),
+  constant-time verification, and **rehash-on-verify** when a stored hash used
+  weaker parameters (`PasswordVerification`); the FIX login path
+  (`verify_fix_password` → `FixLoginOutcome`) is schema-ready for the v0.4
+  acceptor and equalises unknown-username timing. The plaintext, the hash, and the
+  pepper never appear on the wire (the `password_hash` is `skip_serializing`) or
+  in a log/error (redacting `Debug` on `Credentials` / `Account` / `AccountProvision`
+  / `PasswordVerification` / `Argon2Hasher`; issuance errors carry only static
+  labels). The `AccountStore` trait (a `RevocationOracle` supertrait exposing
+  lookup-by-id / lookup-by-fix-username / verify / revoke / count) is the drop-in
+  seam for the v0.2 PostgreSQL `accounts` backend (#023/#024); `AppState`
+  currently pins the concrete `Arc<AccountRegistry>` (so `mint_for_account` stays
+  an inherent method), and the v0.2 swap to `Arc<dyn AccountStore>` promotes
+  `mint_for_account` to a trait default method — a localized change confined to
+  `src/auth.rs`/`src/state.rs`, invisible to the gateways. `AppState` now owns
+  the `AccountRegistry` and a
+  **real** `AuthService<FixedClock>` (replacing `AuthPlaceholder`), pinned to the
+  venue clock, with the registry (as `RevocationOracle`) as its oracle;
+  `AppStateConfig` gains an optional `AuthConfig` (JWT key pair / `dev()`,
+  bootstrap secret, pepper, provisioned accounts, rate-limit budget) and
+  `AppState::new` is now fallible (`Result<Arc<Self>, AuthError>`) on the auth
+  build. New dependencies: `argon2` 0.5 (pure-Rust RustCrypto Argon2id) and
+  `rand_core` 0.6 with `getrandom` (already in the tree; only the salt CSPRNG
+  feature is added).
+
 - **JWT (RS256/x509) auth, the `Permission` implication, and the sliding-60 s
   `RateLimiter`** (#11) in `src/auth.rs` — the **one** authorization model across
   every surface ([ADR-0005](docs/adr/0005-jwt-auth-for-rest-ws.md),
