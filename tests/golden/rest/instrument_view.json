@@ -1,0 +1,8 @@
+{
+  "expiration": "20240329",
+  "status": "active",
+  "strike": 50000,
+  "style": "call",
+  "symbol": "BTC-20240329-50000-C",
+  "underlying": "BTC"
+}

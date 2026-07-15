@@ -30,6 +30,7 @@ use axum::Json;
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::exchange::{MoneyError, SymbolError};
 use crate::models::Permission;
@@ -339,7 +340,7 @@ impl IntoResponse for VenueError {
 /// Serialised as the JSON response body by [`VenueError::into_response`]; a
 /// concrete struct, never a `serde_json::Value`. `code` shares its vocabulary
 /// with the WS [`WsErrorCode`]; `message` is the redacted, client-safe form.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ErrorEnvelope {
     /// Schema tag pinning this wire shape — always [`REST_ERROR_SCHEMA`].
     pub schema: String,
@@ -485,7 +486,7 @@ pub struct FixReject {
 /// The full wire vocabulary — including `BadRequest` (a decode failure) and
 /// `Busy` (a full mailbox), which are produced by the WS transport (#014)
 /// rather than a [`VenueError`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum WsErrorCode {
@@ -510,7 +511,7 @@ pub enum WsErrorCode {
 
 /// The category on the WS error envelope
 /// ([03 §4.2](../docs/03-protocol-surfaces.md)). Serialised `snake_case`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
 pub enum WsErrorCategory {
@@ -536,7 +537,7 @@ pub enum WsErrorCategory {
 ///
 /// The outer `{ type, data }` framing is the WS transport's `WsMessage::Error`
 /// variant (#014); this struct is the versioned envelope it wraps.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct WsError {
     /// Schema tag pinning this wire shape — always [`WS_ERROR_SCHEMA`].
     pub schema: String,

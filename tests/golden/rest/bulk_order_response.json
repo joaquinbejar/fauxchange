@@ -1,0 +1,17 @@
+{
+  "failure_count": 1,
+  "results": [
+    {
+      "index": 0,
+      "order_id": "lin:BTC:7:0",
+      "status": "accepted"
+    },
+    {
+      "error": "invalid order: limit price must be positive",
+      "index": 1,
+      "status": "rejected"
+    }
+  ],
+  "rolled_back": false,
+  "success_count": 1
+}

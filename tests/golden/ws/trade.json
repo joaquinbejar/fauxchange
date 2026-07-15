@@ -1,0 +1,12 @@
+{
+  "data": {
+    "maker_order_id": "lin:BTC:7:0",
+    "price": 50000,
+    "quantity": 2,
+    "symbol": "BTC-20240329-50000-C",
+    "taker_order_id": "lin:BTC:8:0",
+    "timestamp": 1700000000000,
+    "trade_id": "trade-1"
+  },
+  "type": "trade"
+}

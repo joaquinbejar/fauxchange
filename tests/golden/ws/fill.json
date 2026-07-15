@@ -1,0 +1,15 @@
+{
+  "data": {
+    "edge": -50,
+    "execution_id": "lin:BTC:7:0",
+    "instrument": "BTC-20240329-50000-C",
+    "liquidity": "taker",
+    "price": 50000,
+    "quantity": 2,
+    "side": "buy",
+    "symbol": "BTC",
+    "underlying_sequence": 7,
+    "venue_ts": 1700000000000
+  },
+  "type": "fill"
+}

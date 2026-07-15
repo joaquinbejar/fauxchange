@@ -1,0 +1,8 @@
+{
+  "client_order_id": "client-42",
+  "gtd_expires_at": null,
+  "price": 50000,
+  "quantity": 10,
+  "side": "buy",
+  "time_in_force": "GTC"
+}

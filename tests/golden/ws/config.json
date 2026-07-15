@@ -1,0 +1,9 @@
+{
+  "data": {
+    "directional_skew": -0.25,
+    "enabled": true,
+    "size_scalar": 0.5,
+    "spread_multiplier": 1.5
+  },
+  "type": "config"
+}

@@ -1,0 +1,20 @@
+{
+  "data": {
+    "asks": [
+      {
+        "price": 50100,
+        "quantity": 8
+      }
+    ],
+    "bids": [
+      {
+        "price": 49900,
+        "quantity": 12
+      }
+    ],
+    "channel": "orderbook",
+    "sequence": 42,
+    "symbol": "BTC-20240329-50000-C"
+  },
+  "type": "orderbook_snapshot"
+}

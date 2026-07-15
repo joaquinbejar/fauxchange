@@ -11,6 +11,36 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- REST/WS DTO layer (#4) in `src/models.rs`: the venue value objects and their
+  `serde` + `utoipa::ToSchema` projection onto the wire, prices in integer cents
+  and timestamps in venue-clock milliseconds. Covers the whole inherited Backend
+  route surface — order entry (`PlaceLimitOrderRequest` / `PlaceMarketOrderRequest`
+  + responses), bulk/cancel-all, price get/set, hierarchy CRUD views
+  (`InstrumentView`, quotes, underlying/expiration/strike summaries), the
+  account-scoped `ExecutionRecord` and the distinct public-anonymised WS `fill`
+  print (no `account`/`fee`; the four join keys `execution_id` /
+  `underlying_sequence` / `venue_ts` / `liquidity`), positions, controls, chain /
+  volatility-surface, greeks / metrics, OHLC, auth token, and admin
+  snapshot req/resp. Adds the value objects `Order` / `Fill` / `Position` /
+  `Account`, the wire enums with pinned casing (`Permission` / `Side` /
+  `OptionStyle` / `OrderStatus` lowercase, `TimeInForce` `UPPERCASE`,
+  `OrderType` / `LiquidityFlag` `snake_case`), the opaque identity newtypes
+  (`AccountId` / `ClientOrderId` / `VenueOrderId` / `ExecutionId`), and the
+  `WsMessage` protocol (`#[serde(tag = "type", content = "data")]`, all
+  server→client variants), whose `error` variant reuses the #003 `WsError`
+  envelope verbatim. Money fields are only `Cents` / `SignedCents` newtypes (the
+  sole floats are documented analytics — Greeks/IV/VWAP/impact); every request
+  DTO carries `#[serde(deny_unknown_fields)]`; and `validate_order_shape`
+  enforces the boundary order rules (Limit⇒price, Market⇒none, quantity>0,
+  price>0) as a typed `VenueError`. Adds `ToSchema` to the #003 `ErrorEnvelope`
+  / `WsError` / `WsErrorCode` / `WsErrorCategory` (architect finding B) and the
+  `utoipa` 5 dependency (already resolved transitively — no new tree version).
+  New tests: co-located validation + casing + `deny_unknown_fields` units,
+  the `order_dto_serde_identity` / `ws_message_serde_identity` property tests in
+  `tests/property.rs`, and per-DTO / per-`WsMessage`-variant wire goldens under
+  `tests/golden/{rest,ws}/` (asserting integer cents and the `type` discriminant,
+  with an `UPDATE_GOLDEN` regeneration mode) in `tests/golden.rs`.
+
 - Typed error boundary (#3) in `src/error.rs`: the closed-set `VenueError`
   (`NotFound` / `InvalidOrder` / `Unauthorized` / `Forbidden(Permission)` /
   `RateLimited` / `Overflow` / `Upstream(#[from] option_chain_orderbook::Error)`)

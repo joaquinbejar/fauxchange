@@ -32,6 +32,13 @@ optionstratlib = { version = "0.17", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# OpenAPI schema derivation: `ToSchema` on every REST/WS DTO and on the shared
+# error envelopes, so #013 can register them in the OpenAPI document. Version 5
+# (`5.5.0`) is already resolved transitively via the upstream stack, so this
+# direct dependency adds NO new version to the tree. Default features only (no
+# framework integration); the Swagger UI / `utoipa-axum` wiring lands with the
+# REST gateway (#013). MIT/Apache-2.0, maintained by the utoipa project.
+utoipa = "5"
 
 [dev-dependencies]
 proptest = "1"
