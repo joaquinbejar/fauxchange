@@ -98,6 +98,21 @@ pub enum VenueError {
     /// HTTP `500`, cause redacted — never a wrap or a saturate.
     #[error("arithmetic overflow")]
     Overflow,
+    /// The per-underlying `underlying_sequence` reached `u64::MAX` and cannot
+    /// advance without wrapping, so the underlying was **sealed** — a wrapped
+    /// sequence would corrupt gap detection and replay. HTTP `500`, cause
+    /// **redacted** on every client surface. This is the actor's checked
+    /// sequence-exhaustion seal ([ADR-0006 §2](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md),
+    /// [08 §5](../docs/08-threat-model.md)); it never surfaces internal state.
+    #[error("sequence exhausted")]
+    SequenceExhausted,
+    /// The command journal could not durably record a write, so the command was
+    /// rejected — either a confirmed pre-execution write-ahead append failure
+    /// (the sequence is reused, the book untouched) or a post-mutation event
+    /// append failure that **sealed** the underlying fail-stop. HTTP `500`, cause
+    /// **redacted** ([ADR-0006 §3](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
+    #[error("journal unavailable")]
+    JournalUnavailable,
     /// A failure propagated from the upstream matching stack. HTTP `500`, cause
     /// **redacted** on every client surface. `#[error(transparent)]` keeps the
     /// upstream `Display`/`source` chain intact for server-side logging, but
@@ -156,6 +171,8 @@ impl VenueError {
             VenueError::Forbidden(_) => StatusCode::FORBIDDEN,
             VenueError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             VenueError::Overflow => StatusCode::INTERNAL_SERVER_ERROR,
+            VenueError::SequenceExhausted => StatusCode::INTERNAL_SERVER_ERROR,
+            VenueError::JournalUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
             VenueError::Upstream(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -172,6 +189,8 @@ impl VenueError {
             VenueError::Forbidden(_) => "forbidden",
             VenueError::RateLimited => "throttled",
             VenueError::Overflow => "internal",
+            VenueError::SequenceExhausted => "internal",
+            VenueError::JournalUnavailable => "internal",
             VenueError::Upstream(_) => "internal",
         }
     }
@@ -190,6 +209,8 @@ impl VenueError {
             VenueError::Forbidden(permission) => format!("missing permission {permission:?}"),
             VenueError::RateLimited => "rate limited".to_string(),
             VenueError::Overflow => REDACTED_INTERNAL_MESSAGE.to_string(),
+            VenueError::SequenceExhausted => REDACTED_INTERNAL_MESSAGE.to_string(),
+            VenueError::JournalUnavailable => REDACTED_INTERNAL_MESSAGE.to_string(),
             VenueError::Upstream(_) => REDACTED_INTERNAL_MESSAGE.to_string(),
         }
     }
@@ -246,6 +267,8 @@ impl VenueError {
             VenueError::Forbidden(_) => FixRejectReason::Authorization,
             VenueError::RateLimited => FixRejectReason::Throttle,
             VenueError::Overflow => FixRejectReason::Internal,
+            VenueError::SequenceExhausted => FixRejectReason::Internal,
+            VenueError::JournalUnavailable => FixRejectReason::Internal,
             VenueError::Upstream(_) => FixRejectReason::Internal,
         }
     }
@@ -275,6 +298,8 @@ impl VenueError {
             | VenueError::InvalidOrder(_)
             | VenueError::Forbidden(_)
             | VenueError::Overflow
+            | VenueError::SequenceExhausted
+            | VenueError::JournalUnavailable
             | VenueError::Upstream(_) => (false, None, false),
         };
         WsError {
@@ -300,6 +325,8 @@ impl VenueError {
             VenueError::Forbidden(_) => (WsErrorCode::Forbidden, WsErrorCategory::Authorization),
             VenueError::RateLimited => (WsErrorCode::Throttled, WsErrorCategory::Throttle),
             VenueError::Overflow => (WsErrorCode::Internal, WsErrorCategory::Internal),
+            VenueError::SequenceExhausted => (WsErrorCode::Internal, WsErrorCategory::Internal),
+            VenueError::JournalUnavailable => (WsErrorCode::Internal, WsErrorCategory::Internal),
             VenueError::Upstream(_) => (WsErrorCode::Internal, WsErrorCategory::Internal),
         }
     }
@@ -330,6 +357,8 @@ impl IntoResponse for VenueError {
             | VenueError::Unauthorized
             | VenueError::Forbidden(_)
             | VenueError::Overflow
+            | VenueError::SequenceExhausted
+            | VenueError::JournalUnavailable
             | VenueError::Upstream(_) => (status, body).into_response(),
         }
     }
@@ -580,6 +609,8 @@ mod tests {
             VenueError::Forbidden(Permission::Trade),
             VenueError::RateLimited,
             VenueError::Overflow,
+            VenueError::SequenceExhausted,
+            VenueError::JournalUnavailable,
             upstream_with_marker("marker"),
         ]
     }
@@ -640,6 +671,41 @@ mod tests {
             upstream_with_marker("x").http_status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn test_venue_error_sequence_exhausted_is_redacted_internal_500() {
+        // The actor's checked sequence-exhaustion seal surfaces as a redacted
+        // internal failure — never leaking the operational cause to a client.
+        let err = VenueError::SequenceExhausted;
+        assert_eq!(err.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.machine_code(), "internal");
+        assert_eq!(err.redacted_message(), REDACTED_INTERNAL_MESSAGE);
+        // Display carries the distinct cause for server-side logs.
+        assert_eq!(err.to_string(), "sequence exhausted");
+    }
+
+    #[test]
+    fn test_venue_error_journal_unavailable_is_redacted_internal_500() {
+        let err = VenueError::JournalUnavailable;
+        assert_eq!(err.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.machine_code(), "internal");
+        assert_eq!(err.redacted_message(), REDACTED_INTERNAL_MESSAGE);
+        assert_eq!(err.to_string(), "journal unavailable");
+    }
+
+    #[test]
+    fn test_venue_error_sequencing_failures_are_non_retryable_non_terminal_on_ws() {
+        for err in [
+            VenueError::SequenceExhausted,
+            VenueError::JournalUnavailable,
+        ] {
+            let env = err.ws_error(None);
+            assert_eq!(env.code, WsErrorCode::Internal);
+            assert!(!env.retryable);
+            assert!(!env.terminal);
+            assert_eq!(env.retry_after_ms, None);
+        }
     }
 
     // ---- machine code ------------------------------------------------------

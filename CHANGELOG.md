@@ -11,6 +11,53 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- Per-underlying single-writer actor + in-memory write-ahead envelope journal
+  (#6) in `src/exchange/` (`actor.rs`, `journal.rs`) — the determinism
+  foundation every book mutation flows through
+  ([ADR-0006 §2–§3](docs/adr/0006-venue-command-envelope-and-single-writer-journal.md),
+  [02 §4–§6, §8](docs/02-matching-architecture.md)). Adds the
+  `UnderlyingActor` (one `tokio` task per underlying, the sole caller of the
+  order path) with a **bounded** `mpsc` mailbox + `oneshot` receipts
+  (`ActorHandle::submit` → `Receipt`; a full mailbox returns a typed
+  `RateLimited` busy, never an unbounded queue), and its venue-owned
+  `underlying_sequence` as a **`u64` checked counter** (advanced with
+  `checked_add` per committed command — the upstream `OptionChainSequencer` is
+  `pub(crate)`, so the venue owns numbering). Implements the write-ahead
+  durability protocol per turn: append the `VenueCommand` envelope **before**
+  executing (`N` advances only on a confirmed append; a confirmed pre-execution
+  failure **reuses `N`** with the book untouched and no gap; an ambiguous result
+  is resolved by an idempotent durable **tail read-back**), then execute +
+  capture (the `CommandExecutor` seam, filled by #7), append the paired
+  `VenueEvent`, and fan out (the `FanOut` seam, filled by #8) **only after** the
+  event is journaled. A **post-mutation** event-append failure **seals** the
+  underlying (no fan-out); a sequence **exhaustion** at `u64::MAX` seals with
+  `SequenceExhausted`, never wraps. Adds `InMemoryVenueJournal` behind the
+  `VenueJournal` trait (named to match the upstream `OptionChainJournal` shape —
+  `append` / `read_from` / `last_sequence` — so the durable store swaps in at
+  #29), the paired `JournalRecord` (`Command` / `Event`, keyed
+  `(underlying, N, kind)` with idempotent re-append), and the deterministic
+  `FixedClock` / `PlaceholderExecutor` / `NoopFanOut` #006 seam stubs. Extends
+  the boundary `VenueError` with `SequenceExhausted` and `JournalUnavailable`
+  (both redacted `500`/`internal`, non-retryable, non-terminal) and adds
+  `JournalError` (`AppendFailed` / `Ambiguous` / `Conflict` / `Corruption`, the
+  fixed durable/recovery contract). Enables the upstream
+  `option-chain-orderbook` `sequencer` feature (activates upstream `tokio` +
+  `orderbook-rs/journal`, pulling `memmap2` 0.9 into the tree — `crc32fast` was
+  already present) to make the sequencer / mass-cancel types reachable for #7.
+  The `memmap2` machinery is unused by #6 (which ships its own in-memory
+  journal) and is flagged for the `cargo audit` / `cargo deny` gate (#19). New
+  dependencies: `tokio` (`rt` + `sync` + `macros`; `rt-multi-thread` dev-only)
+  for the actor runtime, and `tracing` for the actor's lifecycle / degraded-path
+  logging — both already resolved transitively, adding no new tree version. New
+  tests: unit single-writer ordering under concurrent submits, `checked_add`
+  monotonicity, `SequenceExhausted` at `u64::MAX`, reuse-`N` + tail-read-back
+  idempotency, and mailbox backpressure → busy (`actor.rs`); journal
+  append/read/dedup/conflict units (`journal.rs`); `SequenceExhausted` /
+  `JournalUnavailable` redaction units (`error.rs`); the
+  `sequence_monotonic_per_symbol` property (`tests/property.rs`); and the
+  integration actor round-trip + determinism fault-injection rows
+  (pre-execution append fail → book untouched, reuse `N`; post-mutation append
+  fail → seal, no fan-out) through the public seam surface (`tests/actor.rs`).
 - Versioned `VenueCommand` / `VenueEvent` v1 envelope + lossless outcomes (#5)
   in `src/exchange/` (`envelope.rs`, `identity.rs`) — the venue's own internal
   instruction set, carrying the account/owner/TIF/order-type/STP identity the

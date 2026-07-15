@@ -19,20 +19,37 @@
 //!   grammar, and the [`JournalHeader`].
 //! - [`envelope`] — the versioned [`VenueCommand`] / [`VenueEvent`] v1 envelope,
 //!   the lossless [`VenueOutcome`] shapes, and the internal [`Fill`] projection.
+//! - [`journal`] — the venue's in-memory, append-only, write-ahead
+//!   command/event journal ([`VenueJournal`] / [`InMemoryVenueJournal`] /
+//!   [`JournalRecord`]), named to match the upstream `OptionChainJournal` shape
+//!   so the durable store swaps in behind it (#029).
+//! - [`actor`] — the per-underlying **single-writer actor**
+//!   ([`UnderlyingActor`] / [`ActorHandle`] / [`spawn_underlying_actor`]): the
+//!   bounded mailbox, the venue-owned checked sequence counter, and the
+//!   write-ahead durability protocol every book mutation flows through. The
+//!   execute + fill-capture seam ([`CommandExecutor`]) is filled by #007 and the
+//!   fan-out seam ([`FanOut`]) by #008.
 //!
-//! The single-writer actor, journal store, snapshot/restore, and store wiring
-//! land in later issues; the envelope types here are **pure data**.
+//! Snapshot/restore, recovery, and the durable journal store land in later
+//! issues; the envelope types remain **pure data**.
 //!
 //! Governed by `docs/02-matching-architecture.md` and `docs/01-domain-model.md`.
 
+pub mod actor;
 pub mod boundary;
 pub mod envelope;
 pub mod event;
 pub mod identity;
 pub mod instrument;
+pub mod journal;
 pub mod money;
 pub mod symbol;
 
+pub use self::actor::{
+    ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, FixedClock,
+    JournalSnapshot, NoopFanOut, PlaceholderExecutor, Receipt, UnderlyingActor, VenueClock,
+    spawn_underlying_actor,
+};
 pub use self::boundary::{
     ExpirationDate, Hash32, InstrumentStatus, OptionStyle, OrderId, ParsedSymbol, Price, Quantity,
     STPMode, Side, SymbolParser, TimeInForce, TimestampMs,
@@ -44,5 +61,8 @@ pub use self::envelope::{
 pub use self::event::{EventTimestamp, SequenceNumber};
 pub use self::identity::{JournalHeader, LineageId, VENUE_ENVELOPE_SCHEMA};
 pub use self::instrument::Instrument;
+pub use self::journal::{
+    InMemoryVenueJournal, JournalCommand, JournalError, JournalRecord, RecordKind, VenueJournal,
+};
 pub use self::money::{Cents, MoneyError, Notional, SignedCents};
 pub use self::symbol::{Symbol, SymbolError, validate_venue_expiry};
