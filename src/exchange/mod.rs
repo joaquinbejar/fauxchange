@@ -55,6 +55,7 @@ pub mod identity;
 pub mod instrument;
 pub mod journal;
 pub mod money;
+pub mod snapshot;
 pub mod stores;
 pub mod symbol;
 
@@ -72,13 +73,19 @@ pub use self::envelope::{
     VenueEvent, VenueOutcome,
 };
 pub use self::event::{EventTimestamp, SequenceNumber};
-pub use self::executor::{MatchingExecutor, TopOfBook, spawn_matching_actor};
+pub use self::executor::{MatchingExecutor, PreparedRestore, TopOfBook, spawn_matching_actor};
 pub use self::identity::{JournalHeader, LineageId, VENUE_ENVELOPE_SCHEMA};
 pub use self::instrument::Instrument;
 pub use self::journal::{
-    InMemoryVenueJournal, JournalCommand, JournalError, JournalRecord, RecordKind, VenueJournal,
+    InMemoryVenueJournal, JournalCommand, JournalError, JournalRecord, RecordKind,
+    SnapshotRestored, VenueJournal,
 };
 pub use self::money::{Cents, MoneyError, Notional, SignedCents};
+pub use self::snapshot::{
+    ExecutionCapture, ExecutorState, IdempotencyEntry, IdempotencyFingerprint, IdempotencyKey,
+    IdempotencyMap, IdempotencyRecord, PositionCapture, RestingOrderCapture, SnapshotError,
+    SnapshotMetadata, VenueSnapshot,
+};
 pub use self::stores::{
     ExecutionFilter, ExecutionsStore, InMemoryExecutionsStore, InMemoryPositionsStore,
     MarkPriceBook, MarkSource, NoMarks, PositionLeg, PositionsStore, StoreError, StoreFanOut,

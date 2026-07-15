@@ -83,8 +83,12 @@ use crate::exchange::envelope::{
 use crate::exchange::event::SequenceNumber;
 use crate::exchange::journal::VenueJournal;
 use crate::exchange::money::{Cents, MoneyError, SignedCents};
+use crate::exchange::snapshot::{
+    ExecutorState, IdempotencyEntry, IdempotencyFingerprint, IdempotencyKey, IdempotencyMap,
+    IdempotencyRecord, RestingOrderCapture, SnapshotError,
+};
 use crate::exchange::symbol::Symbol;
-use crate::models::{AccountId, LiquidityFlag, OrderType, VenueOrderId};
+use crate::models::{AccountId, ClientOrderId, LiquidityFlag, OrderType, VenueOrderId};
 
 // ============================================================================
 // Top-of-book projection (the determinism oracle's read surface)
@@ -114,8 +118,13 @@ pub struct TopOfBook {
 /// A resting order's venue identity, keyed by its engine [`OrderId`] so a match's
 /// maker leg is attributed from the **journaled** add command, not live book
 /// state ([ADR-0009 §2](../../../docs/adr/0009-lossless-venue-envelope-outcomes.md)).
+///
+/// The `symbol` resolves the leaf the order rests on for the snapshot cut (#009):
+/// a capture reads each order's *current* resting quantity back from that leaf,
+/// and a restore clears the leaf before re-adding.
 #[derive(Debug, Clone)]
 struct RestingRecord {
+    symbol: Symbol,
     venue_order_id: VenueOrderId,
     account: AccountId,
     owner: Hash32,
@@ -157,6 +166,11 @@ pub struct MatchingExecutor {
     resting: HashMap<OrderId, RestingRecord>,
     /// Venue order id → engine order id (cancel / replace resolution).
     venue_to_engine: HashMap<VenueOrderId, OrderId>,
+    /// The per-account client-order-id idempotency map (#009): a matching retry
+    /// returns the stored terminal result rather than opening a second order,
+    /// and it is captured/restored as the fourth store of a snapshot cut
+    /// ([01 §6.1](../../../docs/01-domain-model.md)).
+    idempotency: IdempotencyMap,
 }
 
 impl MatchingExecutor {
@@ -168,6 +182,7 @@ impl MatchingExecutor {
             underlying_book: UnderlyingOrderBook::new(underlying),
             resting: HashMap::new(),
             venue_to_engine: HashMap::new(),
+            idempotency: IdempotencyMap::new(),
         }
     }
 
@@ -243,10 +258,12 @@ impl MatchingExecutor {
     // ---- registry --------------------------------------------------------
 
     /// Registers a newly-resting order so a future match can recover its maker
-    /// identity and a cancel/replace can find its engine id.
+    /// identity, a cancel/replace can find its engine id, and a snapshot cut can
+    /// resolve the leaf it rests on (#009).
     fn register_resting(
         &mut self,
         engine_id: OrderId,
+        symbol: Symbol,
         venue_order_id: VenueOrderId,
         account: AccountId,
         owner: Hash32,
@@ -256,6 +273,7 @@ impl MatchingExecutor {
         self.resting.insert(
             engine_id,
             RestingRecord {
+                symbol,
                 venue_order_id,
                 account,
                 owner,
@@ -288,6 +306,94 @@ impl MatchingExecutor {
     }
 
     // ---- command handlers -----------------------------------------------
+
+    /// Applies **client-order-id idempotency** (#009) around an `AddOrder`
+    /// before it touches a leaf ([01 §6.1](../../../docs/01-domain-model.md)).
+    ///
+    /// A placement carrying a `client_order_id` is deduplicated on the
+    /// account-scoped key: a retry with a **matching** payload fingerprint
+    /// returns the **stored terminal result** (no second order is created, the
+    /// book is untouched), and a **different** payload at the same key is a
+    /// conflicting reuse and is rejected. A first, non-duplicate placement runs
+    /// normally and its terminal result is recorded under the key. The lookup is
+    /// a `HashMap` point read — no wall-clock, RNG, or iteration order — so the
+    /// map is a deterministic function of the journal and dedup fires identically
+    /// on a live run and a replay. This is the **minimum** dedup #009 needs so a
+    /// retry after a restore returns the stored result; the full pre-journal
+    /// dedup and cancel/replace correlation land with the later idempotency work.
+    #[allow(clippy::too_many_arguments)]
+    fn add_with_idempotency(
+        &mut self,
+        ctx: &ExecutionContext<'_>,
+        symbol: &Symbol,
+        order_id: &VenueOrderId,
+        account: &AccountId,
+        owner: Hash32,
+        client_order_id: Option<&ClientOrderId>,
+        side: Side,
+        order_type: OrderType,
+        limit_price: Option<Cents>,
+        quantity: u64,
+        time_in_force: TimeInForce,
+    ) -> VenueOutcome {
+        let Some(client_order_id) = client_order_id else {
+            return self.execute_add_order(
+                ctx,
+                symbol,
+                order_id,
+                account,
+                owner,
+                side,
+                order_type,
+                limit_price,
+                quantity,
+                time_in_force,
+            );
+        };
+
+        let key = IdempotencyKey::new(account.clone(), client_order_id.clone());
+        let fingerprint = IdempotencyFingerprint {
+            symbol: symbol.clone(),
+            side,
+            order_type,
+            limit_price,
+            quantity,
+            time_in_force,
+        };
+        if let Some(entry) = self.idempotency.lookup(&key) {
+            if entry.fingerprint == fingerprint {
+                // A matching retry: replay the stored terminal result, untouched
+                // book — no second order.
+                return entry.terminal.clone();
+            }
+            // Conflicting reuse of the same key: refuse rather than rebind it.
+            return VenueOutcome::Rejected {
+                reason: "client_order_id was reused with a different order".to_string(),
+            };
+        }
+
+        let outcome = self.execute_add_order(
+            ctx,
+            symbol,
+            order_id,
+            account,
+            owner,
+            side,
+            order_type,
+            limit_price,
+            quantity,
+            time_in_force,
+        );
+        self.idempotency.record(
+            key,
+            IdempotencyEntry {
+                fingerprint,
+                order_id: order_id.clone(),
+                terminal: outcome.clone(),
+            },
+        );
+        outcome
+    }
 
     /// Routes an `AddOrder` onto the limit or market leaf path.
     #[allow(clippy::too_many_arguments)]
@@ -331,6 +437,7 @@ impl MatchingExecutor {
                 let add = self.run_add(
                     ctx,
                     leaf.as_ref(),
+                    symbol,
                     venue_order_id,
                     account,
                     owner,
@@ -362,6 +469,7 @@ impl MatchingExecutor {
         &mut self,
         ctx: &ExecutionContext<'_>,
         leaf: &OptionOrderBook,
+        symbol: &Symbol,
         venue_order_id: &VenueOrderId,
         account: &AccountId,
         owner: Hash32,
@@ -471,7 +579,13 @@ impl MatchingExecutor {
             0
         };
         if resting_quantity > 0 {
-            self.register_resting(engine_id, venue_order_id.clone(), account.clone(), owner);
+            self.register_resting(
+                engine_id,
+                symbol.clone(),
+                venue_order_id.clone(),
+                account.clone(),
+                owner,
+            );
         }
 
         AddResult {
@@ -741,6 +855,7 @@ impl MatchingExecutor {
                 let result = self.run_add(
                     ctx,
                     leaf.as_ref(),
+                    symbol,
                     new_order_id,
                     account,
                     owner,
@@ -892,6 +1007,200 @@ impl MatchingExecutor {
         }
         legs
     }
+
+    // ---- snapshot capture / restore (#009) -------------------------------
+
+    /// Captures the executor's contribution to a consistent cut: the resting
+    /// orders (read back from the **upstream book** so a partially-filled maker
+    /// carries its *current* quantity, not the stale registered one) and the
+    /// idempotency map ([02 §9](../../../docs/02-matching-architecture.md)).
+    ///
+    /// A pure read: it uses non-creating leaf lookups and never mutates
+    /// hierarchy structure. The resting orders are sorted by `engine_seq` so the
+    /// cut is deterministic and a restore reproduces price-time priority.
+    #[must_use]
+    pub fn capture_state(&self) -> ExecutorState {
+        let mut resting_orders: Vec<RestingOrderCapture> = Vec::with_capacity(self.resting.len());
+        for (engine_id, record) in &self.resting {
+            let Some(leaf) = self.resolve_leaf_read(&record.symbol) else {
+                tracing::error!(
+                    symbol = record.symbol.as_str(),
+                    "resting order's leaf missing during snapshot capture; skipping"
+                );
+                continue;
+            };
+            let Some(order) = leaf.inner().get_order(*engine_id) else {
+                tracing::error!(
+                    order_id = record.venue_order_id.as_str(),
+                    "resting order not present in its leaf during snapshot capture; skipping"
+                );
+                continue;
+            };
+            let Some(engine_seq) = engine_id.as_u64() else {
+                tracing::error!("resting engine id is not sequential; skipping capture");
+                continue;
+            };
+            let Ok(price_cents) = u64::try_from(order.price().as_u128()) else {
+                tracing::error!("resting price out of range during capture; skipping");
+                continue;
+            };
+            resting_orders.push(RestingOrderCapture {
+                symbol: record.symbol.clone(),
+                order_id: record.venue_order_id.clone(),
+                account: record.account.clone(),
+                owner: record.owner,
+                engine_seq,
+                side: order.side(),
+                price: Cents::new(price_cents),
+                quantity: order.visible_quantity().as_u64(),
+                time_in_force: order.time_in_force(),
+            });
+        }
+        resting_orders.sort_by_key(|order| order.engine_seq);
+        ExecutorState {
+            resting_orders,
+            idempotency: self.idempotency.capture(),
+        }
+    }
+
+    /// **Prepares** a restore of the leaf books + idempotency map — the fallible,
+    /// **non-mutating** phase that validates every captured order's symbol
+    /// resolves within this underlying and orders the re-adds by `engine_seq`.
+    ///
+    /// This is the seam that keeps a restore all-or-nothing: every fallible
+    /// check happens here, **before** [`commit_restore`](Self::commit_restore)
+    /// touches a book, so a malformed cut fails the restore with the four stores
+    /// untouched ([02 §9](../../../docs/02-matching-architecture.md)).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::RebuildFailed`] if a captured order's symbol does
+    /// not parse or belongs to a different underlying.
+    pub fn prepare_restore(
+        &self,
+        resting: &[RestingOrderCapture],
+        idempotency: &[IdempotencyRecord],
+    ) -> Result<PreparedRestore, SnapshotError> {
+        let expected = self.underlying_book.underlying();
+        let mut orders: Vec<PreparedRestingOrder> = Vec::with_capacity(resting.len());
+        for capture in resting {
+            let parsed = SymbolParser::parse(capture.symbol.as_str()).map_err(|e| {
+                SnapshotError::RebuildFailed(format!(
+                    "unparseable symbol '{}': {e}",
+                    capture.symbol
+                ))
+            })?;
+            if parsed.underlying() != expected {
+                return Err(SnapshotError::RebuildFailed(format!(
+                    "cross-underlying symbol '{}' does not match underlying '{expected}'",
+                    capture.symbol
+                )));
+            }
+            orders.push(PreparedRestingOrder {
+                symbol: capture.symbol.clone(),
+                order_id: capture.order_id.clone(),
+                account: capture.account.clone(),
+                owner: capture.owner,
+                engine_seq: capture.engine_seq,
+                side: capture.side,
+                price: capture.price,
+                quantity: capture.quantity,
+                time_in_force: capture.time_in_force,
+            });
+        }
+        orders.sort_by_key(|order| order.engine_seq);
+        Ok(PreparedRestore {
+            orders,
+            idempotency: IdempotencyMap::from_records(idempotency),
+        })
+    }
+
+    /// **Commits** a prepared restore — the infallible mutation phase: clear
+    /// every currently-resting order, then re-add the cut's orders in ascending
+    /// `engine_seq` order (reproducing price-time priority; a consistent cut
+    /// never crosses, so no re-add matches) and install the idempotency map.
+    ///
+    /// Reusing each order's original `engine_seq` keeps the venue↔engine id
+    /// mapping stable and cannot collide, because the continued
+    /// `underlying_sequence` is already past every captured `engine_seq`.
+    pub fn commit_restore(&mut self, prepared: PreparedRestore) {
+        // Clear the current book wholesale: cancel every resting order on its
+        // leaf (collected first so `self.resting` is not borrowed while mutating).
+        let engine_ids: Vec<(OrderId, Symbol)> = self
+            .resting
+            .iter()
+            .map(|(id, record)| (*id, record.symbol.clone()))
+            .collect();
+        for (engine_id, symbol) in engine_ids {
+            if let Some(leaf) = self.resolve_leaf_read(&symbol)
+                && let Err(error) = leaf.cancel_order(engine_id)
+            {
+                tracing::warn!(
+                    error = %error,
+                    "clearing a resting order during restore failed; continuing"
+                );
+            }
+        }
+        self.resting.clear();
+        self.venue_to_engine.clear();
+
+        for order in prepared.orders {
+            let leaf = match self.resolve_leaf_vivify(&order.symbol) {
+                Ok(leaf) => leaf,
+                Err(reason) => {
+                    tracing::error!(reason, "restore could not vivify a leaf; dropping order");
+                    continue;
+                }
+            };
+            let engine_id = OrderId::sequential(order.engine_seq);
+            match leaf.add_limit_order_with_tif_and_user_full(
+                engine_id,
+                order.side,
+                order.price.as_u128(),
+                order.quantity,
+                order.time_in_force,
+                order.owner,
+            ) {
+                Ok(_) => self.register_resting(
+                    engine_id,
+                    order.symbol,
+                    order.order_id,
+                    order.account,
+                    order.owner,
+                ),
+                Err(error) => {
+                    tracing::error!(error = %error, "restore re-add failed; dropping order");
+                }
+            }
+        }
+
+        self.idempotency = prepared.idempotency;
+    }
+}
+
+/// A validated, non-mutating plan to restore the leaf books + idempotency map —
+/// the output of [`MatchingExecutor::prepare_restore`] applied by
+/// [`MatchingExecutor::commit_restore`] (#009). The prepare/commit split is what
+/// makes a restore **all-or-nothing**: the fallible validation runs before any
+/// book is touched.
+#[derive(Debug)]
+pub struct PreparedRestore {
+    orders: Vec<PreparedRestingOrder>,
+    idempotency: IdempotencyMap,
+}
+
+/// One validated resting order in a [`PreparedRestore`].
+#[derive(Debug)]
+struct PreparedRestingOrder {
+    symbol: Symbol,
+    order_id: VenueOrderId,
+    account: AccountId,
+    owner: Hash32,
+    engine_seq: u64,
+    side: Side,
+    price: Cents,
+    quantity: u64,
+    time_in_force: TimeInForce,
 }
 
 impl CommandExecutor for MatchingExecutor {
@@ -902,18 +1211,20 @@ impl CommandExecutor for MatchingExecutor {
                 order_id,
                 account,
                 owner,
+                client_order_id,
                 side,
                 order_type,
                 limit_price,
                 quantity,
                 time_in_force,
                 ..
-            } => self.execute_add_order(
+            } => self.add_with_idempotency(
                 &context,
                 symbol,
                 order_id,
                 account,
                 *owner,
+                client_order_id.as_ref(),
                 *side,
                 *order_type,
                 *limit_price,
@@ -1975,5 +2286,245 @@ mod tests {
             top_a, top_b,
             "same command stream must reconstruct identical top-of-book"
         );
+    }
+
+    // ---- snapshot capture / restore (#009) -------------------------------
+
+    /// A limit add with an explicit account-scoped `client_order_id` (the
+    /// idempotency key), rather than the per-sequence default of [`add`].
+    #[allow(clippy::too_many_arguments)]
+    fn add_with_cloid(
+        lineage: &LineageId,
+        sequence: u64,
+        account: &str,
+        owner_byte: u8,
+        side: Side,
+        price: u64,
+        quantity: u64,
+        cloid: &str,
+    ) -> VenueCommand {
+        VenueCommand::AddOrder {
+            symbol: sym(),
+            order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(sequence), 0),
+            account: AccountId::new(account),
+            owner: owner(owner_byte),
+            client_order_id: Some(ClientOrderId::new(cloid.to_string())),
+            side,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(price)),
+            quantity,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        }
+    }
+
+    #[test]
+    fn test_capture_and_restore_returns_books_to_the_cut() {
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        // Two resting orders on opposite sides that do not cross.
+        run(
+            &mut ex,
+            &lin,
+            0,
+            &add(&lin, 0, "m1", 0x11, Side::Sell, 50_100, 3, TimeInForce::Gtc),
+        );
+        run(
+            &mut ex,
+            &lin,
+            1,
+            &add(&lin, 1, "b1", 0x22, Side::Buy, 49_900, 2, TimeInForce::Gtc),
+        );
+        let top_before = ex.top_of_book(&sym());
+        let state = ex.capture_state();
+        assert_eq!(state.resting_orders.len(), 2);
+
+        // Mutate away from the cut: cancel one, add another.
+        run(
+            &mut ex,
+            &lin,
+            2,
+            &VenueCommand::CancelOrder {
+                symbol: sym(),
+                order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0),
+                account: AccountId::new("m1"),
+            },
+        );
+        run(
+            &mut ex,
+            &lin,
+            3,
+            &add(&lin, 3, "m2", 0x33, Side::Sell, 50_050, 4, TimeInForce::Gtc),
+        );
+        assert_ne!(
+            ex.top_of_book(&sym()),
+            top_before,
+            "mutation moved the book"
+        );
+
+        // Restore the cut: prepare then commit returns the book exactly.
+        let prepared = match ex.prepare_restore(&state.resting_orders, &state.idempotency) {
+            Ok(p) => p,
+            Err(e) => panic!("prepare failed: {e}"),
+        };
+        ex.commit_restore(prepared);
+        assert_eq!(
+            ex.top_of_book(&sym()),
+            top_before,
+            "restore returns the books to the snapshot state"
+        );
+    }
+
+    #[test]
+    fn test_capture_reads_current_resting_quantity_after_partial_maker_fill() {
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        // Rest a sell of 5, then a buy of 2 partially consumes it → 3 rests.
+        run(
+            &mut ex,
+            &lin,
+            0,
+            &add(
+                &lin,
+                0,
+                "maker",
+                0x11,
+                Side::Sell,
+                50_000,
+                5,
+                TimeInForce::Gtc,
+            ),
+        );
+        run(
+            &mut ex,
+            &lin,
+            1,
+            &add(
+                &lin,
+                1,
+                "taker",
+                0x22,
+                Side::Buy,
+                50_000,
+                2,
+                TimeInForce::Gtc,
+            ),
+        );
+        let state = ex.capture_state();
+        assert_eq!(state.resting_orders.len(), 1);
+        // The cut reads the reduced resting quantity from the book, not the stale
+        // registered 5.
+        assert_eq!(state.resting_orders[0].quantity, 3);
+    }
+
+    #[test]
+    fn test_prepare_restore_rejects_a_cross_underlying_capture() {
+        let lin = lineage();
+        let ex = MatchingExecutor::new(UNDERLYING);
+        // A capture whose symbol belongs to a different underlying is a fault the
+        // preparation phase refuses before any mutation.
+        let bad = RestingOrderCapture {
+            symbol: match Symbol::parse("ETH-20240329-50000-C") {
+                Ok(s) => s,
+                Err(e) => panic!("fixture parse failed: {e:?}"),
+            },
+            order_id: lin.venue_order_id("ETH", SequenceNumber::new(0), 0),
+            account: AccountId::new("x"),
+            owner: owner(0x11),
+            engine_seq: 0,
+            side: Side::Sell,
+            price: Cents::new(50_000),
+            quantity: 1,
+            time_in_force: TimeInForce::Gtc,
+        };
+        match ex.prepare_restore(&[bad], &[]) {
+            Err(SnapshotError::RebuildFailed(_)) => {}
+            other => panic!("expected RebuildFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_idempotency_retry_returns_stored_result_without_a_second_order() {
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        let first = run(
+            &mut ex,
+            &lin,
+            0,
+            &add_with_cloid(&lin, 0, "acct", 0x11, Side::Sell, 50_000, 2, "dup-1"),
+        );
+        let top_after_first = ex.top_of_book(&sym());
+        assert_eq!(top_after_first.ask_depth, 2);
+
+        // Retry the SAME (account, client_order_id) with a matching payload at a
+        // later sequence: the stored terminal result is replayed, and the book is
+        // untouched (no second order).
+        let retry = run(
+            &mut ex,
+            &lin,
+            1,
+            &add_with_cloid(&lin, 1, "acct", 0x11, Side::Sell, 50_000, 2, "dup-1"),
+        );
+        assert_eq!(retry, first, "the retry replays the stored terminal result");
+        assert_eq!(
+            ex.top_of_book(&sym()),
+            top_after_first,
+            "the retry created no second order"
+        );
+    }
+
+    #[test]
+    fn test_idempotency_conflicting_reuse_is_rejected() {
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        run(
+            &mut ex,
+            &lin,
+            0,
+            &add_with_cloid(&lin, 0, "acct", 0x11, Side::Sell, 50_000, 2, "key-1"),
+        );
+        // Same key, DIFFERENT payload (quantity) → conflicting reuse, rejected.
+        let outcome = run(
+            &mut ex,
+            &lin,
+            1,
+            &add_with_cloid(&lin, 1, "acct", 0x11, Side::Sell, 50_000, 9, "key-1"),
+        );
+        match outcome {
+            VenueOutcome::Rejected { reason } => assert!(reason.contains("client_order_id")),
+            other => panic!("expected a conflicting-reuse rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_idempotency_map_round_trips_through_capture_and_restore() {
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        run(
+            &mut ex,
+            &lin,
+            0,
+            &add_with_cloid(&lin, 0, "acct", 0x11, Side::Sell, 50_000, 2, "dup-1"),
+        );
+        let state = ex.capture_state();
+        assert_eq!(state.idempotency.len(), 1);
+
+        // A fresh executor rehydrated from the cut serves the same retry.
+        let mut restored = MatchingExecutor::new(UNDERLYING);
+        let prepared = match restored.prepare_restore(&state.resting_orders, &state.idempotency) {
+            Ok(p) => p,
+            Err(e) => panic!("prepare failed: {e}"),
+        };
+        restored.commit_restore(prepared);
+        let top_after_restore = restored.top_of_book(&sym());
+        let retry = run(
+            &mut restored,
+            &lin,
+            1,
+            &add_with_cloid(&lin, 1, "acct", 0x11, Side::Sell, 50_000, 2, "dup-1"),
+        );
+        // The rehydrated map serves the stored result; no second order rests.
+        assert!(matches!(retry, VenueOutcome::Added { .. }));
+        assert_eq!(restored.top_of_book(&sym()), top_after_restore);
     }
 }

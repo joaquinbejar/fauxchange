@@ -51,8 +51,13 @@ use tokio::task::JoinHandle;
 use crate::error::VenueError;
 use crate::exchange::envelope::{VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::event::{EventTimestamp, SequenceNumber};
+use crate::exchange::executor::MatchingExecutor;
 use crate::exchange::identity::LineageId;
-use crate::exchange::journal::{JournalError, JournalRecord, RecordKind, VenueJournal};
+use crate::exchange::journal::{
+    JournalError, JournalRecord, RecordKind, SnapshotRestored, VenueJournal,
+};
+use crate::exchange::snapshot::{SnapshotError, SnapshotMetadata, VenueSnapshot};
+use crate::exchange::stores::{InMemoryExecutionsStore, InMemoryPositionsStore, StoreFanOut};
 
 // ============================================================================
 // Clock seam — the venue time service (never `SystemTime`)
@@ -289,6 +294,9 @@ pub struct UnderlyingActor<J, E, F, C> {
     /// (the upstream `OptionChainSequencer::assign()` is `pub(crate)`, so the
     /// venue owns this).
     next_sequence: SequenceNumber,
+    /// The current journal epoch — a fresh venue is `0`; each snapshot restore
+    /// opens the next epoch (#009, [02 §9](../../../docs/02-matching-architecture.md)).
+    epoch: u64,
     /// `Some` once sealed — every further command is rejected.
     sealed: Option<SealReason>,
 }
@@ -311,6 +319,7 @@ where
             fan_out,
             clock,
             next_sequence: config.start_sequence,
+            epoch: 0,
             sealed: None,
         }
     }
@@ -438,6 +447,171 @@ where
             | Err(JournalError::Conflict { .. })
             | Err(JournalError::Corruption { .. }) => WriteAhead::Reuse,
         }
+    }
+}
+
+// ============================================================================
+// Snapshot capture / restore (#009) — the consistent-cut entry points
+// ============================================================================
+
+/// Snapshot **capture** and **restore** for the default order-path wiring — the
+/// real [`MatchingExecutor`] over the in-memory [`StoreFanOut`]. These are the
+/// entry points the admin snapshot routes (#013) and the replay driver (#030)
+/// build on; they run **synchronously under the single writer**, so a
+/// directly-owned actor — or a quiesced spawned one — drives them without racing
+/// a turn (the mailbox plumbing for the spawned path lands with #013).
+impl<J, C>
+    UnderlyingActor<
+        J,
+        MatchingExecutor,
+        StoreFanOut<InMemoryExecutionsStore, InMemoryPositionsStore>,
+        C,
+    >
+where
+    J: VenueJournal,
+    C: VenueClock,
+{
+    /// The current journal epoch (a fresh venue is `0`; each restore opens the
+    /// next).
+    #[must_use]
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Captures a **consistent cut** of the four derived stores plus
+    /// config/version metadata, keyed by `snapshot_id`
+    /// ([02 §9](../../../docs/02-matching-architecture.md)).
+    ///
+    /// A pure read of the leaf books (current resting quantities), the executions
+    /// log, the positions fold, and the idempotency map — non-journaled analytics
+    /// (mark price, unrealised P&L, Greeks, registry ids) are **excluded** and
+    /// recompute live after a restore.
+    #[must_use]
+    pub fn capture(
+        &self,
+        snapshot_id: impl Into<String>,
+        config_fingerprint: impl Into<String>,
+    ) -> VenueSnapshot {
+        let metadata = SnapshotMetadata::new(
+            snapshot_id,
+            self.clock.now_ms(),
+            self.lineage_id.clone(),
+            config_fingerprint,
+        );
+        VenueSnapshot {
+            metadata,
+            executor: self.executor.capture_state(),
+            executions: self.fan_out.executions().capture(),
+            positions: self.fan_out.positions().capture(),
+        }
+    }
+
+    /// Restores a snapshot over a consistent cut, **all-or-nothing**, opening a
+    /// fresh journal epoch (§9).
+    ///
+    /// 1. Validate the snapshot's config/version metadata against the running
+    ///    venue — a mismatch is refused with **no** mutation.
+    /// 2. **Prepare** the book rebuild (fallible, non-mutating) and append the
+    ///    [`SnapshotRestored`] marker at the **continued** `underlying_sequence`
+    ///    (fallible). Both fallible steps run **before** any store is swapped, so
+    ///    a fault here rolls back all four stores.
+    /// 3. **Commit** the swap of all four stores (books, executions, positions,
+    ///    idempotency map) infallibly under quiescence, then continue the
+    ///    `underlying_sequence` from past the marker (it does **not** reset).
+    ///
+    /// The marker carries the run [`LineageId`] forward so restored ids keep
+    /// minting in the same namespace. Reproducibility holds *forward from* the
+    /// new epoch; the restore boundary is **outside** the determinism oracle.
+    ///
+    /// # Errors
+    ///
+    /// - [`SnapshotError::MetadataMismatch`] if the snapshot does not match the
+    ///   running venue;
+    /// - [`SnapshotError::RebuildFailed`] if the captured book cannot be rebuilt
+    ///   (rolls back — nothing swapped);
+    /// - [`SnapshotError::JournalUnavailable`] if the epoch marker cannot be
+    ///   journaled (rolls back), or the underlying is sealed on the journal;
+    /// - [`SnapshotError::SequenceExhausted`] if the underlying is sealed on
+    ///   exhaustion or the sequence cannot advance past the marker.
+    pub fn restore(
+        &mut self,
+        snapshot: &VenueSnapshot,
+        config_fingerprint: &str,
+    ) -> Result<Receipt, SnapshotError> {
+        // Step 1: metadata validation — no mutation on a mismatch.
+        snapshot
+            .metadata
+            .validate_against(&self.lineage_id, config_fingerprint)?;
+
+        if let Some(reason) = self.sealed {
+            return Err(match reason {
+                SealReason::SequenceExhausted => SnapshotError::SequenceExhausted,
+                SealReason::JournalUnavailable => SnapshotError::JournalUnavailable,
+            });
+        }
+
+        let sequence = self.next_sequence; // continues — never reset to 0
+        let venue_ts = self.clock.now_ms();
+        let new_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(SnapshotError::SequenceExhausted)?;
+
+        // Step 2a: prepare the detached book image (fallible, non-mutating).
+        let prepared = self.executor.prepare_restore(
+            &snapshot.executor.resting_orders,
+            &snapshot.executor.idempotency,
+        )?;
+
+        // Step 2b: append the epoch marker as the first record of the fresh
+        // epoch (fallible). Done before any swap so a failure rolls back cleanly.
+        let marker = SnapshotRestored::new(
+            sequence,
+            venue_ts,
+            snapshot.metadata.snapshot_id.clone(),
+            new_epoch,
+            self.lineage_id.clone(),
+        );
+        if self.journal.append(JournalRecord::epoch(marker)).is_err() {
+            tracing::error!(
+                underlying = %self.underlying,
+                "snapshot restore could not journal the epoch marker; rolling back"
+            );
+            return Err(SnapshotError::JournalUnavailable);
+        }
+
+        // Step 3: commit — swap all four stores infallibly under quiescence.
+        self.executor.commit_restore(prepared);
+        self.fan_out
+            .executions()
+            .restore(snapshot.executions.clone());
+        self.fan_out.positions().restore(snapshot.positions.clone());
+        self.epoch = new_epoch;
+
+        // Continue the underlying_sequence past the marker (checked, never wraps).
+        match sequence.checked_next() {
+            Some(next) => self.next_sequence = next,
+            None => {
+                self.sealed = Some(SealReason::SequenceExhausted);
+                tracing::error!(
+                    underlying = %self.underlying,
+                    "underlying_sequence exhausted opening the restore epoch; sealing"
+                );
+            }
+        }
+
+        tracing::info!(
+            underlying = %self.underlying,
+            snapshot_id = %snapshot.metadata.snapshot_id,
+            epoch = new_epoch,
+            underlying_sequence = sequence.get(),
+            "snapshot restored; opened a fresh journal epoch"
+        );
+        Ok(Receipt {
+            underlying_sequence: sequence,
+            venue_ts,
+        })
     }
 }
 

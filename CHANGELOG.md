@@ -11,6 +11,47 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- Book **snapshot + restore** over a consistent cut with a fresh journal epoch
+  (#9) in `src/exchange/` (`snapshot.rs`, plus executor / stores / actor /
+  journal wiring) — the operator escape hatch that is an **explicit replay
+  exclusion**: it captures *state*, not the *sequence of decisions*, so a restore
+  starts a new journal epoch rather than inject a book the journal never produced
+  ([02 §9](docs/02-matching-architecture.md),
+  [03 §10](docs/03-protocol-surfaces.md),
+  [01 §6.1](docs/01-domain-model.md)). A `VenueSnapshot` is an atomic cut, as of
+  one instant, of the **four** derived stores together — the leaf **books**
+  (resting orders read back from the upstream book so a partially-filled maker
+  carries its *current* quantity), the **executions** log, the **positions**
+  fold, and the per-account **client-order-id idempotency map** — plus
+  config/version `SnapshotMetadata`. Non-journaled analytics (mark price,
+  unrealised P&L, Greeks, registry ids) are **excluded** and recompute live.
+  `UnderlyingActor::capture` / `restore` are the entry points for the admin
+  snapshot routes (#13) and the replay base-state hook (#30). A restore is
+  **all-or-nothing**: metadata is validated first (a schema / lineage / config
+  mismatch is refused with no mutation), the book rebuild is *prepared* (fallible,
+  non-mutating) and the `SnapshotRestored` epoch marker journaled **before** any
+  store is swapped, so a mid-restore fault rolls back all four; the commit is an
+  infallible swap under actor quiescence (the "one PostgreSQL transaction" mode is
+  the v0.3 durable seam). The marker opens a fresh epoch carrying the run
+  `lineage_id` forward so id derivation continues in the same namespace, and the
+  `underlying_sequence` **continues** from the last journaled value (it does
+  **not** reset). Reproducibility is asserted **within** an epoch; the restore
+  boundary is explicitly **out of scope** of the determinism oracle, not silently
+  divergent.
+- A `SnapshotRestored { snapshot_id, epoch, lineage_id }` epoch marker as a new
+  `venue.v1` journal record (`JournalRecord::Epoch` / `RecordKind::Epoch`, #9),
+  carrying the mandatory `schema` tag with the same `deny_unknown_fields`
+  discipline and a committed golden; unlike a command/event pair it is **not**
+  re-executable — recovery treats it as an epoch boundary.
+- A per-account **client-order-id idempotency map** (`IdempotencyMap`, #9) owned
+  by the single-writer executor and captured/restored as the fourth store of the
+  cut ([01 §6.1](docs/01-domain-model.md)): a retry with a matching payload
+  fingerprint returns the **stored terminal result** (no second order), and a
+  conflicting reuse of the same key is rejected. It is a deterministic function of
+  the journal, so a duplicate `ClOrdID`/client-id retried **after** a restore
+  returns the stored result. (The full pre-journal dedup, cancel/replace
+  `OrigClOrdID` correlation, and retention-window eviction are completed by the
+  later FIX/idempotency issue.)
 - In-memory executions + positions stores + the backend-agnostic store contract
   (#8) in `src/exchange/` (`stores.rs`) — the authoritative fill log and the
   per-`(account, symbol)` position fold, both derived from committed `VenueEvent`
