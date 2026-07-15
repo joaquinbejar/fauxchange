@@ -11,6 +11,58 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **JWT (RS256/x509) auth, the `Permission` implication, and the sliding-60 s
+  `RateLimiter`** (#11) in `src/auth.rs` — the **one** authorization model across
+  every surface ([ADR-0005](docs/adr/0005-jwt-auth-for-rest-ws.md),
+  [03 §6, §6.1](docs/03-protocol-surfaces.md),
+  [01 §8](docs/01-domain-model.md)); the legacy Backend `ApiKeyStore` /
+  `sk_live_` path is **not** carried over (JWT is the only credential mechanism).
+  `JwtAuth` signs RS256 tokens with an x509 key pair: `from_paths(cert, key)` /
+  `from_pem` load the PEM pair with the **public key extracted from the
+  certificate** (jsonwebtoken's `DecodingKey::from_rsa_pem` reads a `CERTIFICATE`
+  PEM directly, so no separate x509 parser is pulled), `mint_token` /
+  `verify_token`, and a clearly-labelled `dev()` fixture built from an **embedded,
+  non-secret** dev keypair. `verify_token` pins **RS256** (rejecting `alg:none`
+  and HS256 algorithm-confusion), enforces `exp`, and collapses every failure to a
+  redacted `VenueError::Unauthorized` — the token and the cause are never logged
+  or returned. `Claims` carries `sub` (the `AccountId`), the permission set, `iat`
+  / `exp`, and the account `revocation_epoch`; `Claims::has_permission` applies the
+  `Admin ⇒ Read + Trade` implication via the new `Permission::grants` (enforced in
+  the auth layer, matched exhaustively — `Read ⊂ Trade ⊂ Admin`). The
+  `auth_middleware` Axum layer resolves identity, enforces the **admission** rate
+  limit, checks the revocation epoch, and gates the required `Permission`, rendering
+  `401` / `403` / `429` through the #003 `VenueError` boundary; `GET /health` is
+  fully exempt from **both** auth and rate limiting. The `RateLimiter` is a
+  sliding-60 s window on the **injected venue clock** (`RateLimitClock`, bridged
+  from the venue `FixedClock` — never `SystemTime`), keyed on `(account,
+  revocation_epoch)` for an authenticated request (so a revoked-but-signed token
+  cannot drain a fresh session's budget) with a peer-IP fallback, emitting
+  `X-RateLimit-Limit` / `-Remaining` / `-Reset` (and `Retry-After` on `429`);
+  decisions are replay-deterministic on the venue clock, with the `(session_id,
+  arrival_sequence)` tie-break documented as the ingress-ordering seam. The
+  limiter's key-space is bounded **by construction** by a `max_keys` ceiling
+  (default `100_000`, a DoS control per [08 §5](docs/08-threat-model.md)): a
+  would-be new key at capacity triggers an opportunistic inline sweep and, if
+  still full, **fails closed** rather than grow — an attacker cycling source IPs
+  cannot exhaust memory. Token
+  issuance is gated by `BootstrapGate` (`AUTH_BOOTSTRAP_SECRET`, constant-time
+  compare), and `JwtAuth::release_gated(DevMode)` refuses the embedded dev keys in
+  a published image unless `--dev` / `FAUXCHANGE_DEV` is set (the image-scan test
+  is #26). Secrets never leak: `JwtAuth` and `BootstrapGate` have redacting
+  `Debug` impls. New dependency: `jsonwebtoken` 9 (`default-features = false,
+  features = ["use_pem"]`), whose crypto backend `ring` 0.17 is already in the
+  tree (no new crypto impl, no new major version); `tower` 0.5 (`util`, dev-only,
+  already in-tree via axum) drives the middleware integration test. New tests:
+  unit mint/verify (happy + tamper + expiry + `alg:none` + HS256 confusion),
+  `has_permission` implication matrix, `/health` exemption, bootstrap-secret gate,
+  dev-key release-gate refusal, revoked/unknown-account refusal, the rate-limiter
+  sliding window + key independence + sweep + header rendering + venue-clock
+  determinism, and secret-redaction assertions (`auth.rs`); the integration
+  request flow through `auth_middleware` (missing token `401`, insufficient
+  permission `403`, over-limit `429` with `X-RateLimit-*`, `/health` `200`), the
+  `rate_limiter_window_bound` property (≤ N per 60 s window), and the
+  replay-stable venue-clock decision test (`tests/auth.rs`). `src/auth.rs` only —
+  the `AppState` wiring (registry account resolution) is #12.
 - **`AppState`: the shared `Arc` wiring of the venue core and services** (#10) in
   `src/state.rs` — the application seam between the transport gateways and the
   domain ([02 §6, §8](docs/02-matching-architecture.md)). `AppState::new` takes an
