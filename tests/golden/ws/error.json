@@ -1,0 +1,10 @@
+{
+  "schema": "ws-error.v1",
+  "code": "forbidden",
+  "category": "authorization",
+  "message": "missing permission Trade",
+  "request_id": "req-1",
+  "retryable": false,
+  "retry_after_ms": null,
+  "terminal": false
+}

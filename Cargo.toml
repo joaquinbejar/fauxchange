@@ -24,6 +24,12 @@ option-chain-orderbook = "0.7"
 # from `optionstratlib` at the seam. `default-features = false` keeps the build
 # lean (no plotly / async), matching how the upstream crate depends on it.
 optionstratlib = { version = "0.17", default-features = false }
+# REST/WS boundary rendering: `IntoResponse` for `VenueError`, `Json` bodies,
+# and the `http` status/header types (re-exported through `axum::http`). Lean
+# feature set — only `json`, no server/runtime features — because #003 renders
+# responses but does not run the Axum server (that lands with the REST gateway,
+# #012). MIT, maintained by the tokio project.
+axum = { version = "0.8", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 

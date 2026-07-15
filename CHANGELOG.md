@@ -11,6 +11,29 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- Typed error boundary (#3) in `src/error.rs`: the closed-set `VenueError`
+  (`NotFound` / `InvalidOrder` / `Unauthorized` / `Forbidden(Permission)` /
+  `RateLimited` / `Overflow` / `Upstream(#[from] option_chain_orderbook::Error)`)
+  with three renderings of one failure. `IntoResponse` maps each variant to
+  exactly one HTTP status (404/400/401/403/429/500) via an exhaustive match,
+  emits a typed `ErrorEnvelope` JSON body (never `serde_json::Value`), and
+  attaches `Retry-After` + `X-RateLimit-Remaining` context on 429. The FIX
+  reject **seam** (`FixRejectContext` → `FixReject` with `FixRejectKind` /
+  `FixRejectReason`) selects `ExecutionReport (8) Rejected` / `OrderCancelReject
+  (9)` / `MarketDataRequestReject (Y)` / `BusinessMessageReject (j)` / `Reject
+  (3)` **by inbound message context** and the reason category **by the error**,
+  per the authoritative `docs/03 §8` matrix — types and a pure mapping only, no
+  wire encoding (that lands with the acceptor, #039). The versioned WebSocket
+  envelope (`WsError`, schema `ws-error.v1`) maps every variant to a stable
+  `(code, category)` with `terminal` / `retryable` / `retry_after_ms`
+  (`Unauthorized` terminal, command errors non-terminal). Internal / `Overflow`
+  / `Upstream` details are redacted on the HTTP body, the FIX `Text (58)`, and
+  the WS message; the `#002` `MoneyError` / `SymbolError` fold into `VenueError`
+  via `From`. Adds `Permission { Read, Trade, Admin }` (lowercase wire) in
+  `src/models.rs` — the canonical home per `docs/01 §8` — and the `axum` 0.8
+  dependency (lean, `json`-only feature set) for `IntoResponse`. Error-envelope
+  goldens under `tests/golden/{rest,ws}/` with shape tests in `tests/golden.rs`.
+
 - Domain boundary newtypes, integer-cents money, and the symbol grammar (#2)
   in `src/exchange/`: the `Cents` / `SignedCents` / `Notional` money newtypes
   (private fields, validated constructors, checked arithmetic returning a typed
