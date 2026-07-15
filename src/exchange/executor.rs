@@ -67,7 +67,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use option_chain_orderbook::{
-    FeeSchedule, OptionOrderBook, SymbolParser, TradeResult, UnderlyingOrderBook,
+    FeeSchedule, InstrumentRegistry, OptionOrderBook, SymbolIndex, SymbolParser, TradeResult,
+    UnderlyingOrderBook,
 };
 use tokio::task::JoinHandle;
 
@@ -182,6 +183,35 @@ impl MatchingExecutor {
     pub fn new(underlying: impl Into<String>) -> Self {
         Self {
             underlying_book: UnderlyingOrderBook::new(underlying),
+            resting: HashMap::new(),
+            venue_to_engine: HashMap::new(),
+            idempotency: IdempotencyMap::new(),
+        }
+    }
+
+    /// Builds an executor for one underlying whose hierarchy shares a **venue-wide**
+    /// [`InstrumentRegistry`] and [`SymbolIndex`] with every other underlying's
+    /// book, so cross-underlying instrument-id allocation and symbol lookups stay
+    /// O(1) across the whole venue without coupling the single writers — each
+    /// underlying is still driven by its own actor
+    /// ([010](../../../milestones/v0.1-backend-core/010-appstate-wiring.md)).
+    ///
+    /// The shared handles are threaded **straight into** the upstream
+    /// `UnderlyingOrderBook::new_with_registry_and_index` (verified public at the
+    /// locked 0.7.0 registry); matching is unchanged. This is the constructor
+    /// [`crate::state::AppState`] wires per underlying.
+    #[must_use]
+    pub fn new_with_registry_and_index(
+        underlying: impl Into<String>,
+        registry: Arc<InstrumentRegistry>,
+        symbol_index: Arc<SymbolIndex>,
+    ) -> Self {
+        Self {
+            underlying_book: UnderlyingOrderBook::new_with_registry_and_index(
+                underlying,
+                registry,
+                symbol_index,
+            ),
             resting: HashMap::new(),
             venue_to_engine: HashMap::new(),
             idempotency: IdempotencyMap::new(),
@@ -1523,6 +1553,36 @@ where
     C: VenueClock + Send + 'static,
 {
     let executor = MatchingExecutor::new(config.underlying.as_ref());
+    spawn_underlying_actor(config, journal, executor, fan_out, clock)
+}
+
+/// Spawns a per-underlying single-writer actor whose [`MatchingExecutor`] shares a
+/// **venue-wide** [`InstrumentRegistry`] + [`SymbolIndex`] with every other
+/// underlying's book — the O(1) cross-underlying lookup wiring
+/// [`crate::state::AppState`] uses so `BTC` and `ETH` sequence concurrently
+/// without a shared writer lock
+/// ([010](../../../milestones/v0.1-backend-core/010-appstate-wiring.md)). Returns
+/// the bounded [`ActorHandle`] plus the task's [`JoinHandle`] for graceful
+/// shutdown.
+#[must_use]
+pub fn spawn_matching_actor_with_registry_and_index<J, F, C>(
+    config: ActorConfig,
+    journal: J,
+    fan_out: F,
+    clock: C,
+    registry: Arc<InstrumentRegistry>,
+    symbol_index: Arc<SymbolIndex>,
+) -> (ActorHandle, JoinHandle<()>)
+where
+    J: VenueJournal + Send + 'static,
+    F: FanOut + Send + 'static,
+    C: VenueClock + Send + 'static,
+{
+    let executor = MatchingExecutor::new_with_registry_and_index(
+        config.underlying.as_ref(),
+        registry,
+        symbol_index,
+    );
     spawn_underlying_actor(config, journal, executor, fan_out, clock)
 }
 
