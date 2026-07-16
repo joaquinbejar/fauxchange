@@ -85,8 +85,8 @@ use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
 use crate::models::AccountId;
 use crate::simulation::{
     AssetConfig, ClockMode, CorrelationId, JournalStream, PriceSimulator, RecordingController,
-    ReplayError, ReplayReport, RunManifest, ScenarioBundle, SimClock, SimulationConfig,
-    VenueClockConfig, VenueStepSink,
+    ReplayError, ReplayReport, RunManifest, ScenarioBundle, SimClock, SimError, SimulationConfig,
+    SynthesizedChain, VenueClockConfig, VenueStepSink,
 };
 // The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
 // sibling of `crate::auth` / `crate::ohlc`), NOT a gateway. `AppState` owns the
@@ -117,6 +117,14 @@ pub const DEFAULT_LINEAGE_TOKEN: &str = "fauxchange";
 /// while cheap: each tick is a single atomic store **off** the sequenced path — no
 /// journal append, no book mutation. The live value becomes venue config (#046).
 pub const DEFAULT_CLOCK_CADENCE: Duration = Duration::from_millis(250);
+
+/// The bounded number of settle polls a session materialisation (#031) waits for
+/// the async requote forwarder to vivify the synthesised chain — a DoS-free
+/// ceiling, never an unbounded spin (mirrors the seed-phase settle).
+const SESSION_SETTLE_MAX_POLLS: usize = 400;
+
+/// The delay between session-materialisation settle polls, in **milliseconds**.
+const SESSION_SETTLE_POLL_MS: u64 = 5;
 
 /// A failure assembling an [`AppState`] — the two fallible boot steps: building
 /// auth ([`AuthError`]) and opening the durable journal store when `DATABASE_URL` is
@@ -1093,6 +1101,99 @@ impl AppState {
                 operation: "replay task join",
             }),
         }
+    }
+
+    // ---- stepped synthetic sessions (#031) -------------------------------
+
+    /// Materialises a synthesised session chain onto the **live** venue: registers
+    /// each leaf with the market maker at its `smile_curve`-shaped IV, then sets the
+    /// opening price — a journaled [`SimStep`](VenueCommand::SimStep) plus the
+    /// maker's requote, whose `AddOrder`s **vivify** the leaf books through the
+    /// sequenced order path (never a direct book mutation). After this the venue is
+    /// **live** and client orders match against the synthetic liquidity.
+    ///
+    /// The chain's underlying must be a **hosted price-seam asset**
+    /// ([`AssetConfig`], typically `SessionConfig::to_asset_config`) so the opening
+    /// price can be journaled through the simulator. Returns the number of contracts
+    /// registered. A bounded settle waits for the off-thread requote forwarder to
+    /// vivify the chain into the shared symbol index before returning.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::UnknownUnderlying`] if the chain's underlying is not a hosted
+    /// price-seam asset.
+    pub async fn materialize_session(&self, chain: &SynthesizedChain) -> Result<usize, SimError> {
+        // Register every leaf (call + put per strike) with its smile IV BEFORE the
+        // first price, so the opening requote quotes the whole chain in one pass.
+        let instruments = chain.instruments();
+        for (symbol, iv) in &instruments {
+            self.market_maker
+                .register_instrument_with_iv(symbol, Some(*iv));
+        }
+
+        // Opening price → a journaled SimStep + the maker's requote vivifies leaves.
+        self.simulator.set_price(&chain.underlying, chain.spot)?;
+
+        // Bounded settle: wait for the ordered requote forwarder to vivify the
+        // synthesised contracts into the shared symbol index (a completeness wait,
+        // never an unbounded spin).
+        let expected: std::collections::HashSet<String> = chain
+            .strikes
+            .iter()
+            .flat_map(|strike| {
+                [
+                    strike.call.as_str().to_string(),
+                    strike.put.as_str().to_string(),
+                ]
+            })
+            .collect();
+        let mut settled = false;
+        for _ in 0..SESSION_SETTLE_MAX_POLLS {
+            let present: std::collections::HashSet<String> =
+                self.symbol_index.symbols().into_iter().collect();
+            if expected.iter().all(|symbol| present.contains(symbol)) {
+                settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(SESSION_SETTLE_POLL_MS)).await;
+        }
+        if !settled {
+            // Mirrors the seed-phase settle precedent (`seed.rs`): surface a
+            // stalled requote forwarder to the operator instead of proceeding
+            // silently — the session still materialises, but visibility matters.
+            let present: std::collections::HashSet<String> =
+                self.symbol_index.symbols().into_iter().collect();
+            let vivified = expected
+                .iter()
+                .filter(|symbol| present.contains(*symbol))
+                .count();
+            tracing::warn!(
+                expected = expected.len(),
+                vivified,
+                "session settle did not complete within the settle window; proceeding"
+            );
+        }
+
+        Ok(instruments.len())
+    }
+
+    /// Advances a **stepped synthetic session** by one step: advances the venue
+    /// clock by its fixed virtual interval (fanning a journaled `Clock` command to
+    /// every underlying actor under one [`CorrelationId`]) and walks the underlying
+    /// one price step (a journaled `SimStep` per hosted asset, driving the maker's
+    /// journaled requotes). Returns the [`ClockAdvance`] so a caller can inspect the
+    /// correlation id / detect a partial fan-out.
+    ///
+    /// Each step enters the sequencer as journaled commands, so replay reproduces
+    /// the session from the journal with the live requote engine muted (#030). In
+    /// realtime / accelerated modes the clock advance is a no-op read (those advance
+    /// via the cadence driver); this is the **stepped-mode** session path.
+    pub async fn step_session(&self) -> ClockAdvance {
+        // Advance the clock (and journal the Clock command) first, so the SimStep it
+        // triggers is stamped with the advanced instant.
+        let advance = self.advance_clock_step().await;
+        self.simulator.step_once();
+        advance
     }
 
     /// The venue account registry (the [`AccountStore`] backend) — resolution by

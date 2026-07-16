@@ -72,6 +72,11 @@ struct QuotableInstrument {
     strike_cents: u64,
     /// Call or put.
     style: OptionStyle,
+    /// The per-instrument implied volatility override (`None` ⇒ the pricer default).
+    /// A stepped synthetic session (#031) registers each leaf with its
+    /// `smile_curve`-shaped IV here, so the maker's journaled quotes reflect the
+    /// synthesised volatility smile.
+    iv: Option<f64>,
 }
 
 /// A resting market-maker quote leg, tracked for cancel-on-requote and for the
@@ -199,11 +204,23 @@ impl MarketMakerEngine {
         self.muted.load(Ordering::Relaxed)
     }
 
-    /// Registers a contract the maker will quote. Idempotent per symbol.
+    /// Registers a contract the maker will quote, using the pricer's default IV.
+    /// Idempotent per symbol.
+    pub fn register_instrument(&self, symbol: &Symbol) {
+        self.register_instrument_with_iv(symbol, None);
+    }
+
+    /// Registers a contract the maker will quote with an explicit per-instrument
+    /// implied-volatility override (`None` ⇒ the pricer default). Idempotent per
+    /// symbol.
     ///
     /// The symbol is pre-parsed for its underlying, absolute expiry, strike, and
-    /// style; a strike is stored in **cents** (whole-unit strike × 100).
-    pub fn register_instrument(&self, symbol: &Symbol) {
+    /// style; a strike is stored in **cents** (whole-unit strike × 100). A stepped
+    /// synthetic session (#031) passes each leaf's `smile_curve`-shaped IV here, so
+    /// the maker's journaled quotes reflect the synthesised volatility smile. The
+    /// override is a documented analytic `f64`, guarded downstream by the quoter's
+    /// `f64`-boundary (a non-finite IV yields no quote, never a poisoned value).
+    pub fn register_instrument_with_iv(&self, symbol: &Symbol, iv: Option<f64>) {
         let Ok(parsed) = SymbolParser::parse(symbol.as_str()) else {
             // A `Symbol` is already validated, so this is unreachable; fail safe.
             tracing::error!(
@@ -212,6 +229,9 @@ impl MarketMakerEngine {
             );
             return;
         };
+        // Guard the analytic boundary: a non-finite / non-positive override is
+        // dropped to the pricer default rather than carried onto the quote path.
+        let iv = iv.filter(|value| value.is_finite() && *value > 0.0);
         let underlying = parsed.underlying().to_string();
         let strike_cents = parsed.strike().saturating_mul(100);
         let instrument = QuotableInstrument {
@@ -219,6 +239,7 @@ impl MarketMakerEngine {
             expiration: *parsed.expiration(),
             strike_cents,
             style: parsed.option_style(),
+            iv,
         };
         let mut instruments = self
             .instruments
@@ -336,7 +357,7 @@ impl MarketMakerEngine {
             spread_multiplier: config.spread_multiplier,
             size_scalar: config.size_scalar,
             directional_skew: config.directional_skew,
-            iv: None,
+            iv: instrument.iv,
         };
         let Some(params) = self.quoter.generate_quote(&input) else {
             tracing::warn!(
@@ -1018,6 +1039,49 @@ mod tests {
         engine.register_instrument(&sym(BTC_CALL));
         engine.register_instrument(&sym(BTC_CALL));
         assert_eq!(engine.registered_count("BTC"), 1);
+    }
+
+    #[test]
+    fn test_per_instrument_iv_threads_into_the_quote() {
+        // The stepped-session (#031) per-strike smile IV registered on an instrument
+        // flows into the maker's journaled quote: a higher IV raises a call's theo,
+        // so its quote prices are strictly higher than the pricer-default IV's.
+        fn quote_theo(iv: Option<f64>) -> u64 {
+            let (engine, sink) = engine();
+            engine.register_instrument_with_iv(&sym(BTC_CALL), iv);
+            engine.update_price("BTC", 5_000_000);
+            // The tracked theo of the first added leg reflects the IV used.
+            let add = sink
+                .drain()
+                .into_iter()
+                .find_map(|c| match c {
+                    VenueCommand::AddOrder { order_id, .. } => Some(order_id),
+                    _ => None,
+                })
+                .expect("a requote AddOrder");
+            engine.quote_theo(&add)
+        }
+        let default_theo = quote_theo(None); // pricer default IV (0.30)
+        let high_theo = quote_theo(Some(0.80)); // a fat-wing smile IV
+        assert!(
+            high_theo > default_theo,
+            "a higher per-instrument IV raises the call theo: {high_theo} !> {default_theo}"
+        );
+    }
+
+    #[test]
+    fn test_register_with_non_finite_iv_falls_back_to_default() {
+        // A non-finite / non-positive IV override is dropped (guarded), so the
+        // instrument quotes at the pricer default rather than a poisoned value.
+        let (engine, sink) = engine();
+        engine.register_instrument_with_iv(&sym(BTC_CALL), Some(f64::NAN));
+        engine.update_price("BTC", 5_000_000);
+        // It still quotes (two legs) — the NaN was dropped, not carried into theo.
+        assert_eq!(
+            sink.drain().len(),
+            2,
+            "a dropped bad IV still quotes at default"
+        );
     }
 
     // A tiny test-only accessor for the tracked theo of a resting leg.

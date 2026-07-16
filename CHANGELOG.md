@@ -11,6 +11,43 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Stepped synthetic sessions — the OptionChain-Simulator model absorbed as code,
+  not a dependency** (#31) in the new `src/simulation/session.rs` (`SessionConfig`,
+  `synthesize_chain`, `SynthesizedChain`), a per-instrument implied-volatility
+  override on the market maker (`register_instrument_with_iv`), and the
+  `AppState::materialize_session` / `AppState::step_session` wiring
+  ([031](milestones/v0.3-replay/031-stepped-synthetic-sessions.md),
+  [04 §3](docs/04-market-data-and-replay.md#3-chain-synthesis-and-stepped-sessions),
+  [ADR-0001](docs/adr/0001-consolidate-option-chain-orderbook-backend.md)). A
+  session carries per-scenario generation parameters — initial price,
+  days-to-expiration, volatility, risk-free rate, dividend yield, walk method,
+  strike interval, chain size, `smile_curve` (+ `skew_slope`), and `spread`. Chain
+  synthesis deterministically materialises the `expirations × strikes` instrument
+  grid with the per-strike implied volatility shaped by the smile **through
+  `optionstratlib`** (`chains::utils::adjust_volatility`,
+  `σ(K) = σ_atm · clamp(1 + skew·m + smile·m²)`, `m = ln(K/S)` — a positive
+  `smile_curve` raises the wing IVs), never a hand-rolled surface; each leaf is
+  seeded with a smile-shaped market-maker quote (its IV threaded into the maker's
+  journaled quotes), so from that point the venue is **live** and client orders
+  match the synthetic liquidity. Every synthesised expiry is an absolute
+  `ExpirationDate::DateTime` derived by pure civil-date arithmetic (never
+  `Utc::now()`, never `Days`), so a session is replay-stable. A session step
+  advances the stepped venue clock by its fixed virtual interval (a journaled
+  `Clock` command fanned per underlying under one `correlation_id`) and walks the
+  underlying one price step (a journaled `SimStep`, driving the maker's journaled
+  `AddOrder` requotes) — so replay reproduces the session from the journal with the
+  live requote engine muted (#030), and no cascading duplicate orders are
+  generated. Same-seed determinism is scoped **honestly**: the chain *synthesis*
+  (grid + smile IVs + expiry) is a pure deterministic function of the config, while
+  the stochastic *price path* is reproduced from the **journal** (the
+  `optionstratlib` walk sampler owns its own RNG and cannot consume the seed), not
+  seed-regenerated. The retired service's `/api/v1/chain` session-lifecycle REST
+  surface and its ClickHouse / Redis / MongoDB stack are **not** carried over (zero
+  new dependencies). Exercised by unit tests (`test_chain_synthesis_materialises_grid`,
+  `test_smile_curve_shapes_smile`, parameter validation), `tests/determinism.rs`
+  (deterministic synthesis + the smile reshaping with the curve), and
+  `tests/integration.rs` (synthesise → materialise → step → replay via the #030
+  driver identically; a client order matches the synthetic liquidity and fills).
 - **The replay driver — reproduce identical events, fills, and top-of-book from
   the durable journal** (#30) in the new `src/simulation/replay.rs`
   (`replay_streams` / `replay_bundle`, `ScenarioBundle` / `JournalStream`,
