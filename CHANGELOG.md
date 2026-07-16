@@ -11,6 +11,80 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Container hardening — non-root, a distroless variant, a no-baked-secrets
+  scan, loopback metrics, read-only/dropped-caps run posture, and the
+  supply-chain gate on the image build** (#26)
+  ([026](milestones/v0.2-packaging/026-container-hardening.md),
+  [08 §7](docs/08-threat-model.md#7-secrets-handling),
+  [08 §8](docs/08-threat-model.md#8-supply-chain-controls),
+  [08 §9](docs/08-threat-model.md#9-container-hardening-deployment),
+  [06 §12](docs/06-deployment.md#12-container-hardening-v02-26)). Hardens the
+  #25 working image without reshaping it. `docker/Dockerfile` now builds TWO
+  runtime targets off the SAME `builder` stage: `runtime-slim` (unchanged
+  default — last stage in the file, so a plain `docker build` / `docker
+  compose build` still resolves here; `debian:bookworm-slim` + `curl`
+  `HEALTHCHECK`) and the new `runtime-distroless`
+  (`gcr.io/distroless/cc-debian12:nonroot`, **pinned by digest**, verified
+  against the manifest-LIST digest so amd64/arm64 both resolve correctly; no
+  shell, no package manager — `cc-debian12` was chosen because it ships
+  exactly the glibc deps the release binary needs, verified via `ldd`:
+  `libgcc_s.so.1`/`libm.so.6`/`libc.so.6`; no `HEALTHCHECK` on this target —
+  there is no shell/curl to run one from inside the container, an honest
+  tradeoff documented in the Dockerfile, not an oversight — `runtime-slim`
+  stays the default so the one-command distribution keeps a working
+  healthcheck). Both targets run as a fixed **uid/gid 65532** (the
+  conventional distroless "nonroot" id, used on BOTH targets for one
+  consistent PodSecurityContext / compose `user:` value regardless of base
+  image) — verified with real `docker build --target
+  runtime-slim`/`runtime-distroless` + `docker run --entrypoint id` /
+  `docker inspect --format '{{.Config.User}}'`; both boot, self-seed, and
+  serve `GET /health` (`200`), and an `exec sh` into `runtime-distroless`
+  fails as expected (no shell). Measured local image sizes: `runtime-slim`
+  187 MB, `runtime-distroless` 76.4 MB. New
+  `docker/scan-image-secrets.sh` — the no-baked-secrets gate: scans ONLY the
+  layer(s) carrying fauxchange's own `COPY` targets (the compiled binary, the
+  baked `seeds/default.toml`) for an unrecognised PRIVATE KEY block (pinned
+  by SHA-256 against the ONE known, reviewed `JwtAuth::dev()` fixture,
+  src/auth.rs — a real leaked key still fails), a credentialed
+  `postgres(ql)://user:pass@...` connection string, an
+  `AUTH_BOOTSTRAP_SECRET=value` assignment, and any `fix_password` other than
+  the documented dev fixture (`dev-taker-secret-change-me`); deliberately
+  scoped away from the upstream `debian:bookworm-slim` base image after
+  verifying locally that an unscoped scan trips on GnuPG's OWN internal
+  test-key fixtures (`gpgv`/`libgcrypt`, compiled in for `apt` package-
+  signature verification) — Debian's supply chain, not a fauxchange-baked
+  secret. Verified against a deliberately "dirty" test image (a smuggled real
+  private key + a substituted `fix_password` in a separate `COPY` layer) to
+  confirm the scan actually fails on a real finding, not just passes on a
+  clean one; run in CI (`image-build` job) against both runtime targets, and
+  locally via `docker/scan-image-secrets.sh <image-ref>`. The dev-keys
+  release gate (`JwtAuth::release_gated`, shipped in #011) already refused
+  `JwtAuth::dev()` keys without `--dev`/`FAUXCHANGE_DEV`; its named
+  acceptance test `test_auth_refuses_dev_keys_without_flag` did not yet exist
+  under that exact name (a functionally-identical test existed as
+  `test_dev_key_release_gate_refuses_without_dev_mode`) — renamed to the
+  milestone-specified name with a doc comment cross-referencing
+  `docker/scan-image-secrets.sh` as the content-layer backstop on the same
+  control. `:9090`'s loopback-only compose binding (already true since #25)
+  now has a CI assertion (`docker compose config --format json | jq`,
+  `image-build` job) so a future metrics server inherits it by construction.
+  `docker-compose.yml`'s `fauxchange` service gains `read_only: true`,
+  `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]` (an explicit
+  `target: runtime-slim` was also added to its `build:` block, defensive
+  against a future Dockerfile stage reorder) — verified locally
+  (`docker run --read-only --cap-drop=ALL --security-opt
+  no-new-privileges:true`, both targets) that the venue still serves
+  `/health` with **zero `tmpfs` mounts**: it needed no writable path at all
+  (fully in-memory, `tracing` to stdout only) — an honest finding, not a
+  gap papered over with a defensive mount nothing exercises. The `postgres`
+  service itself is NOT hardened here (out of scope; its data-directory /
+  Unix-socket writable paths make read-only-rootfs a separate, non-trivial
+  change). The `image-build` CI job now `needs: [cargo-audit, cargo-deny]` —
+  a new advisory or a policy violation fails BEFORE either runtime image is
+  built, wiring the existing #19 supply-chain gate onto the image build
+  itself, not just the crate. No new Rust dependency (the scan script is
+  bash + the runner's preinstalled `jq`/`python3`, matching #25's "no extra
+  action to pin for a plain `docker build`" precedent).
 - **Multi-stage `docker/Dockerfile` and the `docker/docker-compose.yml`
   one-command topology** (#25)
   ([025](milestones/v0.2-packaging/025-dockerfile-compose.md),

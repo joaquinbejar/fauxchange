@@ -15,19 +15,31 @@
 # `sqlx::query!` macros never need a DB — a query changed without a regenerated
 # `.sqlx/` fails the offline build.
 #
-# The `image-build` job (added in v0.2 #025) proves `docker/Dockerfile`
-# BUILDS on every push/PR (the scope #025 owns) and validates
+# The `image-build` job (added in v0.2 #025; hardened in v0.2 #026) proves
+# `docker/Dockerfile` BUILDS on every push/PR and validates
 # `docker/docker-compose.yml` with `docker compose config`. It does NOT push
 # anywhere — publishing a tagged image to a registry is a release-pipeline
 # concern (docs/06-deployment.md §10, RELEASE-PROCESS.md) and a risky action
 # requiring explicit confirmation, out of scope here.
 #
+# #026 additions to `image-build`: it now builds BOTH runtime targets
+# (`runtime-slim` — the default, curl `HEALTHCHECK` — and the minimal
+# `runtime-distroless`, no shell / package manager), asserts both start as
+# the unprivileged uid 65532, asserts distroless truly has no shell, runs
+# `docker/scan-image-secrets.sh` against both built images (the no-baked-
+# secrets gate, docs/08 §7), and boots `runtime-slim` under
+# `--read-only --cap-drop=ALL --security-opt no-new-privileges:true` to prove
+# the recommended hardened run posture (docs/08 §9, docker-compose.yml) still
+# serves `/health`. It also now `needs: [cargo-audit, cargo-deny]` — the
+# supply-chain gate now blocks the image build itself, not just the crate
+# (docs/08 §8): a new advisory or a policy violation fails BEFORE any image
+# is built.
+#
 # Explicitly OUT of this workflow (see
 # milestones/v0.1-backend-core/019-ci-audit-deny-lint.md "Scope"):
 # the `fuzz` job (FIX gateway lands v0.4), the `bench-regression` gate
-# (armed before v1.0), the container HARDENING posture (non-root /
-# distroless / dev-key release-refusal test, v0.2 #026), and the
-# `docker-smoke` cold-bring-up + one-order-round-trip e2e stage (v0.2 #027).
+# (armed before v1.0), and the `docker-smoke` cold-bring-up +
+# one-order-round-trip e2e stage (v0.2 #027).
 #
 # `make workflow-<job-id>` (see Makefile) runs any job here locally via
 # `act` — job ids below are the stable contract those targets rely on.
@@ -279,25 +291,85 @@ jobs:
       # wildcard versions) and sources (crates.io only) policy.
       - run: cargo deny check
 
-  # --- Image build (docs/06-deployment.md §2/§3, #025) -----------------------
-  # Proves `docker/Dockerfile` builds the single `fauxchange` release image
-  # (multi-stage: the pinned `rust:1.97.0-bookworm` builder, offline `sqlx`
+  # --- Image build + container hardening (docs/06-deployment.md §2/§3, #025; ---
+  # --- hardened in #026, docs/08-threat-model.md §7-9) ------------------------
+  # Proves `docker/Dockerfile` builds BOTH runtime targets: the default
+  # `runtime-slim` (the pinned `rust:1.97.0-bookworm` builder, offline `sqlx`
   # via the committed `.sqlx/`, into the `debian:bookworm-slim` runtime) and
-  # that `docker/docker-compose.yml` is valid, both profiles. It does NOT push
-  # an image anywhere and does NOT run the compose-up / one-order-round-trip
-  # e2e (that is the dedicated `docker-smoke` stage, v0.2 #027). The runner's
+  # the minimal `runtime-distroless` (`gcr.io/distroless/cc-debian12`, pinned
+  # by digest, no shell / package manager); that `docker/docker-compose.yml`
+  # is valid, both profiles; and the #026 hardening posture — non-root,
+  # no-baked-secrets, and read-only-rootfs + dropped-capabilities still
+  # serving `/health`. `needs: [cargo-audit, cargo-deny]` gates the image
+  # build on the supply-chain scan (docs/08 §8): a new advisory or a policy
+  # violation fails BEFORE either image is built. This job does NOT push an
+  # image anywhere and does NOT run the compose-up / one-order-round-trip e2e
+  # (that is the dedicated `docker-smoke` stage, v0.2 #027). The runner's
   # preinstalled Docker Engine + Compose plugin (ubuntu-24.04) are used
-  # directly — no extra action to pin for a plain `docker build`.
+  # directly — no extra action to pin for a plain `docker build`; `jq` and
+  # `python3` (used by `docker/scan-image-secrets.sh`) are preinstalled too.
   image-build:
     name: image-build
     runs-on: ubuntu-24.04
+    needs: [cargo-audit, cargo-deny]
     steps:
       - uses: actions/checkout@v7
-      - name: Build the fauxchange image (proves it builds; SQLX_OFFLINE from the committed .sqlx/)
-        run: docker build -f docker/Dockerfile -t fauxchange:ci .
+      - name: Build runtime-slim (the DEFAULT target; proves it builds; SQLX_OFFLINE from the committed .sqlx/)
+        run: docker build -f docker/Dockerfile --target runtime-slim -t fauxchange:ci .
+      - name: Build runtime-distroless (#26 — no shell / package manager in the runtime layer)
+        run: docker build -f docker/Dockerfile --target runtime-distroless -t fauxchange:ci-distroless .
       - name: Validate docker-compose.yml (DB-less default profile)
         run: docker compose -f docker/docker-compose.yml config
       - name: Validate docker-compose.yml (persistent profile)
         run: |
           DATABASE_URL="postgres://fauxchange:fauxchange@postgres:5432/fauxchange" \
             docker compose -f docker/docker-compose.yml --profile persistent config
+      - name: Loopback metrics — :9090 binds 127.0.0.1 by default (#26, docs/06 §5)
+        # No metrics server exists yet (RESERVED port, docker/Dockerfile), so
+        # this asserts the compose PORT BINDING itself — the honest,
+        # currently-verifiable half of "metrics on loopback": the resolved
+        # `docker compose config` output must publish target 9090 with
+        # `host_ip: 127.0.0.1` and nothing else, so a future metrics server
+        # inherits a loopback-only bind by construction, not by convention.
+        run: |
+          docker compose -f docker/docker-compose.yml config --format json \
+            | jq -e '[.services.fauxchange.ports[] | select(.target == 9090) | .host_ip == "127.0.0.1"] | length == 1 and all'
+      - name: Non-root — runtime-slim starts as the unprivileged uid 65532 (#26)
+        run: |
+          actual="$(docker run --rm --entrypoint id fauxchange:ci)"
+          echo "runtime-slim id: $actual"
+          case "$actual" in
+            uid=65532*) ;;
+            *) echo "runtime-slim did not run as uid 65532" >&2; exit 1 ;;
+          esac
+      - name: Non-root — runtime-distroless defaults to the unprivileged uid 65532 (#26)
+        run: |
+          user="$(docker inspect fauxchange:ci-distroless --format '{{.Config.User}}')"
+          echo "runtime-distroless Config.User: $user"
+          [ "$user" = "65532:65532" ] || { echo "runtime-distroless Config.User is not 65532:65532 (got: $user)" >&2; exit 1; }
+      - name: Distroless has no shell / package manager (#26)
+        run: |
+          if docker run --rm --entrypoint sh fauxchange:ci-distroless -c 'echo should-not-run'; then
+            echo "runtime-distroless unexpectedly has a working shell" >&2
+            exit 1
+          fi
+          echo "confirmed: exec sh fails in runtime-distroless (no shell present)"
+      - name: No baked secrets — image-scan gate on both runtime targets (#26, docs/08 §7)
+        run: |
+          docker/scan-image-secrets.sh fauxchange:ci
+          docker/scan-image-secrets.sh fauxchange:ci-distroless
+      - name: Read-only rootfs + dropped capabilities still serve /health (#26, docs/08 §9)
+        run: |
+          docker run -d --rm --name fx-hardening-check \
+            --read-only --cap-drop=ALL --security-opt no-new-privileges:true \
+            -p 18080:8080 -e FAUXCHANGE_DEV=1 -e AUTH_BOOTSTRAP_SECRET=ci-hardening-check \
+            fauxchange:ci --config /app/seeds/default.toml
+          status="000"
+          for _ in $(seq 1 30); do
+            status="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/health || true)"
+            [ "$status" = "200" ] && break
+            sleep 1
+          done
+          docker logs fx-hardening-check
+          docker stop fx-hardening-check
+          [ "$status" = "200" ] || { echo "venue did not serve /health under --read-only --cap-drop=ALL --security-opt no-new-privileges:true" >&2; exit 1; }

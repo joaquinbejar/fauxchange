@@ -2209,11 +2209,21 @@ mod tests {
 
     // ---- dev-key release gate --------------------------------------------
 
+    /// The #26 container-hardening named acceptance test: the release image
+    /// refuses to start auth on `JwtAuth::dev()` keys unless `--dev` /
+    /// `FAUXCHANGE_DEV` is set ([08 §7](../docs/08-threat-model.md#7-secrets-handling),
+    /// `docker/scan-image-secrets.sh` backstops this at the image-content
+    /// layer; this test backstops it at the auth-startup layer — the SAME
+    /// [`JwtAuth::release_gated`] gate `main.rs` calls unconditionally
+    /// before serving). Named exactly per the milestone spec
+    /// (`milestones/v0.2-packaging/026-container-hardening.md` "Tests
+    /// required") so it is grep-discoverable as the release-gate assertion.
     #[test]
-    fn test_dev_key_release_gate_refuses_without_dev_mode() {
+    fn test_auth_refuses_dev_keys_without_flag() {
         let dev = dev_auth();
         assert!(dev.is_dev());
-        // Dev mode disabled: refused.
+        // Dev mode disabled (the release-image default — no `--dev` flag):
+        // refused.
         assert_eq!(
             dev.release_gated(DevMode::from_flag(false)).map(|_| ()),
             Err(AuthError::DevKeyRefused)

@@ -39,6 +39,16 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # Explicit — the Dockerfile's LAST stage (`runtime-slim`) is already the
+      # implicit default when `--target` is omitted (#26 comment header,
+      # docker/Dockerfile), but naming it here means the one-command
+      # distribution's healthcheck (curl, below) keeps working even if the
+      # stage order in the Dockerfile is ever reshuffled. The minimal
+      # `runtime-distroless` target (no shell / curl, #26) is NOT used by
+      # this compose file — see docker/Dockerfile's stage comment for why —
+      # but is available for a manual `docker build --target
+      # runtime-distroless`.
+      target: runtime-slim
     image: fauxchange:local
     # Self-seed at boot from the baked default scenario (see the note above).
     # Swap this for a different mounted scenario file to run a custom one:
@@ -49,6 +59,29 @@ services:
       - "8080:8080" # REST + WebSocket (live)
       - "9878:9878" # FIX 4.4 — RESERVED, the acceptor lands v0.4; nothing listens yet
       - "127.0.0.1:9090:9090" # metrics — RESERVED, loopback only; no server binds it yet (docs/06 §9)
+    # --- Run posture hardening (#26, docs/08 §9) -------------------------
+    # Non-root already lives in the IMAGE (docker/Dockerfile `USER
+    # 65532:65532`, both runtime targets) — these three are the run-time
+    # complement: a read-only root filesystem and every Linux capability
+    # dropped, so a compromised process cannot write to its own image layer
+    # or exploit a capability it never needed in the first place
+    # (`no-new-privileges` blocks privilege escalation via a setuid binary,
+    # moot here since there is none, but is the standard belt-and-braces
+    # pairing with `cap_drop`).
+    #
+    # NO `tmpfs:` entry — verified locally (#26): the venue boots, self-seeds,
+    # serves `/health`, and answers the container `HEALTHCHECK` (`curl`, which
+    # itself needs no scratch space for a plain unauthenticated GET) under
+    # `--read-only --cap-drop=ALL --security-opt no-new-privileges:true` with
+    # ZERO writable paths — it is fully in-memory (DB-less default) and never
+    # spools to disk (`tracing` writes to stdout only). If a future capability
+    # needs scratch space (e.g. a local snapshot spool), add the SPECIFIC
+    # `tmpfs:` path here rather than widening `read_only`.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     environment:
       # Local-dev-only: admits the embedded `JwtAuth::dev()` RS256 keypair
       # (src/auth.rs `release_gated`). `main.rs` does not yet load a real key
