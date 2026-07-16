@@ -54,6 +54,7 @@ pub mod executor;
 pub mod identity;
 pub mod instrument;
 pub mod journal;
+pub mod mm_identity;
 pub mod money;
 pub mod snapshot;
 pub mod stores;
@@ -82,6 +83,10 @@ pub use self::instrument::Instrument;
 pub use self::journal::{
     InMemoryVenueJournal, JournalCommand, JournalError, JournalRecord, RecordKind,
     SnapshotRestored, VenueJournal,
+};
+pub use self::mm_identity::{
+    MARKET_MAKER_ACCOUNT, MARKET_MAKER_OWNER, is_market_maker_account, is_market_maker_command,
+    market_maker_account,
 };
 pub use self::money::{Cents, MoneyError, Notional, SignedCents};
 pub use self::snapshot::{
