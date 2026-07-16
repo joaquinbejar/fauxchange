@@ -17,6 +17,11 @@
 //! - `sequence_monotonic_per_symbol` — the per-underlying single-writer actor
 //!   assigns `0, 1, 2, …` gaplessly in its turn order, independently per symbol,
 //!   over an arbitrary interleaving of commands across two underlyings.
+//! - `ws_instrument_sequence_monotonic_per_symbol` — the WS market-data
+//!   `instrument_sequence` (a **separate** namespace from the journaled
+//!   `underlying_sequence`) is strictly increasing per instrument across an
+//!   arbitrary stream of book mutations folded through the subscription manager
+//!   ([03 §4.1](../docs/03-protocol-surfaces.md), [01 §9.1](../docs/01-domain-model.md)).
 //! - `position_pnl_stays_consistent_across_fills` — over an arbitrary fill
 //!   sequence, a position's `realized + unrealized` P&L equals the net cash flow
 //!   plus `net_quantity × mark`, exactly, in integer cents
@@ -30,6 +35,7 @@ use fauxchange::exchange::{
     VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
 };
 use fauxchange::exchange::{Hash32, STPMode, Side as SeamSide, TimeInForce as SeamTif};
+use fauxchange::subscription::OrderbookSubscriptionManager;
 use fauxchange::{
     AccountId, ClientOrderId, ExecutionId, LiquidityFlag, Order, OrderStatus, OrderType,
     Permission, Side, TimeInForce, VenueError, VenueOrderId, WsMessage,
@@ -571,6 +577,70 @@ proptest! {
         let (outcomes_b, top_b) = replay(&lineage);
         prop_assert_eq!(outcomes_a, outcomes_b);
         prop_assert_eq!(top_a, top_b);
+    }
+
+    /// The WS market-data `instrument_sequence` is strictly increasing **per
+    /// instrument** and gapless (`1, 2, 3, …`) across an arbitrary interleaving of
+    /// book mutations, independently for two instruments (`true` → the call,
+    /// `false` → the put). This is the market-data gap-detection namespace — a
+    /// separate counter from the journaled `underlying_sequence` — folded through
+    /// the subscription manager exactly as the actor's `WsFanOut` feeds it.
+    #[test]
+    fn ws_instrument_sequence_monotonic_per_symbol(
+        routes in prop::collection::vec(any::<bool>(), 0..96),
+    ) {
+        let manager = OrderbookSubscriptionManager::new();
+        let call = Symbol::parse("BTC-20240329-50000-C")
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+        let put = Symbol::parse("BTC-20240329-50000-P")
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+
+        // A resting limit add (no fills) always changes the book, so it always
+        // emits a delta and advances that instrument's sequence.
+        let resting_add = |symbol: &fauxchange::exchange::Symbol, index: u64| -> VenueEvent {
+            let command = VenueCommand::AddOrder {
+                symbol: symbol.clone(),
+                order_id: VenueOrderId::new(format!("o-{}-{index}", symbol.as_str())),
+                account: AccountId::new("acct"),
+                owner: Hash32([1; 32]),
+                client_order_id: None,
+                side: SeamSide::Sell,
+                // A unique price per add so each rests at its own level.
+                limit_price: Some(Cents::new(50_000 + index)),
+                order_type: OrderType::Limit,
+                quantity: 1,
+                time_in_force: SeamTif::Gtc,
+                stp_mode: STPMode::None,
+            };
+            VenueEvent::new(
+                SequenceNumber::new(index),
+                EventTimestamp::new(1),
+                command,
+                VenueOutcome::Added {
+                    fills: vec![],
+                    resting_quantity: 1,
+                    stp_cancelled: vec![],
+                },
+            )
+        };
+
+        let mut next_call = 0u64;
+        let mut next_put = 0u64;
+        for (index, route) in routes.into_iter().enumerate() {
+            let (symbol, expected) = if route {
+                next_call += 1;
+                (&call, next_call)
+            } else {
+                next_put += 1;
+                (&put, next_put)
+            };
+            let sequence = manager.on_committed_event(&resting_add(symbol, index as u64));
+            prop_assert_eq!(
+                sequence,
+                Some(expected),
+                "each instrument's sequence advances gaplessly and independently"
+            );
+        }
     }
 }
 

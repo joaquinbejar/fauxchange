@@ -45,7 +45,9 @@
 //!   journal, executions, and venue configuration; the venue runs fully
 //!   in-memory when `DATABASE_URL` is unset.
 //! - **Services** — [`auth`], JWT authentication and the permission
-//!   model shared by every gateway.
+//!   model shared by every gateway; and [`subscription`], the WebSocket
+//!   market-data service (the per-instrument subscription manager + broadcast
+//!   fan-out) the `/ws` gateway reads through `AppState`.
 //!
 //! [`error`] and [`models`] are the shared boundary — typed errors mapped
 //! to HTTP status codes and FIX rejects, and the DTOs that carry data
@@ -68,6 +70,7 @@ pub mod models;
 pub mod ohlc;
 pub mod simulation;
 pub mod state;
+pub mod subscription;
 
 // Re-exported at the crate root: `error` and `models` are the shared
 // boundary types every gateway and downstream crate depends on directly.

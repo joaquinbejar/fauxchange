@@ -78,9 +78,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // `/health` is exempt from both auth and rate limiting.
     let public = Router::new().route("/health", get(meta::health));
 
+    // The WebSocket surface (#014): `GET /ws` authenticates the handshake inside
+    // the handler (bearer header OR `?token=` query param), so it is NOT behind
+    // the REST route-layer auth — but it IS below the peer-injection layer, so the
+    // real socket peer reaches the handshake rate-limit key.
+    let ws = crate::gateway::ws::ws_routes();
+
     let api = protected
         .merge(token)
         .merge(public)
+        .merge(ws)
         .with_state(state)
         // The peer-injection layer is OUTERMOST so `PeerAddr` is set before the
         // auth layer reads it (per-route `route_layer`s run inside this).

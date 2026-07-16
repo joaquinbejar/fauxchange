@@ -1785,6 +1785,35 @@ impl<C: RateLimitClock> AuthService<C> {
             rate_limit: decision,
         }
     }
+
+    /// Re-validates an **already-admitted** session for a long-lived connection
+    /// (the WebSocket socket loop, #014): the handshake admits once, but a
+    /// persistent socket must not outlive a revocation or the token's expiry.
+    /// Re-queries the [`RevocationOracle`] against the session's minted
+    /// `revocation_epoch` **and** re-checks the token expiry, mirroring the
+    /// revocation branch of [`admit`](Self::admit).
+    ///
+    /// `now_secs` is wall-clock **seconds** — token expiry is a credential-plane
+    /// concern and an explicit replay exclusion
+    /// ([03 §10](../docs/03-protocol-surfaces.md#10-state-changing-operation-classification)),
+    /// so it is checked against the wall clock (exactly as `jsonwebtoken` does at
+    /// the handshake), never the venue clock. This is transport liveness, outside
+    /// the sequenced path and the determinism oracle.
+    ///
+    /// # Errors
+    ///
+    /// [`VenueError::Unauthorized`] — a **terminal** WS error that closes the
+    /// socket — if the token has expired, the account is unknown, or the session's
+    /// epoch is below the account's current epoch.
+    pub fn revalidate_session(&self, claims: &Claims, now_secs: u64) -> Result<(), VenueError> {
+        if now_secs >= claims.exp {
+            return Err(VenueError::Unauthorized);
+        }
+        match self.revocation.current_revocation_epoch(claims.account()) {
+            Some(current) if claims.revocation_epoch >= current => Ok(()),
+            _ => Err(VenueError::Unauthorized),
+        }
+    }
 }
 
 // ============================================================================
@@ -3066,5 +3095,46 @@ mod tests {
             assert!(!rendered.contains("$argon2id$"));
             assert!(!rendered.is_empty());
         }
+    }
+
+    // ---- session revalidation (the WS liveness re-check, #014) -------------
+
+    #[test]
+    fn test_revalidate_session_accepts_a_live_unrevoked_token() {
+        let service = service_for("acct-1", 0, TestClock::new(1_000), 100);
+        let claims = valid_claims("acct-1", vec![Permission::Read]);
+        assert!(service.revalidate_session(&claims, now_secs()).is_ok());
+    }
+
+    #[test]
+    fn test_revalidate_session_refuses_an_expired_token() {
+        let service = service_for("acct-1", 0, TestClock::new(1_000), 100);
+        let claims = valid_claims("acct-1", vec![Permission::Read]);
+        // A wall-clock instant past `exp` closes the socket.
+        assert!(matches!(
+            service.revalidate_session(&claims, claims.exp + 1),
+            Err(VenueError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn test_revalidate_session_refuses_a_revoked_token() {
+        // The account's CURRENT epoch is 1, but the session was minted at epoch 0.
+        let service = service_for("acct-1", 1, TestClock::new(1_000), 100);
+        let claims = valid_claims("acct-1", vec![Permission::Read]);
+        assert!(matches!(
+            service.revalidate_session(&claims, now_secs()),
+            Err(VenueError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn test_revalidate_session_refuses_an_unknown_account() {
+        let service = service_for("acct-1", 0, TestClock::new(1_000), 100);
+        let claims = valid_claims("ghost", vec![Permission::Read]);
+        assert!(matches!(
+            service.revalidate_session(&claims, now_secs()),
+            Err(VenueError::Unauthorized)
+        ));
     }
 }

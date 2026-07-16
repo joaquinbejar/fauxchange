@@ -60,23 +60,37 @@ optionstratlib = { version = "0.17", default-features = false }
 # dependency adds NO new version to the tree. MIT/Apache-2.0, maintained by the
 # `xacrimon/dashmap` project.
 dashmap = "6"
-# REST/WS boundary + the live Axum server (#013). `#003` needed only `json`
+# REST/WS boundary + the live Axum server (#013/#014). `#003` needed only `json`
 # (render `VenueError` / `Json` bodies); #013 turns the router into a running
-# server, so the feature set grows to what the server actually uses:
+# server and #014 adds the WebSocket surface, so the feature set grows to what
+# the server actually uses:
 #   - `json`   — `Json<T>` request/response bodies (unchanged from #003).
-#   - `query`  — the `Query<T>` extractor for the list/OHLC query DTOs.
+#   - `query`  — the `Query<T>` extractor for the list/OHLC query DTOs and the
+#     WS handshake token (`?token=` / `?access_token=`, #014).
 #   - `http1`  — the HTTP/1 protocol `axum::serve` speaks (no HTTP/2 dep pulled).
 #   - `tokio`  — `axum::serve`, `TcpListener` wiring, and
 #     `into_make_service_with_connect_info::<SocketAddr>()` so the REAL socket
 #     peer reaches the rate-limit key (the `PeerAddr` seam, #011/#013).
-# `Path`, `State`, and `middleware::from_fn*` need no feature flag. No new crate
-# enters the tree — these are feature flags on the already-present axum 0.8.
-# MIT, maintained by the tokio project.
+#   - `ws`     — the `WebSocketUpgrade` / `WebSocket` / `Message` surface for
+#     `GET /ws` (#014). Audit note: the `ws` feature pulls the WebSocket protocol
+#     codec axum wraps NEW into the tree — `tokio-tungstenite` + `tungstenite` +
+#     `data-encoding` + `futures-sink` — all pure-Rust, permissively licensed
+#     (MIT/Apache-2.0), maintained crates; `cargo audit` / `cargo deny` (#019)
+#     gate them. `sha1` + `base64` (the RFC-6455 handshake accept-key) were
+#     ALREADY resolved in the tree, so the `ws` feature adds only a new dependency
+#     EDGE to them, not new crate versions. No CLIENT WebSocket crate is added —
+#     the conformance tests drive the handshake over a bound server with a raw TCP
+#     client (`std::net::TcpStream`), so no `tokio-tungstenite` client
+#     dev-dependency is introduced.
+# `Path`, `State`, and `middleware::from_fn*` need no feature flag. No new
+# top-level crate is declared — these are feature flags on the already-present
+# axum 0.8. MIT, maintained by the tokio project.
 axum = { version = "0.8", default-features = false, features = [
     "json",
     "query",
     "http1",
     "tokio",
+    "ws",
 ] }
 # Swagger UI served at boot (#013). `utoipa-swagger-ui` 9.x is the version that
 # targets **axum 0.8** + **utoipa 5** (verified against the crate manifest:
@@ -99,6 +113,15 @@ utoipa-swagger-ui = { version = "9", default-features = false, features = [
     "vendored",
 ] }
 serde = { version = "1", features = ["derive"] }
+# JSON parsing for the WebSocket client-action frames (#014). A `/ws` text frame
+# is not an HTTP body, so the `axum::Json` extractor cannot reach it — the WS
+# handler parses the frame itself (`serde_json::from_str`) to detect and reject
+# order-entry-shaped frames and to decode the `{ "action": … }` protocol. Audit
+# note: `serde_json` 1 is ALREADY resolved in the tree — `axum`'s `json` feature
+# depends on it and it is a dev-dependency — so promoting it to a direct
+# dependency adds NO new crate version; `cargo audit` / `cargo deny` (#019) gate
+# it. MIT/Apache-2.0, maintained by the serde project.
+serde_json = "1"
 thiserror = "2"
 # Structured logging for the actor lifecycle and its degraded paths — the venue
 # logs through `tracing` exclusively (never `println!` / `log`), per CLAUDE.md
