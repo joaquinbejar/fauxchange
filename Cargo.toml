@@ -200,6 +200,38 @@ argon2 = "0.5"
 # minimal. It is the SAME `rand_core` `password-hash` uses, so `OsRng` satisfies
 # the `CryptoRngCore` bound. MIT/Apache-2.0, maintained by the rust-random project.
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+# OPTIONAL durable persistence: the `sqlx` PostgreSQL layer (#023). `sqlx` is a
+# NORMAL (non-feature-gated) dependency selected at RUNTIME by `DATABASE_URL`
+# presence — the in-memory backend is always compiled and serves when the URL is
+# unset; the `PgPool` opens (and `sqlx::migrate!` runs) only when it is set. It is
+# NOT behind a cargo feature because the venue must build one image that runs both
+# DB-less and durable from the same binary (docs/06 §6), so a compile-time toggle
+# would defeat the "one image, both modes" packaging goal. Version `0.9.0` matches
+# the `sqlx-cli` 0.9.0 that generates the committed `.sqlx/` offline data.
+# `default-features = false` drops the `any`/`json` defaults we do not use; the
+# explicit feature set is exactly the Postgres path:
+#   - `runtime-tokio`     — the async runtime the venue already runs on.
+#   - `tls-rustls-ring`   — RUSTLS with the **ring** crypto backend (NOT
+#     `native-tls`/OpenSSL — no C toolchain, no OpenSSL in the image; NOT
+#     `tls-rustls-aws-lc-rs` — that would add the aws-lc C/asm crate NEW to the
+#     tree). `ring` 0.17 is ALREADY resolved (via `jsonwebtoken`), so the crypto
+#     backend adds no new crypto crate; the rustls stack (`rustls`,
+#     `rustls-pki-types`, `webpki-roots`) is pure-Rust, permissively licensed.
+#   - `postgres`          — the Postgres driver (the only backend the venue uses).
+#   - `macros`            — the COMPILE-TIME-checked `query!` / `query_as!` /
+#     `migrate!` macros (`macros` pulls `derive` for `#[derive(sqlx::FromRow)]`).
+#   - `migrate`           — `sqlx::migrate!("./migrations")` run at boot.
+# Audit note: `sqlx` pulls a large transitive tree (the driver + rustls stack);
+# `cargo audit` / `cargo deny` (#019) gate it and any new SPDX id is added to
+# `deny.toml`'s allow-list with a reason. MIT/Apache-2.0, maintained by the
+# launchbadge/sqlx project.
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "postgres",
+    "macros",
+    "migrate",
+] }
 
 [dev-dependencies]
 proptest = "1"
@@ -274,6 +306,17 @@ criterion = { version = "0.8", default-features = false }
 # accounting, so the recorded `allocs/op` / `bytes_alloc/op` numbers in
 # `BENCH.md` §5 were re-measured (not carried over) — see that section's note.
 stats_alloc = { version = "0.1.10", default-features = false }
+# The REAL-Postgres integration harness for the optional persistence layer (#023):
+# an EPHEMERAL `postgres:18-alpine` container spun up per test run, so the DB
+# tests use a real Postgres, never a mocked DB (rules SQL & Persistence). Dev-only
+# — never reaches the shipped binary. The `#[ignore]`-gated DB test runs only under
+# `cargo test -- --ignored` (the CI `migrations` job, where Docker is available);
+# the default `cargo test` suite skips it and stays green WITHOUT Docker. Audit
+# note: `testcontainers` + `testcontainers-modules` and their transitive tree
+# (`bollard`-style docker client) are dev-only; `cargo audit` / `cargo deny` (#019)
+# gate them. MIT/Apache-2.0, maintained by the testcontainers-rs project.
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 [[bench]]
 name = "hp1_order_path"

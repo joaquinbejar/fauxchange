@@ -34,6 +34,7 @@
 
 use fauxchange::auth::{DevMode, JwtAuth};
 use fauxchange::config::Config;
+use fauxchange::db::{DatabasePool, DbPoolConfig};
 use fauxchange::gateway::rest;
 use fauxchange::state::{AppState, AppStateConfig, AuthConfig};
 
@@ -80,12 +81,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth = auth.with_bootstrap_secret(secret);
     }
 
+    // Optional durable persistence (#023): when `DATABASE_URL` is set, open the
+    // `PgPool` and run `sqlx::migrate!("./migrations")` at boot; unset ⇒ fully
+    // in-memory. The URL is exposed from the `Secret` at this one legitimate
+    // consumer and is NEVER logged. Pool size + slow-acquire threshold come from
+    // config, not hard-coded. "Both modes serve" — the venue starts either way.
+    let db = match config.persistence.connection_url() {
+        Some(url) => {
+            let pool_config = DbPoolConfig::from_persistence(&config.persistence);
+            let pool = DatabasePool::connect_and_migrate(url, pool_config).await?;
+            tracing::info!("durable persistence enabled; migrations applied at boot");
+            Some(pool)
+        }
+        None => {
+            tracing::info!("no DATABASE_URL; running fully in-memory persistence");
+            None
+        }
+    };
+
     // The run lineage is derived from the seed, so ids namespace per seed.
     let app_config = AppStateConfig::new(underlyings)
         .with_lineage(config.determinism.lineage_id())
-        .with_auth(auth);
+        .with_auth(auth)
+        .with_db(db);
     let state = AppState::new(app_config)?;
-    tracing::info!(underlyings = state.underlying_count(), "AppState assembled");
+    tracing::info!(
+        underlyings = state.underlying_count(),
+        durable = state.is_persistent(),
+        "AppState assembled"
+    );
 
     rest::serve(state, config.server.http_addr).await?;
     Ok(())

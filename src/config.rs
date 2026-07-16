@@ -76,6 +76,18 @@ pub const DEFAULT_LOG_FORMAT: LogFormat = LogFormat::Pretty;
 /// Colon-free, matching the id-grammar invariant.
 pub const LINEAGE_PREFIX: &str = "fauxchange";
 
+/// The default maximum size of the durable `PgPool`
+/// (`FAUXCHANGE_DB_MAX_CONNECTIONS`) — the connection-pool ceiling the DB layer
+/// (#23) opens with when `DATABASE_URL` is set. A bounded default so the pool
+/// size is **config, not hard-coded** ([06 §6](../docs/06-deployment.md#6-persistence)).
+pub const DEFAULT_DB_POOL_MAX_CONNECTIONS: u32 = 10;
+
+/// The default slow-acquire warning threshold, in **milliseconds**
+/// (`FAUXCHANGE_DB_SLOW_ACQUIRE_MS`) — a pool `acquire` slower than this is logged
+/// at `WARN` (`rules/global_rules.md` *Logging*: "slow pool acquires"). Config, not
+/// hard-coded.
+pub const DEFAULT_DB_SLOW_ACQUIRE_MS: u64 = 500;
+
 /// The rendered placeholder for a redacted secret in any log / effective-config
 /// output.
 pub const REDACTED: &str = "<redacted>";
@@ -315,6 +327,15 @@ pub enum ConfigError {
         /// The offending value.
         value: String,
     },
+    /// A persistence pool knob (`pool_max_connections` / `slow_acquire_ms`) did
+    /// not parse as its expected integer. Names the field and value.
+    #[error("invalid persistence value '{value}' for {field}: expected a positive integer")]
+    BadPersistenceValue {
+        /// The config field (`pool_max_connections` / `slow_acquire_ms`).
+        field: &'static str,
+        /// The offending value.
+        value: String,
+    },
     /// A CLI flag that takes a value was given none.
     #[error("missing value for CLI flag '{flag}'")]
     MissingCliValue {
@@ -367,6 +388,12 @@ pub struct FixConfig {
 pub struct PersistenceConfig {
     /// The `DATABASE_URL`, redacted in every log; `None` ⇒ in-memory.
     pub database_url: Option<Secret>,
+    /// The maximum durable `PgPool` size the DB layer (#23) opens with — carried
+    /// even in-memory (unused until a URL is set). Config, not hard-coded.
+    pub pool_max_connections: u32,
+    /// The slow-`acquire` warning threshold, in **milliseconds** — a pool acquire
+    /// slower than this is logged at `WARN`. Config, not hard-coded.
+    pub slow_acquire_ms: u64,
 }
 
 impl PersistenceConfig {
@@ -375,6 +402,20 @@ impl PersistenceConfig {
     #[inline]
     pub fn is_persistent(&self) -> bool {
         self.database_url.is_some()
+    }
+
+    /// The maximum durable pool size the DB layer opens with.
+    #[must_use]
+    #[inline]
+    pub fn pool_max_connections(&self) -> u32 {
+        self.pool_max_connections
+    }
+
+    /// The slow-`acquire` warning threshold, in **milliseconds**.
+    #[must_use]
+    #[inline]
+    pub fn slow_acquire_ms(&self) -> u64 {
+        self.slow_acquire_ms
     }
 
     /// The backend the config selects.
@@ -573,11 +614,14 @@ impl Config {
         format!(
             "server.http_addr={http} fix.fix_addr={fix} \
              persistence.backend={backend} persistence.database_url={database_url} \
+             persistence.pool_max_connections={pool} persistence.slow_acquire_ms={slow} \
              clock.mode={clock} determinism.seed={seed} \
              auth.bootstrap_secret={bootstrap_secret} logging.format={log}",
             http = self.server.http_addr,
             fix = self.fix.fix_addr,
             backend = self.persistence.backend().as_str(),
+            pool = self.persistence.pool_max_connections,
+            slow = self.persistence.slow_acquire_ms,
             clock = self.clock.mode.as_str(),
             seed = self.determinism.seed,
             log = self.logging.format.as_str(),
@@ -602,6 +646,8 @@ struct RawConfig {
     http_addr: Option<String>,
     fix_addr: Option<String>,
     database_url: Option<String>,
+    db_pool_max_connections: Option<String>,
+    db_slow_acquire_ms: Option<String>,
     clock: Option<String>,
     seed: Option<String>,
     bootstrap_secret: Option<String>,
@@ -616,6 +662,8 @@ impl RawConfig {
             http_addr: Some(DEFAULT_HTTP_ADDR.to_string()),
             fix_addr: Some(DEFAULT_FIX_ADDR.to_string()),
             database_url: None,
+            db_pool_max_connections: Some(DEFAULT_DB_POOL_MAX_CONNECTIONS.to_string()),
+            db_slow_acquire_ms: Some(DEFAULT_DB_SLOW_ACQUIRE_MS.to_string()),
             clock: Some(DEFAULT_CLOCK.as_str().to_string()),
             seed: Some(DEFAULT_SEED.to_string()),
             bootstrap_secret: None,
@@ -634,6 +682,12 @@ impl RawConfig {
         }
         if other.database_url.is_some() {
             self.database_url = other.database_url;
+        }
+        if other.db_pool_max_connections.is_some() {
+            self.db_pool_max_connections = other.db_pool_max_connections;
+        }
+        if other.db_slow_acquire_ms.is_some() {
+            self.db_slow_acquire_ms = other.db_slow_acquire_ms;
         }
         if other.clock.is_some() {
             self.clock = other.clock;
@@ -658,11 +712,23 @@ impl RawConfig {
         let mode = parse_clock(self.clock)?;
         let format = parse_log_format(self.log_format)?;
         let seed = parse_seed(self.seed)?;
+        let pool_max_connections = parse_pool_u32(
+            "pool_max_connections",
+            self.db_pool_max_connections,
+            DEFAULT_DB_POOL_MAX_CONNECTIONS,
+        )?;
+        let slow_acquire_ms = parse_pool_u64(
+            "slow_acquire_ms",
+            self.db_slow_acquire_ms,
+            DEFAULT_DB_SLOW_ACQUIRE_MS,
+        )?;
         Ok(Config {
             server: ServerConfig { http_addr },
             fix: FixConfig { fix_addr },
             persistence: PersistenceConfig {
                 database_url: self.database_url.map(Secret::new),
+                pool_max_connections,
+                slow_acquire_ms,
             },
             clock: ClockConfig { mode },
             determinism: DeterminismConfig { seed },
@@ -723,6 +789,8 @@ fn raw_from_env<F: Fn(&str) -> Option<String>>(get: F) -> RawConfig {
         http_addr: pick("FAUXCHANGE_HTTP_ADDR"),
         fix_addr: pick("FAUXCHANGE_FIX_ADDR"),
         database_url: pick("DATABASE_URL"),
+        db_pool_max_connections: pick("FAUXCHANGE_DB_MAX_CONNECTIONS"),
+        db_slow_acquire_ms: pick("FAUXCHANGE_DB_SLOW_ACQUIRE_MS"),
         clock: pick("FAUXCHANGE_CLOCK"),
         seed: pick("FAUXCHANGE_SEED"),
         bootstrap_secret: pick("AUTH_BOOTSTRAP_SECRET"),
@@ -767,6 +835,14 @@ fn parse_cli<I: IntoIterator<Item = String>>(args: I) -> Result<CliLayer, Config
             }
             "--database-url" => {
                 layer.raw.database_url = Some(take_cli_value("--database-url", inline, &mut iter)?);
+            }
+            "--db-max-connections" => {
+                layer.raw.db_pool_max_connections =
+                    Some(take_cli_value("--db-max-connections", inline, &mut iter)?);
+            }
+            "--db-slow-acquire-ms" => {
+                layer.raw.db_slow_acquire_ms =
+                    Some(take_cli_value("--db-slow-acquire-ms", inline, &mut iter)?);
             }
             "--clock" => layer.raw.clock = Some(take_cli_value("--clock", inline, &mut iter)?),
             "--seed" => layer.raw.seed = Some(take_cli_value("--seed", inline, &mut iter)?),
@@ -834,6 +910,35 @@ fn parse_seed(value: Option<String>) -> Result<u64, ConfigError> {
     }
 }
 
+/// Parses a persistence pool `u32` knob (clamped to at least `1`), failing with
+/// [`ConfigError::BadPersistenceValue`].
+fn parse_pool_u32(
+    field: &'static str,
+    value: Option<String>,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    match value.trim().parse::<u32>() {
+        // A zero-size pool can never serve a query; clamp up to a usable minimum.
+        Ok(parsed) => Ok(parsed.max(1)),
+        Err(_) => Err(ConfigError::BadPersistenceValue { field, value }),
+    }
+}
+
+/// Parses a persistence pool `u64` knob (milliseconds), failing with
+/// [`ConfigError::BadPersistenceValue`].
+fn parse_pool_u64(
+    field: &'static str,
+    value: Option<String>,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    match value.trim().parse::<u64>() {
+        Ok(parsed) => Ok(parsed),
+        Err(_) => Err(ConfigError::BadPersistenceValue { field, value }),
+    }
+}
+
 // ============================================================================
 // File deserialization structs — deny_unknown_fields on every section
 // ============================================================================
@@ -891,10 +996,26 @@ struct FileConfig {
 impl FileConfig {
     /// Flattens the structured file document into the untyped [`RawConfig`] layer.
     fn into_raw(self) -> RawConfig {
+        // Bind the persistence section once so all three of its knobs read the
+        // same optional table (a moved-out field cannot be read twice).
+        let persistence = self.persistence;
+        let database_url = persistence
+            .as_ref()
+            .and_then(|section| section.database_url.clone());
+        let db_pool_max_connections = persistence
+            .as_ref()
+            .and_then(|section| section.pool_max_connections)
+            .map(|value| value.to_string());
+        let db_slow_acquire_ms = persistence
+            .as_ref()
+            .and_then(|section| section.slow_acquire_ms)
+            .map(|value| value.to_string());
         RawConfig {
             http_addr: self.server.and_then(|section| section.http_addr),
             fix_addr: self.fix.and_then(|section| section.fix_addr),
-            database_url: self.persistence.and_then(|section| section.database_url),
+            database_url,
+            db_pool_max_connections,
+            db_slow_acquire_ms,
             clock: self.clock.and_then(|section| section.mode),
             seed: self
                 .determinism
@@ -928,6 +1049,10 @@ struct FileFix {
 struct FilePersistence {
     #[serde(default)]
     database_url: Option<String>,
+    #[serde(default)]
+    pool_max_connections: Option<u32>,
+    #[serde(default)]
+    slow_acquire_ms: Option<u64>,
 }
 
 /// `[clock]` — an unrecognised inner key aborts startup.
@@ -1183,6 +1308,69 @@ read_per_window = 6000
         assert!(config.persistence.is_persistent());
         assert_eq!(config.persistence.backend(), PersistenceBackend::Postgres);
         assert_eq!(config.persistence.connection_url(), Some(url));
+        Ok(())
+    }
+
+    /// The pool knobs default when unset and are overridden from the env layer.
+    #[test]
+    fn test_config_persistence_pool_knobs_default_and_override() -> Result<(), ConfigError> {
+        let defaults = Config::assemble(
+            RawConfig::default(),
+            raw_from_env(|_| None),
+            RawConfig::default(),
+        )?;
+        assert_eq!(
+            defaults.persistence.pool_max_connections(),
+            DEFAULT_DB_POOL_MAX_CONNECTIONS
+        );
+        assert_eq!(
+            defaults.persistence.slow_acquire_ms(),
+            DEFAULT_DB_SLOW_ACQUIRE_MS
+        );
+
+        let env = raw_from_env(env_map(&[
+            ("FAUXCHANGE_DB_MAX_CONNECTIONS", "25"),
+            ("FAUXCHANGE_DB_SLOW_ACQUIRE_MS", "1500"),
+        ]));
+        let config = Config::assemble(RawConfig::default(), env, RawConfig::default())?;
+        assert_eq!(config.persistence.pool_max_connections(), 25);
+        assert_eq!(config.persistence.slow_acquire_ms(), 1_500);
+        Ok(())
+    }
+
+    /// A zero pool size is clamped up to a usable minimum (a zero-size pool can
+    /// never serve a query).
+    #[test]
+    fn test_config_persistence_pool_zero_is_clamped() -> Result<(), ConfigError> {
+        let env = raw_from_env(env_map(&[("FAUXCHANGE_DB_MAX_CONNECTIONS", "0")]));
+        let config = Config::assemble(RawConfig::default(), env, RawConfig::default())?;
+        assert_eq!(config.persistence.pool_max_connections(), 1);
+        Ok(())
+    }
+
+    /// A non-integer pool knob aborts startup naming the field and value.
+    #[test]
+    fn test_config_persistence_bad_pool_value_is_rejected() {
+        let env = raw_from_env(env_map(&[("FAUXCHANGE_DB_MAX_CONNECTIONS", "lots")]));
+        match Config::assemble(RawConfig::default(), env, RawConfig::default()) {
+            Err(ConfigError::BadPersistenceValue { field, value }) => {
+                assert_eq!(field, "pool_max_connections");
+                assert_eq!(value, "lots");
+            }
+            other => panic!("expected BadPersistenceValue, got {other:?}"),
+        }
+    }
+
+    /// The pool knobs are read from the `[persistence]` file section.
+    #[test]
+    fn test_config_persistence_pool_from_file_section() -> Result<(), ConfigError> {
+        let file = raw_from_toml_str(
+            "[persistence]\ndatabase_url = \"postgres://db/x\"\npool_max_connections = 7\nslow_acquire_ms = 250\n",
+        )?;
+        let config = Config::assemble(file, raw_from_env(|_| None), RawConfig::default())?;
+        assert!(config.persistence.is_persistent());
+        assert_eq!(config.persistence.pool_max_connections(), 7);
+        assert_eq!(config.persistence.slow_acquire_ms(), 250);
         Ok(())
     }
 
