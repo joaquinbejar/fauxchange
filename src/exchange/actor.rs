@@ -499,10 +499,13 @@ where
 
 /// Snapshot **capture** and **restore** for the default order-path wiring — the
 /// real [`MatchingExecutor`] over the in-memory [`StoreFanOut`]. These are the
-/// entry points the admin snapshot routes (#013) and the replay driver (#030)
-/// build on; they run **synchronously under the single writer**, so a
-/// directly-owned actor — or a quiesced spawned one — drives them without racing
-/// a turn (the mailbox plumbing for the spawned path lands with #013).
+/// entry points the admin snapshot routes (#013) build on; they run
+/// **synchronously under the single writer**, so a directly-owned actor — or a
+/// quiesced spawned one — drives them without racing a turn (the mailbox plumbing
+/// for the spawned path lands with #013). The #030 replay driver does **not** use
+/// these — it re-executes a journal/bundle **offline** into a fresh registry, not
+/// via a snapshot restore; the boot-time recovery wiring that would restore an
+/// epoch on restart is tracked in #85.
 impl<J, C>
     UnderlyingActor<
         J,

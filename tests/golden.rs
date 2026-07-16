@@ -27,9 +27,10 @@ use fauxchange::{
     FillPrint, InstrumentLifecycle, InstrumentView, LimitOrderStatus, LiquidityFlag,
     MarketOrderStatus, OhlcBar, OptionStyle, Order, OrderStatus, OrderType, Permission,
     PlaceLimitOrderRequest, PlaceLimitOrderResponse, PlaceMarketOrderResponse, Position,
-    PriceLevelChange, PriceLevelData, QuoteResponse, RestoreSnapshotResponse, Side,
-    SnapshotSummary, SnapshotsListResponse, SubscriptionChannel, SubscriptionResult,
-    SystemControlResponse, TimeInForce, TokenResponse, VenueError, VenueOrderId, WsMessage,
+    PriceLevelChange, PriceLevelData, QuoteResponse, ReplayReportResponse, RestoreSnapshotResponse,
+    Side, SnapshotSummary, SnapshotsListResponse, SubscriptionChannel, SubscriptionResult,
+    SystemControlResponse, TimeInForce, TokenResponse, UnderlyingReplaySummary, VenueError,
+    VenueOrderId, WsMessage,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -763,6 +764,27 @@ fn test_golden_ws_subscriptions_list() {
         }],
     };
     assert_golden("ws/subscriptions.json", &msg);
+}
+
+#[test]
+fn test_golden_ws_recording_state() {
+    let msg = WsMessage::RecordingState { recording: true };
+    assert_golden("ws/recording_state.json", &msg);
+}
+
+#[test]
+fn test_golden_ws_replay_complete() {
+    let msg = WsMessage::ReplayComplete {
+        report: ReplayReportResponse {
+            per_underlying: vec![UnderlyingReplaySummary {
+                underlying: "BTC".to_string(),
+                event_count: 3,
+                last_sequence: Some(2),
+            }],
+            executions: 2,
+        },
+    };
+    assert_golden("ws/replay_complete.json", &msg);
 }
 
 #[test]

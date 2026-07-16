@@ -22,6 +22,7 @@ pub mod middleware;
 pub mod openapi;
 pub mod orders;
 pub mod prices;
+pub mod replay;
 pub mod support;
 
 use std::net::SocketAddr;
@@ -135,6 +136,13 @@ fn protected_routes() -> Router<Arc<AppState>> {
             "/api/v1/controls/instrument/{symbol}/toggle",
             post(controls::toggle_instrument),
         )
+        // ---- record / replay (#030) ---------------------------------------
+        .route(
+            "/api/v1/replay/record",
+            get(replay::get_record_status).post(replay::set_record),
+        )
+        .route("/api/v1/replay/export", get(replay::export_bundle))
+        .route("/api/v1/replay/bundle", post(replay::replay_bundle))
         // ---- prices --------------------------------------------------------
         .route(
             "/api/v1/prices",

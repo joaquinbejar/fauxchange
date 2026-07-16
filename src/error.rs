@@ -34,6 +34,7 @@ use utoipa::ToSchema;
 
 use crate::exchange::{MoneyError, SymbolError};
 use crate::models::Permission;
+use crate::simulation::ReplayError;
 
 /// Schema tag identifying the versioned REST error-envelope wire contract.
 ///
@@ -155,6 +156,27 @@ impl From<SymbolError> for VenueError {
     #[inline]
     fn from(err: SymbolError) -> Self {
         VenueError::InvalidOrder(err.to_string())
+    }
+}
+
+impl From<ReplayError> for VenueError {
+    /// Folds the #030 replay error into the boundary. A submitted scenario bundle
+    /// that is corrupt, schema-refused, version-mismatched, or malformed is a
+    /// **client-input** validation failure — [`VenueError::InvalidOrder`] (`400`),
+    /// carrying only the client's own bundle detail (underlying + sequence, a
+    /// version tag, a decode message) which is safe to echo. A durable-store read
+    /// failure while building a replay input is an internal
+    /// [`VenueError::JournalUnavailable`] (`500`, redacted).
+    #[cold]
+    #[inline]
+    fn from(err: ReplayError) -> Self {
+        match err {
+            ReplayError::JournalCorruption { .. }
+            | ReplayError::SchemaRefused { .. }
+            | ReplayError::VersionMismatch { .. }
+            | ReplayError::BundleDecode(_) => VenueError::InvalidOrder(err.to_string()),
+            ReplayError::Backend { .. } => VenueError::JournalUnavailable,
+        }
     }
 }
 

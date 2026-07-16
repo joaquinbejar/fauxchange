@@ -60,6 +60,7 @@
 
 pub mod clock;
 pub mod manifest;
+pub mod replay;
 pub mod simulator;
 pub mod sink;
 pub mod walk;
@@ -68,7 +69,11 @@ pub use self::clock::{
     ClockMode, CorrelationId, DEFAULT_ACCEL_MULTIPLIER, DEFAULT_CLOCK_START_MS,
     DEFAULT_STEP_INTERVAL_MS, SimClock, VenueClockConfig,
 };
-pub use self::manifest::RunManifest;
+pub use self::manifest::{DEFAULT_MICROSTRUCTURE_FINGERPRINT, DependencyVersions, RunManifest};
+pub use self::replay::{
+    JournalStream, RecordingController, ReplayError, ReplayReport, SCENARIO_BUNDLE_SCHEMA,
+    ScenarioBundle, UnderlyingReplay, replay_bundle, replay_streams,
+};
 pub use self::simulator::{
     AssetConfig, DEFAULT_HORIZON_STEPS, DEFAULT_PRICE_CHANNEL_CAPACITY, DEFAULT_START_MS,
     DEFAULT_STEP_MS, DEFAULT_TICK_INTERVAL, PriceSimulator, PriceUpdate, SimulationConfig,

@@ -57,6 +57,7 @@ use crate::exchange::{EventTimestamp, Symbol, VenueCommand};
 use crate::models::{
     ActiveSubscription, Permission, SubscriptionChannel, SubscriptionResult, WsMessage,
 };
+use crate::simulation::ScenarioBundle;
 use crate::state::AppState;
 
 // The subscription manager is a `crate::subscription` SERVICE (not a gateway); it
@@ -495,7 +496,82 @@ impl Connection {
                 )
                 .await,
             ],
+            ClientAction::Record(param) => {
+                vec![self.record_control(state, param.enabled, request_id).await]
+            }
+            ClientAction::ReplayBundle(param) => {
+                vec![self.replay_control(state, param.bundle, request_id).await]
+            }
         }
+    }
+
+    /// Handles the `record` control action (#030), **admission-first** like
+    /// [`control`](Self::control): pass the rate limiter, gate [`Permission::Admin`],
+    /// then flip the venue's scenario-capture window via the **same**
+    /// [`AppState::set_recording`] the REST record route calls (control parity).
+    async fn record_control(
+        &self,
+        state: &Arc<AppState>,
+        enabled: bool,
+        request_id: Option<String>,
+    ) -> WsMessage {
+        if let Some(error) = self.admit_control(state, &request_id) {
+            return error;
+        }
+        state.set_recording(enabled);
+        WsMessage::RecordingState {
+            recording: state.is_recording(),
+        }
+    }
+
+    /// Handles the `replay_bundle` control action (#030): admission-first, then
+    /// replay the submitted bundle **offline** via the **same**
+    /// [`AppState::replay_bundle`] the REST replay route calls (control parity). A
+    /// corrupt / version-mismatched / malformed bundle surfaces as a non-terminal
+    /// typed WS error (the connection stays open); a clean replay returns the
+    /// reconstructed summary.
+    async fn replay_control(
+        &self,
+        state: &Arc<AppState>,
+        bundle: ScenarioBundle,
+        request_id: Option<String>,
+    ) -> WsMessage {
+        if let Some(error) = self.admit_control(state, &request_id) {
+            return error;
+        }
+        match state.replay_bundle(&bundle).await {
+            Ok(report) => WsMessage::ReplayComplete {
+                report: report.to_response(),
+            },
+            Err(error) => WsMessage::Error(VenueError::from(error).ws_error(request_id)),
+        }
+    }
+
+    /// The shared control-admission gate: rate-limit **before** the permission
+    /// check (so a forbidden control frame still counts against the budget), then
+    /// require [`Permission::Admin`]. Returns `Some(error)` to reject, `None` to
+    /// proceed.
+    fn admit_control(
+        &self,
+        state: &Arc<AppState>,
+        request_id: &Option<String>,
+    ) -> Option<WsMessage> {
+        let key = RateLimitKey::Account {
+            account: self.claims.account().clone(),
+            revocation_epoch: self.claims.revocation_epoch,
+        };
+        let decision = state.auth().rate_limiter().check_and_record_status(&key);
+        if !decision.allowed {
+            return Some(WsMessage::Error(
+                VenueError::RateLimited.ws_error(request_id.clone()),
+            ));
+        }
+        if !self.claims.has_permission(Permission::Admin) {
+            return Some(WsMessage::Error(
+                VenueError::Forbidden(Permission::Admin).ws_error(request_id.clone()),
+            ));
+        }
+        None
     }
 
     /// Resolves the subscription key for `(channel, symbol)`: the canonical
@@ -1020,6 +1096,113 @@ mod tests {
                 assert!(!error.terminal);
             }
             other => panic!("expected a not-routable error, got {other:?}"),
+        }
+    }
+
+    // ---- record / replay control actions (#030) --------------------------
+
+    /// A crossing add pair seeded onto the sequenced path so the venue journal +
+    /// executions carry one fill (for the replay-control test).
+    async fn seed_crossing_ws(state: &Arc<AppState>) {
+        use crate::exchange::{Cents, Hash32, LineageId, STPMode, TimeInForce};
+        let lineage = LineageId::new("fauxchange");
+        for (seq, account, owner, side) in [
+            (0u64, "maker", 0x11u8, crate::exchange::Side::Sell),
+            (1, "taker", 0x22, crate::exchange::Side::Buy),
+        ] {
+            let command = VenueCommand::AddOrder {
+                symbol: sym(),
+                order_id: lineage.venue_order_id(
+                    "BTC",
+                    crate::exchange::SequenceNumber::new(seq),
+                    0,
+                ),
+                account: AccountId::new(account),
+                owner: Hash32([owner; 32]),
+                client_order_id: None,
+                side,
+                order_type: crate::models::OrderType::Limit,
+                limit_price: Some(Cents::new(50_000)),
+                quantity: 2,
+                time_in_force: TimeInForce::Gtc,
+                stp_mode: STPMode::None,
+            };
+            state.submit(command).await.expect("seed submit commits");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_record_control_admin_flips_the_shared_flag() {
+        let state = crate::state::AppState::new(crate::state::AppStateConfig::new(["BTC"]))
+            .expect("state builds");
+        assert!(state.is_recording(), "records by default");
+        let connection = Connection::new(claims("admin", vec![Permission::Admin]));
+        let message = connection.record_control(&state, false, None).await;
+        match message {
+            WsMessage::RecordingState { recording } => assert!(!recording),
+            other => panic!("expected a RecordingState ack, got {other:?}"),
+        }
+        assert!(
+            !state.is_recording(),
+            "the WS record action flips the SAME AppState flag the REST route does"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_record_control_without_admin_is_forbidden_and_leaves_flag() {
+        let state = crate::state::AppState::new(crate::state::AppStateConfig::new(["BTC"]))
+            .expect("state builds");
+        let connection = Connection::new(claims("reader", vec![Permission::Read]));
+        let message = connection
+            .record_control(&state, false, Some("req-1".to_string()))
+            .await;
+        match message {
+            WsMessage::Error(error) => {
+                assert_eq!(error.code, crate::error::WsErrorCode::Forbidden);
+                assert!(!error.terminal, "a forbidden control is non-terminal");
+            }
+            other => panic!("expected a forbidden error, got {other:?}"),
+        }
+        assert!(
+            state.is_recording(),
+            "a forbidden record action did not flip the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_replay_control_admin_returns_reconstructed_report() {
+        let state = crate::state::AppState::new(crate::state::AppStateConfig::new(["BTC"]))
+            .expect("state builds");
+        seed_crossing_ws(&state).await;
+        let bundle = state.export_bundle().await.expect("export bundle");
+        let connection = Connection::new(claims("admin", vec![Permission::Admin]));
+        let message = connection.replay_control(&state, bundle, None).await;
+        match message {
+            WsMessage::ReplayComplete { report } => {
+                assert_eq!(
+                    report.executions, 2,
+                    "the crossing's two legs are reconstructed"
+                );
+            }
+            other => panic!("expected a ReplayComplete ack, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ws_replay_control_version_mismatch_is_non_terminal_error() {
+        let state = crate::state::AppState::new(crate::state::AppStateConfig::new(["BTC"]))
+            .expect("state builds");
+        seed_crossing_ws(&state).await;
+        let mut bundle = state.export_bundle().await.expect("export bundle");
+        bundle.manifest.versions.fauxchange = "0.0.0-mismatch".to_string();
+        let connection = Connection::new(claims("admin", vec![Permission::Admin]));
+        let message = connection.replay_control(&state, bundle, None).await;
+        match message {
+            WsMessage::Error(error) => {
+                assert_eq!(error.code, crate::error::WsErrorCode::InvalidOrder);
+                assert!(!error.terminal, "a bad-bundle reject keeps the socket open");
+            }
+            other => panic!("expected a non-terminal version-mismatch error, got {other:?}"),
         }
     }
 

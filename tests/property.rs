@@ -45,6 +45,7 @@ use fauxchange::exchange::{
     Hash32, OptionStyle, STPMode, Side as SeamSide, TimeInForce as SeamTif,
 };
 use fauxchange::market_maker::{QuoteInput, Quoter};
+use fauxchange::simulation::{JournalStream, replay_streams};
 use fauxchange::subscription::OrderbookSubscriptionManager;
 use fauxchange::{
     AccountId, ClientOrderId, ExecutionId, LiquidityFlag, Order, OrderStatus, OrderType,
@@ -587,6 +588,81 @@ proptest! {
         let (outcomes_b, top_b) = replay(&lineage);
         prop_assert_eq!(outcomes_a, outcomes_b);
         prop_assert_eq!(top_a, top_b);
+    }
+
+    /// `journal_driver_replay_reconstructs_book` (#030): a randomly generated
+    /// journaled session (limit adds against one contract, driven through the real
+    /// single-writer actor into its write-ahead journal) replays through the
+    /// **production replay driver** ([`replay_streams`]) into a **fresh** registry
+    /// to the **identical** ordered `VenueEvent` stream and top-of-book. This
+    /// exercises the same re-execution core recovery uses, over the driver's public
+    /// `JournalStream` input, so the driver is not a second apply path
+    /// ([04 §4](../docs/04-market-data-and-replay.md#4-historical-replay)).
+    #[test]
+    fn journal_driver_replay_reconstructs_book(
+        orders in prop::collection::vec((any::<bool>(), 1u64..=1_000_000, 1u64..=20), 1..12)
+    ) {
+        let lineage = LineageId::new("run-1");
+        let symbol = Symbol::parse("BTC-20240329-50000-C")
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+
+        // Drive the random stream through a REAL single-writer actor so the journal
+        // is exactly what the live venue writes.
+        let header = JournalHeader::new(lineage.clone());
+        let mut actor = UnderlyingActor::new(
+            ActorConfig::new("BTC", lineage.clone(), 64),
+            InMemoryVenueJournal::new(header.clone()),
+            MatchingExecutor::new("BTC"),
+            NoopFanOut,
+            FixedClock::new(EventTimestamp::new(1_700_000_000_000)),
+        );
+        for (index, &(is_buy, price, quantity)) in orders.iter().enumerate() {
+            let sequence = SequenceNumber::new(index as u64);
+            let command = VenueCommand::AddOrder {
+                symbol: symbol.clone(),
+                order_id: lineage.venue_order_id("BTC", sequence, 0),
+                account: AccountId::new(format!("acct-{index}")),
+                owner: Hash32([index as u8; 32]),
+                client_order_id: None,
+                side: if is_buy { SeamSide::Buy } else { SeamSide::Sell },
+                order_type: OrderType::Limit,
+                limit_price: Some(Cents::new(price)),
+                quantity,
+                time_in_force: SeamTif::Gtc,
+                stp_mode: STPMode::None,
+            };
+            actor
+                .handle(command)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        }
+        let records = actor
+            .journal()
+            .read_from(SequenceNumber::START)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        let stored_events: Vec<VenueEvent> = records
+            .iter()
+            .filter_map(|record| match record {
+                JournalRecord::Event(event) => Some(event.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // Two independent driver replays into fresh registries agree with each
+        // other AND with the recorded stream — the persistent-path oracle.
+        let stream = JournalStream::new("BTC", header, records);
+        let report_a = replay_streams(std::slice::from_ref(&stream))
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        let report_b = replay_streams(std::slice::from_ref(&stream))
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        let replay_a = report_a
+            .underlying("BTC")
+            .ok_or_else(|| TestCaseError::fail("BTC replay missing"))?;
+        let replay_b = report_b
+            .underlying("BTC")
+            .ok_or_else(|| TestCaseError::fail("BTC replay missing"))?;
+        prop_assert_eq!(&replay_a.events, &stored_events);
+        prop_assert_eq!(&replay_a.events, &replay_b.events);
+        prop_assert_eq!(replay_a.top_of_book(&symbol), replay_b.top_of_book(&symbol));
     }
 
     /// The **store-level** `journal_replay_reconstructs_book` invariant (#029): an
