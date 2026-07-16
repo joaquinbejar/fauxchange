@@ -39,10 +39,12 @@
 //! venue clock the sequenced order path stamps events from
 //! ([`crate::exchange::VenueClock`]) — never `SystemTime`. Because the
 //! `auth_middleware` runs **outside** the per-underlying actor, the venue injects
-//! a shared clock handle it owns; [`FixedClock`]
-//! bridges [`RateLimitClock`] today (it is what the actor uses), and the
-//! advanceable seeded/stepped clock arrives with the simulation clock (#016)
-//! while the rate-limit configuration (the per-window budget) is wired by #046.
+//! a shared clock handle it owns. As of #028 that handle is the advanceable,
+//! seeded `SimClock` (`crate::simulation::SimClock`, realtime/accelerated/stepped)
+//! — it implements [`RateLimitClock`] and is the **same** clock the actors stamp
+//! `venue_ts` from, so rate-limit decisions replay deterministically; the trivial
+//! [`FixedClock`] still bridges [`RateLimitClock`] for tests. The rate-limit
+//! configuration (the per-window budget) is wired by #046.
 //! When two admissions carry the same venue-clock deadline the deterministic
 //! tie-break is `(session_id, arrival_sequence)`; the counting here is
 //! order-independent, and that final ingress ordering into the single writer is
@@ -620,8 +622,9 @@ impl BootstrapGate {
 /// deterministically ([03 §6.1](../docs/03-protocol-surfaces.md#61-deterministic-ingress-ordering)).
 /// Milliseconds on the venue clock, never `SystemTime`.
 ///
-/// [`FixedClock`] bridges it today; the advanceable
-/// seeded/stepped venue clock arrives with #016.
+/// As of #028 the injected handle is the advanceable, seeded `SimClock`
+/// (`crate::simulation::SimClock`); the trivial [`FixedClock`] still bridges it
+/// for tests.
 pub trait RateLimitClock: Send + Sync {
     /// The current venue-clock instant, in **milliseconds**.
     #[must_use]

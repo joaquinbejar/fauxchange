@@ -127,8 +127,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lineage = config.determinism.lineage_id();
     let assets = seed::asset_configs(manifest);
     let manifest_summary = manifest.summary(); // secret-free counts only
+    // The venue clock (#028): map the `[clock]` mode + knobs onto the runtime
+    // clock config, pinning its virtual epoch to the price-walk epoch, and record
+    // the run seed in the run manifest. The chosen mode drives `venue_ts`, the
+    // simulator cadence, and the rate limiter.
+    let venue_clock = config
+        .clock
+        .to_venue_clock_config(fauxchange::simulation::DEFAULT_CLOCK_START_MS);
+    let seed = config.determinism.seed;
     let app_config = AppStateConfig::new(underlyings)
         .with_lineage(lineage)
+        .with_clock(venue_clock)
+        .with_seed(seed)
         .with_auth(auth)
         .with_assets(assets)
         .with_db(db)

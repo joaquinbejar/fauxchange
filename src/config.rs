@@ -89,6 +89,13 @@ pub const DEFAULT_FIX_ADDR: &str = "0.0.0.0:9878";
 pub const DEFAULT_SEED: u64 = 0;
 /// Default clock mode (`FAUXCHANGE_CLOCK`).
 pub const DEFAULT_CLOCK: ClockMode = ClockMode::Realtime;
+/// Default accelerated multiplier (`[clock] multiplier`) — `60×`, one wall second
+/// per virtual minute — consumed only when the mode is `accelerated`.
+pub const DEFAULT_CLOCK_MULTIPLIER: u32 = crate::simulation::DEFAULT_ACCEL_MULTIPLIER;
+/// Default stepped virtual interval in **milliseconds** (`[clock]
+/// step_interval_ms`) — one virtual minute per step, aligned with the price-walk
+/// step — consumed only when the mode is `stepped`.
+pub const DEFAULT_CLOCK_STEP_INTERVAL_MS: u64 = crate::simulation::DEFAULT_STEP_INTERVAL_MS;
 /// Default log format (`FAUXCHANGE_LOG_FORMAT`) — human-readable locally; the
 /// production image sets `json` ([06 §9](../docs/06-deployment.md#9-observability)).
 pub const DEFAULT_LOG_FORMAT: LogFormat = LogFormat::Pretty;
@@ -366,6 +373,15 @@ pub enum ConfigError {
         /// The offending value.
         value: String,
     },
+    /// A `[clock]` knob (`multiplier` / `step_interval_ms`) did not parse as its
+    /// expected integer. Names the field and value.
+    #[error("invalid clock value '{value}' for {field}: expected a positive integer")]
+    BadClockValue {
+        /// The config field (`multiplier` / `step_interval_ms`).
+        field: &'static str,
+        /// The offending value.
+        value: String,
+    },
     /// A CLI flag that takes a value was given none.
     #[error("missing value for CLI flag '{flag}'")]
     MissingCliValue {
@@ -527,14 +543,42 @@ impl PersistenceConfig {
     }
 }
 
-/// The `[clock]` section: the venue clock mode.
+/// The `[clock]` section: the venue clock mode and its mode-specific knobs.
 ///
 /// `#[non_exhaustive]` for forward-compatible field additions (see [`ServerConfig`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ClockConfig {
-    /// The clock mode (`FAUXCHANGE_CLOCK`), carried through for #28.
+    /// The clock mode (`FAUXCHANGE_CLOCK` / `--clock`).
     pub mode: ClockMode,
+    /// The accelerated multiplier (`[clock] multiplier`) — virtual milliseconds per
+    /// wall millisecond; consumed only when `mode == Accelerated`
+    /// ([04 §5](../docs/04-market-data-and-replay.md#5-clock-control)).
+    pub multiplier: u32,
+    /// The stepped virtual interval (`[clock] step_interval_ms`) — the amount one
+    /// stepped-clock advance moves virtual time; consumed only when
+    /// `mode == Stepped`.
+    pub step_interval_ms: u64,
+}
+
+impl ClockConfig {
+    /// Maps this config section onto the runtime venue-clock construction
+    /// parameters, folding the parameterless [`ClockMode`] token together with the
+    /// mode-specific knob it selects, and pinning the virtual epoch to `start_ms`
+    /// (the price-walk epoch, so the clock and the walk share one time base).
+    #[must_use]
+    pub fn to_venue_clock_config(&self, start_ms: u64) -> crate::simulation::VenueClockConfig {
+        let mode = match self.mode {
+            ClockMode::Realtime => crate::simulation::ClockMode::Realtime,
+            ClockMode::Accelerated => crate::simulation::ClockMode::Accelerated {
+                multiplier: self.multiplier,
+            },
+            ClockMode::Stepped => crate::simulation::ClockMode::Stepped {
+                step_ms: self.step_interval_ms,
+            },
+        };
+        crate::simulation::VenueClockConfig { mode, start_ms }
+    }
 }
 
 /// The `[determinism]` section: the one run-level seed.
@@ -757,6 +801,8 @@ struct RawConfig {
     db_pool_max_connections: Option<String>,
     db_slow_acquire_ms: Option<String>,
     clock: Option<String>,
+    clock_multiplier: Option<String>,
+    clock_step_interval_ms: Option<String>,
     seed: Option<String>,
     bootstrap_secret: Option<String>,
     log_format: Option<String>,
@@ -773,6 +819,8 @@ impl RawConfig {
             db_pool_max_connections: Some(DEFAULT_DB_POOL_MAX_CONNECTIONS.to_string()),
             db_slow_acquire_ms: Some(DEFAULT_DB_SLOW_ACQUIRE_MS.to_string()),
             clock: Some(DEFAULT_CLOCK.as_str().to_string()),
+            clock_multiplier: Some(DEFAULT_CLOCK_MULTIPLIER.to_string()),
+            clock_step_interval_ms: Some(DEFAULT_CLOCK_STEP_INTERVAL_MS.to_string()),
             seed: Some(DEFAULT_SEED.to_string()),
             bootstrap_secret: None,
             log_format: Some(DEFAULT_LOG_FORMAT.as_str().to_string()),
@@ -800,6 +848,12 @@ impl RawConfig {
         if other.clock.is_some() {
             self.clock = other.clock;
         }
+        if other.clock_multiplier.is_some() {
+            self.clock_multiplier = other.clock_multiplier;
+        }
+        if other.clock_step_interval_ms.is_some() {
+            self.clock_step_interval_ms = other.clock_step_interval_ms;
+        }
         if other.seed.is_some() {
             self.seed = other.seed;
         }
@@ -818,6 +872,16 @@ impl RawConfig {
         let http_addr = parse_addr("http_addr", self.http_addr)?;
         let fix_addr = parse_addr("fix_addr", self.fix_addr)?;
         let mode = parse_clock(self.clock)?;
+        let clock_multiplier = parse_clock_u32(
+            "multiplier",
+            self.clock_multiplier,
+            DEFAULT_CLOCK_MULTIPLIER,
+        )?;
+        let clock_step_interval_ms = parse_clock_u64(
+            "step_interval_ms",
+            self.clock_step_interval_ms,
+            DEFAULT_CLOCK_STEP_INTERVAL_MS,
+        )?;
         let format = parse_log_format(self.log_format)?;
         let seed = parse_seed(self.seed)?;
         let pool_max_connections = parse_pool_u32(
@@ -838,7 +902,11 @@ impl RawConfig {
                 pool_max_connections,
                 slow_acquire_ms,
             },
-            clock: ClockConfig { mode },
+            clock: ClockConfig {
+                mode,
+                multiplier: clock_multiplier,
+                step_interval_ms: clock_step_interval_ms,
+            },
             determinism: DeterminismConfig { seed },
             auth: AuthConfig {
                 bootstrap_secret: self.bootstrap_secret.map(Secret::new),
@@ -996,6 +1064,10 @@ fn raw_from_env<F: Fn(&str) -> Option<String>>(get: F) -> RawConfig {
         db_pool_max_connections: pick("FAUXCHANGE_DB_MAX_CONNECTIONS"),
         db_slow_acquire_ms: pick("FAUXCHANGE_DB_SLOW_ACQUIRE_MS"),
         clock: pick("FAUXCHANGE_CLOCK"),
+        // The accelerated multiplier / stepped interval are file-only knobs (no
+        // env/CLI override), so the env layer never supplies them.
+        clock_multiplier: None,
+        clock_step_interval_ms: None,
         seed: pick("FAUXCHANGE_SEED"),
         bootstrap_secret: pick("AUTH_BOOTSTRAP_SECRET"),
         log_format: pick("FAUXCHANGE_LOG_FORMAT"),
@@ -1129,6 +1201,36 @@ fn parse_pool_u32(
     }
 }
 
+/// Parses a `[clock]` `u32` knob (`multiplier`), clamping to a usable `>= 1` (a
+/// `0` multiplier would freeze the accelerated clock), failing with
+/// [`ConfigError::BadClockValue`] on a non-integer.
+fn parse_clock_u32(
+    field: &'static str,
+    value: Option<String>,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    match value.trim().parse::<u32>() {
+        Ok(parsed) => Ok(parsed.max(1)),
+        Err(_) => Err(ConfigError::BadClockValue { field, value }),
+    }
+}
+
+/// Parses a `[clock]` `u64` knob (`step_interval_ms`), clamping to a usable
+/// `>= 1` (a `0` interval would freeze the stepped clock), failing with
+/// [`ConfigError::BadClockValue`] on a non-integer.
+fn parse_clock_u64(
+    field: &'static str,
+    value: Option<String>,
+    default: u64,
+) -> Result<u64, ConfigError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    match value.trim().parse::<u64>() {
+        Ok(parsed) => Ok(parsed.max(1)),
+        Err(_) => Err(ConfigError::BadClockValue { field, value }),
+    }
+}
+
 /// Parses a persistence pool `u64` knob (milliseconds), failing with
 /// [`ConfigError::BadPersistenceValue`].
 fn parse_pool_u64(
@@ -1219,13 +1321,26 @@ impl FileConfig {
             .as_ref()
             .and_then(|section| section.slow_acquire_ms)
             .map(|value| value.to_string());
+        // Bind the clock section once so its mode and both mode knobs read the same
+        // optional table (a moved-out field cannot be read twice).
+        let clock = self.clock;
+        let clock_multiplier = clock
+            .as_ref()
+            .and_then(|section| section.multiplier)
+            .map(|value| value.to_string());
+        let clock_step_interval_ms = clock
+            .as_ref()
+            .and_then(|section| section.step_interval_ms)
+            .map(|value| value.to_string());
         RawConfig {
             http_addr: self.server.and_then(|section| section.http_addr),
             fix_addr: self.fix.and_then(|section| section.fix_addr),
             database_url,
             db_pool_max_connections,
             db_slow_acquire_ms,
-            clock: self.clock.and_then(|section| section.mode),
+            clock: clock.and_then(|section| section.mode),
+            clock_multiplier,
+            clock_step_interval_ms,
             seed: self
                 .determinism
                 .and_then(|section| section.seed)
@@ -1290,12 +1405,17 @@ struct FilePersistence {
     slow_acquire_ms: Option<u64>,
 }
 
-/// `[clock]` — an unrecognised inner key aborts startup.
+/// `[clock]` — an unrecognised inner key aborts startup. `multiplier` /
+/// `step_interval_ms` are file-only mode knobs (no env/CLI override).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileClock {
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    multiplier: Option<u32>,
+    #[serde(default)]
+    step_interval_ms: Option<u64>,
 }
 
 /// `[determinism]` — an unrecognised inner key aborts startup. The seed is a
@@ -2235,6 +2355,72 @@ read_per_window = 6000
         assert_eq!(config.persistence.pool_max_connections(), 7);
         assert_eq!(config.persistence.slow_acquire_ms(), 250);
         Ok(())
+    }
+
+    #[test]
+    fn test_config_clock_knobs_from_file_section() -> Result<(), ConfigError> {
+        let file = raw_from_toml_str(
+            "[clock]\nmode = \"accelerated\"\nmultiplier = 120\nstep_interval_ms = 30000\n",
+        )?;
+        let config = Config::assemble(file, raw_from_env(|_| None), RawConfig::default())?;
+        assert_eq!(config.clock.mode, ClockMode::Accelerated);
+        assert_eq!(config.clock.multiplier, 120);
+        assert_eq!(config.clock.step_interval_ms, 30_000);
+        // The accelerated knob folds into the runtime clock config; the stepped
+        // interval is ignored for this mode.
+        let venue = config.clock.to_venue_clock_config(1_000);
+        assert_eq!(
+            venue.mode,
+            crate::simulation::ClockMode::Accelerated { multiplier: 120 }
+        );
+        assert_eq!(venue.start_ms, 1_000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_clock_knobs_default_when_absent() -> Result<(), ConfigError> {
+        // No `[clock]` knobs → the documented defaults are carried.
+        let config = Config::assemble(
+            RawConfig::default(),
+            raw_from_env(|_| None),
+            RawConfig::default(),
+        )?;
+        assert_eq!(config.clock.multiplier, DEFAULT_CLOCK_MULTIPLIER);
+        assert_eq!(
+            config.clock.step_interval_ms,
+            DEFAULT_CLOCK_STEP_INTERVAL_MS
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_stepped_clock_maps_interval_to_venue_clock() -> Result<(), ConfigError> {
+        let file = raw_from_toml_str("[clock]\nmode = \"stepped\"\nstep_interval_ms = 500\n")?;
+        let config = Config::assemble(file, raw_from_env(|_| None), RawConfig::default())?;
+        let venue = config.clock.to_venue_clock_config(7_000);
+        assert_eq!(
+            venue.mode,
+            crate::simulation::ClockMode::Stepped { step_ms: 500 }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_bad_clock_multiplier_is_rejected() {
+        // A non-integer multiplier is refused (the `[clock]` knob is a typed
+        // integer at the file layer).
+        let file = raw_from_toml_str("[clock]\nmultiplier = \"fast\"\n");
+        assert!(file.is_err(), "a non-integer multiplier must be refused");
+    }
+
+    #[test]
+    fn test_config_unknown_clock_key_names_the_key() {
+        // `deny_unknown_fields` is preserved on the extended `[clock]` section.
+        match raw_from_toml_str("[clock]\nmode = \"realtime\"\ntypo = 1\n") {
+            Err(ConfigError::UnknownKey { key }) => assert!(key.contains("typo")),
+            Err(other) => panic!("expected an unknown-key rejection, got {other}"),
+            Ok(_) => panic!("expected an unknown-key rejection, got a parsed config"),
+        }
     }
 
     /// The effective-config render (and the derived Debug) redact both secrets —

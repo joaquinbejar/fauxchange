@@ -11,6 +11,34 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The clock as a seeded venue service (realtime / accelerated / stepped) — the
+  first v0.3 replay seam** (#28) in the new `src/simulation/clock.rs` (`SimClock`,
+  `VenueClockConfig`, `ClockMode`, `CorrelationId`) and `src/simulation/manifest.rs`
+  (`RunManifest` recording `seed` + `clock_mode`)
+  ([028](milestones/v0.3-replay/028-clock-venue-service.md),
+  [04 §5](docs/04-market-data-and-replay.md#5-clock-control),
+  [ADR-0004](docs/adr/0004-deterministic-replay-with-seeded-clock.md)). Time is a
+  venue service, not `SystemTime`: `SimClock` is the **one** clock the venue reads
+  — the per-underlying actors stamp `venue_ts` from it, the price-walk cadence
+  stamps its `SimStep.now_ms` from it, and the auth rate limiter reads it (so
+  rate-limit decisions replay deterministically); `now_ms()` on the sequenced path
+  is a pure atomic load with no wall-clock read (guarded by
+  `tests/determinism.rs::test_no_wall_clock_read_on_the_sequenced_path`). A
+  stepped advance is a per-underlying **sequenced, journaled** `Clock { now_ms }`
+  command fanned to every actor by the `AppState` venue-control coordinator
+  (`advance_clock_step` / `advance_clock_to`, returning a `ClockAdvance` that
+  surfaces a partial fan-out), so replay reproduces the advance from the journaled
+  value — never a replay clock. The `[clock]` config section gains the file-only
+  `multiplier` (accelerated) and `step_interval_ms` (stepped) knobs
+  (`deny_unknown_fields` preserved). **Named upstream limitation (documented, not
+  silent):** `orderbook-rs` 0.10.5 exposes `OrderBook::with_clock` /
+  `Arc<dyn Clock>`, but the pinned `option-chain-orderbook` 0.7.0 does not thread
+  it through lazy `get_or_create_*` leaf construction, so deterministic `Day`/`GTD`
+  time-in-force **admission** at the leaf is deferred to that upstream work — the
+  cross-run check exists today as the clearly-labeled `#[ignore]`d
+  `test_day_gtd_admission_determinism_blocked_by_leaf_clock_gap`, and the intraday
+  `EvictExpiredOrders` sweep stays a journaled no-op
+  ([02 §5.5b](docs/02-matching-architecture.md#5-determinism)).
 - **The Docker e2e smoke test and the cold-bring-up wall-clock budget — the
   v0.2 "one command" proof** (#27) in the new `tests/docker_smoke.rs`,
   `.github/workflows/ci.yml`, `Makefile`, and `BENCH.md`
