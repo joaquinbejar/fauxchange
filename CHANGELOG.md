@@ -11,6 +11,39 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Durable persistence for the venue envelope journal — swap the store, keep
+  the contract** (#29) in the new `src/db/journal.rs` (`PgVenueJournal`) and
+  `src/exchange/recovery.rs` (`recover` / `Recovered`, the production recovery
+  reducer), behind the unchanged `VenueJournal` trait
+  ([029](milestones/v0.3-replay/029-persist-envelope-journal.md),
+  [02 §6](docs/02-matching-architecture.md#6-the-journal),
+  [ADR-0006](docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
+  The same `venue.v1` envelope the per-underlying actor already journaled
+  in-memory is now durably persisted when `DATABASE_URL` is set (in-memory
+  otherwise); the receipt / recovery / durability contract is **identical** —
+  only the store changed. A new migration (`migrations/20260716120500_journal.sql`)
+  adds a per-underlying `journal_headers` row (`lineage_id` + `schema_version`)
+  and an append-only `journal_records` stream keyed **unique** on
+  `(underlying, underlying_sequence, kind)`, storing each record's exact
+  `venue.v1` bytes as `TEXT` (so a JSONB key-reorder can never mutate the
+  oracle); an idempotent re-append is `ON CONFLICT DO NOTHING` + an O(1)
+  read-back (identical payload → no-op, differing → typed `Conflict`). The
+  write-ahead protocol is preserved on the durable store (confirmed pre-execute
+  failure reuses `N`; an ambiguous append is resolved by durable tail read-back;
+  a post-mutation event-append failure seals the underlying with
+  `JournalUnavailable`). Recovery is **re-execution with the stored event as the
+  oracle** (no event-applier): it reads the header first, refuses a
+  newer-than-binary journal with the typed `JournalError::SchemaTooNew`, and
+  halts on a divergent stored event with `JournalError::Corruption { underlying,
+  sequence }`. `sqlx::Error` is mapped to typed domain errors at the boundary
+  (never on a `pub` surface, never leaking `DATABASE_URL`); all queries are
+  parameterised with the offline `.sqlx` cache committed. The boot-time replay
+  **driver** (reload a snapshot and re-execute into a running venue) remains #30;
+  until then a fresh boot persists forward and the unique key makes an accidental
+  resume of a non-empty journal fail loud. Exercised by `testcontainers`
+  `postgres:18-alpine` integration tests (recovery-by-re-execution,
+  sequence-continuity across a snapshot epoch, idempotent re-append,
+  newer-schema refusal), now wired into the CI `migrations` job.
 - **The clock as a seeded venue service (realtime / accelerated / stepped) — the
   first v0.3 replay seam** (#28) in the new `src/simulation/clock.rs` (`SimClock`,
   `VenueClockConfig`, `ClockMode`, `CorrelationId`) and `src/simulation/manifest.rs`

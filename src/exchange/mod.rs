@@ -19,10 +19,14 @@
 //!   grammar, and the [`JournalHeader`].
 //! - [`envelope`] — the versioned [`VenueCommand`] / [`VenueEvent`] v1 envelope,
 //!   the lossless [`VenueOutcome`] shapes, and the internal [`Fill`] projection.
-//! - [`journal`] — the venue's in-memory, append-only, write-ahead
-//!   command/event journal ([`VenueJournal`] / [`InMemoryVenueJournal`] /
-//!   [`JournalRecord`]), named to match the upstream `OptionChainJournal` shape
-//!   so the durable store swaps in behind it (#029).
+//! - [`journal`] — the venue's append-only, write-ahead command/event journal
+//!   ([`VenueJournal`] / [`InMemoryVenueJournal`] / [`JournalRecord`]), named to
+//!   match the upstream `OptionChainJournal` shape so the durable PostgreSQL store
+//!   ([`crate::db::PgVenueJournal`], #029) swaps in behind the **same** contract.
+//! - [`recovery`] — recovery-as-re-execution ([`recover`]): rebuild a per-underlying
+//!   book from any [`VenueJournal`] (in-memory or durable) by re-executing every
+//!   journaled command in `N` order with the stored [`VenueEvent`] as the integrity
+//!   oracle, refusing a newer-than-binary schema and halting on corruption.
 //! - [`actor`] — the per-underlying **single-writer actor**
 //!   ([`UnderlyingActor`] / [`ActorHandle`] / [`spawn_underlying_actor`]): the
 //!   bounded mailbox, the venue-owned checked sequence counter, and the
@@ -41,8 +45,8 @@
 //!   per-`(account, symbol)` [`Position`](crate::Position), marked live-only
 //!   against the upstream [`MarkPriceBook`].
 //!
-//! Snapshot/restore, recovery, and the durable journal store land in later
-//! issues; the envelope types remain **pure data**.
+//! The **live boot-time replay driver** (reload a snapshot + re-execute into a
+//! running `AppState`) lands with #030; the envelope types remain **pure data**.
 //!
 //! Governed by `docs/02-matching-architecture.md` and `docs/01-domain-model.md`.
 
@@ -56,6 +60,7 @@ pub mod instrument;
 pub mod journal;
 pub mod mm_identity;
 pub mod money;
+pub mod recovery;
 pub mod snapshot;
 pub mod stores;
 pub mod symbol;
@@ -89,6 +94,7 @@ pub use self::mm_identity::{
     market_maker_account,
 };
 pub use self::money::{Cents, MoneyError, Notional, SignedCents};
+pub use self::recovery::{Recovered, recover};
 pub use self::snapshot::{
     ExecutionCapture, ExecutorState, IdempotencyEntry, IdempotencyFingerprint, IdempotencyKey,
     IdempotencyMap, IdempotencyRecord, PositionCapture, RestingOrderCapture, SnapshotError,

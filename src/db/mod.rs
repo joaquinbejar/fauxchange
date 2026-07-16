@@ -33,14 +33,23 @@
 //! ([06 §6](../../docs/06-deployment.md#6-persistence)). Positions are a derived
 //! fold — **not** persisted (no PG positions store).
 //!
-//! ## The command journal is NOT built here (v0.3, #029)
+//! ## The durable command journal ([`PgVenueJournal`], #029)
 //!
-//! The durable `VenueEvent` envelope journal and journal-backed recovery are v0.3
-//! (#029). This layer supplies a durable executions store (proven at parity, not
-//! yet wired to the live fan-out — see above) and the config/account tables, but
-//! it does **not** recover book state, the position fold, or the idempotency map on
-//! restart. Until journal-backed recovery lands, **a restart without an admin
-//! snapshot is a fresh venue** ([06 §6](../../docs/06-deployment.md#6-persistence)).
+//! [`journal`] adds the durable `VenueCommand` / `VenueEvent` envelope store behind
+//! the **same** [`VenueJournal`](crate::exchange::VenueJournal) trait shape as the
+//! in-memory journal ([ADR-0006 §3](../../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)):
+//! when `DATABASE_URL` is set, [`AppState`](crate::state::AppState) wires a
+//! [`PgVenueJournal`] per underlying so every journaled command (client orders,
+//! market-maker requotes, `SetInstrumentStatus`, `EvictExpiredOrders`, and the
+//! control-plane `MarketMakerControl` / `Clock` / `SimStep`) is persisted
+//! write-ahead. The recovery reducer that re-executes a journal into a fresh
+//! registry is [`crate::exchange::recover`]. The **boot-time replay driver** that
+//! reloads a snapshot + resumes a running venue from a non-empty durable journal is
+//! #030; #029 makes the journal durable and recovery real, but a fresh boot against
+//! an empty durable store is the supported live path (the `(underlying, N, kind)`
+//! UNIQUE key makes an accidental resume fail loud, never silently divergent). The
+//! derived position fold is not persisted (it recomputes from the recovered event
+//! stream).
 //!
 //! ## Security
 //!
@@ -53,6 +62,7 @@
 
 pub mod error;
 pub mod executions;
+pub mod journal;
 pub mod pool;
 
 use std::sync::Arc;
@@ -61,6 +71,7 @@ use crate::exchange::{ExecutionsStore, InMemoryExecutionsStore};
 
 pub use self::error::DbError;
 pub use self::executions::PgExecutionsStore;
+pub use self::journal::PgVenueJournal;
 pub use self::pool::{DatabasePool, DbPoolConfig};
 
 /// Resolves an executions backend behind the #008 [`ExecutionsStore`] contract:

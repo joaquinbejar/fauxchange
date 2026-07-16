@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT payload FROM journal_records\n            WHERE underlying = $1 AND underlying_sequence = $2 AND kind = $3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "payload",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "journal_records",
+            "name": "payload"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c0e96fc2e5b9775ff3941f51c673d85be0302af8244d989ec2eb840eec1094e3"
+}

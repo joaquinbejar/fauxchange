@@ -259,15 +259,40 @@ pub enum JournalError {
         kind: RecordKind,
     },
     /// The recovery reducer's re-executed event does **not** equal the stored
-    /// event at `(underlying, sequence)` — journal corruption. Recovery (#017)
-    /// halts here rather than resume on divergent state; never constructed on the
-    /// live submit path ([02 §6](../../../docs/02-matching-architecture.md)).
+    /// event at `(underlying, sequence)` — journal corruption. Recovery
+    /// ([`crate::exchange::recover`]) halts here rather than resume on divergent
+    /// state; never constructed on the live submit path
+    /// ([02 §6](../../../docs/02-matching-architecture.md)).
     #[error("journal corruption at underlying {underlying} sequence {}", sequence.get())]
     Corruption {
         /// The underlying whose stream diverged.
         underlying: String,
         /// The exact sequence at which re-execution disagreed with the store.
         sequence: SequenceNumber,
+    },
+    /// The journal's envelope schema is **newer** than the running binary
+    /// understands (a forward-incompatible `venue.v1+` journal written by a later
+    /// version). Recovery **refuses to start** rather than mis-parse — a schema bump
+    /// is a major SemVer event ([SEMVER.md](../../../docs/SEMVER.md),
+    /// [ADR-0006 §3 Version mismatch](../../../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
+    /// This is the typed production error the v0.1 slice deferred (it existed only as
+    /// the `JournalHeader::is_current_schema()` predicate plus a test-local halt);
+    /// the recovery reducer (#029) makes it real, matching the [`Corruption`](Self::Corruption)
+    /// sibling. No `venue.v1` wire shape changes.
+    #[error("journal schema {found} is newer than this binary understands")]
+    SchemaTooNew {
+        /// The forward-incompatible schema tag found in the journal header.
+        found: String,
+    },
+    /// A durable-store read or query failed (a connection/decode failure on
+    /// [`read_from`](VenueJournal::read_from) / [`last_sequence`](VenueJournal::last_sequence)),
+    /// mapped from the underlying `sqlx::Error` at the [`crate::db`] boundary and
+    /// carrying only a **non-secret** operation label — never the SQL, the row data,
+    /// or the `DATABASE_URL`. The in-memory store never returns it.
+    #[error("journal store backend failed: {operation}")]
+    Backend {
+        /// The non-secret operation label naming the failed durable call.
+        operation: &'static str,
     },
 }
 

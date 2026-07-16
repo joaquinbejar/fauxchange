@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO journal_records (underlying, underlying_sequence, kind, payload)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT (underlying, underlying_sequence, kind) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "eb7e3c7ae7c0d2bfa8d8e94fe631806eb861406b237e02b62c4836c965d7fd38"
+}

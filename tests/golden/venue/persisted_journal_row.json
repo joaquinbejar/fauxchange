@@ -1,0 +1,6 @@
+{
+  "kind": "command",
+  "payload": "{\"Command\":{\"sequence\":7,\"venue_ts\":1700000000000,\"command\":{\"CancelOrder\":{\"symbol\":\"BTC-20240329-50000-C\",\"order_id\":\"run-1:BTC:7:0\",\"account\":\"acct-1\"}}}}",
+  "underlying": "BTC",
+  "underlying_sequence": 7
+}

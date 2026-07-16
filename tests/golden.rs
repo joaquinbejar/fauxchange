@@ -1084,3 +1084,50 @@ fn test_golden_venue_snapshot_restored_epoch() {
     assert_eq!(golden["Epoch"]["epoch"], serde_json::json!(1));
     assert_eq!(golden["Epoch"]["lineage_id"], serde_json::json!("run-1"));
 }
+
+#[test]
+fn test_golden_venue_persisted_journal_row() {
+    // The durable ON-DISK layout of one journal record (#029,
+    // `migrations/…_journal.sql`, `src/db/journal.rs`): the routing / unique-key
+    // columns `(underlying, underlying_sequence, kind)` plus the VERBATIM `venue.v1`
+    // envelope `payload` — the `serde_json` bytes stored as TEXT, so a `venue.v1`
+    // record can never be silently mutated by a JSONB key reorder. Pins the row
+    // projection the durable `PgVenueJournal` writes so a schema / store drift is a
+    // golden mismatch in the same commit.
+    let command = VenueCommand::CancelOrder {
+        symbol: sym("BTC-20240329-50000-C"),
+        order_id: VenueOrderId::new("run-1:BTC:7:0"),
+        account: AccountId::new("acct-1"),
+    };
+    let record = JournalRecord::command(
+        SequenceNumber::new(7),
+        EventTimestamp::new(1_700_000_000_000),
+        command,
+    );
+    let payload = match serde_json::to_string(&record) {
+        Ok(payload) => payload,
+        Err(e) => panic!("serialise journal record: {e}"),
+    };
+    // The persisted row = the projected columns + the verbatim envelope payload.
+    let row = serde_json::json!({
+        "underlying": "BTC",
+        "underlying_sequence": record.sequence().get(),
+        "kind": record.kind(),
+        "payload": payload,
+    });
+    assert_golden("venue/persisted_journal_row.json", &row);
+
+    let golden = load_golden("venue/persisted_journal_row.json");
+    assert_eq!(golden["kind"], serde_json::json!("command"));
+    assert_eq!(golden["underlying_sequence"], serde_json::json!(7));
+    // The `payload` column holds the exact `venue.v1` `JournalRecord` JSON and
+    // round-trips back to the identical record.
+    let payload_str = match golden["payload"].as_str() {
+        Some(payload) => payload,
+        None => panic!("the payload column must be a JSON string"),
+    };
+    match serde_json::from_str::<JournalRecord>(payload_str) {
+        Ok(reparsed) => assert_eq!(reparsed, record, "the payload reparses to the record"),
+        Err(e) => panic!("payload must reparse to a JournalRecord: {e}"),
+    }
+}

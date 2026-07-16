@@ -37,9 +37,9 @@ use fauxchange::config::{ClockMode, Config, ConfigError, LogFormat};
 use fauxchange::exchange::{
     ActorConfig, CancelReason, CancelledLeg, Cents, CommandExecutor, EventTimestamp,
     ExecutionContext, Fill as VenueFill, FixedClock, InMemoryPositionsStore, InMemoryVenueJournal,
-    JournalHeader, LineageId, MatchingExecutor, NoopFanOut, Notional, PlaceholderExecutor,
-    PositionLeg, PositionsStore, SequenceNumber, SignedCents, Symbol, TopOfBook, UnderlyingActor,
-    VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
+    JournalHeader, JournalRecord, LineageId, MatchingExecutor, NoopFanOut, Notional,
+    PlaceholderExecutor, PositionLeg, PositionsStore, RecordKind, SequenceNumber, SignedCents,
+    Symbol, TopOfBook, UnderlyingActor, VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
 };
 use fauxchange::exchange::{
     Hash32, OptionStyle, STPMode, Side as SeamSide, TimeInForce as SeamTif,
@@ -587,6 +587,62 @@ proptest! {
         let (outcomes_b, top_b) = replay(&lineage);
         prop_assert_eq!(outcomes_a, outcomes_b);
         prop_assert_eq!(top_a, top_b);
+    }
+
+    /// The **store-level** `journal_replay_reconstructs_book` invariant (#029): an
+    /// arbitrary sequence of write-ahead `(command, event)` pairs appended to a
+    /// fresh journal reads back through `read_from(0)` as **exactly** those records,
+    /// in append (`N`) order — the durable substrate the recovery reducer
+    /// re-executes over. This is the physical-store contract the durable
+    /// `PgVenueJournal` swaps in behind unchanged; end-to-end book reconstruction is
+    /// asserted in the determinism + integration suites
+    /// ([TESTING.md §3](../docs/TESTING.md#3-property-tests)).
+    #[test]
+    fn journal_read_from_returns_appended_pairs_in_n_order(count in 0usize..40) {
+        let lineage = LineageId::new("run-1");
+        let mut journal = InMemoryVenueJournal::new(JournalHeader::new(lineage));
+        let symbol = Symbol::parse("BTC-20240329-50000-C")
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+
+        let mut expected: Vec<JournalRecord> = Vec::with_capacity(count * 2);
+        for n in 0..count as u64 {
+            let seq = SequenceNumber::new(n);
+            let order_id = VenueOrderId::new(format!("order-{n}"));
+            let command = VenueCommand::CancelOrder {
+                symbol: symbol.clone(),
+                order_id: order_id.clone(),
+                account: AccountId::new("acct-1"),
+            };
+            let cmd = JournalRecord::command(seq, EventTimestamp::new(1), command.clone());
+            let evt = JournalRecord::event(VenueEvent::new(
+                seq,
+                EventTimestamp::new(1),
+                command,
+                VenueOutcome::Cancelled { order_id },
+            ));
+            journal
+                .append(cmd.clone())
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            journal
+                .append(evt.clone())
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            expected.push(cmd);
+            expected.push(evt);
+        }
+
+        let read = journal
+            .read_from(SequenceNumber::START)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+        prop_assert_eq!(&read, &expected);
+
+        // Filtering the command records yields ascending, gapless `N` (0..count).
+        let sequences: Vec<u64> = read
+            .iter()
+            .filter(|record| record.kind() == RecordKind::Command)
+            .map(|record| record.sequence().get())
+            .collect();
+        let expected_sequences: Vec<u64> = (0..count as u64).collect();
+        prop_assert_eq!(sequences, expected_sequences);
     }
 
     /// The WS market-data `instrument_sequence` is strictly increasing **per
