@@ -57,7 +57,7 @@
 //! | `accounts`      | [`AccountRegistry`] (real)         | #012      |
 //! | `subscriptions` | [`crate::subscription::OrderbookSubscriptionManager`] (real) | #014 |
 //! | `market_maker`  | [`crate::market_maker::MarketMakerEngine`] (real) | #015 |
-//! | `simulator`     | [`SimulatorPlaceholder`]          | #016      |
+//! | `simulator`     | [`crate::simulation::PriceSimulator`] (real) | #016 |
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,6 +77,7 @@ use crate::exchange::{
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
 use crate::models::AccountId;
+use crate::simulation::{AssetConfig, PriceSimulator, SimulationConfig, VenueStepSink};
 // The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
 // sibling of `crate::auth` / `crate::ohlc`), NOT a gateway. `AppState` owns the
 // manager and tees a `WsFanOut` alongside `StoreFanOut` (via the exchange-owned
@@ -101,14 +102,6 @@ pub const DEFAULT_VENUE_CLOCK_MS: u64 = 0;
 /// venue-minted id ([01 §6.1](../docs/01-domain-model.md)); the per-run unique
 /// lineage is minted at bootstrap (#022).
 pub const DEFAULT_LINEAGE_TOKEN: &str = "fauxchange";
-
-// ============================================================================
-// Service placeholders — stable field types for #014–#016
-// ============================================================================
-
-/// Placeholder for the price simulator handle — filled by **#016**.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct SimulatorPlaceholder;
 
 // ============================================================================
 // Construction parameters
@@ -230,6 +223,11 @@ pub struct AppStateConfig {
     /// The auth inputs; `None` defaults to [`AuthConfig::dev`] in
     /// [`AppState::new`].
     pub auth: Option<AuthConfig>,
+    /// The price-simulator asset walks (empty ⇒ the simulator hosts no walked
+    /// underlyings; the venue is fully usable and a `SimStep` still routes).
+    pub assets: Vec<AssetConfig>,
+    /// The simulation-wide parameters (cadence, horizon, virtual clock).
+    pub simulation: SimulationConfig,
 }
 
 impl AppStateConfig {
@@ -245,6 +243,8 @@ impl AppStateConfig {
             mailbox_capacity: DEFAULT_MAILBOX_CAPACITY,
             venue_clock_ms: EventTimestamp::new(DEFAULT_VENUE_CLOCK_MS),
             auth: None,
+            assets: Vec::new(),
+            simulation: SimulationConfig::default(),
         }
     }
 
@@ -267,6 +267,20 @@ impl AppStateConfig {
     #[must_use]
     pub fn with_auth(mut self, auth: AuthConfig) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    /// Sets the price-simulator asset walks.
+    #[must_use]
+    pub fn with_assets(mut self, assets: Vec<AssetConfig>) -> Self {
+        self.assets = assets;
+        self
+    }
+
+    /// Overrides the simulation-wide parameters.
+    #[must_use]
+    pub fn with_simulation(mut self, simulation: SimulationConfig) -> Self {
+        self.simulation = simulation;
         self
     }
 }
@@ -340,8 +354,13 @@ pub struct AppState {
     /// that routes every generated quote onto the sequenced order path through
     /// an [`ActorCommandSink`] over the same per-underlying actors.
     market_maker: Arc<MarketMakerEngine>,
-    /// The price simulator handle (placeholder until #016).
-    simulator: SimulatorPlaceholder,
+    /// The price simulator (real as of #016): pre-generated `optionstratlib`
+    /// walks whose every step routes onto the sequenced order path as a journaled
+    /// [`VenueCommand::SimStep`] and drives the market maker. The interval loop is
+    /// **not** auto-started here (a stepped-clock / bootstrap concern); drive
+    /// [`PriceSimulator::step_once`](crate::simulation::PriceSimulator::step_once)
+    /// or [`PriceSimulator::spawn`](crate::simulation::PriceSimulator::spawn).
+    simulator: Arc<PriceSimulator>,
 }
 
 impl AppState {
@@ -385,6 +404,8 @@ impl AppState {
             mailbox_capacity,
             venue_clock_ms,
             auth,
+            assets,
+            simulation,
         } = config;
 
         // A deterministic fixed clock (`venue_ts` is not the journaled order); the
@@ -487,6 +508,18 @@ impl AppState {
             Quoter::default(),
         ));
 
+        // The price simulator (#016): each walked (or overridden) price step routes
+        // through a `VenueStepSink` onto the SAME per-underlying actors as client
+        // orders (a journaled `SimStep`) and drives the market maker, so synthetic
+        // prices and the requotes they induce are journaled and replayable. The
+        // interval loop is not auto-started (a stepped-clock / bootstrap concern);
+        // the wiring is in place and every served step is journaled through the sink.
+        let simulator = PriceSimulator::new(
+            assets,
+            simulation,
+            VenueStepSink::new(handles.clone(), Arc::clone(&market_maker)),
+        );
+
         tracing::info!(
             underlyings = handles.len(),
             accounts = account_registry.account_count(),
@@ -506,7 +539,7 @@ impl AppState {
             bootstrap_gate,
             subscriptions,
             market_maker,
-            simulator: SimulatorPlaceholder,
+            simulator,
         }))
     }
 
@@ -742,10 +775,15 @@ impl AppState {
         &self.market_maker
     }
 
-    /// The price simulator handle (placeholder until #016).
+    /// The price simulator (real as of #016) — pre-generated `optionstratlib`
+    /// walks whose every step routes onto the sequenced order path as a journaled
+    /// `SimStep` and drives the market maker. Operators / a bootstrap start its
+    /// loop ([`PriceSimulator::spawn`](crate::simulation::PriceSimulator::spawn)) or
+    /// step it deterministically
+    /// ([`PriceSimulator::step_once`](crate::simulation::PriceSimulator::step_once)).
     #[must_use]
     #[inline]
-    pub fn simulator(&self) -> &SimulatorPlaceholder {
+    pub fn simulator(&self) -> &Arc<PriceSimulator> {
         &self.simulator
     }
 }

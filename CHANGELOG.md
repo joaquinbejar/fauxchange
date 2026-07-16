@@ -11,6 +11,41 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The `PriceSimulator` over `optionstratlib` walks routed through the
+  sequencer** (#16) in `src/simulation/`
+  ([016](milestones/v0.1-backend-core/016-price-simulator-walks.md),
+  [04 §2](docs/04-market-data-and-replay.md),
+  [specs §5](docs/specs/option-chain-orderbook-backend.md#5-simulation-and-ohlc)).
+  The Backend `PriceSimulator` is ported: an async interval loop that walks each
+  configured underlying and publishes `PriceUpdate`s over a **bounded**
+  `tokio::broadcast`, with `get_price` / `get_all_prices` / `set_price`; paths are
+  pre-generated over a horizon and regenerated **off-lock** when exhausted, and a
+  walk failure backs the asset off dormant rather than busy-looping. `WalkTypeConfig`
+  surfaces the v1 set — `GeometricBrownian` / `MeanReverting` (OU) / `JumpDiffusion` —
+  each mapped 1:1 onto an `optionstratlib::simulation::WalkType`; the walk runs
+  **entirely through `optionstratlib`** (no hand-rolled stochastic process), and
+  the **`f64` boundary is guarded** on the way back to integer `Cents` (a
+  non-finite / negative / out-of-range price is rejected, never cast). Each step
+  is **not** a bare price write: it enters the venue through a `VenueStepSink`,
+  which routes it onto the per-underlying sequenced order path as a journaled
+  `VenueCommand::SimStep` **and** drives the market maker (#15
+  `update_price`), whose requotes enter the **same** actor path as their own
+  journaled `AddOrder`s — so synthetic prices and the liquidity they induce are
+  both replayable exactly like real order flow. A manual `set_price` override is
+  journaled the same way. **The `now_ms` comes from a deterministic virtual venue
+  clock** (`start_ms + step × step_ms`), never `SystemTime`, and is carried in the
+  `SimStep` so replay reuses the exact value. **Determinism is journal-driven, not
+  seed-regenerated**: `optionstratlib`'s walk sampler builds its own RNG per draw
+  and cannot consume the run seed, so the walk is excluded from same-seed
+  regeneration; the guaranteed reproduction is the journal — the integration test
+  runs a simulated session (journaled `SimStep`s + requotes → a crossing fill) and
+  the determinism test replays the journal into a **fresh** venue (with the live
+  market maker muted, #15 `set_muted`) and reproduces byte-identical events,
+  price path, and fills without cascading duplicate orders. Wired into `AppState`
+  (replacing the `SimulatorPlaceholder`); the interval loop is not auto-started
+  (a stepped-clock / bootstrap concern). **No new dependencies** — the
+  `optionstratlib::simulation` API is in the existing (no-feature) build.
+
 - **The market maker on the sequenced order path — `MarketMakerEngine` /
   `OptionPricer` / `Quoter`** (#15) in `src/market_maker/`
   ([015](milestones/v0.1-backend-core/015-market-maker-on-sequenced-path.md),
