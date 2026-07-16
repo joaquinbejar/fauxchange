@@ -11,6 +11,62 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **`bench-hdr` harness + first `BENCH.md` baseline** (#20) in `benches/`,
+  `Cargo.toml`, `tests/bench_harness.rs`, and `BENCH.md` at the repo root
+  ([020](milestones/v0.1-backend-core/020-bench-hdr-harness-baseline.md),
+  [07 §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention)).
+  Four registered `[[bench]]` targets (`harness = false`, so each controls its
+  own measurement loop rather than criterion's default statistical-convergence
+  runner): `hp1_order_path` (the sequenced order path — full-turn closed-loop,
+  the upstream match cost paired per turn and reported as its own out-of-budget
+  series, the resulting venue-added delta, the write-ahead command/event
+  append's own cost, and a coordinated-omission-corrected open-loop sojourn-time
+  series via a genuine intended-send-time load generator), `hp2_ws_fanout` (a
+  committed `VenueEvent` fanned out to `N ∈ {1, 10, 100, 1 000}` subscriber
+  broadcast slots over the real `TeeFanOut(StoreFanOut, WsFanOut)` /
+  `OrderbookSubscriptionManager` from #008/#014, checking HP-1 p99 stays flat
+  in N), `alloc_profile` (a `#[global_allocator]` counting-allocator profile of
+  the steady-state actor turn, both direct (`UnderlyingActor::handle`) and via
+  the async `ActorHandle::submit` mailbox round-trip), and a supplementary
+  `criterion_match_cost` (a real, working example of the convention's
+  "criterion for orchestration" half, explicitly never cited as `BENCH.md`
+  evidence — mean is not an accepted quantile report). Every reported
+  distribution goes through `benches/support/hdr.rs`'s `hdrhistogram`-backed
+  p50/p99/p99.9/p99.99 report — never criterion's default mean — and the
+  quantile/histogram plumbing itself is unit-tested against known
+  distributions (uniform, constant, bimodal, empty) in
+  `tests/bench_harness.rs` (5/5 passing), pulling in the exact same
+  `benches/support/hdr.rs` file `cargo bench` uses via `#[path]` rather than a
+  duplicated copy. Two new dev-only dependencies, each with a Cargo.toml audit
+  note: `hdrhistogram` (`7`, `default-features = false` — only the base
+  `Histogram` type is used, not `.hgrm` serialisation or `SyncHistogram`) and
+  `criterion` (`0.8`, `default-features = false` — only `Bencher::iter` is
+  used, not `rayon`/`plotters`/HTML reports). `BENCH.md` records the first
+  real baseline: every figure was actually measured by running `cargo bench`
+  on the reference host (Apple M4 Max, macOS, `rustc 1.97.0`) — none
+  estimated or invented — with full run conditions, and every number is
+  labelled a DESIGN TARGET comparison, never an achieved SLO. The baseline
+  surfaces a real, reproducible finding worth a follow-up:
+  `InMemoryVenueJournal::append`'s `(sequence, kind)` uniqueness check is a
+  linear scan over the whole in-memory record stream, so the write-ahead
+  append's cost — and therefore HP-1's full-turn p99/p99.9/p99.99 — grows
+  with journal depth within a single run (p99 932 µs at ~105k journaled
+  records vs 33 µs at ~2.2k, on the identical code path); HP-1's own "< 1 ms
+  p99" DESIGN TARGET is only marginally met at that depth and is exceeded at
+  p99.9/p99.99. The allocation profile likewise shows the steady-state turn is
+  measurably far from the "zero heap allocation" DESIGN TARGET (~78 / ~63
+  allocs per submitted command, direct vs. async-mailbox path) — honestly
+  reported as a process-wide allocation-pressure count, not a call-stack
+  attribution (no such profiler is available in this environment), and named
+  as the regression-signal baseline going forward. HP-2's N-sweep confirms its
+  DESIGN TARGET holds: p99 does not grow across a 1 000× increase in
+  subscriber count. Deliberately out of scope, per the milestone: HP-3 (FIX
+  parse, v0.4 #043), HP-4 (market-maker requote, v0.5 #050), HP-5 durable/
+  PostgreSQL journal append (v0.3 #035), and the CI `bench-regression` gate
+  (armed before v1.0, #053) — nothing in CI fails a PR on these numbers today,
+  only confirms the benches compile (`cargo clippy --all-targets
+  --all-features -- -D warnings`).
+
 - **CI: `cargo audit` + `cargo deny` + fmt/clippy/test/build gates** (#19) in
   `.github/workflows/ci.yml`, `deny.toml`, `.cargo/audit.toml`,
   `rust-toolchain.toml`, and the `Makefile`
