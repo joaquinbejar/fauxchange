@@ -113,6 +113,19 @@ utoipa-swagger-ui = { version = "9", default-features = false, features = [
     "vendored",
 ] }
 serde = { version = "1", features = ["derive"] }
+# TOML parse for the layered venue config file (#022). `default-features = false,
+# features = ["parse", "serde"]` keeps exactly the deserialize path we need
+# (`toml::from_str` into the `#[serde(deny_unknown_fields)]` section structs) and
+# drops `display` (no serializer — the venue only READS its config). Audit note:
+# this adds `toml` 1 and `serde_spanned` NEW to the tree (both `toml-rs`
+# project, MIT OR Apache-2.0, already on the deny.toml license allow-list — no
+# new SPDX id); its parser deps `toml_parser` / `toml_datetime` / `winnow` and
+# `serde_core` are ALREADY resolved (via `toml_edit` ← `proc-macro-crate`), so
+# they add no new crate version. No CLI-parsing crate is pulled — a single
+# `--config` / scalar-override flag set is parsed by a small hand-rolled parser
+# in `src/config.rs`, so `clap` (a dev-only transitive of `criterion`) is NOT
+# promoted to a runtime dependency. `cargo audit` / `cargo deny` (#019) gate it.
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 # JSON parsing for the WebSocket client-action frames (#014). A `/ws` text frame
 # is not an HTTP body, so the `axum::Json` extractor cannot reach it — the WS
 # handler parses the frame itself (`serde_json::from_str`) to detect and reject
