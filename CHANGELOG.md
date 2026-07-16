@@ -11,6 +11,39 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The scenario seed format + the bounded seeding phase** (#24) in
+  `src/config.rs`, the new `src/seed.rs`, and `seeds/`
+  ([024](milestones/v0.2-packaging/024-seed-data-format.md),
+  [06 §7](docs/06-deployment.md#7-seed-data-and-scenarios),
+  [06 §8](docs/06-deployment.md#8-auth-bootstrap),
+  [03 §10](docs/03-protocol-surfaces.md#10-state-changing-operation-classification)).
+  The `[accounts.*]` / `[instruments.*]` / `[market_maker.*]` config sections —
+  previously `IgnoredAny` placeholders (#22) — are now **real, validated**
+  `#[serde(deny_unknown_fields)]` structs resolving into a `SeedManifest` on
+  `Config::seed`, so a typo *inside* a seeded account or instrument now aborts
+  startup naming the key. Every seeded expiry is validated at **load** to an
+  absolute canonical `ExpirationDate::DateTime` (a `YYYYMMDD` date or a
+  `23:59:59 UTC` instant); a relative `Days` expiry is **refused**
+  (`ConfigError::SeedDaysExpiry`) because it is wall-clock-relative and breaks
+  replay. Strike ladders must be non-empty with distinct positive strikes, and
+  persona knobs are range-checked. `main.rs` assembles the venue in a bounded
+  **seeding phase** (`AppStateConfig::with_serving(false)`), then
+  `seed::apply_seed_phase` applies the manifest in a **fixed order** — default
+  persona → account provisioning (idempotent, Argon2id-hashed FIX passwords) →
+  contract registration → opening prices — and flips to **serving**
+  (`AppState::begin_serving`). Opening prices are set through the #016 price seam
+  as journaled `SimStep`s whose market-maker quotes **vivify** the leaf books onto
+  the shared symbol index (the honest population path — there is no REST
+  hierarchy-create; the inherited `POST /api/v1/underlyings/…` routes are refusal
+  stubs, now **phase-aware**: refused as a seed-time manifest input once serving).
+  Re-running the seeder is **idempotent** (an account or instrument already present
+  at the same specs is a no-op; a conflicting spec — a different opening price, or
+  an account id at different permissions — is a typed error). A default
+  `seeds/default.toml` scenario ships two underlyings, a strike ladder on
+  `DateTime` expiries, opening prices, a default persona, and a Read + a Trade
+  account with credentials. Money stays **integer cents** throughout; no new
+  dependencies (`toml` from #22, `argon2` from #12). Prior `AppState` /
+  `AppStateConfig` construction is unchanged (the venue defaults to serving).
 - **The optional `sqlx`/PostgreSQL persistence layer — a durable executions
   backend behind the v0.1 store contract** (#23) in `src/db/`, `migrations/`,
   and `.sqlx/`, wired into `src/main.rs` and `AppState`

@@ -1,0 +1,69 @@
+# fauxchange — default scenario seed (v0.2, #024)
+#
+# A versioned, reproducible scenario the bounded SEEDING PHASE applies before the
+# venue flips to serving: a couple of underlyings with a strike ladder on absolute
+# `DateTime` expiries, opening prices (integer cents), a default market-maker
+# persona so the books quote immediately, and a small account registry.
+#
+# Load it with `--config seeds/default.toml` (or `FAUXCHANGE_CONFIG`); the compose
+# one-shot `seed` service (#25) drives this same manifest.
+#
+# Rules the loader enforces at boot:
+#   - money is integer CENTS (never a float): opening prices and strike×100;
+#   - expiries are absolute `YYYYMMDD` dates → the canonical 23:59:59 UTC instant
+#     (a relative day-count like "30" is a `Days` expiry and is REFUSED — it breaks
+#     replay);
+#   - a typo inside any [accounts.*] / [instruments.*] / [market_maker.*] table
+#     aborts startup naming the key (deny_unknown_fields);
+#   - re-running the seeder is idempotent (same specs = no-op; a conflict errors).
+#
+# The FIX passwords below are CLEARLY-LABELLED DEV credentials for local use only.
+# They are hashed with Argon2id at provisioning and dropped — never stored or
+# logged. Replace them for anything real, and gate token issuance with
+# AUTH_BOOTSTRAP_SECRET (a JWT is minted for a NAMED account, never a fresh one).
+
+[server]
+http_addr = "0.0.0.0:8080"
+
+[determinism]
+seed = 0
+
+# ---------------------------------------------------------------------------
+# Market-maker personas — the default persona applied to the quoting engine so
+# the seeded books quote immediately once serving.
+# ---------------------------------------------------------------------------
+[market_maker]
+default_persona = "balanced"
+
+[market_maker.personas.balanced]
+spread_multiplier = 1.0
+size_scalar = 1.0
+directional_skew = 0.0
+
+# ---------------------------------------------------------------------------
+# Instruments — the underlyings, their opening prices (cents), and the option
+# chain (expirations × strike ladder). Both call and put are seeded by default.
+# ---------------------------------------------------------------------------
+[instruments.BTC]
+opening_price_cents = 5000000            # $50,000.00
+expirations = ["20261231", "20270630"]
+strikes = [45000, 50000, 55000]
+persona = "balanced"
+
+[instruments.ETH]
+opening_price_cents = 300000             # $3,000.00
+expirations = ["20261231"]
+strikes = [2500, 3000, 3500]
+persona = "balanced"
+
+# ---------------------------------------------------------------------------
+# Account registry — a Read and a Trade account with credentials, so a consumer
+# can authenticate immediately (bootstrap a JWT for the named account).
+# ---------------------------------------------------------------------------
+[accounts.market-reader]
+permissions = ["read"]
+
+[accounts.market-taker]
+permissions = ["read", "trade"]
+fix_username = "TAKER1"
+fix_password = "dev-taker-secret-change-me"

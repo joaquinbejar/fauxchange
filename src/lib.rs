@@ -35,7 +35,8 @@
 //!   A gateway translates; it never decides.
 //! - **Application** — [`state`], the shared wiring that assembles the
 //!   domain, persistence, and service layers into the state every
-//!   gateway handler is given.
+//!   gateway handler is given; and [`seed`], the bounded seeding phase
+//!   that applies a scenario manifest before the venue flips to serving.
 //! - **Domain** — [`exchange`] (the sequenced order path onto the
 //!   upstream matching stack), [`market_maker`] (persona-driven
 //!   quoting), [`simulation`] (synthetic price generation and replay),
@@ -68,6 +69,7 @@ pub mod market_maker;
 pub mod microstructure;
 pub mod models;
 pub mod ohlc;
+pub mod seed;
 pub mod simulation;
 pub mod state;
 pub mod subscription;
