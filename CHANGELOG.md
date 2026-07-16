@@ -11,6 +11,52 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The REST gateway — the ~50-route Backend surface on Axum 0.8 with utoipa
+  OpenAPI + Swagger UI** (#13) in `src/gateway/rest/`
+  ([03 §3, §10](docs/03-protocol-surfaces.md),
+  [specs/option-chain-orderbook-backend.md §1](docs/specs/option-chain-orderbook-backend.md)).
+  `create_router(Arc<AppState>) -> Router` assembles every Backend route group —
+  health/meta, auth-token, controls, prices, underlyings/expirations/strikes
+  hierarchy CRUD, volatility-surface, chain matrix, per-contract
+  book/orders/quote/greeks/snapshot/last-trade/ohlc/metrics, orders (bulk +
+  cancel-all), positions, executions, admin snapshots — as handlers extracting
+  `State(Arc<AppState>)` and returning `Result<Json<T>, VenueError>`, each with
+  `#[utoipa::path]` and its #004 DTOs registered in the served
+  `/api-docs/openapi.json`; the Swagger UI is merged at `/swagger-ui`.
+  **Order-entry is re-pointed onto the sequenced path**: `POST .../orders`,
+  `.../orders/market`, `DELETE .../orders/{id}`, and bulk-place each translate to
+  an `AddOrder`/`CancelOrder` `VenueCommand` submitted through `AppState::submit`
+  (never a direct book call) and return the resulting event's
+  `underlying_sequence` for cross-surface correlation. **Operation-class routing**
+  ([03 §10](docs/03-protocol-surfaces.md#10-state-changing-operation-classification)):
+  `POST /api/v1/prices` is journaled as a **SimStep**-class command (not a bare
+  price write), runtime hierarchy create/delete is **refused as a manifest
+  input**, and auth-token issuance + admin snapshots are replay exclusions.
+  **Auth on every mutating op**: a shared JWT + sliding-window rate-limit layer
+  (`AppState::auth().admit`) gates a baseline `Read` for all non-exempt routes
+  and each handler gates its own `Trade`/`Admin`; `GET /health` is exempt from
+  both, `POST /api/v1/auth/token` is JWT-exempt but peer-rate-limited. The
+  **`ConnectInfo<SocketAddr>` → `PeerAddr`** injection layer feeds the real socket
+  peer (never an `X-Forwarded-For` header) to the rate-limit key, and a bounded
+  periodic task runs `RateLimiter::sweep_expired` off the request path (both
+  DoS controls, [08 §5](docs/08-threat-model.md)). Adds `utoipa-swagger-ui` 9
+  (axum 0.8, `vendored` assets → offline-safe build) and enables the axum
+  server + tokio `net`/`time` features; `src/main.rs` now serves the router with
+  the dev-key release gate. Book-state reads (quote/depth/chain/greeks/metrics),
+  venue-global controls, and live snapshot capture/restore are honest empty
+  projections or typed errors pending the actor book-read path and control-plane
+  routing (flagged as `matching-expert` seam dependencies — no fabricated data).
+  Review-hardening: the bulk endpoints are bounded (`MAX_BULK_ORDER_ITEMS` /
+  `MAX_BULK_CANCEL_ITEMS` = 500, a DoS control so one account cannot monopolize a
+  single-writer mailbox); `TokenRequest`'s `Debug` is hand-rolled to **redact the
+  bootstrap secret**; `CancelOrderResponse`, `BulkOrderResultItem`, and
+  `InstrumentToggleResponse` carry a **typed `sequence`** (not prose) so #018
+  parity can read it; the limit-order status is TIF-aware so a killed `IOC`/`FOK`
+  reports `Rejected` (never a false `Accepted`), and the instrument toggle reports
+  *accepted and sequenced* rather than a confirmed effect (the applied/rejected
+  outcome waits on the `Receipt`→`VenueOutcome` seam). `src/main.rs` installs a
+  `tracing-subscriber` (fmt + `RUST_LOG` env filter) at boot so startup logs are
+  not dropped.
 - **The venue account registry — credentials, revocation epoch, and
   account-resolved bootstrap minting** (#12) in `src/auth.rs`, wired into
   `src/state.rs` ([ADR-0007](docs/adr/0007-fix-credentials-and-account-model.md),

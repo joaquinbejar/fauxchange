@@ -555,12 +555,14 @@ fn test_golden_rest_bulk_order_response() {
             BulkOrderResultItem {
                 index: 0,
                 order_id: Some(VenueOrderId::new("lin:BTC:7:0")),
+                sequence: Some(SequenceNumber::new(7)),
                 status: BulkOrderStatus::Accepted,
                 error: None,
             },
             BulkOrderResultItem {
                 index: 1,
                 order_id: None,
+                sequence: None,
                 status: BulkOrderStatus::Rejected,
                 error: Some("invalid order: limit price must be positive".to_string()),
             },
