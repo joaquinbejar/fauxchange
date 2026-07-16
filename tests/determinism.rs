@@ -1403,6 +1403,107 @@ fn test_no_wall_clock_read_on_the_sequenced_path() {
     );
 }
 
+/// Lint / grep GUARD (#032 acceptance): **no wall-clock-relative
+/// `ExpirationDate::Days` construction survives anywhere in the venue.** A `Days(n)`
+/// expiry re-resolves against "now" on replay and maps to a different calendar date,
+/// so the venue's stored / journaled / identity form is **always**
+/// `ExpirationDate::DateTime`; at the clock-free kernel seams the venue converts
+/// `DateTime − venue_now` → a `Days`-valued duration, and the kernel never reads
+/// wall-clock ([04 §6](../docs/04-market-data-and-replay.md#6-determinism-and-seeding),
+/// [02 §5.4](../docs/02-matching-architecture.md#5-determinism),
+/// [ADR-0004](../docs/adr/0004-deterministic-replay-with-seeded-clock.md)).
+///
+/// The acceptance criterion names `src/exchange/` + `src/simulation/`; this guard
+/// scans the **whole `src/`** so the allow-list is **complete and future-tight** — a
+/// new `Days` use cannot hide in `src/market_maker/` (the pricer seam) either. It is
+/// **non-vacuous and honest**: it recurses subdirectories, asserts it scanned files,
+/// matches the real construction token (not the prose), and exempts only two
+/// auditable classes:
+/// - **comment lines** — a doc mention of the variant name is prose, not a call;
+/// - lines (or the line directly above a match arm) carrying the greppable sentinel
+///   **`days-expiry-allow`** — the explicit, enumerated allow-list of the only
+///   legitimate uses, each annotated in-place with its upstream evidence:
+///   1. **pricer seam** (`src/market_maker/pricer.rs`) — the clock-free pricing
+///      kernel argument;
+///   2. **walk x-axis nominal** (`src/simulation/walk.rs`) — where a `DateTime`
+///      would call optionstratlib `Xstep::new` → `get_days()` → `Utc::now()`;
+///   3. **engine defensive read-arm** (`src/market_maker/engine.rs`) — reads a
+///      `Days` duration, never constructs a stored expiry;
+///   4. **match-to-reject** (`src/exchange/symbol.rs`) — matches the variant only to
+///      refuse it (`validate_venue_expiry`).
+///
+/// Because it scans the whole tree, `expiration_date`'s `Days.get_years()` being pure
+/// while `DateTime.get_years()`/`get_days()` read `Utc::now()` (verified 0.2.1
+/// `convert.rs:26,65,83`) is the invariant asserted at every seam at once.
+#[test]
+fn test_no_days_relative_expiry_survives_anywhere_in_the_venue() {
+    const TOKEN: &str = "ExpirationDate::Days";
+    const ALLOW: &str = "days-expiry-allow";
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let roots = [manifest.join("src")];
+
+    let mut pending: Vec<std::path::PathBuf> = roots.to_vec();
+    let mut offenders = Vec::new();
+    let mut scanned = 0_usize;
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => panic!("a scanned root must be readable at {}: {e}", dir.display()),
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => panic!("reading a scanned entry: {e}"),
+            };
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(e) => panic!("reading {}: {e}", path.display()),
+            };
+            scanned += 1;
+            let lines: Vec<&str> = contents.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if !line.contains(TOKEN) {
+                    continue;
+                }
+                // A doc/line comment mentioning the variant is prose, not a call.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // An explicitly-annotated legitimate clock-free use (match-to-reject
+                // or the walk x-axis nominal) is allowed and auditable. The sentinel
+                // may sit on the token line (a trailing comment) or on the line
+                // directly above the match arm.
+                let prev_allows = idx
+                    .checked_sub(1)
+                    .and_then(|p| lines.get(p))
+                    .is_some_and(|prev| prev.contains(ALLOW));
+                if line.contains(ALLOW) || prev_allows {
+                    continue;
+                }
+                offenders.push(format!("{}:{}", path.display(), idx + 1));
+            }
+        }
+    }
+    assert!(
+        scanned > 0,
+        "the expiry guard scanned no files under {roots:?} — check the paths"
+    );
+    assert!(
+        offenders.is_empty(),
+        "wall-clock-relative `ExpirationDate::Days` found on the sequenced/simulation \
+         path; use an absolute `ExpirationDate::DateTime` resolved against the venue \
+         clock (or annotate a genuinely clock-free kernel use with `days-expiry-allow`): \
+         {offenders:?}"
+    );
+}
+
 // ============================================================================
 // #031: stepped synthetic sessions — deterministic synthesis
 // ============================================================================

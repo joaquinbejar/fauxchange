@@ -485,8 +485,13 @@ impl MarketMakerEngine {
         VenueOrderId::new(format!("{}:MM:{seq}", self.lineage_id.as_str()))
     }
 
-    /// The relative time-to-expiry in **days**, derived from the venue clock —
-    /// never the wall clock (rule 3). `None` for an expired or degenerate expiry.
+    /// The relative time-to-expiry in **days**, resolved venue-side from the
+    /// instrument's absolute `ExpirationDate::DateTime` against the **venue clock** —
+    /// `DateTime − venue_now`, never the wall clock (rule 3). This is the venue's
+    /// clock-free pricing seam: the instrument's stored/journaled/identity expiry is
+    /// always `DateTime`, and here the venue converts it to a `Days`-valued duration
+    /// the pricer hands to `optionstratlib` so the kernel never reads wall-clock (see
+    /// [`crate::market_maker::pricer`]). `None` for an expired or degenerate expiry.
     #[must_use]
     fn days_to_expiry(&self, expiration: &ExpirationDate) -> Option<f64> {
         let now_ms = self.venue_now_ms.load(Ordering::Relaxed);
@@ -500,7 +505,10 @@ impl MarketMakerEngine {
                     Some(remaining_ms as f64 / MILLIS_PER_DAY)
                 }
             }
-            // Defensive: the venue only ever registers absolute `DateTime` expiries.
+            // Defensive: the venue only ever registers absolute `DateTime` expiries;
+            // this arm reads a `Days` duration clock-free (`to_f64()`) and never
+            // constructs or stores a relative expiry.
+            // days-expiry-allow: defensive read-arm (sibling to the pricer carve-out).
             ExpirationDate::Days(days) => {
                 let value = days.to_f64();
                 if value > 0.0 { Some(value) } else { None }

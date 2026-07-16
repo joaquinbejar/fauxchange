@@ -119,6 +119,44 @@ fn test_requote_produces_market_maker_add_orders() {
     }
 }
 
+/// #032: the pricer resolves time-to-expiry from the instrument's **absolute
+/// `ExpirationDate::DateTime`** against the **venue clock**, never the wall clock.
+/// Two requotes at the **same `venue_now_ms`** produce byte-identical limit prices
+/// even though `Utc::now()` advances between the two calls — proving the clock-free
+/// `DateTime − venue_now → days` seam is a pure function of the injected clock, the
+/// precondition the replay oracle rests on.
+#[test]
+fn test_requote_prices_are_identical_under_a_fixed_venue_clock() {
+    fn limit_prices(commands: &[VenueCommand]) -> Vec<(Side, Cents)> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                VenueCommand::AddOrder {
+                    side, limit_price, ..
+                } => limit_price.map(|price| (*side, price)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    let (engine, sink) = engine();
+    engine.register_instrument(&sym(CALL));
+
+    engine.update_price(UNDERLYING, 5_000_000);
+    let first = limit_prices(&sink.take());
+    assert_eq!(first.len(), 2, "a requote quotes a bid and an ask");
+
+    // A second requote at the identical venue clock — wall time has advanced since
+    // the first call, the injected venue clock has not.
+    engine.update_price(UNDERLYING, 5_000_000);
+    let second = limit_prices(&sink.take());
+
+    assert_eq!(
+        first, second,
+        "the pricer is a pure function of the venue clock — no wall-clock drift between requotes"
+    );
+}
+
 #[test]
 fn test_requote_commands_replay_to_a_crossing_fill_attributed_to_the_market_maker() {
     let (engine, sink) = engine();

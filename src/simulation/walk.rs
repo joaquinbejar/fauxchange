@@ -34,6 +34,21 @@
 //! ([04 §2, §6](../../docs/04-market-data-and-replay.md#6-determinism-and-seeding)).
 //! A venue-owned *seeded* adapter awaits an injectable-RNG seam upstream.
 //!
+//! ## The expiry carve-out (#032): `Days` is the clock-free variant here
+//!
+//! The venue's stored / journaled / identity expiry form is **always**
+//! [`ExpirationDate::DateTime`]; at the two clock-free kernel seams (this walk and
+//! the market-maker pricer) the venue converts `DateTime − venue_now` → a
+//! `Days`-valued duration, and the kernel never reads wall-clock. The `Step`'s
+//! `ExpirationDate::Days(Positive::ONE)` below is one such seam — an x-axis nominal
+//! that is **never journaled** (the cents path is). It MUST stay `Days`, not
+//! `DateTime`: optionstratlib's `Xstep::new` normalises a `DateTime` via
+//! `get_days()`, which reads `Utc::now()` (verified `expiration_date` 0.2.1
+//! `convert.rs:83`), whereas `Days(_).get_years()` is pure — so `DateTime` here
+//! would reintroduce the exact wall-clock non-determinism #032 removes. The
+//! `days-expiry-allow`-annotated line is one entry in the venue-wide expiry guard's
+//! allow-list ([ADR-0004](../../docs/adr/0004-deterministic-replay-with-seeded-clock.md)).
+//!
 //! ## The `f64` boundary is guarded (rule 2)
 //!
 //! The walk works in `f64` dollars inside the `optionstratlib` kernel; every
@@ -226,13 +241,18 @@ pub(crate) fn generate_path(
     let mapped = walk_type.to_walk_type(dt, drift_dec, vol, mean)?;
 
     let size = size.max(MIN_PATH_STEPS);
-    // The `Step`'s `ExpirationDate::Days` is a clock-free nominal for the walk's
-    // x-axis only; it is never journaled (the walk output is), so it does not
-    // touch the `DateTime`-only sequenced-path rule.
+    // The `Step`'s expiry is a clock-free nominal for the walk's x-axis only; it is
+    // never journaled (the walk's cents output is). It MUST stay `Days`, not
+    // `DateTime`: optionstratlib's `Xstep::new` normalises a `DateTime` via
+    // `ExpirationDate::get_days()`, which reads `Utc::now()` (verified
+    // `expiration_date` 0.2.1 `convert.rs:83`) — passing `DateTime` here would
+    // reintroduce the exact wall-clock non-determinism #032 removes, whereas
+    // `Days(_).get_years()` is `days / DAYS_IN_A_YEAR` (pure). This is the walk's
+    // documented clock-free carve-out, sibling to the market-maker pricer's.
     let init_step = Step::new(
         0.0_f64,
         TimeFrame::Minute,
-        ExpirationDate::Days(Positive::ONE),
+        ExpirationDate::Days(Positive::ONE), // days-expiry-allow: clock-free walk x-axis nominal
         start_dollars,
     );
     let params = WalkParams {

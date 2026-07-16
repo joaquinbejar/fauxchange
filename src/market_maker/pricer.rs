@@ -24,15 +24,23 @@
 //! turns a `None` into "skip quoting this instrument", so a `NaN`/`Inf` can never
 //! reach a `QuoteParams`, an `AddOrder`, or a broadcast event.
 //!
-//! ## Determinism (rule 5)
+//! ## Determinism (rule 5) — the clock-free pricing carve-out ([ADR-0004](../../docs/adr/0004-deterministic-replay-with-seeded-clock.md))
 //!
 //! Time-to-expiry is passed in as a **relative day count** (`days_to_expiry`)
-//! derived by the caller from the **venue clock**, never the wall clock: the
-//! pricer builds [`ExpirationDate::Days`], whose year fraction is
-//! `days / DAYS_IN_A_YEAR` (a pure function, verified clock-free upstream). It
-//! never constructs [`ExpirationDate::DateTime`], whose `optionstratlib`
-//! conversion reads `Utc::now()`. So for a fixed input the pricer returns the
-//! identical value on every call, on a live run and on a replay alike.
+//! derived by the caller ([`crate::market_maker::MarketMakerEngine::days_to_expiry`])
+//! from the **venue clock** — `DateTime_instant − venue_now`, never the wall clock.
+//! The pricer wraps it in [`ExpirationDate::Days`] because that is the **only**
+//! clock-free time-to-expiry vehicle `optionstratlib` exposes: `Days(n).get_years()`
+//! is `days / DAYS_IN_A_YEAR`, a pure function (verified pinned: `expiration_date`
+//! 0.2.1 `convert.rs:59-64`). Feeding the instrument's stored
+//! [`ExpirationDate::DateTime`] here instead would call `DateTime(_).get_years()`
+//! → `get_years_with_convention(Actual365Fixed)` → `Utc::now()` (`convert.rs:26,65`),
+//! injecting the wall clock into the kernel — the exact non-determinism #032 removes.
+//! There is no public `get_years_from(base)`, so `Days` is forced. The instrument's
+//! identity stays `DateTime` everywhere; this `Days` is a transient kernel argument
+//! whose output is captured as the journaled integer-cents `AddOrder.limit_price`. So
+//! for a fixed input the pricer returns the identical value on every call, live and
+//! on replay alike.
 
 use optionstratlib::greeks::Greeks;
 use optionstratlib::model::types::{OptionType, Side as OptSide};
@@ -131,6 +139,11 @@ impl OptionPricer {
             OptSide::Long,
             PRICER_UNDERLYING.to_string(),
             strike_price,
+            // Clock-free pricing kernel arg. `Days(_).get_years()` is
+            // `days / DAYS_IN_A_YEAR` (pure); `DateTime` would read `Utc::now()`
+            // (expiration_date 0.2.1 convert.rs:26,65,83). `days` is resolved
+            // venue-side from `DateTime − venue_now`; the kernel never reads wall-clock.
+            // days-expiry-allow: the venue's clock-free `Days` pricing-kernel seam.
             ExpirationDate::Days(days),
             implied_volatility,
             Positive::ONE,

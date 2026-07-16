@@ -186,6 +186,7 @@ impl From<Symbol> for String {
 #[inline]
 pub fn validate_venue_expiry(expiration: &ExpirationDate) -> Result<ExpirationDate, SymbolError> {
     let instant = match expiration {
+        // days-expiry-allow: matched only to reject a relative expiry (#032 guard).
         ExpirationDate::Days(_) => return Err(SymbolError::RelativeExpiryRefused),
         ExpirationDate::DateTime(instant) => instant,
     };
@@ -212,6 +213,7 @@ pub fn validate_venue_expiry(expiration: &ExpirationDate) -> Result<ExpirationDa
             Err(SymbolError::NonCanonicalExpiryInstant { date: yyyymmdd })
         }
         // `parse_yyyymmdd` always returns a `DateTime`; this arm is defensive.
+        // days-expiry-allow: matched only to reject a non-absolute instant (#032 guard).
         ExpirationDate::Days(_) => Err(SymbolError::UnresolvableExpiry {
             reason: "canonical parse did not yield an absolute instant".to_string(),
         }),

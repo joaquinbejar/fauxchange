@@ -1094,8 +1094,12 @@ mod tests {
 
     #[test]
     fn test_from_symbol_error_expiry_variant_maps_to_invalid_order() {
+        // #032 DTO-boundary guard: a relative `ExpirationDate::Days` reaching the
+        // runtime order boundary is a typed client rejection — `VenueError::InvalidOrder`
+        // (HTTP 400 / FIX Reject), never a silent wall-clock re-resolution.
         let err = VenueError::from(SymbolError::RelativeExpiryRefused);
         assert!(matches!(err, VenueError::InvalidOrder(_)));
+        assert_eq!(err.http_status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

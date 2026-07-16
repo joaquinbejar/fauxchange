@@ -100,6 +100,18 @@ pub const DEFAULT_CLOCK_STEP_INTERVAL_MS: u64 = crate::simulation::DEFAULT_STEP_
 /// production image sets `json` ([06 §9](../docs/06-deployment.md#9-observability)).
 pub const DEFAULT_LOG_FORMAT: LogFormat = LogFormat::Pretty;
 
+/// Default **operational expiry** time-of-day (`[expiry_lifecycle] expiry_time`) —
+/// `08:00:00 UTC`, the upstream `ExpiryCycleConfig` default (verified
+/// `option-chain-orderbook` v0.7.0). Drives admission closure + the `Active →
+/// Settling` transition; **distinct** from the `23:59:59 UTC` symbol-identity
+/// instant ([01 §5](../docs/01-domain-model.md#5-instruments-and-the-symbol-grammar)).
+pub const DEFAULT_EXPIRY_TIME: &str = "08:00:00";
+/// Default **operational settlement** time-of-day (`[expiry_lifecycle]
+/// settlement_time`) — `08:30:00 UTC`, the upstream `ExpiryCycleConfig` default.
+/// Drives the `Settling → Expired` transition; must be at or after the operational
+/// expiry and strictly before the identity instant.
+pub const DEFAULT_SETTLEMENT_TIME: &str = "08:30:00";
+
 /// The lineage-token prefix the run seed is namespaced under
 /// ([01 §6.1](../docs/01-domain-model.md#61-order-identity-and-cross-protocol-idempotency)).
 /// Colon-free, matching the id-grammar invariant.
@@ -382,6 +394,42 @@ pub enum ConfigError {
         /// The offending value.
         value: String,
     },
+    /// An `[expiry_lifecycle]` operational time (`expiry_time` / `settlement_time`)
+    /// did not parse as an `HH:MM:SS` time-of-day in `00:00:00..=23:59:59`.
+    #[error(
+        "invalid expiry_lifecycle value '{value}' for {field}: expected an HH:MM:SS UTC time-of-day"
+    )]
+    BadOperationalTime {
+        /// The config field (`expiry_time` / `settlement_time`).
+        field: &'static str,
+        /// The offending value.
+        value: String,
+    },
+    /// The operational `settlement_time` fell **before** the operational
+    /// `expiry_time`. Settlement must be at or after expiry — naming the offending
+    /// combination.
+    #[error(
+        "expiry_lifecycle settlement_time ({settlement}) must be at or after expiry_time ({expiry})"
+    )]
+    OperationalSettlementBeforeExpiry {
+        /// The configured operational expiry time.
+        expiry: String,
+        /// The configured operational settlement time (the earlier one).
+        settlement: String,
+    },
+    /// An operational time was **not strictly before** the `23:59:59 UTC`
+    /// symbol-identity instant. The operational times must not reach or cross the
+    /// identity instant (which is reserved for symbol identity / aliasing, not a
+    /// lifecycle transition).
+    #[error(
+        "expiry_lifecycle {field} ({value}) must be strictly before the 23:59:59 UTC identity instant"
+    )]
+    OperationalTimeNotBeforeIdentity {
+        /// The config field (`expiry_time` / `settlement_time`).
+        field: &'static str,
+        /// The offending time-of-day.
+        value: String,
+    },
     /// A CLI flag that takes a value was given none.
     #[error("missing value for CLI flag '{flag}'")]
     MissingCliValue {
@@ -581,6 +629,92 @@ impl ClockConfig {
     }
 }
 
+/// The canonical `23:59:59 UTC` symbol-**identity** instant, as seconds since UTC
+/// midnight (`86_399`). It fixes symbol round-trip and the aliasing rule and
+/// **nothing else** — it is *not* an operational time. Operational expiry /
+/// settlement must fall strictly before it
+/// ([01 §5](../docs/01-domain-model.md#5-instruments-and-the-symbol-grammar)).
+pub const IDENTITY_EXPIRY_SECS: u32 = 23 * 3_600 + 59 * 60 + 59;
+
+/// A UTC **time-of-day** (`HH:MM:SS`), stored as whole seconds since midnight
+/// (`0..=86_399`).
+///
+/// Dependency-free by design: the venue hand-rolls civil-time handling rather than
+/// pull a date library (see [`crate::gateway`]'s RFC3339 formatter), so this needs
+/// no `chrono`. The v0.5 lifecycle scheduler that *consumes* these times maps them
+/// onto the upstream `ExpiryCycleConfig`'s `chrono::NaiveTime` at that seam;
+/// `fauxchange` only stores and **validates** them here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OperationalTime {
+    secs_since_midnight: u32,
+}
+
+impl OperationalTime {
+    /// Builds a time-of-day from `hour:minute:second`, or `None` if any component
+    /// is out of range (`hour > 23`, `minute > 59`, `second > 59`).
+    #[must_use]
+    pub const fn from_hms(hour: u32, minute: u32, second: u32) -> Option<Self> {
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        Some(Self {
+            secs_since_midnight: hour * 3_600 + minute * 60 + second,
+        })
+    }
+
+    /// Parses an `HH:MM:SS` (24-hour, zero-padded or not) string into a
+    /// time-of-day. Returns `None` on a wrong shape or an out-of-range component.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let mut parts = raw.trim().split(':');
+        let hour = parts.next()?.parse::<u32>().ok()?;
+        let minute = parts.next()?.parse::<u32>().ok()?;
+        let second = parts.next()?.parse::<u32>().ok()?;
+        if parts.next().is_some() {
+            return None; // more than three colon-separated fields
+        }
+        Self::from_hms(hour, minute, second)
+    }
+
+    /// The seconds since UTC midnight (`0..=86_399`).
+    #[must_use]
+    #[inline]
+    pub const fn secs_since_midnight(&self) -> u32 {
+        self.secs_since_midnight
+    }
+}
+
+impl std::fmt::Display for OperationalTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.secs_since_midnight;
+        write!(f, "{:02}:{:02}:{:02}", s / 3_600, (s % 3_600) / 60, s % 60)
+    }
+}
+
+/// The `[expiry_lifecycle]` section: the **operational** expiry / settlement
+/// times-of-day, distinct from the `23:59:59 UTC` symbol-identity instant.
+///
+/// **Validated at startup now; not yet consumed.** The lifecycle scheduler that
+/// acts on these instants (the scoped `MassCancel` + `SetInstrumentStatus(Settling
+/// / Expired)` sequence) lands with the v0.5 halt-scenario work — the milestone's
+/// explicit out-of-scope. Here the venue only enforces that the configured
+/// combination is coherent, so an invalid one fails fast at load rather than
+/// surfacing later ([01 §5](../docs/01-domain-model.md#5-instruments-and-the-symbol-grammar),
+/// [02 §5.3](../docs/02-matching-architecture.md#5-determinism)).
+///
+/// `#[non_exhaustive]` for forward-compatible field additions (see [`ServerConfig`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExpiryLifecycleConfig {
+    /// Operational expiry time-of-day (default `08:00:00 UTC`) — admission closure
+    /// and the `Active → Settling` transition.
+    pub expiry_time: OperationalTime,
+    /// Operational settlement time-of-day (default `08:30:00 UTC`) — the `Settling
+    /// → Expired` transition. At or after `expiry_time`, strictly before the
+    /// identity instant.
+    pub settlement_time: OperationalTime,
+}
+
 /// The `[determinism]` section: the one run-level seed.
 ///
 /// `#[non_exhaustive]` for forward-compatible field additions (see [`ServerConfig`]).
@@ -663,6 +797,9 @@ pub struct Config {
     pub persistence: PersistenceConfig,
     /// The venue clock mode.
     pub clock: ClockConfig,
+    /// The operational expiry / settlement times-of-day (validated at load;
+    /// consumed by the v0.5 lifecycle scheduler).
+    pub expiry_lifecycle: ExpiryLifecycleConfig,
     /// The one run-level seed.
     pub determinism: DeterminismConfig,
     /// The token-issuance bootstrap secret.
@@ -767,7 +904,10 @@ impl Config {
             "server.http_addr={http} fix.fix_addr={fix} \
              persistence.backend={backend} persistence.database_url={database_url} \
              persistence.pool_max_connections={pool} persistence.slow_acquire_ms={slow} \
-             clock.mode={clock} determinism.seed={seed} \
+             clock.mode={clock} \
+             expiry_lifecycle.expiry_time={expiry_time} \
+             expiry_lifecycle.settlement_time={settlement_time} \
+             determinism.seed={seed} \
              auth.bootstrap_secret={bootstrap_secret} logging.format={log}",
             http = self.server.http_addr,
             fix = self.fix.fix_addr,
@@ -775,6 +915,8 @@ impl Config {
             pool = self.persistence.pool_max_connections,
             slow = self.persistence.slow_acquire_ms,
             clock = self.clock.mode.as_str(),
+            expiry_time = self.expiry_lifecycle.expiry_time,
+            settlement_time = self.expiry_lifecycle.settlement_time,
             seed = self.determinism.seed,
             log = self.logging.format.as_str(),
         )
@@ -803,6 +945,8 @@ struct RawConfig {
     clock: Option<String>,
     clock_multiplier: Option<String>,
     clock_step_interval_ms: Option<String>,
+    expiry_time: Option<String>,
+    settlement_time: Option<String>,
     seed: Option<String>,
     bootstrap_secret: Option<String>,
     log_format: Option<String>,
@@ -821,6 +965,8 @@ impl RawConfig {
             clock: Some(DEFAULT_CLOCK.as_str().to_string()),
             clock_multiplier: Some(DEFAULT_CLOCK_MULTIPLIER.to_string()),
             clock_step_interval_ms: Some(DEFAULT_CLOCK_STEP_INTERVAL_MS.to_string()),
+            expiry_time: Some(DEFAULT_EXPIRY_TIME.to_string()),
+            settlement_time: Some(DEFAULT_SETTLEMENT_TIME.to_string()),
             seed: Some(DEFAULT_SEED.to_string()),
             bootstrap_secret: None,
             log_format: Some(DEFAULT_LOG_FORMAT.as_str().to_string()),
@@ -854,6 +1000,12 @@ impl RawConfig {
         if other.clock_step_interval_ms.is_some() {
             self.clock_step_interval_ms = other.clock_step_interval_ms;
         }
+        if other.expiry_time.is_some() {
+            self.expiry_time = other.expiry_time;
+        }
+        if other.settlement_time.is_some() {
+            self.settlement_time = other.settlement_time;
+        }
         if other.seed.is_some() {
             self.seed = other.seed;
         }
@@ -882,6 +1034,7 @@ impl RawConfig {
             self.clock_step_interval_ms,
             DEFAULT_CLOCK_STEP_INTERVAL_MS,
         )?;
+        let expiry_lifecycle = parse_expiry_lifecycle(self.expiry_time, self.settlement_time)?;
         let format = parse_log_format(self.log_format)?;
         let seed = parse_seed(self.seed)?;
         let pool_max_connections = parse_pool_u32(
@@ -907,6 +1060,7 @@ impl RawConfig {
                 multiplier: clock_multiplier,
                 step_interval_ms: clock_step_interval_ms,
             },
+            expiry_lifecycle,
             determinism: DeterminismConfig { seed },
             auth: AuthConfig {
                 bootstrap_secret: self.bootstrap_secret.map(Secret::new),
@@ -1068,6 +1222,10 @@ fn raw_from_env<F: Fn(&str) -> Option<String>>(get: F) -> RawConfig {
         // env/CLI override), so the env layer never supplies them.
         clock_multiplier: None,
         clock_step_interval_ms: None,
+        // The operational expiry / settlement times are file-only `[expiry_lifecycle]`
+        // knobs (no env/CLI override), so the env layer never supplies them.
+        expiry_time: None,
+        settlement_time: None,
         seed: pick("FAUXCHANGE_SEED"),
         bootstrap_secret: pick("AUTH_BOOTSTRAP_SECRET"),
         log_format: pick("FAUXCHANGE_LOG_FORMAT"),
@@ -1231,6 +1389,57 @@ fn parse_clock_u64(
     }
 }
 
+/// Parses and validates the `[expiry_lifecycle]` operational times into an
+/// [`ExpiryLifecycleConfig`], enforcing the identity-vs-operational rule
+/// ([01 §5](../docs/01-domain-model.md#5-instruments-and-the-symbol-grammar)):
+/// each time is a valid `HH:MM:SS` UTC time-of-day, `settlement_time` is at or
+/// after `expiry_time`, and both are **strictly before** the `23:59:59 UTC`
+/// symbol-identity instant. Fails fast at load with a typed [`ConfigError`] naming
+/// the offending value / combination.
+fn parse_expiry_lifecycle(
+    expiry_time: Option<String>,
+    settlement_time: Option<String>,
+) -> Result<ExpiryLifecycleConfig, ConfigError> {
+    let expiry = parse_operational_time("expiry_time", expiry_time, DEFAULT_EXPIRY_TIME)?;
+    let settlement =
+        parse_operational_time("settlement_time", settlement_time, DEFAULT_SETTLEMENT_TIME)?;
+
+    // Both operational times must sit strictly before the identity instant — it is
+    // reserved for symbol identity / the aliasing rule, never a lifecycle transition.
+    for (field, time) in [("expiry_time", expiry), ("settlement_time", settlement)] {
+        if time.secs_since_midnight() >= IDENTITY_EXPIRY_SECS {
+            return Err(ConfigError::OperationalTimeNotBeforeIdentity {
+                field,
+                value: time.to_string(),
+            });
+        }
+    }
+    // Settlement is at or after expiry — a settlement that precedes expiry is an
+    // incoherent lifecycle order.
+    if settlement < expiry {
+        return Err(ConfigError::OperationalSettlementBeforeExpiry {
+            expiry: expiry.to_string(),
+            settlement: settlement.to_string(),
+        });
+    }
+
+    Ok(ExpiryLifecycleConfig {
+        expiry_time: expiry,
+        settlement_time: settlement,
+    })
+}
+
+/// Parses one `[expiry_lifecycle]` `HH:MM:SS` time-of-day, failing with
+/// [`ConfigError::BadOperationalTime`] on a wrong shape or an out-of-range field.
+fn parse_operational_time(
+    field: &'static str,
+    value: Option<String>,
+    default: &str,
+) -> Result<OperationalTime, ConfigError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    OperationalTime::parse(&value).ok_or(ConfigError::BadOperationalTime { field, value })
+}
+
 /// Parses a persistence pool `u64` knob (milliseconds), failing with
 /// [`ConfigError::BadPersistenceValue`].
 fn parse_pool_u64(
@@ -1273,6 +1482,8 @@ struct FileConfig {
     persistence: Option<FilePersistence>,
     #[serde(default)]
     clock: Option<FileClock>,
+    #[serde(default)]
+    expiry_lifecycle: Option<FileExpiryLifecycle>,
     #[serde(default)]
     determinism: Option<FileDeterminism>,
     #[serde(default)]
@@ -1332,6 +1543,15 @@ impl FileConfig {
             .as_ref()
             .and_then(|section| section.step_interval_ms)
             .map(|value| value.to_string());
+        // Bind the expiry-lifecycle section once so both time knobs read the same
+        // optional table.
+        let expiry_lifecycle = self.expiry_lifecycle;
+        let expiry_time = expiry_lifecycle
+            .as_ref()
+            .and_then(|section| section.expiry_time.clone());
+        let settlement_time = expiry_lifecycle
+            .as_ref()
+            .and_then(|section| section.settlement_time.clone());
         RawConfig {
             http_addr: self.server.and_then(|section| section.http_addr),
             fix_addr: self.fix.and_then(|section| section.fix_addr),
@@ -1341,6 +1561,8 @@ impl FileConfig {
             clock: clock.and_then(|section| section.mode),
             clock_multiplier,
             clock_step_interval_ms,
+            expiry_time,
+            settlement_time,
             seed: self
                 .determinism
                 .and_then(|section| section.seed)
@@ -1416,6 +1638,18 @@ struct FileClock {
     multiplier: Option<u32>,
     #[serde(default)]
     step_interval_ms: Option<u64>,
+}
+
+/// `[expiry_lifecycle]` — an unrecognised inner key aborts startup. Both
+/// `expiry_time` / `settlement_time` are file-only `HH:MM:SS` UTC knobs (no
+/// env/CLI override), validated at load by [`parse_expiry_lifecycle`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileExpiryLifecycle {
+    #[serde(default)]
+    expiry_time: Option<String>,
+    #[serde(default)]
+    settlement_time: Option<String>,
 }
 
 /// `[determinism]` — an unrecognised inner key aborts startup. The seed is a
@@ -2417,6 +2651,131 @@ read_per_window = 6000
     fn test_config_unknown_clock_key_names_the_key() {
         // `deny_unknown_fields` is preserved on the extended `[clock]` section.
         match raw_from_toml_str("[clock]\nmode = \"realtime\"\ntypo = 1\n") {
+            Err(ConfigError::UnknownKey { key }) => assert!(key.contains("typo")),
+            Err(other) => panic!("expected an unknown-key rejection, got {other}"),
+            Ok(_) => panic!("expected an unknown-key rejection, got a parsed config"),
+        }
+    }
+
+    // ---- #032: [expiry_lifecycle] operational times ------------------------
+
+    #[test]
+    fn test_operational_time_parse_accepts_and_rejects() {
+        // Valid HH:MM:SS in range.
+        assert_eq!(
+            OperationalTime::parse("08:00:00"),
+            OperationalTime::from_hms(8, 0, 0)
+        );
+        assert_eq!(
+            OperationalTime::parse("23:59:59").map(|t| t.secs_since_midnight()),
+            Some(IDENTITY_EXPIRY_SECS)
+        );
+        // Out-of-range components and malformed shapes are refused.
+        for bad in [
+            "24:00:00",
+            "08:60:00",
+            "08:00:60",
+            "8:00",
+            "8-00-00",
+            "",
+            "08:00:00:00",
+        ] {
+            assert!(
+                OperationalTime::parse(bad).is_none(),
+                "'{bad}' must not parse as a time-of-day"
+            );
+        }
+    }
+
+    #[test]
+    fn test_operational_time_display_roundtrips() {
+        let t = OperationalTime::from_hms(8, 30, 0).expect("valid time");
+        assert_eq!(t.to_string(), "08:30:00");
+    }
+
+    #[test]
+    fn test_default_operational_times_are_valid() -> Result<(), ConfigError> {
+        // The documented defaults (08:00 / 08:30 UTC) are a coherent combination.
+        let config = Config::assemble(
+            RawConfig::default(),
+            raw_from_env(|_| None),
+            RawConfig::default(),
+        )?;
+        assert_eq!(config.expiry_lifecycle.expiry_time.to_string(), "08:00:00");
+        assert_eq!(
+            config.expiry_lifecycle.settlement_time.to_string(),
+            "08:30:00"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_operational_times_from_file_section() -> Result<(), ConfigError> {
+        let file = raw_from_toml_str(
+            "[expiry_lifecycle]\nexpiry_time = \"09:15:00\"\nsettlement_time = \"09:45:30\"\n",
+        )?;
+        let config = Config::assemble(file, raw_from_env(|_| None), RawConfig::default())?;
+        assert_eq!(config.expiry_lifecycle.expiry_time.to_string(), "09:15:00");
+        assert_eq!(
+            config.expiry_lifecycle.settlement_time.to_string(),
+            "09:45:30"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_expiry_lifecycle_rejects_settlement_before_expiry() {
+        // settlement_time earlier than expiry_time is an incoherent lifecycle order.
+        let file = raw_from_toml_str(
+            "[expiry_lifecycle]\nexpiry_time = \"08:30:00\"\nsettlement_time = \"08:00:00\"\n",
+        )
+        .expect("the file layer parses; validation happens at assemble");
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::OperationalSettlementBeforeExpiry { expiry, settlement }) => {
+                assert_eq!(expiry, "08:30:00");
+                assert_eq!(settlement, "08:00:00");
+            }
+            other => panic!("expected OperationalSettlementBeforeExpiry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expiry_lifecycle_rejects_time_at_or_after_identity_instant() {
+        // A settlement AT the 23:59:59 identity instant is refused — the identity
+        // instant is reserved for symbol identity, never a lifecycle transition.
+        let file = raw_from_toml_str(
+            "[expiry_lifecycle]\nexpiry_time = \"08:00:00\"\nsettlement_time = \"23:59:59\"\n",
+        )
+        .expect("the file layer parses; validation happens at assemble");
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::OperationalTimeNotBeforeIdentity { field, value }) => {
+                assert_eq!(field, "settlement_time");
+                assert_eq!(value, "23:59:59");
+            }
+            other => panic!("expected OperationalTimeNotBeforeIdentity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expiry_lifecycle_rejects_malformed_time() {
+        // A non-HH:MM:SS value is a typed BadOperationalTime.
+        let file = raw_from_toml_str(
+            "[expiry_lifecycle]\nexpiry_time = \"25:00:00\"\nsettlement_time = \"08:30:00\"\n",
+        )
+        .expect("the file layer parses; validation happens at assemble");
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::BadOperationalTime { field, value }) => {
+                assert_eq!(field, "expiry_time");
+                assert_eq!(value, "25:00:00");
+            }
+            other => panic!("expected BadOperationalTime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expiry_lifecycle_unknown_key_names_the_key() {
+        // `deny_unknown_fields` is preserved on the new `[expiry_lifecycle]` section.
+        match raw_from_toml_str("[expiry_lifecycle]\nexpiry_time = \"08:00:00\"\ntypo = 1\n") {
             Err(ConfigError::UnknownKey { key }) => assert!(key.contains("typo")),
             Err(other) => panic!("expected an unknown-key rejection, got {other}"),
             Ok(_) => panic!("expected an unknown-key rejection, got a parsed config"),
