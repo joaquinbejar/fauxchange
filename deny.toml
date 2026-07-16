@@ -1,0 +1,119 @@
+# cargo-deny policy for `fauxchange` — supply-chain gate wired in CI from v0.1
+# (docs/08-threat-model.md §8, docs/TESTING.md §11). Run locally with:
+#
+#   cargo deny check
+#
+# Every section below was verified against the REAL dependency tree on the
+# branch that introduced this file (`cargo deny list` / `cargo deny check`
+# per-check). Do NOT blanket-allow a license family or silence a check to
+# make CI green — extend the specific list with a reason, or fix the
+# dependency. A NEW advisory or a policy-violating dependency MUST fail the
+# build; that is the point of this gate.
+
+# ---------------------------------------------------------------------------
+# graph — which target platforms the dependency graph is evaluated against.
+# `fauxchange` ships as a Linux binary/container (CI runner + the Alpine
+# runtime image, docs/06-deployment.md) and is developed on macOS. Restricting
+# to the targets we actually build for prunes platform-conditional deps we
+# never compile (e.g. `r-efi` / UEFI-only crates pulled in by `getrandom`'s
+# cfg-gated deps, which carry LGPL-2.1-or-later and would otherwise force a
+# license exception for code that never builds here). If a new target is
+# added (e.g. a musl cross-build), extend this list rather than dropping it.
+# ---------------------------------------------------------------------------
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",   # GitHub Actions runner (ubuntu-24.04)
+    "x86_64-unknown-linux-musl",  # docker/Dockerfile runtime (alpine)
+    "aarch64-apple-darwin",       # developer laptops (Apple Silicon)
+    "x86_64-apple-darwin",        # developer laptops (Intel)
+]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# advisories — RustSec advisory-DB scan. A NEW vulnerability MUST fail the
+# build; nothing here silences a vulnerability. The single ignored id below
+# is an UNMAINTAINED notice, not a vulnerability — see the inline reason.
+# ---------------------------------------------------------------------------
+[advisories]
+ignore = [
+    # `paste` (dtolnay) was archived/marked unmaintained by its author in
+    # 2024 (RUSTSEC-2024-0436, "no longer maintained", no CVE, no known
+    # vulnerability, "No safe upgrade is available"). It reaches fauxchange
+    # transitively and indirectly: optionstratlib -> statrs -> nalgebra ->
+    # simba -> paste (a proc-macro helper used at compile time only, not
+    # linked into runtime logic). fauxchange does not depend on `paste`
+    # directly and has no upstream control over `statrs`/`nalgebra`'s choice
+    # of proc-macro helper. Ignoring an UNMAINTAINED advisory with a
+    # documented reason is standard practice; a real vulnerability in this
+    # or any other crate is NEVER added to this list — it fails the build.
+    # Re-evaluate when optionstratlib/statrs/nalgebra drop the dependency or
+    # RustSec publishes a maintained fork advisory.
+    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 is unmaintained (not vulnerable); transitive compile-time proc-macro dep via optionstratlib -> statrs -> nalgebra -> simba -> paste. No safe upgrade exists upstream. Re-check when optionstratlib/statrs/nalgebra move off it." },
+]
+
+# ---------------------------------------------------------------------------
+# licenses — explicit allow-list. Every SPDX id below is a permissive license
+# actually present in the tree for the targets above, enumerated with
+# `cargo deny list` on this branch. No blanket wildcard, no GPL/AGPL/LGPL
+# family. Add a new id here only after confirming (via `cargo deny list`)
+# what license it actually is and that it is compatible with MIT (fauxchange
+# itself is MIT).
+# ---------------------------------------------------------------------------
+[licenses]
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",         # Boost Software License 1.0 (ryu)
+    "CC0-1.0",         # public-domain-equivalent (constant_time_eq, ppmd-rust)
+    "ISC",             # ring, simple_asn1, untrusted
+    "Unicode-3.0",     # unicode-ident
+    "Unlicense",       # aho-corasick, csv, memchr, same-file, walkdir
+    "Zlib",            # bytemuck, safe_arch, wide, zlib-rs
+    "bzip2-1.0.6",     # libbz2-rs-sys (via zip -> bzip2, permissive BSD-style)
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+# ---------------------------------------------------------------------------
+# bans — duplicate-version visibility + banned-crate / wildcard-version
+# policy.
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicate transitive versions are WARN, not DENY: fauxchange has no direct
+# control over the exact version `optionstratlib`/`orderbook-rs`/`axum`
+# resolve for shared deps (thiserror, unicode-width, windows-sys, zip), and
+# denying here would turn the gate red on ordinary upstream version skew
+# rather than a real policy violation. Duplicates remain VISIBLE in the CI
+# log so a reviewer notices a needless proliferation.
+multiple-versions = "warn"
+# `*` version requirements accept literally any future release of a
+# dependency (a real supply-chain risk); none exist in the tree today, and
+# a new one should fail the build rather than silently pass.
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow-workspace = false
+
+# ---------------------------------------------------------------------------
+# sources — only the crates.io registry is trusted. No git or unknown
+# registry dependency is allowed without an explicit, reviewed addition here.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

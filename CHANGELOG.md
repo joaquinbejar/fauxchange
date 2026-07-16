@@ -11,6 +11,65 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **CI: `cargo audit` + `cargo deny` + fmt/clippy/test/build gates** (#19) in
+  `.github/workflows/ci.yml`, `deny.toml`, `.cargo/audit.toml`,
+  `rust-toolchain.toml`, and the `Makefile`
+  ([019](milestones/v0.1-backend-core/019-ci-audit-deny-lint.md),
+  [08 §8](docs/08-threat-model.md#8-supply-chain-controls),
+  [TESTING.md §11–§12](docs/TESTING.md#11-ci-matrix)). Wires the CI-matrix
+  jobs — `fmt` (`cargo fmt --all --check`), `clippy`
+  (`cargo clippy --all-targets --all-features -- -D warnings`), `test`
+  (`cargo test --all-features`), `build-release` (`cargo build --release`,
+  `RUSTFLAGS=-D warnings`), `doctests`, `msrv`, and the `golden` /
+  `determinism` / `parity` suites (#4/#17/#18) — as the v0.1 **supply-chain
+  gate from the first milestone**: `cargo-audit` and `cargo-deny` run on
+  every push and on PRs into `main`/`release/**`, on a pinned runner
+  (`ubuntu-24.04`) with every action pinned (no `latest`, no floating branch
+  refs), and cancellation of superseded runs on this ref. `deny.toml`
+  encodes the license allow-list actually present in the tree (MIT, MIT-0,
+  Apache-2.0, BSD-2-Clause, BSD-3-Clause, BSL-1.0, CC0-1.0, ISC, Unicode-3.0,
+  Unlicense, Zlib, `bzip2-1.0.6` — enumerated with `cargo deny list`, no
+  blanket wildcard), a crates.io-only source policy, a `wildcards = "deny"`
+  ban on unpinned dependency ranges, and one documented advisory ignore
+  (RUSTSEC-2024-0436, `paste` unmaintained — a compile-time proc-macro dep
+  transitive via `optionstratlib → statrs → nalgebra → simba`, **not** a
+  vulnerability, no safe upgrade available upstream); `.cargo/audit.toml`
+  mirrors the same ignore for the `cargo audit` CLI a developer runs
+  locally, so the two tools agree. The `[graph] targets` restriction to the
+  platforms `fauxchange` actually builds for (Linux gnu/musl, macOS
+  aarch64/x86_64) prunes UEFI/wasm-only transitive deps (`r-efi`,
+  `LGPL-2.1-or-later`) that never compile here, rather than papering over
+  them with a license exception. No actual vulnerability was found on the
+  current dependency tree — a real advisory is never added to either ignore
+  list; it fails the build. `rust-toolchain.toml` pins the stable toolchain
+  (1.97.0); the `msrv` job pins 1.96.0, the verified floor
+  (`expiration_date`, transitive via `optionstratlib`, requires rustc
+  1.96 — confirmed locally that `cargo +1.95.0 check --all-features` fails
+  and `cargo +1.96.0 check --all-features` passes). The `msrv` job's
+  `cargo check` uses an explicit `cargo +${{ env.RUST_MSRV }}` override
+  rather than relying on `dtolnay/rust-toolchain`'s `rustup default`: rustup
+  toolchain-selection precedence is `+toolchain` override >
+  `RUSTUP_TOOLCHAIN` env > `rust-toolchain(.toml)` file > `rustup default`,
+  and the repo-root `rust-toolchain.toml` (pinning 1.97.0) OUTRANKS a bare
+  `rustup default 1.96.0` — so an unqualified `cargo check` in that job
+  would silently compile under 1.97.0 and never exercise the MSRV floor it
+  claims to gate (confirmed locally: plain `cargo -V` resolves 1.97.0 with
+  `rust-toolchain.toml` present; `cargo +1.96.0 -V` correctly resolves
+  1.96.0 despite it). The `Makefile` adds `pre-push`
+  (`fix fmt lint-fix test check-spanish release readme doc` — every binding
+  Pre-Submission Checklist item in one canonical local gate, so local and CI
+  never diverge), `lint-fix`, `check-spanish` (a diacritics heuristic over
+  `src/` + `tests/` per `rules/global_rules.md`), `audit`, `deny`,
+  `test-conformance`, `coverage`/`coverage-html`, `publish`, `run`/
+  `run-seeded`, and `workflow-<job-id>` targets that run any CI job locally
+  via `act` against the stable job ids above. Explicitly out of scope (per
+  the milestone doc's Scope): the `fuzz` job (FIX gateway, v0.4), the
+  `bench-regression` gate (armed before v1.0), the `migrations` job (lands
+  with the optional PostgreSQL persistence layer, v0.2 #023), and the
+  `docker-smoke` / `image-build` stages (land with the Dockerfile/compose
+  topology and container hardening, v0.2 #025/#026, and the cold-bring-up
+  e2e smoke, v0.2 #027). No `src/` change; no new crate dependency
+  (`cargo-audit` / `cargo-deny` are CI-installed tools, not crate deps).
 - **The v0.1 protocol-parity suite** (#18) in `tests/parity.rs` +
   `tests/conformance/`
   ([018](milestones/v0.1-backend-core/018-parity-fixtures-rest-ws.md),

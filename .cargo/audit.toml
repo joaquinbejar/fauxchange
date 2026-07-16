@@ -1,0 +1,25 @@
+# cargo-audit config (docs/08-threat-model.md §8, docs/TESTING.md §11).
+# Auto-discovered by `cargo audit` from this path (verified locally).
+#
+# `cargo audit`'s default behavior already exits non-zero ONLY on an actual
+# vulnerability advisory; an "unmaintained" notice is reported but does not
+# fail the build unless `--deny unmaintained` (or `deny = ["unmaintained"]`
+# below) is set. This file makes that policy explicit and pins the one
+# advisory we knowingly accept, rather than relying on the tool's implicit
+# default:
+#
+#   RUSTSEC-2024-0436 — `paste` 1.0.15 is unmaintained (archived by its
+#   author), NOT a vulnerability. It reaches fauxchange transitively as a
+#   compile-time proc-macro helper: optionstratlib -> statrs -> nalgebra ->
+#   simba -> paste. fauxchange does not depend on it directly, has no
+#   upstream control over nalgebra/statrs/simba's choice of macro helper,
+#   and "No safe upgrade is available" per the advisory itself. See the same
+#   entry (with a longer justification) in deny.toml [advisories].
+#
+# A REAL vulnerability advisory on ANY crate is NEVER added here — it must
+# fail the build. `deny = ["warnings"]` is intentionally NOT set so that any
+# newly discovered vulnerability advisory (a hard "Vulnerability" finding,
+# distinct from an informational "unmaintained"/"notice") still fails
+# `cargo audit` by its own default behavior.
+[advisories]
+ignore = ["RUSTSEC-2024-0436"]
