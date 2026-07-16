@@ -11,6 +11,45 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The determinism guarantee, written down and made enforceable — the v0.3
+  capstone** (#33) as documentation + a consolidated test-oracle, no new runtime
+  behaviour ([033](milestones/v0.3-replay/033-determinism-guarantee-oracle.md),
+  [02 §5](docs/02-matching-architecture.md#5-determinism),
+  [04 §6](docs/04-market-data-and-replay.md#6-determinism-and-seeding),
+  [ADR-0004](docs/adr/0004-deterministic-replay-with-seeded-clock.md)). The
+  canonical guarantee is finalised against the **shipped** replay driver (#30) and
+  the `ExpirationDate::DateTime` guard (#32): given the same journal (the `venue.v1`
+  `VenueEvent` stream incl. `MarketMakerControl` / `Clock` / `SimStep`), the same
+  config manifest (seed, clock mode, microstructure config, instrument seed), and
+  the same crate/dependency versions, a replay reproduces identical fills, events,
+  and resting book state **per underlying**, judged by ordered `VenueEvent`-stream
+  equality per underlying (top-of-book a cheap witness). It now lives in the
+  **tracked** crate docs (`src/lib.rs` → regenerated `README.md` via
+  `make readme`) as the shipped claim, alongside the local canonical docs. The
+  **documented exclusions** are enumerated consistently and each is asserted *as an
+  exclusion*: mark price / unrealised P&L / Greeks / derived analytic floats
+  (recomputed live); process-global numeric registry ids (canonical symbol string
+  is the identity); the engine clock + its `Uuid::new_v4()` trade-id namespace;
+  cross-underlying interleaving (no venue-wide total order); out-of-sequencer state
+  (an admin snapshot restore starts a new journal lineage — not a replay input; a
+  restore-boundary journal fail-stops under the single-epoch driver); and OHLC bars
+  (by derivation — same fills ⇒ same bars). The already-established honesty threads
+  are folded in so the list matches code, not aspiration: the price walk is
+  journal-driven, **not** seed-regenerated (`optionstratlib`'s sampler is
+  unseedable); `Day`/`GTD` TIF admission determinism is deferred to the upstream
+  leaf-clock seam (the `#[ignore]`d ready-to-enable test); the two annotated `Days`
+  carve-outs at the clock-free kernel seams (#32); and boot-time resume of a
+  non-empty durable journal is the reducer (#29/#30) plus not-yet-built wiring
+  (tracked in #85). The flagship `tests/determinism.rs` module doc is now the
+  **oracle's index** (each guarantee clause and each exclusion names the test that
+  enforces it); new cases assert the two remaining exclusions — out-of-sequencer
+  state is not a replay input (a restore boundary fail-stops through the shipped
+  #30 driver) and **seed isolation** for the venue-owned derivation (`seed →
+  LineageId → id namespace`: same seed reproduces the id namespace, distinct seeds
+  never collide) — while the price-walk reproduction is asserted journal-driven and
+  the v0.5 RNG sub-streams (persona jitter, latency) are noted forward-scoped, not
+  fabricated. A stepped session advancing identically for the same config is wired
+  into the oracle.
 - **`ExpirationDate::DateTime` everywhere + a permanent replay-stability guard**
   (#32) — every *stored / journaled* expiry is an absolute `ExpirationDate::DateTime`
   (an instant), never a wall-clock-relative `ExpirationDate::Days` (which re-resolves

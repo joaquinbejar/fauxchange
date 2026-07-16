@@ -1,44 +1,73 @@
-//! The **flagship determinism suite** — `fauxchange`'s product stated as a
-//! bounded, testable contract
+//! # The determinism oracle — the v0.3 capstone (#033)
+//!
+//! `fauxchange`'s product, stated as a **bounded, testable contract** and made
+//! enforceable here. **This module doc IS the oracle's index**: each clause of the
+//! canonical guarantee and each documented exclusion names the test(s) that enforce
+//! it, so the guarantee names exactly what the shipped code backs — no over-claim
 //! ([017](../milestones/v0.1-backend-core/017-determinism-test-harness.md),
+//! [033](../milestones/v0.3-replay/033-determinism-guarantee-oracle.md),
 //! [02 §5–§6](../docs/02-matching-architecture.md),
+//! [04 §6](../docs/04-market-data-and-replay.md#6-determinism-and-seeding),
+//! [ADR-0004](../docs/adr/0004-deterministic-replay-with-seeded-clock.md),
 //! [ADR-0006](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md),
 //! [TESTING.md §5](../docs/TESTING.md#5-determinism--replay-tests)).
 //!
-//! ## The oracle
+//! ## The canonical guarantee
 //!
-//! The comparison oracle is **ordered `VenueEvent`-stream equality per
-//! underlying**: a replay `≡` the recorded run iff, for each underlying, the
-//! sequence of `VenueEvent`s (each command and its captured outcome — fills,
-//! cancels, evictions, status changes) is equal in order and in value. Top-of-book
-//! after each event follows from event equality and is asserted as a **cheap
-//! witness**. Cross-underlying interleaving is outside a single underlying's claim,
-//! and process-local instrument-registry ids are **excluded** — equality is stated
-//! over the canonical symbol string and `underlying_sequence`, never registry ids
-//! ([02 §5, §5.2](../docs/02-matching-architecture.md)).
+//! > Given the **same journal** (the `venue.v1` `VenueEvent` stream, including the
+//! > `MarketMakerControl` / `Clock` / `SimStep` commands), the **same config
+//! > manifest** (seed, clock mode, microstructure config, instrument seed), and the
+//! > **same crate/dependency versions**, a replay reproduces **identical fills,
+//! > events, and resting book state per underlying**, judged by **ordered
+//! > `VenueEvent`-stream equality per underlying** (top-of-book after each event a
+//! > cheap witness).
 //!
-//! ## The harness API (the record/replay helpers, unit-covered here)
+//! Replay and recovery share **one algorithm** — re-execution with the stored event
+//! as the integrity oracle — always into a **fresh** registry. The guarantee
+//! clauses and the tests that enforce them:
+//!
+//! | Guarantee clause | Enforcing test(s) |
+//! |------------------|-------------------|
+//! | Same journal → identical events/fills/top-of-book per underlying (the flagship oracle) | [`test_recorded_session_replays_to_identical_events_and_top_of_book`], [`test_replay_driver_reproduces_events_fills_and_top_of_book`], `tests/property.rs::journal_driver_replay_reconstructs_book` |
+//! | Executions store + positions fold are a deterministic function of the journal | [`test_replay_driver_reconstructs_executions_and_positions_fold`] |
+//! | Journaled non-order inputs applied **from the command** (`Clock` / `SimStep` / `EvictExpiredOrders { now_ms }`) | [`test_journaled_clock_advance_replays_to_identical_now_ms`] |
+//! | One algorithm with recovery (stored event = integrity oracle; corruption halts; newer schema refused) | [`test_recovery_reexecutes_clean_journal_to_events_equal_to_stored`], [`test_recovery_halts_on_corrupted_stored_event_with_exact_underlying_and_sequence`], [`test_recovery_refuses_a_newer_than_binary_schema`] |
+//! | Lossless capture on the error / partial paths replays identically | [`test_ioc_order_that_fills_and_errs_is_journaled_with_fills_and_replays`], [`test_partial_replace_replays_identically`] |
+//! | Fault-injection at both append stages → gapless / fail-stop restart re-executes identically | [`test_pre_execution_append_failure_reuses_sequence_and_replay_is_gapless`], [`test_post_mutation_append_failure_seals_and_restart_reexecutes_to_identical_event`] |
+//! | Replay-stable expiries (`ExpirationDate::DateTime` only) | [`test_datetime_expiry_fixture_replays_identically`], [`test_days_relative_expiry_is_rejected_at_load`], [`test_no_days_relative_expiry_survives_anywhere_in_the_venue`] |
+//! | A **stepped session advances identically for the same seed** (config synthesis deterministic) | [`test_stepped_session_synthesis_is_deterministic_for_the_same_config`], [`test_stepped_session_smile_reshapes_with_the_curve_parameter`] |
+//! | **Seed isolation** for the venue-owned derivation (seed → lineage → id namespace) | [`test_seed_isolation_for_venue_owned_derivations`] |
+//! | No wall-clock read on the sequenced path | [`test_no_wall_clock_read_on_the_sequenced_path`] |
+//!
+//! ## The documented exclusions — each asserted AS an exclusion (not silently divergent)
+//!
+//! | Exclusion (recomputed live / out of scope) | Enforcing test / basis |
+//! |--------------------------------------------|------------------------|
+//! | Mark price / unrealised P&L / Greeks / any derived analytic float | [`test_live_marks_are_recomputed_and_excluded_from_the_event_oracle`], [`test_replay_driver_mark_prices_are_recomputed_and_excluded_from_the_oracle`], [`test_excluded_analytics_are_structurally_absent_from_the_oracle`] |
+//! | Process-global numeric registry ids (canonical symbol string is the identity) | [`test_excluded_analytics_are_structurally_absent_from_the_oracle`] (structural absence); the oracle is stated over symbols + `underlying_sequence` throughout |
+//! | Engine clock + its `Uuid::new_v4()` trade-id namespace | [`test_engine_clock_value_is_excluded_from_the_captured_outcome`], [`test_excluded_analytics_are_structurally_absent_from_the_oracle`] |
+//! | Cross-underlying interleaving (no venue-wide total order) — a PARTIAL fan-out reproduced per underlying | [`test_multi_underlying_partial_fan_out_reproduced_per_underlying`] |
+//! | Out-of-sequencer state — an admin snapshot restore starts a NEW lineage, **not** a replay input; a restore-boundary journal fail-stops (single-epoch scope, #030) | [`test_out_of_sequencer_state_is_not_a_replay_input`] |
+//! | OHLC bars — an exclusion **by derivation** (same fills ⇒ same bars, not separately asserted) | derivation basis (documented in [04 §7](../docs/04-market-data-and-replay.md#7-ohlc-aggregation)); the fills they derive from are asserted above |
+//! | The synthetic price **walk** — journal-driven, **not** seed-regenerated (`optionstratlib` sampler unseedable) | asserted throughout replay (the recorded `SimStep`s replay identically); [`test_stepped_session_synthesis_is_deterministic_for_the_same_config`] separates the deterministic synthesis from the journal-driven path |
+//! | `Day`/`GTD` TIF admission determinism — **deferred** to the upstream leaf-clock seam | [`test_evict_expired_orders_is_a_documented_leaf_clock_limitation`] (pinned as a journaled no-op); [`test_day_gtd_admission_determinism_blocked_by_leaf_clock_gap`] (`#[ignore]`d, ready-to-enable) |
+//! | The two annotated `Days` carve-outs at the clock-free kernel seams (walk x-axis, MM pricer) | [`test_no_days_relative_expiry_survives_anywhere_in_the_venue`] enumerates them as the ONLY `Days` sites (#032) |
+//! | Boot-time resume of a non-empty durable journal — the reducer exists (#029/#030), the boot wiring is **not yet built** (tracked in #85) | out of this suite's runtime scope (the offline driver replays into a fresh registry, never the live venue) |
+//!
+//! ## The harness API (record / replay / recover)
 //!
 //! - [`record`] / `record_with` — drive a `VenueCommand` stream through a fresh
-//!   [`MatchingExecutor`], journaling every write-ahead `(command, event)` pair
-//!   into an [`InMemoryVenueJournal`] and capturing the per-event top-of-book
-//!   witness. This is *the same executor path the single-writer actor drives*
-//!   (`test_actor_journal_and_harness_record_agree` proves the recording mirrors a
-//!   real [`UnderlyingActor`] journal byte-for-byte).
-//! - [`replay`] — reconstruct the events + witnesses by re-executing every
-//!   journaled `VenueCommand` in `N` order into a **fresh** registry (replay
-//!   reconstructs book state, not historical marks).
-//! - [`recover`] — recovery-as-re-execution: the same re-execution as [`replay`],
-//!   but using the stored `VenueEvent` as the **integrity oracle** — it halts with
-//!   a typed `JournalCorruption { underlying, sequence }` on divergence, derives
-//!   the event for a tail command with no paired event, and refuses a
-//!   newer-than-binary envelope schema (the one recovery algorithm of
-//!   [ADR-0006](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
+//!   [`MatchingExecutor`], journaling every write-ahead `(command, event)` pair (the
+//!   same executor path the single-writer actor drives —
+//!   `test_actor_journal_and_harness_record_agree` proves it byte-for-byte).
+//! - [`replay`] — reconstruct events + witnesses by re-executing every journaled
+//!   `VenueCommand` in `N` order into a **fresh** registry.
+//! - [`recover`] — the production recovery reducer: the same re-execution, with the
+//!   stored `VenueEvent` as the integrity oracle.
 //!
-//! The randomised sibling `journal_replay_reconstructs_book` lives in
-//! `tests/property.rs`; this file adds the deterministic fixtures and the
-//! recovery / fault-injection / lossless-capture / exclusion / expiry cases the
-//! property cannot express.
+//! The production driver `fauxchange::simulation::{replay_streams, replay_bundle}`
+//! (#030) is exercised directly by the `test_replay_driver_*` cases; the randomised
+//! sibling `journal_driver_replay_reconstructs_book` lives in `tests/property.rs`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -1893,5 +1922,139 @@ fn test_replay_driver_datetime_expiry_is_replay_stable_via_bundle() {
     assert_eq!(
         replay.events, recording.events,
         "the DateTime-expiry session replays identically through the bundle path"
+    );
+}
+
+// ============================================================================
+// #033 capstone: the remaining exclusions + seed isolation, asserted
+// ============================================================================
+
+#[test]
+fn test_out_of_sequencer_state_is_not_a_replay_input() {
+    // An admin snapshot restore captures STATE, not the sequence of decisions: it
+    // opens a NEW journal epoch (a `SnapshotRestored` marker) over restored state
+    // that the journal never produced. That restored, out-of-sequencer state is an
+    // explicit REPLAY EXCLUSION — the driver re-executes ONE epoch and fail-stops at
+    // the first post-restore command whose stored event only holds against the
+    // (un-modeled) restored state, rather than silently reproducing it. Proven here
+    // through the shipped #030 driver: a stream with a restore boundary halts with a
+    // typed `JournalCorruption`, never a divergent resume.
+    let lineage = LineageId::new("run-1");
+    let stored = record(
+        &[add(
+            &lineage,
+            0,
+            CALL,
+            "mm",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        )],
+        &lineage,
+        &[sym(CALL)],
+    );
+    let mut records = read_all(&stored.journal);
+    // The epoch marker opens at the continued sequence 1 (a restore boundary).
+    records.push(JournalRecord::epoch(
+        fauxchange::exchange::SnapshotRestored::new(
+            SequenceNumber::new(1),
+            EventTimestamp::new(1_700_000_000_000),
+            "snap-1",
+            1,
+            lineage.clone(),
+        ),
+    ));
+    // A post-restore cancel of an order that only exists in the RESTORED state — its
+    // stored event claims `Cancelled`, but a from-empty re-execution rejects it.
+    let restored_only = fauxchange::models::VenueOrderId::new("restored-only");
+    let cancel_cmd = VenueCommand::CancelOrder {
+        symbol: sym(CALL),
+        order_id: restored_only.clone(),
+        account: AccountId::new("acct"),
+    };
+    records.push(JournalRecord::command(
+        SequenceNumber::new(2),
+        EventTimestamp::new(1_700_000_000_000),
+        cancel_cmd.clone(),
+    ));
+    records.push(JournalRecord::event(VenueEvent::new(
+        SequenceNumber::new(2),
+        EventTimestamp::new(1_700_000_000_000),
+        cancel_cmd,
+        VenueOutcome::Cancelled {
+            order_id: restored_only,
+        },
+    )));
+
+    let stream = JournalStream::new(UNDERLYING, JournalHeader::new(lineage), records);
+    match replay_streams(&[stream]) {
+        Err(fauxchange::simulation::ReplayError::JournalCorruption {
+            underlying,
+            sequence,
+        }) => {
+            assert_eq!(underlying, UNDERLYING);
+            assert_eq!(
+                sequence,
+                SequenceNumber::new(2),
+                "the fail-stop names the first post-restore command; restored state is not reproduced"
+            );
+        }
+        other => panic!("out-of-sequencer restored state must not be reproduced; got {other:?}"),
+    }
+}
+
+/// The run seed's derived lineage id — the venue-owned derivation the seed
+/// actually controls today (`DeterminismConfig::lineage_id`, unit-tested in
+/// `src/config.rs`), obtained here through the real layered config loader.
+fn lineage_for_seed(seed: u64) -> LineageId {
+    let config = fauxchange::config::Config::load_from(std::iter::empty::<String>(), move |key| {
+        if key == "FAUXCHANGE_SEED" {
+            Some(seed.to_string())
+        } else {
+            None
+        }
+    })
+    .expect("config loads with a seed override");
+    config.determinism.lineage_id()
+}
+
+#[test]
+fn test_seed_isolation_for_venue_owned_derivations() {
+    // Seed isolation is asserted for the venue-owned derivation ONLY. Today the run
+    // seed deterministically derives the run LINEAGE, which namespaces every
+    // venue-minted id: the same seed reproduces the same id namespace, and DISTINCT
+    // seeds produce DISTINCT namespaces (no cross-run id collision). The stochastic
+    // RNG sub-streams (latency, persona jitter) are v0.5 forward-scoped and are NOT
+    // fabricated here; the price walk is reproduced from the journal, not the seed.
+
+    // Reproducible: the same seed derives the identical lineage → identical ids.
+    let a = lineage_for_seed(7);
+    let b = lineage_for_seed(7);
+    assert_eq!(
+        a, b,
+        "the same seed derives the same run lineage (reproducible)"
+    );
+    let seq = SequenceNumber::new(3);
+    assert_eq!(
+        a.venue_order_id(UNDERLYING, seq, 0),
+        b.venue_order_id(UNDERLYING, seq, 0),
+        "the same seed mints the identical venue order id"
+    );
+
+    // Isolated: a different seed derives a different lineage → a disjoint id
+    // namespace, so two runs never collide on a minted id.
+    let other = lineage_for_seed(8);
+    assert_ne!(a, other, "distinct seeds derive distinct run lineages");
+    assert_ne!(
+        a.venue_order_id(UNDERLYING, seq, 0),
+        other.venue_order_id(UNDERLYING, seq, 0),
+        "distinct seeds mint disjoint venue order ids (no cross-run collision)"
+    );
+    assert_ne!(
+        a.execution_id(UNDERLYING, seq, 0),
+        other.execution_id(UNDERLYING, seq, 0),
+        "distinct seeds mint disjoint execution ids"
     );
 }
