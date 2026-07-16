@@ -76,7 +76,9 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::error::VenueError;
-use crate::exchange::{FixedClock, Hash32, VenueClock};
+use crate::exchange::{
+    FixedClock, Hash32, MARKET_MAKER_OWNER, VenueClock, is_market_maker_account,
+};
 use crate::models::{AccountId, Permission};
 
 // ============================================================================
@@ -1384,7 +1386,9 @@ impl AccountRegistry {
     /// # Errors
     ///
     /// - [`AuthError::PasswordHash`] if hashing a provisioned password fails;
-    /// - [`AuthError::Provisioning`] on a duplicate account id or FIX username.
+    /// - [`AuthError::Provisioning`] on a duplicate account id or FIX username, or an
+    ///   attempt to provision the venue-reserved market-maker id / owner hash (see
+    ///   [`insert_account`](Self::insert_account)).
     pub fn provision(
         hasher: Argon2Hasher,
         provisions: impl IntoIterator<Item = AccountProvision>,
@@ -1402,7 +1406,9 @@ impl AccountRegistry {
     /// # Errors
     ///
     /// - [`AuthError::PasswordHash`] if hashing fails;
-    /// - [`AuthError::Provisioning`] on a duplicate account id or FIX username.
+    /// - [`AuthError::Provisioning`] on a duplicate account id or FIX username, or an
+    ///   attempt to provision the venue-reserved market-maker id / owner hash (see
+    ///   [`insert_account`](Self::insert_account)).
     pub fn provision_account(&self, provision: AccountProvision) -> Result<(), AuthError> {
         let AccountProvision {
             id,
@@ -1435,12 +1441,29 @@ impl AccountRegistry {
 
     /// Inserts a fully-formed account (its `password_hash` already an Argon2id PHC
     /// string) — the **DB-restore / drop-in** path (v0.2). Rejects a duplicate
-    /// account id or FIX username.
+    /// account id or FIX username, and **refuses to shadow the venue-reserved
+    /// market-maker identity**.
+    ///
+    /// The market-maker account id ([`MARKET_MAKER_ACCOUNT`](crate::exchange::MARKET_MAKER_ACCOUNT))
+    /// and STP owner hash ([`MARKET_MAKER_OWNER`]) are venue-owned sentinels the
+    /// requote path attributes to; a seed/admin that
+    /// provisioned an account with either would be able to **impersonate or mass-cancel
+    /// the venue's own quotes**, so provisioning it is rejected up-front (#015
+    /// follow-up, [08 §4](../docs/08-threat-model.md#4-untrusted-input-hardening)).
     ///
     /// # Errors
     ///
-    /// [`AuthError::Provisioning`] on a duplicate account id or FIX username.
+    /// [`AuthError::Provisioning`] on a duplicate account id or FIX username, or an
+    /// attempt to provision the reserved market-maker id / owner hash.
     pub fn insert_account(&self, account: Account) -> Result<(), AuthError> {
+        // Venue-reserved market-maker identity guard: a provisioned account must
+        // never shadow the requote path's attribution marker.
+        if is_market_maker_account(&account.id) {
+            return Err(AuthError::Provisioning("reserved market-maker account id"));
+        }
+        if account.owner == MARKET_MAKER_OWNER {
+            return Err(AuthError::Provisioning("reserved market-maker owner hash"));
+        }
         // Check both indices before mutating either (provisioning is a seed-time
         // single-writer step, so this check-then-insert is not racing writers).
         if self.by_id.contains_key(&account.id) {
@@ -2701,6 +2724,65 @@ mod tests {
             Err(AuthError::Provisioning(label)) => assert_eq!(label, "duplicate FIX username"),
             other => panic!("a duplicate FIX username must be rejected, got {other:?}"),
         }
+    }
+
+    // ---- venue-reserved market-maker identity guard (#015 follow-up) ------
+
+    #[test]
+    fn test_provision_reserved_market_maker_account_id_is_rejected() {
+        // A seed/admin must not shadow the venue-reserved MM account id, or a
+        // provisioned account could impersonate the venue's own requotes.
+        let provisions = vec![AccountProvision::new(
+            crate::exchange::market_maker_account(),
+            owner(0x10),
+            vec![Permission::Trade],
+        )];
+        match AccountRegistry::provision(fast_hasher(), provisions) {
+            Err(AuthError::Provisioning(label)) => {
+                assert_eq!(label, "reserved market-maker account id");
+            }
+            other => panic!("the reserved MM account id must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_provision_reserved_market_maker_owner_hash_is_rejected() {
+        // Even under a different id, the reserved MM STP owner hash is refused, so
+        // no account can mass-cancel the venue's own resting quotes.
+        let provisions = vec![AccountProvision::new(
+            AccountId::new("not-the-mm"),
+            MARKET_MAKER_OWNER,
+            vec![Permission::Trade],
+        )];
+        match AccountRegistry::provision(fast_hasher(), provisions) {
+            Err(AuthError::Provisioning(label)) => {
+                assert_eq!(label, "reserved market-maker owner hash");
+            }
+            other => panic!("the reserved MM owner hash must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_insert_account_rejects_reserved_market_maker_identity() {
+        // The direct insert_account (DB-restore / drop-in path) enforces the same
+        // guard as provisioning.
+        let registry = AccountRegistry::new(fast_hasher());
+        let mm = Account {
+            id: crate::exchange::market_maker_account(),
+            owner: owner(0x10),
+            permissions: vec![Permission::Trade],
+            credentials: Credentials {
+                fix_username: None,
+                password_hash: None,
+                fix_comp_ids: None,
+            },
+            revocation_epoch: 0,
+        };
+        assert!(matches!(
+            registry.insert_account(mm),
+            Err(AuthError::Provisioning("reserved market-maker account id"))
+        ));
+        assert_eq!(registry.account_count(), 0, "the reserved id never lands");
     }
 
     // ---- Argon2id verify happy + wrong-password --------------------------

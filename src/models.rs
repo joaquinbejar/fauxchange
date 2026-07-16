@@ -414,14 +414,55 @@ impl OhlcInterval {
 // Order-shape validation (the only business logic this DTO layer carries)
 // ============================================================================
 
+/// The venue-owned **maximum accepted / resting order price**, in **cents** — the
+/// order economic-field ceiling the threat model names as the *required* bound
+/// ([08 §4](../docs/08-threat-model.md#4-untrusted-input-hardening)). A limit
+/// order whose price exceeds it is a typed `400` (`InvalidOrder`) reject **before**
+/// the sequenced path, never accepted.
+///
+/// The value (`10^12` cents = `$10` billion per contract) is generous for any
+/// realistic option premium yet bounds the economic fields so the downstream fee
+/// arithmetic stays **off both saturation branches**. The widest accepted notional
+/// is `MAX_PRICE_CENTS × MAX_ORDER_QUANTITY = 10^12 × 10^6 = 10^18` cents, which
+/// sits ~9.2× below `i64::MAX` (`≈ 9.22 × 10^18`); so the per-leg fee — at most the
+/// full notional for any fee rate ≤ 100%, and vastly less for realistic bps — always
+/// fits the narrowing to `SignedCents` (`i64`) in `crate::exchange`'s `per_leg_fee`
+/// and never trips its `MoneyError::Overflow` arm, while the upstream `notional × bps`
+/// product is computed in `u128` with vast headroom. The compile-time assertion below
+/// pins the `MAX_PRICE_CENTS × MAX_ORDER_QUANTITY ≤ i64::MAX` invariant that guarantees
+/// it. The live per-instrument value becomes venue config (#046); this is the
+/// bounded default until then.
+pub const MAX_PRICE_CENTS: u64 = 1_000_000_000_000;
+
+/// The venue-owned **maximum accepted order quantity**, in **contracts** — the lot
+/// ceiling paired with [`MAX_PRICE_CENTS`]
+/// ([08 §4](../docs/08-threat-model.md#4-untrusted-input-hardening)). An order (limit
+/// or market) whose quantity exceeds it is a typed `400` (`InvalidOrder`) reject
+/// before the sequenced path. The live per-instrument value becomes venue config
+/// (#046); this is the bounded default until then.
+pub const MAX_ORDER_QUANTITY: u64 = 1_000_000;
+
+// The fee-bound proof, pinned at compile time: the widest accepted notional
+// (`MAX_PRICE_CENTS × MAX_ORDER_QUANTITY`) must fit `i64`, so the per-leg fee —
+// at most the full notional for any fee rate ≤ 100%, and vastly less for realistic
+// bps — always fits the `SignedCents` narrowing in `per_leg_fee` and never reaches
+// its checked-overflow arm. This is what keeps the economic math off both
+// saturation branches ([08 §4](../docs/08-threat-model.md#4-untrusted-input-hardening)).
+const _: () = assert!(
+    (MAX_PRICE_CENTS as u128) * (MAX_ORDER_QUANTITY as u128) <= i64::MAX as u128,
+    "max accepted notional must fit i64 so the per-leg fee narrowing never overflows",
+);
+
 /// Validates the boundary order-shape invariants before an order reaches the
 /// sequencer ([01 §6](../docs/01-domain-model.md)), returning a typed
 /// [`VenueError`] the gateway maps to a `400` / FIX reject:
 ///
 /// - `Limit` ⇒ `limit_price.is_some()`;
 /// - `Market` ⇒ `limit_price.is_none()`;
-/// - `quantity > 0` (contracts);
-/// - `limit_price > 0` cents when present.
+/// - `0 < quantity ≤` [`MAX_ORDER_QUANTITY`] (contracts);
+/// - `0 < limit_price ≤` [`MAX_PRICE_CENTS`] cents when present — the venue-owned
+///   max accepted/resting price ceiling, enforced **here, before the sequenced
+///   path** ([08 §4](../docs/08-threat-model.md#4-untrusted-input-hardening)).
 ///
 /// # Errors
 ///
@@ -430,12 +471,16 @@ impl OhlcInterval {
 /// # Examples
 ///
 /// ```
-/// use fauxchange::{OrderType, validate_order_shape};
+/// use fauxchange::{MAX_PRICE_CENTS, OrderType, validate_order_shape};
 /// use fauxchange::exchange::Cents;
-/// // A limit order needs a positive price and quantity.
+/// // A limit order needs a positive, in-range price and quantity.
 /// assert!(validate_order_shape(OrderType::Limit, Some(Cents::new(500)), 10).is_ok());
 /// // A market order must not carry a price.
 /// assert!(validate_order_shape(OrderType::Market, Some(Cents::new(500)), 10).is_err());
+/// // A price above the venue ceiling is a typed reject before the sequenced path.
+/// assert!(
+///     validate_order_shape(OrderType::Limit, Some(Cents::new(MAX_PRICE_CENTS + 1)), 10).is_err()
+/// );
 /// ```
 pub fn validate_order_shape(
     order_type: OrderType,
@@ -447,6 +492,11 @@ pub fn validate_order_shape(
             "order quantity must be positive".to_string(),
         ));
     }
+    if quantity > MAX_ORDER_QUANTITY {
+        return Err(VenueError::InvalidOrder(format!(
+            "order quantity {quantity} exceeds MAX_ORDER_QUANTITY ({MAX_ORDER_QUANTITY})"
+        )));
+    }
     match (order_type, limit_price) {
         (OrderType::Limit, None) => Err(VenueError::InvalidOrder(
             "limit order requires a limit price".to_string(),
@@ -457,6 +507,12 @@ pub fn validate_order_shape(
         (OrderType::Limit, Some(price)) if price.get() == 0 => Err(VenueError::InvalidOrder(
             "limit price must be positive".to_string(),
         )),
+        (OrderType::Limit, Some(price)) if price.get() > MAX_PRICE_CENTS => {
+            Err(VenueError::InvalidOrder(format!(
+                "limit price {} cents exceeds MAX_PRICE_CENTS ({MAX_PRICE_CENTS})",
+                price.get()
+            )))
+        }
         (OrderType::Limit, Some(_)) | (OrderType::Market, None) => Ok(()),
     }
 }
@@ -2267,6 +2323,60 @@ mod tests {
             Err(VenueError::InvalidOrder(msg)) => assert!(msg.contains("limit price must be")),
             other => panic!("expected InvalidOrder, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_validate_order_shape_rejects_price_above_max_price_cents() {
+        // The venue-owned max accepted/resting price ceiling: a price one cent over
+        // is a typed 400, not accepted (caught before the sequenced path).
+        match validate_order_shape(OrderType::Limit, Some(Cents::new(MAX_PRICE_CENTS + 1)), 10) {
+            Err(VenueError::InvalidOrder(msg)) => assert!(msg.contains("MAX_PRICE_CENTS")),
+            other => panic!("expected InvalidOrder, got {other:?}"),
+        }
+        // Exactly at the ceiling is accepted.
+        assert!(
+            validate_order_shape(OrderType::Limit, Some(Cents::new(MAX_PRICE_CENTS)), 10).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_validate_order_shape_rejects_quantity_above_max_order_quantity() {
+        // The lot ceiling: over-limit quantity is a typed 400 on both order kinds.
+        match validate_order_shape(
+            OrderType::Limit,
+            Some(Cents::new(500)),
+            MAX_ORDER_QUANTITY + 1,
+        ) {
+            Err(VenueError::InvalidOrder(msg)) => assert!(msg.contains("MAX_ORDER_QUANTITY")),
+            other => panic!("expected InvalidOrder, got {other:?}"),
+        }
+        match validate_order_shape(OrderType::Market, None, MAX_ORDER_QUANTITY + 1) {
+            Err(VenueError::InvalidOrder(msg)) => assert!(msg.contains("MAX_ORDER_QUANTITY")),
+            other => panic!("expected InvalidOrder, got {other:?}"),
+        }
+        // Exactly at the ceiling is accepted.
+        assert!(validate_order_shape(OrderType::Market, None, MAX_ORDER_QUANTITY).is_ok());
+    }
+
+    #[test]
+    fn test_max_accepted_notional_fits_i64_keeping_fee_math_off_both_branches() {
+        // The fee-bound invariant the compile-time assertion pins: the widest
+        // accepted notional fits i64, so the per-leg fee narrowing never overflows.
+        let max_notional = u128::from(MAX_PRICE_CENTS) * u128::from(MAX_ORDER_QUANTITY);
+        assert!(max_notional <= i64::MAX as u128);
+    }
+
+    #[test]
+    fn test_place_limit_order_request_validate_rejects_price_over_ceiling() {
+        let req = PlaceLimitOrderRequest {
+            side: Side::Buy,
+            price: Cents::new(MAX_PRICE_CENTS + 1),
+            quantity: 5,
+            time_in_force: None,
+            gtd_expires_at: None,
+            client_order_id: None,
+        };
+        assert!(req.validate().is_err());
     }
 
     #[test]

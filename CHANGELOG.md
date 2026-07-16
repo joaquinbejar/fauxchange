@@ -11,6 +11,64 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Threat-model input hardening + captured-log credential test — the v0.1
+  security capstone** (#21) across `src/models.rs`, `src/gateway/rest/mod.rs`,
+  `src/auth.rs`, and a new `tests/security.rs`
+  ([021](milestones/v0.1-backend-core/021-threat-model-input-hardening.md),
+  [08 §4–§7](docs/08-threat-model.md#4-untrusted-input-hardening),
+  [TESTING.md §14](docs/TESTING.md#14-security-testing)). Audits every v0.1
+  untrusted input against the [08 §4](docs/08-threat-model.md#4-untrusted-input-hardening)
+  table so each names its validation + resource ceiling + typed error, fills the
+  gaps, and adds the defining security-test deliverables:
+  - **The venue-owned max accepted/resting price ceiling** — the CODEX-tracked
+    prerequisite the threat model names as the required economic-field bound.
+    Two documented venue constants, `MAX_PRICE_CENTS` (`10^12` cents) and
+    `MAX_ORDER_QUANTITY` (`10^6` contracts), are enforced in
+    `validate_order_shape` (`src/models.rs`) — the boundary the REST/bulk
+    handlers call **before** the sequenced order path. An order with
+    `price > MAX_PRICE_CENTS` or `quantity > MAX_ORDER_QUANTITY` is a typed
+    `400` (`InvalidOrder`), never accepted. A compile-time assertion pins the
+    `MAX_PRICE_CENTS × MAX_ORDER_QUANTITY ≤ i64::MAX` invariant that keeps the
+    per-leg fee narrowing (`SignedCents`/`i64`) and the upstream `notional × bps`
+    product (`u128`) **off both saturation branches**.
+  - **An explicit REST request-body ceiling** — `MAX_REQUEST_BODY_BYTES`
+    (`1` MiB) applied via `DefaultBodyLimit`, replacing axum's undocumented
+    framework default with a *named* DoS bound an oversized body hits (`413`)
+    before it is buffered; it pairs with the per-batch `MAX_BULK_ORDER_ITEMS`
+    item cap.
+  - **The venue-reserved market-maker identity guard** (tracked #15 follow-up) —
+    `AccountRegistry::insert_account` now rejects provisioning any account whose
+    id is the reserved `@market-maker` account or whose STP owner is the reserved
+    `MARKET_MAKER_OWNER` (`Hash32([0xEE; 32])`) with a typed `AuthError::Provisioning`,
+    so a seed/admin cannot shadow (impersonate or mass-cancel) the venue's own
+    quotes.
+  - **The captured-log credential test** (`tests/security.rs`) — drives a full
+    mint → order → error flow with a `tracing_subscriber` capture layer installed
+    (a `MakeWriter` over a shared buffer; no new dependency — `tracing-subscriber`
+    is already a runtime dependency) and asserts no captured log, error response
+    body, or serialised state contains a password, an Argon2id hash
+    (`$argon2id$`), the JWT signing key, the bootstrap secret, the Argon2 pepper,
+    or a DB connection string; the effective-config-at-boot log is asserted
+    redacted.
+  - **The auth/authorization matrix, adversarial fixtures, and DoS-control
+    suites** — every mutating REST op rejects missing/insufficient permission; a
+    `Read` account is refused order entry on REST and (via the frame parser) on
+    WS; a revocation refuses the account's tokens; oversized bodies, truncated
+    JSON, out-of-range economic fields, malformed symbols, and unknown DTO fields
+    each produce the correct typed `4xx`/typed WS reject (never a panic, never a
+    silent accept); and the rate limiter (one budget), bounded actor mailbox
+    (backpressure → typed `RateLimited`), bounded broadcast (laggard drop, no
+    OOM), connection cap, and sequence-exhaustion sealing are each exercised as
+    **security controls**; the captured-log test additionally proves a
+    spawned-actor-task tracing event lands in the capture buffer, so its
+    credential-absence assertions are not vacuously true. No new dependency; no
+    `.unwrap()` on any inbound-data path; no `unsafe`. Known follow-ups (tracked,
+    out of #21 scope): the `modify_order` handler carries no economic-field ceiling
+    yet because it is an inert stub returning `InvalidOrder` unconditionally — the
+    ceiling lands when modify is wired to the sequenced path; and the
+    auth/authorization matrix is representative, not exhaustive (every mutating
+    handler structurally calls `require()` — a per-handler exhaustive-matrix test is
+    a nice-to-have follow-up).
 - **`bench-hdr` harness + first `BENCH.md` baseline** (#20) in `benches/`,
   `Cargo.toml`, `tests/bench_harness.rs`, and `BENCH.md` at the repo root
   ([020](milestones/v0.1-backend-core/020-bench-hdr-harness-baseline.md),
