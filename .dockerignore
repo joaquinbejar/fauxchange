@@ -1,0 +1,39 @@
+# Docker build-context exclusions (#25, docker/Dockerfile + docker/docker-compose.yml).
+#
+# Keeps the context sent to the daemon small and NEVER ships developer
+# tooling / design docs into an image layer (CLAUDE.md "never bundle
+# developer config"). `docker build -f docker/Dockerfile .` runs from the
+# repo root, so this file lives at the root too (Docker only honours a
+# `.dockerignore` next to the build context, not next to the Dockerfile).
+
+# Build artifacts (can be tens of GB locally) — never needed in the context.
+/target
+**/target
+
+# VCS / CI / editor / agent tooling.
+.git
+.github
+.idea
+.claude
+.vscode
+
+# Design docs, rules, and agent instructions — dev-only, never in an image
+# (mirrors .gitignore's local-only set; CLAUDE.md, rules/, docs/, milestones/
+# are explicitly excluded from the image per the packaging rules).
+docs
+rules
+milestones
+AGENTS.md
+CLAUDE.md
+
+# Local env / secrets — never baked into a layer.
+.env
+.env.*
+
+# Test / bench support fixtures the release binary build does not need.
+tests
+
+# Compose already lives under docker/ and is not needed inside the build
+# context beyond the Dockerfile itself (COPY only reads named paths anyway;
+# this just keeps the tarball smaller).
+docker/docker-compose.yml

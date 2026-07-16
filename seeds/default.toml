@@ -5,8 +5,14 @@
 # `DateTime` expiries, opening prices (integer cents), a default market-maker
 # persona so the books quote immediately, and a small account registry.
 #
-# Load it with `--config seeds/default.toml` (or `FAUXCHANGE_CONFIG`); the compose
-# one-shot `seed` service (#25) drives this same manifest.
+# Load it with `--config seeds/default.toml` — the seed sections live on the
+# FILE layer only (no env/CLI override, src/config.rs). `docker/Dockerfile`
+# (#25) bakes this file into the image at `/app/seeds/default.toml`, and
+# `docker/docker-compose.yml` passes `--config /app/seeds/default.toml` to the
+# `fauxchange` service itself: the venue applies this manifest IN-PROCESS at
+# boot (src/seed.rs `apply_seed_phase`) before it flips to serving, so there is
+# no separate seed service driving it over REST (see the compose file's SEED
+# MODEL note for why).
 #
 # Rules the loader enforces at boot:
 #   - money is integer CENTS (never a float): opening prices and strike×100;

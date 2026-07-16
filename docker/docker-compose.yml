@@ -1,0 +1,117 @@
+# docker/docker-compose.yml — the ONE-COMMAND distribution for fauxchange
+# (docs/06-deployment.md §2 "distribution model", §3 "docker compose
+# topology"). Two modes from the SAME image (docs/06 §6):
+#
+#   DB-less (default):  docker compose -f docker/docker-compose.yml up
+#   Persistent (+ pg):  DATABASE_URL=postgres://fauxchange:fauxchange@postgres:5432/fauxchange \
+#                        docker compose -f docker/docker-compose.yml --profile persistent up
+#
+# Run from the repo root so the build `context: ..` resolves; or `cd docker`
+# and drop the `-f` flag.
+#
+# -----------------------------------------------------------------------------
+# SEED MODEL — reconciled against #24 (this is the load-bearing decision #25
+# had to make; see the branch task notes)
+# -----------------------------------------------------------------------------
+# `docs/06-deployment.md §3` (drafted before #24 landed) describes a one-shot
+# `seed` service that drives the scenario manifest over REST once the venue is
+# healthy. #24 shipped a DIFFERENT, and now-authoritative, mechanism: the venue
+# SELF-SEEDS at boot. `src/main.rs` loads the manifest via `Config::seed` (the
+# `--config <file>` layer) and `src/seed.rs::apply_seed_phase` applies it
+# IN-PROCESS — default persona -> accounts -> instruments -> opening prices —
+# BEFORE `AppState::begin_serving()` flips the venue to serving
+# (docs/06 §7 "One seed workflow"). After that flip, runtime hierarchy
+# create/delete is REFUSED as an immutable seed-time manifest input.
+#
+# A separate REST-driving `seed` service is therefore NOT wired here: it would
+# either (a) duplicate work the venue already did before its first health
+# check ever answers `200`, or (b) hit the post-flip refusal for anything
+# beyond the idempotent no-op case, since by the time any external caller can
+# reach a healthy venue the seeding phase has already run and closed. Instead
+# this file passes `--config /app/seeds/default.toml` (baked into the image,
+# docker/Dockerfile) to the `fauxchange` service itself, in both profiles, so
+# `docker compose up` yields a seeded, immediately-usable venue with no extra
+# step — the one-command promise, honoured through the ACTUAL wiring rather
+# than the pre-#24 sketch.
+
+services:
+  fauxchange:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: fauxchange:local
+    # Self-seed at boot from the baked default scenario (see the note above).
+    # Swap this for a different mounted scenario file to run a custom one:
+    #   volumes: ["./my-scenario.toml:/app/seeds/scenario.toml:ro"]
+    #   command: ["--config", "/app/seeds/scenario.toml"]
+    command: ["--config", "/app/seeds/default.toml"]
+    ports:
+      - "8080:8080" # REST + WebSocket (live)
+      - "9878:9878" # FIX 4.4 — RESERVED, the acceptor lands v0.4; nothing listens yet
+      - "127.0.0.1:9090:9090" # metrics — RESERVED, loopback only; no server binds it yet (docs/06 §9)
+    environment:
+      # Local-dev-only: admits the embedded `JwtAuth::dev()` RS256 keypair
+      # (src/auth.rs `release_gated`). `main.rs` does not yet load a real key
+      # pair from mounted paths, so THIS IS REQUIRED for the venue to start at
+      # all today — without it the process EXITS at startup (`DevKeyRefused`)
+      # and the container never becomes healthy (tracked; the real-key
+      # mounting + hardening land with #26). A real deployment must NOT set
+      # this once that wiring exists.
+      FAUXCHANGE_DEV: "1"
+      # Gates `POST /api/v1/auth/token` (docs/06 §8). Clearly-labelled DEV
+      # default so the one-command venue is usable immediately — CHANGE THIS
+      # for anything beyond a laptop:
+      #   AUTH_BOOTSTRAP_SECRET=some-real-secret docker compose up
+      AUTH_BOOTSTRAP_SECRET: "${AUTH_BOOTSTRAP_SECRET:-dev-bootstrap-secret-change-me}"
+      FAUXCHANGE_LOG_FORMAT: "${FAUXCHANGE_LOG_FORMAT:-pretty}"
+      # Unset by default (DB-less, in-memory). Export DATABASE_URL and add
+      # `--profile persistent` (see the header comment) to run against the
+      # `postgres` service below instead — same image, same binary, `main.rs`
+      # opens the `PgPool` and runs `sqlx::migrate!` at boot whenever this is
+      # set (docs/06 §6).
+      DATABASE_URL: "${DATABASE_URL:-}"
+    depends_on:
+      # `required: false`: tolerate `postgres` being entirely absent from the
+      # DB-less default run (it isn't part of the compose profile a bare
+      # `up` activates); when the `persistent` profile IS requested, still
+      # wait for its healthcheck before starting so the boot-time migration
+      # step never races an unready Postgres.
+      postgres:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      # `GET /health` is auth- and rate-limit-exempt and answers
+      # unconditionally (src/gateway/rest/meta.rs) — the same probe the
+      # container's own Dockerfile HEALTHCHECK uses.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # Optional durable backend (docs/06 §6) — PINNED, never `latest`, internal
+  # to the compose network only (no host port published, docs/06 §5). Opt in:
+  #   docker compose -f docker/docker-compose.yml --profile persistent up
+  postgres:
+    image: postgres:18-alpine
+    profiles: ["persistent"]
+    environment:
+      POSTGRES_USER: fauxchange
+      POSTGRES_PASSWORD: fauxchange
+      POSTGRES_DB: fauxchange
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fauxchange -d fauxchange"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      # `postgres:18-alpine` (the `docker-library/postgres` 18+ layout) expects
+      # a SINGLE mount at `/var/lib/postgresql` (it manages a major-version
+      # subdirectory beneath it, pg_ctlcluster-style) — NOT the pre-18
+      # `/var/lib/postgresql/data` convention. Mounting at `.../data` makes the
+      # image refuse to start ("PostgreSQL data in .../data (unused
+      # mount/volume)"), verified while validating this file.
+      - fauxchange-postgres-data:/var/lib/postgresql
+
+volumes:
+  fauxchange-postgres-data:
