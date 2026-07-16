@@ -1,0 +1,1285 @@
+//! The **flagship determinism suite** — `fauxchange`'s product stated as a
+//! bounded, testable contract
+//! ([017](../milestones/v0.1-backend-core/017-determinism-test-harness.md),
+//! [02 §5–§6](../docs/02-matching-architecture.md),
+//! [ADR-0006](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md),
+//! [TESTING.md §5](../docs/TESTING.md#5-determinism--replay-tests)).
+//!
+//! ## The oracle
+//!
+//! The comparison oracle is **ordered `VenueEvent`-stream equality per
+//! underlying**: a replay `≡` the recorded run iff, for each underlying, the
+//! sequence of `VenueEvent`s (each command and its captured outcome — fills,
+//! cancels, evictions, status changes) is equal in order and in value. Top-of-book
+//! after each event follows from event equality and is asserted as a **cheap
+//! witness**. Cross-underlying interleaving is outside a single underlying's claim,
+//! and process-local instrument-registry ids are **excluded** — equality is stated
+//! over the canonical symbol string and `underlying_sequence`, never registry ids
+//! ([02 §5, §5.2](../docs/02-matching-architecture.md)).
+//!
+//! ## The harness API (the record/replay helpers, unit-covered here)
+//!
+//! - [`record`] / `record_with` — drive a `VenueCommand` stream through a fresh
+//!   [`MatchingExecutor`], journaling every write-ahead `(command, event)` pair
+//!   into an [`InMemoryVenueJournal`] and capturing the per-event top-of-book
+//!   witness. This is *the same executor path the single-writer actor drives*
+//!   (`test_actor_journal_and_harness_record_agree` proves the recording mirrors a
+//!   real [`UnderlyingActor`] journal byte-for-byte).
+//! - [`replay`] — reconstruct the events + witnesses by re-executing every
+//!   journaled `VenueCommand` in `N` order into a **fresh** registry (replay
+//!   reconstructs book state, not historical marks).
+//! - [`recover`] — recovery-as-re-execution: the same re-execution as [`replay`],
+//!   but using the stored `VenueEvent` as the **integrity oracle** — it halts with
+//!   a typed `JournalCorruption { underlying, sequence }` on divergence, derives
+//!   the event for a tail command with no paired event, and refuses a
+//!   newer-than-binary envelope schema (the one recovery algorithm of
+//!   [ADR-0006](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
+//!
+//! The randomised sibling `journal_replay_reconstructs_book` lives in
+//! `tests/property.rs`; this file adds the deterministic fixtures and the
+//! recovery / fault-injection / lossless-capture / exclusion / expiry cases the
+//! property cannot express.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use fauxchange::exchange::{
+    ActorConfig, AddOutcome, Cents, CommandExecutor, EventTimestamp, ExecutionContext,
+    ExpirationDate, FanOut, FixedClock, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore,
+    InMemoryVenueJournal, JournalCommand, JournalError, JournalHeader, JournalRecord, LineageId,
+    MarkPriceBook, MatchingExecutor, NoopFanOut, PositionsStore, RecordKind, STPMode,
+    SequenceNumber, Side, StoreFanOut, Symbol, SymbolError, SymbolParser, TimeInForce, TopOfBook,
+    UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
+    validate_venue_expiry,
+};
+use fauxchange::{AccountId, OrderType, VenueError};
+
+const UNDERLYING: &str = "BTC";
+const CALL: &str = "BTC-20240329-50000-C";
+const PUT: &str = "BTC-20240329-50000-P";
+/// The deterministic venue clock the sequenced path stamps events from — a fixed
+/// instant is sufficient because the journaled total order is the
+/// `underlying_sequence`, not `venue_ts`.
+const CLOCK: FixedClock = FixedClock::new(EventTimestamp::new(1_700_000_000_000));
+
+// ============================================================================
+// Fixtures
+// ============================================================================
+
+fn sym(raw: &str) -> Symbol {
+    match Symbol::parse(raw) {
+        Ok(s) => s,
+        Err(e) => panic!("fixture symbol {raw} failed to parse: {e:?}"),
+    }
+}
+
+/// A limit add whose venue order id is the deterministic grammar id for the
+/// sequence it will be assigned (submissions are serial, so `sequence` matches).
+#[allow(clippy::too_many_arguments)]
+fn add(
+    lineage: &LineageId,
+    sequence: u64,
+    raw_symbol: &str,
+    account: &str,
+    owner_byte: u8,
+    side: Side,
+    price: u64,
+    quantity: u64,
+    tif: TimeInForce,
+) -> VenueCommand {
+    VenueCommand::AddOrder {
+        symbol: sym(raw_symbol),
+        order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(sequence), 0),
+        account: AccountId::new(account),
+        owner: Hash32([owner_byte; 32]),
+        client_order_id: None,
+        side,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(price)),
+        quantity,
+        time_in_force: tif,
+        stp_mode: STPMode::None,
+    }
+}
+
+fn market(
+    lineage: &LineageId,
+    sequence: u64,
+    raw_symbol: &str,
+    account: &str,
+    side: Side,
+    quantity: u64,
+) -> VenueCommand {
+    VenueCommand::AddOrder {
+        symbol: sym(raw_symbol),
+        order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(sequence), 0),
+        account: AccountId::new(account),
+        owner: Hash32([0xAA; 32]),
+        client_order_id: None,
+        side,
+        order_type: OrderType::Market,
+        limit_price: None,
+        quantity,
+        time_in_force: TimeInForce::Ioc,
+        stp_mode: STPMode::None,
+    }
+}
+
+fn cancel(lineage: &LineageId, target_seq: u64, raw_symbol: &str, account: &str) -> VenueCommand {
+    VenueCommand::CancelOrder {
+        symbol: sym(raw_symbol),
+        order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(target_seq), 0),
+        account: AccountId::new(account),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace(
+    lineage: &LineageId,
+    target_seq: u64,
+    new_seq: u64,
+    raw_symbol: &str,
+    account: &str,
+    side: Side,
+    limit_price: Option<u64>,
+    quantity: u64,
+    tif: TimeInForce,
+) -> VenueCommand {
+    VenueCommand::Replace {
+        symbol: sym(raw_symbol),
+        order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(target_seq), 0),
+        new_order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(new_seq), 0),
+        account: AccountId::new(account),
+        side,
+        limit_price: limit_price.map(Cents::new),
+        quantity,
+        time_in_force: tif,
+        stp_mode: STPMode::None,
+    }
+}
+
+/// A rich single-underlying session that touches two contracts (call + put),
+/// crosses into fills, takes liquidity with a market order, and cancels a resting
+/// order — enough distinct outcomes to make the oracle non-vacuous.
+///
+/// Timeline: seq0 rests a call ask (3), seq1 a second call ask (2), seq2 a put bid
+/// (4), seq3 a call bid (5, rests), seq4 a call buy (2, crosses seq0), seq5 a call
+/// market buy (1, takes seq0's remainder), seq6 cancels the put bid.
+fn rich_stream(lineage: &LineageId) -> Vec<VenueCommand> {
+    vec![
+        add(
+            lineage,
+            0,
+            CALL,
+            "m1",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+        add(
+            lineage,
+            1,
+            CALL,
+            "m2",
+            0x12,
+            Side::Sell,
+            50_100,
+            2,
+            TimeInForce::Gtc,
+        ),
+        add(
+            lineage,
+            2,
+            PUT,
+            "p1",
+            0x13,
+            Side::Buy,
+            30_000,
+            4,
+            TimeInForce::Gtc,
+        ),
+        add(
+            lineage,
+            3,
+            CALL,
+            "b1",
+            0x33,
+            Side::Buy,
+            49_900,
+            5,
+            TimeInForce::Gtc,
+        ),
+        add(
+            lineage,
+            4,
+            CALL,
+            "t1",
+            0x22,
+            Side::Buy,
+            50_000,
+            2,
+            TimeInForce::Gtc,
+        ),
+        market(lineage, 5, CALL, "t2", Side::Buy, 1),
+        cancel(lineage, 2, PUT, "p1"),
+    ]
+}
+
+fn witnesses() -> Vec<Symbol> {
+    vec![sym(CALL), sym(PUT)]
+}
+
+// ============================================================================
+// The record/replay harness
+// ============================================================================
+
+/// A recorded session: the write-ahead journal plus the per-event artifacts
+/// captured at record time — the oracle's inputs.
+struct Recording {
+    underlying: String,
+    witnesses: Vec<Symbol>,
+    journal: InMemoryVenueJournal,
+    /// The ordered `VenueEvent`s as recorded (the oracle's primary artifact).
+    events: Vec<VenueEvent>,
+    /// Top-of-book after each committed event, one row per witness symbol.
+    tops: Vec<Vec<TopOfBook>>,
+}
+
+/// The reconstructed artifacts a [`replay`] produces from a recording's journal.
+struct Replay {
+    events: Vec<VenueEvent>,
+    tops: Vec<Vec<TopOfBook>>,
+}
+
+/// Records a command stream under the default venue [`CLOCK`].
+fn record(commands: &[VenueCommand], lineage: &LineageId, witnesses: &[Symbol]) -> Recording {
+    record_with(commands, lineage, witnesses, CLOCK)
+}
+
+/// Records a command stream by driving a fresh [`MatchingExecutor`] and journaling
+/// every write-ahead `(command, event)` pair (exactly as the single-writer actor
+/// does), capturing the per-event top-of-book witness.
+fn record_with(
+    commands: &[VenueCommand],
+    lineage: &LineageId,
+    witnesses: &[Symbol],
+    clock: FixedClock,
+) -> Recording {
+    let mut executor = MatchingExecutor::new(UNDERLYING);
+    let mut journal = InMemoryVenueJournal::new(JournalHeader::new(lineage.clone()));
+    let mut events = Vec::with_capacity(commands.len());
+    let mut tops = Vec::with_capacity(commands.len());
+
+    for (index, command) in commands.iter().enumerate() {
+        let sequence = SequenceNumber::new(index as u64);
+        let venue_ts = clock.now_ms();
+        // Step 1: write-ahead command append, before executing.
+        append(
+            &mut journal,
+            JournalRecord::command(sequence, venue_ts, command.clone()),
+        );
+        // Steps 3–4: execute + capture the lossless outcome, then append the event.
+        let outcome = executor.execute(ExecutionContext {
+            underlying: UNDERLYING,
+            lineage_id: lineage,
+            sequence,
+            venue_ts,
+            command,
+        });
+        let event = VenueEvent::new(sequence, venue_ts, command.clone(), outcome);
+        append(&mut journal, JournalRecord::event(event.clone()));
+        // The cheap witness: top-of-book after this event, per witness symbol.
+        tops.push(witnesses.iter().map(|w| executor.top_of_book(w)).collect());
+        events.push(event);
+    }
+
+    Recording {
+        underlying: UNDERLYING.to_string(),
+        witnesses: witnesses.to_vec(),
+        journal,
+        events,
+        tops,
+    }
+}
+
+/// Replays a recording's journal by re-executing every journaled `VenueCommand` in
+/// `N` order into a **fresh** registry — the replay algorithm. The lineage is read
+/// back from the journal header, so re-derived ids land in the same namespace.
+fn replay(recording: &Recording) -> Replay {
+    let lineage = recording.journal.header().lineage_id.clone();
+    let mut executor = MatchingExecutor::new(recording.underlying.as_str());
+    let commands = command_records(&recording.journal);
+    let mut events = Vec::with_capacity(commands.len());
+    let mut tops = Vec::with_capacity(commands.len());
+
+    for jc in commands {
+        let outcome = executor.execute(ExecutionContext {
+            underlying: recording.underlying.as_str(),
+            lineage_id: &lineage,
+            sequence: jc.sequence,
+            venue_ts: jc.venue_ts,
+            command: &jc.command,
+        });
+        tops.push(
+            recording
+                .witnesses
+                .iter()
+                .map(|w| executor.top_of_book(w))
+                .collect(),
+        );
+        events.push(VenueEvent::new(
+            jc.sequence,
+            jc.venue_ts,
+            jc.command.clone(),
+            outcome,
+        ));
+    }
+
+    Replay { events, tops }
+}
+
+/// The oracle: ordered `VenueEvent`-stream equality per underlying, plus the
+/// top-of-book witness after each event.
+fn assert_replay_equals(recording: &Recording, replay: &Replay) {
+    assert_eq!(
+        replay.events, recording.events,
+        "the ordered VenueEvent stream must be equal per underlying"
+    );
+    assert_eq!(
+        replay.tops, recording.tops,
+        "top-of-book after each event must be equal (the cheap witness)"
+    );
+}
+
+// ============================================================================
+// Recovery-as-re-execution (the integrity oracle)
+// ============================================================================
+
+/// Why a recovery run halted rather than resumed — the two fail-stop conditions of
+/// [ADR-0006 §3](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md).
+#[derive(Debug)]
+enum RecoveryHalt {
+    /// The journal's envelope schema is newer than the binary understands —
+    /// recovery refuses to start rather than mis-parse.
+    SchemaTooNew { found: String },
+    /// A stored `VenueEvent` diverged from its re-execution — the fixed
+    /// `JournalError::Corruption { underlying, sequence }` naming the exact
+    /// `(underlying, N)`.
+    Corruption(JournalError),
+}
+
+/// Recovery-as-re-execution: walk each underlying's stream in `N` order into a
+/// **fresh** registry, re-executing every `VenueCommand` and using the stored
+/// `VenueEvent` as the **integrity oracle** — not an apply source.
+///
+/// - a command with its paired event at `N` → re-execute, then assert the
+///   re-derived event **equals** the stored one; a mismatch **halts** with
+///   [`RecoveryHalt::Corruption`];
+/// - a command with **no** paired event at `N` (a crash between write-ahead and
+///   event append) → re-execute to **derive** the event (no stored event to
+///   compare against);
+/// - a journal whose header schema is newer than the binary → refuse to start
+///   with [`RecoveryHalt::SchemaTooNew`].
+fn recover<J: VenueJournal>(
+    journal: &J,
+    underlying: &str,
+) -> Result<Vec<VenueEvent>, RecoveryHalt> {
+    // Refuse a forward-incompatible journal BEFORE replaying anything.
+    let header = journal.header();
+    if !header.is_current_schema() {
+        return Err(RecoveryHalt::SchemaTooNew {
+            found: header.schema_version.clone(),
+        });
+    }
+    let lineage = header.lineage_id.clone();
+    let records = read_all(journal);
+    let mut executor = MatchingExecutor::new(underlying);
+    let mut recovered = Vec::new();
+
+    for jc in command_records_from(&records) {
+        let outcome = executor.execute(ExecutionContext {
+            underlying,
+            lineage_id: &lineage,
+            sequence: jc.sequence,
+            venue_ts: jc.venue_ts,
+            command: &jc.command,
+        });
+        let derived = VenueEvent::new(jc.sequence, jc.venue_ts, jc.command.clone(), outcome);
+        // The stored event (when present) is the integrity oracle, not an apply
+        // source: a mismatch halts, never a silent divergent resume.
+        if let Some(stored) = stored_event_at(&records, jc.sequence)
+            && stored != &derived
+        {
+            return Err(RecoveryHalt::Corruption(JournalError::Corruption {
+                underlying: underlying.to_string(),
+                sequence: jc.sequence,
+            }));
+        }
+        recovered.push(derived);
+    }
+    Ok(recovered)
+}
+
+// ============================================================================
+// Journal helpers
+// ============================================================================
+
+fn append(journal: &mut InMemoryVenueJournal, record: JournalRecord) {
+    if let Err(e) = journal.append(record) {
+        panic!("in-memory journal append must not fail: {e}");
+    }
+}
+
+fn read_all<J: VenueJournal>(journal: &J) -> Vec<JournalRecord> {
+    match journal.read_from(SequenceNumber::START) {
+        Ok(records) => records,
+        Err(e) => panic!("in-memory journal read must not fail: {e}"),
+    }
+}
+
+fn command_records(journal: &InMemoryVenueJournal) -> Vec<JournalCommand> {
+    command_records_from(&read_all(journal))
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+fn command_records_from(records: &[JournalRecord]) -> Vec<&JournalCommand> {
+    let mut commands: Vec<&JournalCommand> = records
+        .iter()
+        .filter_map(|record| match record {
+            JournalRecord::Command(command) => Some(command),
+            _ => None,
+        })
+        .collect();
+    commands.sort_by_key(|command| command.sequence);
+    commands
+}
+
+fn stored_event_at(records: &[JournalRecord], sequence: SequenceNumber) -> Option<&VenueEvent> {
+    records.iter().find_map(|record| match record {
+        JournalRecord::Event(event) if event.underlying_sequence == sequence => Some(event),
+        _ => None,
+    })
+}
+
+/// Rebuilds a recording's journal, replacing the stored EVENT at `target` with a
+/// divergent outcome — a corrupted stored event for the integrity-oracle test.
+fn corrupt_event_at(recording: &Recording, target: SequenceNumber) -> InMemoryVenueJournal {
+    let mut journal = InMemoryVenueJournal::new(recording.journal.header().clone());
+    for record in read_all(&recording.journal) {
+        match record {
+            JournalRecord::Event(event) if event.underlying_sequence == target => {
+                let corrupted = VenueEvent::new(
+                    event.underlying_sequence,
+                    event.venue_ts,
+                    event.command.clone(),
+                    VenueOutcome::Rejected {
+                        reason: "corrupted-by-test".to_string(),
+                    },
+                );
+                append(&mut journal, JournalRecord::event(corrupted));
+            }
+            other => append(&mut journal, other),
+        }
+    }
+    journal
+}
+
+/// Rebuilds a recording's journal without the paired EVENT for its highest
+/// sequence — a tail command with no paired event (a crash between write-ahead and
+/// event append).
+fn drop_tail_event(recording: &Recording) -> InMemoryVenueJournal {
+    let tail = recording
+        .events
+        .last()
+        .map(|event| event.underlying_sequence);
+    let mut journal = InMemoryVenueJournal::new(recording.journal.header().clone());
+    for record in read_all(&recording.journal) {
+        if let JournalRecord::Event(event) = &record
+            && Some(event.underlying_sequence) == tail
+        {
+            continue; // drop the tail event; keep its command
+        }
+        append(&mut journal, record);
+    }
+    journal
+}
+
+/// Rebuilds a recording's journal under a header schema newer than the binary.
+fn with_newer_schema(recording: &Recording) -> InMemoryVenueJournal {
+    let header = JournalHeader {
+        schema_version: "venue.v2".to_string(),
+        lineage_id: recording.journal.header().lineage_id.clone(),
+    };
+    let mut journal = InMemoryVenueJournal::new(header);
+    for record in read_all(&recording.journal) {
+        append(&mut journal, record);
+    }
+    journal
+}
+
+// ============================================================================
+// A fault-injecting journal (consolidated from the #006 fault-injection rows)
+// ============================================================================
+
+/// A [`VenueJournal`] wrapping the in-memory store that **confirms-fails** the
+/// append at one chosen `(sequence, kind)`, once — the both-append-stages fault
+/// substrate.
+struct FaultJournal {
+    inner: InMemoryVenueJournal,
+    fail_at: Option<(SequenceNumber, RecordKind)>,
+}
+
+impl FaultJournal {
+    fn new(inner: InMemoryVenueJournal, fail_at: (SequenceNumber, RecordKind)) -> Self {
+        Self {
+            inner,
+            fail_at: Some(fail_at),
+        }
+    }
+}
+
+impl VenueJournal for FaultJournal {
+    fn header(&self) -> &JournalHeader {
+        self.inner.header()
+    }
+
+    fn append(&mut self, record: JournalRecord) -> Result<(), JournalError> {
+        if self.fail_at == Some((record.sequence(), record.kind())) {
+            self.fail_at = None; // fire once, then let the reuse/retry succeed
+            return Err(JournalError::AppendFailed("injected".to_string()));
+        }
+        self.inner.append(record)
+    }
+
+    fn read_from(&self, from: SequenceNumber) -> Result<Vec<JournalRecord>, JournalError> {
+        self.inner.read_from(from)
+    }
+
+    fn last_sequence(&self) -> Option<SequenceNumber> {
+        self.inner.last_sequence()
+    }
+}
+
+/// The default order-path actor over a fault-injecting journal (real executor,
+/// no-op fan-out — the harness inspects the journal, not the stores).
+fn fault_actor(
+    lineage: &LineageId,
+    fail_at: (SequenceNumber, RecordKind),
+) -> UnderlyingActor<FaultJournal, MatchingExecutor, NoopFanOut, FixedClock> {
+    let inner = InMemoryVenueJournal::new(JournalHeader::new(lineage.clone()));
+    UnderlyingActor::new(
+        ActorConfig::new(UNDERLYING, lineage.clone(), 16),
+        FaultJournal::new(inner, fail_at),
+        MatchingExecutor::new(UNDERLYING),
+        NoopFanOut,
+        CLOCK,
+    )
+}
+
+// ============================================================================
+// 1. The record/replay harness + oracle
+// ============================================================================
+
+#[test]
+fn test_recorded_session_replays_to_identical_events_and_top_of_book() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+
+    // Non-vacuous: the session actually crossed into fills.
+    assert!(
+        recording.events.iter().any(|event| matches!(
+            &event.outcome,
+            VenueOutcome::Added { fills, .. } | VenueOutcome::Market { fills, .. } if !fills.is_empty()
+        )),
+        "the fixture must exercise a real match"
+    );
+
+    // The oracle: a fresh-registry replay reconstructs identical events + witness.
+    assert_replay_equals(&recording, &replay(&recording));
+}
+
+#[test]
+fn test_harness_record_and_replay_helpers_reconstruct_from_a_fresh_registry() {
+    let lineage = LineageId::new("run-1");
+    let commands = vec![
+        add(
+            &lineage,
+            0,
+            CALL,
+            "m",
+            0x11,
+            Side::Sell,
+            50_000,
+            2,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            1,
+            CALL,
+            "t",
+            0x22,
+            Side::Buy,
+            50_000,
+            2,
+            TimeInForce::Gtc,
+        ),
+    ];
+    let recording = record(&commands, &lineage, &[sym(CALL)]);
+
+    // record journaled a write-ahead (command, event) pair per sequence.
+    assert!(
+        recording
+            .journal
+            .contains(SequenceNumber::new(0), RecordKind::Command)
+    );
+    assert!(
+        recording
+            .journal
+            .contains(SequenceNumber::new(0), RecordKind::Event)
+    );
+    assert!(
+        recording
+            .journal
+            .contains(SequenceNumber::new(1), RecordKind::Command)
+    );
+    assert!(
+        recording
+            .journal
+            .contains(SequenceNumber::new(1), RecordKind::Event)
+    );
+    assert_eq!(recording.events.len(), 2);
+
+    // replay always starts from a FRESH registry: two independent replays agree,
+    // and both agree with the recording.
+    let first = replay(&recording);
+    let second = replay(&recording);
+    assert_eq!(first.events, second.events);
+    assert_eq!(first.tops, second.tops);
+    assert_replay_equals(&recording, &first);
+}
+
+#[test]
+fn test_actor_journal_and_harness_record_agree() {
+    let lineage = LineageId::new("run-1");
+    let commands = rich_stream(&lineage);
+
+    // Drive the SAME stream through the real per-underlying single-writer actor.
+    let journal = InMemoryVenueJournal::new(JournalHeader::new(lineage.clone()));
+    let mut actor = UnderlyingActor::new(
+        ActorConfig::new(UNDERLYING, lineage.clone(), 64),
+        journal,
+        MatchingExecutor::new(UNDERLYING),
+        NoopFanOut,
+        CLOCK,
+    );
+    for command in &commands {
+        if let Err(e) = actor.handle(command.clone()) {
+            panic!("actor submit failed: {e}");
+        }
+    }
+
+    // The actor's journal events equal the harness recording's events — the
+    // harness records exactly what the production single writer journals.
+    let actor_events: Vec<VenueEvent> = read_all(actor.journal())
+        .into_iter()
+        .filter_map(|record| match record {
+            JournalRecord::Event(event) => Some(event),
+            _ => None,
+        })
+        .collect();
+    let recording = record(&commands, &lineage, &[sym(CALL)]);
+    assert_eq!(
+        actor_events, recording.events,
+        "the harness record mirrors the real actor's journal"
+    );
+
+    // And recovery over the actor's own journal reconstructs those events.
+    match recover(actor.journal(), UNDERLYING) {
+        Ok(recovered) => assert_eq!(recovered, actor_events),
+        Err(e) => panic!("recovery over a clean actor journal failed: {e:?}"),
+    }
+}
+
+// ============================================================================
+// 2. Exclusions asserted AS exclusions (not silently divergent)
+// ============================================================================
+
+#[test]
+fn test_excluded_analytics_are_structurally_absent_from_the_oracle() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+
+    // The crossing event (seq 4) carries fills — the richest oracle artifact.
+    let event = &recording.events[4];
+    let fills = match &event.outcome {
+        VenueOutcome::Added { fills, .. } if !fills.is_empty() => fills,
+        other => panic!("expected the crossing event to carry fills, got {other:?}"),
+    };
+
+    let value = match serde_json::to_value(event) {
+        Ok(v) => v,
+        Err(e) => panic!("serialize event failed: {e}"),
+    };
+    let mut keys = BTreeSet::new();
+    collect_keys(&value, &mut keys);
+
+    // The journaled artifacts the oracle IS stated over are present...
+    for present in [
+        "schema",
+        "underlying_sequence",
+        "venue_ts",
+        "command",
+        "outcome",
+    ] {
+        assert!(
+            keys.contains(present),
+            "expected the journaled key {present}"
+        );
+    }
+    // ...and every recomputed-live / process-local artifact is STRUCTURALLY absent
+    // (mark price, unrealised P&L, Greeks, instrument_sequence, engine trade
+    // ids / clock), so it cannot even be asserted equal — it is out of scope.
+    for excluded in [
+        "mark",
+        "mark_price",
+        "unrealized_pnl",
+        "unrealised_pnl",
+        "greeks",
+        "delta",
+        "gamma",
+        "vega",
+        "theta",
+        "rho",
+        "iv",
+        "implied_volatility",
+        "instrument_sequence",
+        "trade_id",
+        "engine_seq",
+        "engine_order_id",
+        "wall_clock",
+    ] {
+        assert!(
+            !keys.contains(excluded),
+            "excluded analytic {excluded} must not appear in a journaled VenueEvent"
+        );
+    }
+
+    // A Fill carries only the journaled join keys — no engine trade-id / uuid /
+    // clock leaked in beside them.
+    let fill_value = match serde_json::to_value(&fills[0]) {
+        Ok(v) => v,
+        Err(e) => panic!("serialize fill failed: {e}"),
+    };
+    let fill_obj = match fill_value.as_object() {
+        Some(obj) => obj,
+        None => panic!("a Fill must serialise as an object"),
+    };
+    let mut fill_keys: Vec<&str> = fill_obj.keys().map(String::as_str).collect();
+    fill_keys.sort_unstable();
+    assert_eq!(
+        fill_keys,
+        vec![
+            "account",
+            "execution_id",
+            "fee",
+            "liquidity",
+            "order_id",
+            "owner",
+            "price",
+            "quantity",
+            "side",
+        ],
+        "a Fill carries only its journaled join keys — no engine trade-id/uuid/clock"
+    );
+}
+
+#[test]
+fn test_live_marks_are_recomputed_and_excluded_from_the_event_oracle() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+
+    // Two fresh-registry replays agree on the compared artifact (the events).
+    let first = replay(&recording);
+    let second = replay(&recording);
+    assert_eq!(
+        first.events, second.events,
+        "the compared event stream is identical (the oracle)"
+    );
+
+    // Fold the replayed fills into a positions store, then mark the SAME journaled
+    // fold against two DIFFERENT live marks. The net quantity (a journaled fold) is
+    // identical; only the unrealised P&L — recomputed live from the non-journaled
+    // mark — changes, proving it is outside the oracle, not silently divergent.
+    let positions = fold_positions(&first.events);
+    let account = AccountId::new("t1");
+    let symbol = sym(CALL);
+    let at_entry = position_at(&positions, &account, &symbol, 50_000);
+    let at_higher = position_at(&positions, &account, &symbol, 70_000);
+
+    assert_eq!(
+        at_entry.net_quantity, at_higher.net_quantity,
+        "the journaled position fold is mark-independent"
+    );
+    assert_ne!(
+        at_entry.unrealized_pnl, at_higher.unrealized_pnl,
+        "unrealised P&L is recomputed live from the non-journaled mark — excluded from the oracle"
+    );
+}
+
+#[test]
+fn test_engine_clock_value_is_excluded_from_the_captured_outcome() {
+    let lineage = LineageId::new("run-1");
+    let stream = rich_stream(&lineage);
+    let wits = witnesses();
+
+    // Record the same stream under two different venue clocks.
+    let early = record_with(
+        &stream,
+        &lineage,
+        &wits,
+        FixedClock::new(EventTimestamp::new(1_700_000_000_000)),
+    );
+    let late = record_with(
+        &stream,
+        &lineage,
+        &wits,
+        FixedClock::new(EventTimestamp::new(1_888_000_000_000)),
+    );
+
+    // The captured OUTCOMES (fills / cancels / remainders) are identical — matching
+    // does not depend on the clock value, so the engine clock (and its Uuid
+    // trade-id namespace) is excluded from the outcome oracle.
+    let outcomes_early: Vec<&VenueOutcome> = early.events.iter().map(|e| &e.outcome).collect();
+    let outcomes_late: Vec<&VenueOutcome> = late.events.iter().map(|e| &e.outcome).collect();
+    assert_eq!(
+        outcomes_early, outcomes_late,
+        "the clock value is excluded from the matching outcome"
+    );
+    // Only the journaled venue_ts differs — the deterministic value replay reuses.
+    assert!(
+        early
+            .events
+            .iter()
+            .zip(&late.events)
+            .all(|(a, b)| a.venue_ts != b.venue_ts),
+        "venue_ts reflects the (journaled) clock, but the outcome does not"
+    );
+}
+
+// ============================================================================
+// 3. Recovery-as-re-execution
+// ============================================================================
+
+#[test]
+fn test_recovery_reexecutes_clean_journal_to_events_equal_to_stored() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    match recover(&recording.journal, UNDERLYING) {
+        Ok(recovered) => assert_eq!(
+            recovered, recording.events,
+            "recovery re-executes a clean journal to events equal to the stored ones"
+        ),
+        Err(e) => panic!("recovery of a clean journal must not halt: {e:?}"),
+    }
+}
+
+#[test]
+fn test_recovery_halts_on_corrupted_stored_event_with_exact_underlying_and_sequence() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+
+    // Corrupt the stored event at the cancel (seq 6): its re-execution is a
+    // deterministic `Cancelled`, so the injected `Rejected` diverges.
+    let target = SequenceNumber::new(6);
+    let corrupted = corrupt_event_at(&recording, target);
+
+    match recover(&corrupted, UNDERLYING) {
+        Err(RecoveryHalt::Corruption(JournalError::Corruption {
+            underlying,
+            sequence,
+        })) => {
+            assert_eq!(
+                underlying, UNDERLYING,
+                "the halt names the exact underlying"
+            );
+            assert_eq!(sequence, target, "the halt names the exact sequence N");
+        }
+        other => panic!("expected a Corruption halt at the exact (underlying, N), got {other:?}"),
+    }
+}
+
+#[test]
+fn test_recovery_derives_event_for_tail_command_with_no_paired_event() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+
+    // Drop the paired event for the tail sequence: recovery must re-execute the
+    // command to DERIVE the identical event (there is no stored event to compare).
+    let journal = drop_tail_event(&recording);
+    match recover(&journal, UNDERLYING) {
+        Ok(recovered) => assert_eq!(
+            recovered, recording.events,
+            "a tail command with no paired event re-executes to derive the identical event"
+        ),
+        Err(e) => panic!("recovery of a tail-command-only journal must not halt: {e:?}"),
+    }
+}
+
+#[test]
+fn test_recovery_refuses_a_newer_than_binary_schema() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    let newer = with_newer_schema(&recording);
+
+    match recover(&newer, UNDERLYING) {
+        Err(RecoveryHalt::SchemaTooNew { found }) => assert_eq!(found, "venue.v2"),
+        other => panic!("expected a SchemaTooNew refusal, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// 4. Fault injection at both append stages, with a restart assertion
+// ============================================================================
+
+#[test]
+fn test_pre_execution_append_failure_reuses_sequence_and_replay_is_gapless() {
+    let lineage = LineageId::new("run-1");
+    let mut actor = fault_actor(&lineage, (SequenceNumber::new(0), RecordKind::Command));
+
+    // The first command's write-ahead append is confirmed-failed: nothing executes,
+    // the book is untouched, and N=0 is REUSED (no gap, not sealed).
+    let rejected = add(
+        &lineage,
+        0,
+        CALL,
+        "a",
+        0x11,
+        Side::Sell,
+        50_000,
+        2,
+        TimeInForce::Gtc,
+    );
+    match actor.handle(rejected) {
+        Err(VenueError::JournalUnavailable) => {}
+        other => panic!("expected JournalUnavailable on a pre-exec append failure, got {other:?}"),
+    }
+
+    // The retry commits at the reused N=0.
+    let committed = add(
+        &lineage,
+        0,
+        CALL,
+        "b",
+        0x22,
+        Side::Sell,
+        50_500,
+        3,
+        TimeInForce::Gtc,
+    );
+    match actor.handle(committed.clone()) {
+        Ok(receipt) => assert_eq!(receipt.underlying_sequence, SequenceNumber::new(0)),
+        other => panic!("expected the retry to commit at N=0, got {other:?}"),
+    }
+
+    // No gap, no tombstone: exactly one committed command in the stream.
+    let command_count = read_all(actor.journal())
+        .iter()
+        .filter(|record| record.kind() == RecordKind::Command)
+        .count();
+    assert_eq!(command_count, 1, "the reused N leaves no gap");
+
+    // Recovery reconstructs exactly the committed command's event — the reuse is
+    // invisible to replay.
+    let clean = record(&[committed], &lineage, &[sym(CALL)]);
+    match recover(actor.journal(), UNDERLYING) {
+        Ok(recovered) => assert_eq!(
+            recovered, clean.events,
+            "a pre-exec append failure reused N with no gap; replay reconstructs identically"
+        ),
+        Err(e) => panic!("recovery after a pre-exec fault must not halt: {e:?}"),
+    }
+}
+
+#[test]
+fn test_post_mutation_append_failure_seals_and_restart_reexecutes_to_identical_event() {
+    let lineage = LineageId::new("run-1");
+    let mut actor = fault_actor(&lineage, (SequenceNumber::new(1), RecordKind::Event));
+
+    let maker = add(
+        &lineage,
+        0,
+        CALL,
+        "maker",
+        0x11,
+        Side::Sell,
+        50_000,
+        2,
+        TimeInForce::Gtc,
+    );
+    let taker = add(
+        &lineage,
+        1,
+        CALL,
+        "taker",
+        0x22,
+        Side::Buy,
+        50_000,
+        2,
+        TimeInForce::Gtc,
+    );
+
+    // seq 0 commits fully.
+    match actor.handle(maker.clone()) {
+        Ok(receipt) => assert_eq!(receipt.underlying_sequence, SequenceNumber::new(0)),
+        other => panic!("expected the maker to commit at N=0, got {other:?}"),
+    }
+    // seq 1 executes a crossing fill, but the post-mutation event append fails →
+    // the underlying is SEALED (the write-ahead command@1 is journaled, no event).
+    match actor.handle(taker.clone()) {
+        Err(VenueError::JournalUnavailable) => {}
+        other => {
+            panic!("expected JournalUnavailable on a post-mutation append failure, got {other:?}")
+        }
+    }
+    // Sealed: a further command is rejected without executing, fault cleared or not.
+    match actor.handle(taker.clone()) {
+        Err(VenueError::JournalUnavailable) => {}
+        other => panic!("expected a sealed JournalUnavailable, got {other:?}"),
+    }
+
+    // Restart-as-re-execution: recovery re-executes the tail command@1 to derive
+    // the identical event — the crossing fill survives the seal, never lost.
+    let clean = record(&[maker, taker], &lineage, &[sym(CALL)]);
+    let recovered = match recover(actor.journal(), UNDERLYING) {
+        Ok(recovered) => recovered,
+        Err(e) => panic!("recovery after a post-mutation seal must not halt: {e:?}"),
+    };
+    assert_eq!(
+        recovered, clean.events,
+        "the post-mutation seal leaves a tail command; restart re-executes to the identical event"
+    );
+    let event = recovered
+        .iter()
+        .find(|event| event.underlying_sequence == SequenceNumber::new(1))
+        .expect("a derived event at the tail sequence");
+    match &event.outcome {
+        VenueOutcome::Added { fills, .. } => assert_eq!(
+            fills.len(),
+            2,
+            "the fill survives the restart re-execution, not lost to the seal"
+        ),
+        other => panic!("expected the derived tail event to carry the fill, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// 5. Lossless capture on the error / partial paths
+// ============================================================================
+
+#[test]
+fn test_ioc_order_that_fills_and_errs_is_journaled_with_fills_and_replays() {
+    let lineage = LineageId::new("run-1");
+    let commands = vec![
+        add(
+            &lineage,
+            0,
+            CALL,
+            "maker",
+            0x11,
+            Side::Sell,
+            50_000,
+            1,
+            TimeInForce::Gtc,
+        ),
+        // IOC buy of 3 crosses 1, then the 2-lot remainder is unfillable — the
+        // upstream `_full` leaf returns Err, but the executed fill is diff-captured.
+        add(
+            &lineage,
+            1,
+            CALL,
+            "taker",
+            0x22,
+            Side::Buy,
+            50_000,
+            3,
+            TimeInForce::Ioc,
+        ),
+    ];
+    let recording = record(&commands, &lineage, &[sym(CALL)]);
+
+    // The IOC event is journaled WITH its fill — never a bare Rejected.
+    match &recording.events[1].outcome {
+        VenueOutcome::Added {
+            fills,
+            resting_quantity,
+            ..
+        } => {
+            assert_eq!(
+                fills.len(),
+                2,
+                "the executed fill is captured, not lost to a bare Rejected"
+            );
+            assert_eq!(fills[1].quantity, 1, "one contract crossed");
+            assert_eq!(*resting_quantity, 0, "an IOC never rests its remainder");
+        }
+        other => panic!("expected a diff-captured Added with fills, got {other:?}"),
+    }
+
+    // Replay and recovery reconstruct the identical lossless event.
+    assert_replay_equals(&recording, &replay(&recording));
+    match recover(&recording.journal, UNDERLYING) {
+        Ok(recovered) => assert_eq!(recovered, recording.events),
+        Err(e) => panic!("recovery of the IOC-error journal must not halt: {e:?}"),
+    }
+}
+
+#[test]
+fn test_partial_replace_replays_identically() {
+    let lineage = LineageId::new("run-1");
+    let commands = vec![
+        add(
+            &lineage,
+            0,
+            CALL,
+            "acct",
+            0x11,
+            Side::Sell,
+            50_000,
+            2,
+            TimeInForce::Gtc,
+        ),
+        // Replace: the cancel leg succeeds, but the FOK add leg cannot fill in full
+        // and is rejected — a defined partial state (not rolled back).
+        replace(
+            &lineage,
+            0,
+            1,
+            CALL,
+            "acct",
+            Side::Buy,
+            Some(40_000),
+            2,
+            TimeInForce::Fok,
+        ),
+    ];
+    let recording = record(&commands, &lineage, &[sym(CALL)]);
+
+    match &recording.events[1].outcome {
+        VenueOutcome::Replace { cancelled, add } => {
+            assert!(*cancelled, "the cancel leg succeeded");
+            assert!(
+                matches!(add, AddOutcome::Rejected { .. }),
+                "the FOK add leg could not fill and was rejected, got {add:?}"
+            );
+        }
+        other => panic!("expected a partial Replace, got {other:?}"),
+    }
+
+    assert_replay_equals(&recording, &replay(&recording));
+    match recover(&recording.journal, UNDERLYING) {
+        Ok(recovered) => assert_eq!(
+            recovered, recording.events,
+            "a partial replace replays identically"
+        ),
+        Err(e) => panic!("recovery of the partial-replace journal must not halt: {e:?}"),
+    }
+}
+
+// ============================================================================
+// 6. Replay-stable expiries
+// ============================================================================
+
+#[test]
+fn test_datetime_expiry_fixture_replays_identically() {
+    let lineage = LineageId::new("run-1");
+
+    // The fixture contracts are keyed on a canonical `ExpirationDate::DateTime`
+    // instant — an absolute expiry that resolves the same on replay.
+    let expiry = match SymbolParser::parse_yyyymmdd("20240329", "") {
+        Ok(e) => e,
+        Err(e) => panic!("parse_yyyymmdd failed: {e}"),
+    };
+    match validate_venue_expiry(&expiry) {
+        Ok(validated) => assert!(
+            matches!(validated, ExpirationDate::DateTime(_)),
+            "a canonical expiry must validate to an absolute DateTime"
+        ),
+        Err(e) => panic!("the canonical DateTime expiry must validate: {e:?}"),
+    }
+
+    // A session over that absolute-expiry contract replays identically.
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    assert_replay_equals(&recording, &replay(&recording));
+}
+
+#[test]
+fn test_days_relative_expiry_is_rejected_at_load() {
+    // A relative `ExpirationDate::Days` expiry is wall-clock-relative and would map
+    // to a different calendar date on replay, so it is refused at load — guarding
+    // the invariant, never admitted onto the sequenced path.
+    let days = match ExpirationDate::from_string("30") {
+        Ok(e) => e,
+        Err(e) => panic!("from_string failed: {e}"),
+    };
+    match validate_venue_expiry(&days) {
+        Err(SymbolError::RelativeExpiryRefused) => {}
+        other => panic!("a Days-relative expiry must be rejected at load, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// Shared helpers (positions fold + JSON key walk)
+// ============================================================================
+
+/// Folds a committed event stream's fills into a positions store through the same
+/// post-journal `StoreFanOut` the actor uses.
+fn fold_positions(events: &[VenueEvent]) -> Arc<InMemoryPositionsStore> {
+    let positions = Arc::new(InMemoryPositionsStore::new());
+    let mut fan = StoreFanOut::new(
+        Arc::new(InMemoryExecutionsStore::new()),
+        Arc::clone(&positions),
+        Arc::new(MarkPriceBook::new()),
+    );
+    for event in events {
+        fan.emit(event);
+    }
+    positions
+}
+
+/// Reads a folded position marked at `mark` cents, panicking with a clear message
+/// on any store failure or a missing position.
+fn position_at(
+    positions: &InMemoryPositionsStore,
+    account: &AccountId,
+    symbol: &Symbol,
+    mark: u64,
+) -> fauxchange::Position {
+    match positions.get(account, symbol, Some(Cents::new(mark))) {
+        Ok(Some(position)) => position,
+        Ok(None) => panic!("expected a folded position for {account:?} / {symbol}"),
+        Err(e) => panic!("positions get failed: {e}"),
+    }
+}
+
+/// Recursively collects every object key in a JSON value.
+fn collect_keys(value: &serde_json::Value, keys: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                keys.insert(key.clone());
+                collect_keys(child, keys);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                collect_keys(child, keys);
+            }
+        }
+        _ => {}
+    }
+}

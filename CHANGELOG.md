@@ -11,6 +11,48 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The flagship determinism harness** (#17) in `tests/determinism.rs`
+  ([017](milestones/v0.1-backend-core/017-determinism-test-harness.md),
+  [02 §5–§6](docs/02-matching-architecture.md),
+  [ADR-0006](docs/adr/0006-venue-command-envelope-and-single-writer-journal.md),
+  [TESTING.md §5](docs/TESTING.md)). The one canonical record/replay harness
+  `fauxchange`'s bounded determinism contract ships against from v0.1: `record`
+  drives a `VenueCommand` stream through a fresh `MatchingExecutor`, journaling
+  every write-ahead `(command, event)` pair and capturing the per-event
+  top-of-book witness (proven to mirror a real `UnderlyingActor` journal
+  record-for-record — `VenueEvent` value equality); `replay` reconstructs the
+  events + witnesses by re-executing
+  every journaled `VenueCommand` in `N` order into a **fresh** registry; and the
+  **oracle** asserts ordered-`VenueEvent`-stream equality per underlying plus the
+  top-of-book cheap witness. `recover` is the recovery-as-re-execution reducer —
+  the same re-execution with the stored `VenueEvent` as the **integrity oracle**:
+  a clean journal re-executes to events equal to the stored ones, a **corrupted
+  stored event** halts with the typed `JournalCorruption { underlying, sequence }`
+  naming the exact `(underlying, N)`, a **tail command with no paired event**
+  re-executes to derive the event, and a **newer-than-binary envelope schema**
+  refuses to start. **Exclusions are asserted AS exclusions**: mark price,
+  unrealised P&L, Greeks, `instrument_sequence`, and the engine `Uuid`
+  trade-id / clock namespace are **structurally absent** from a journaled
+  `VenueEvent` (a `Fill` carries only its nine journaled join keys), two replays
+  with **different live marks** still agree on the event stream while the
+  live-recomputed unrealised P&L differs, and two records under **different venue
+  clocks** capture identical outcomes (only `venue_ts` differs). **Fault injection
+  at both append stages** (a consolidated `FaultJournal` over the real actor): a
+  pre-execution append failure reuses `N` with no gap and replay reconstructs
+  identically; a post-mutation event-append failure seals the underlying, and a
+  restart re-executes the tail command to the identical event (the crossing fill
+  survives the seal). **Lossless capture**: an `IOC` order that fills and returns
+  `Err` from the upstream `_full` leaf is journaled with its fill (never a bare
+  `Rejected`) and replays identically, and a **partial `Replace`** (cancel
+  succeeded, `FOK` add rejected) replays as one identical
+  `Replace { cancelled: true, add: Rejected }`. **Replay-stable expiries**: a
+  canonical `ExpirationDate::DateTime` fixture replays identically, and a
+  `Days`-relative expiry is rejected at load. Consolidates the determinism rows
+  previously scattered across `tests/{order_path,actor,stores,snapshot,
+  market_maker,simulation}.rs` into the one suite the `determinism` CI job (#19)
+  targets; the randomised `journal_replay_reconstructs_book` property stays in
+  `tests/property.rs`. Tests-only — no `src/` change.
+
 - **The `PriceSimulator` over `optionstratlib` walks routed through the
   sequencer** (#16) in `src/simulation/`
   ([016](milestones/v0.1-backend-core/016-price-simulator-walks.md),
