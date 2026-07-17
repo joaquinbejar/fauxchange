@@ -233,6 +233,22 @@ pub enum FixDecodeError {
         /// The actual body length implied by the frame.
         actual: usize,
     },
+    /// A `CheckSum (10)` field carried a value that would overflow
+    /// `ironfix-tagvalue`'s `parse_checksum`, which folds the three checksum
+    /// digits as `d0*100 + d1*10 + d2` into a `u8` — ANY value `> 255` overflows
+    /// it (panicking in a debug build, wrapping in release). Because
+    /// [`ironfix_tagvalue::Decoder::decode`] folds the **first** `CheckSum (10)`
+    /// field it reaches — wherever tag 10 occurs, not only the trailing field — a
+    /// duplicate or mid-body `10=` reaches the fold and crashes, bypassing the
+    /// trailing-only framing precheck. **Validated in `fauxchange`'s own `decode`
+    /// before the codec**, scanning every `CheckSum (10)` occurrence; a
+    /// conformant checksum is `sum % 256` and always `000..=255`, so a value
+    /// `> 255` can never be real.
+    #[error("malformed checksum (tag 10): {reason}")]
+    MalformedChecksum {
+        /// A payload-free category describing why the checksum field was rejected.
+        reason: &'static str,
+    },
     /// A tag appeared more than once outside a repeating group — a session
     /// violation (`SessionRejectReason=13`), rejected rather than silently
     /// first-wins.
@@ -316,6 +332,7 @@ impl FixDecodeError {
             Self::UnsupportedMsgType { .. } => session(R::InvalidMsgType, Some(35)),
             Self::UnsupportedApplicationMsgType { .. } => FixRejectRoute::BusinessMessageReject,
             Self::InvalidBodyLength { .. } => session(R::IncorrectDataFormat, Some(9)),
+            Self::MalformedChecksum { .. } => session(R::IncorrectDataFormat, Some(10)),
             Self::DuplicateTag { tag } => session(R::TagAppearsMoreThanOnce, Some(*tag)),
             Self::TooManyFields { .. } => session(R::Other(99), None),
             Self::TooManyGroupEntries { count_tag, .. } => {
@@ -383,6 +400,20 @@ mod tests {
             FixRejectRoute::SessionReject { reason, ref_tag } => {
                 assert_eq!(reason, SessionRejectReason::ValueIsIncorrect);
                 assert_eq!(ref_tag, Some(54));
+            }
+            other => panic!("expected SessionReject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_malformed_checksum_routes_to_session_reject_on_tag_10() {
+        let err = FixDecodeError::MalformedChecksum {
+            reason: "checksum value exceeds 255",
+        };
+        match err.reject_route() {
+            FixRejectRoute::SessionReject { reason, ref_tag } => {
+                assert_eq!(reason, SessionRejectReason::IncorrectDataFormat);
+                assert_eq!(ref_tag, Some(10));
             }
             other => panic!("expected SessionReject, got {other:?}"),
         }

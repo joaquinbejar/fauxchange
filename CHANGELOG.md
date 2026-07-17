@@ -11,6 +11,55 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The FIX parser fuzz target, adversarial corpus, and no-credential-echo
+  proof — the v0.4 security gate** (#42) — `fuzz/fuzz_targets/fix_decode.rs`
+  (a `cargo-fuzz`/`libfuzzer-sys` harness, its own deliberately separate Cargo
+  workspace so the root `Cargo.lock` and `cargo audit`/`cargo deny` gates never
+  see it) drives arbitrary bytes through the **exact real two-stage decode
+  path** the acceptor runs on every inbound TCP read —
+  `BoundedFrameDecoder::decode` (framing) then
+  `fauxchange::gateway::fix::decode` (tag-value) — never a reimplementation.
+  `fuzz/corpus/fix_decode/` commits 15 hand-crafted adversarial fixtures
+  (oversized frame, truncated/incomplete frame, malformed checksum, tag
+  injection reopening a duplicate `Symbol`, duplicate/missing required tags,
+  an out-of-range `Price`, a malformed `Symbol`, a repeating-group
+  count/delimiter violation, field- and group-entry ceilings, a `BeginString`
+  mismatch, and both unsupported `MsgType` shapes), and the new
+  `tests/fix_adversarial.rs` feeds each one to the real pipeline asserting the
+  **specific** `FixDecodeError`/`FrameError` variant and its `FixRejectRoute`
+  classification — never a blanket `is_err()`, never a panic, never a silent
+  accept — plus a blanket no-panic sweep over the whole corpus directory.
+  `tests/fix_session.rs` gains a companion captured-log test driving a full
+  logon **+ order flow** (resting order, crossing fill, an unknown-order
+  cancel reject, an unsupported-message business reject — every reply type
+  that can carry a `Text (58)`) and asserting no password, Argon2id hash,
+  bootstrap secret, or JWT signing-key fragment appears in either the captured
+  `tracing` output or any outbound `Text (58)`, complementing the existing
+  #38 logon-only test. The CI `fuzz` job (nightly toolchain pinned to that job
+  only, `.github/workflows/ci.yml`) runs a short bounded pass
+  (`-max_total_time=120 -max_len=262144`) over the committed corpus on every
+  push/PR.
+  **A real bug, found and closed in this issue:** a short local fuzzing run
+  surfaced a genuine crash within ~90 seconds — a duplicate/mid-body injected
+  `CheckSum (10)` field (e.g. `10=624`, before the real trailing checksum)
+  reached `ironfix-tagvalue`'s `parse_checksum`, which folds
+  `d0*100 + d1*10 + d2` in unchecked `u8` arithmetic and overflows for any
+  three-digit value `> 255` (panicking in a debug build, silently wrapping to
+  a wrong value in a release build). The existing `BoundedFrameDecoder`
+  framing-layer precheck only inspects the positionally-**trailing** checksum,
+  so it did not close this: `ironfix_tagvalue::Decoder::decode` folds the
+  **first** `CheckSum (10)` it reaches, wherever tag 10 occurs. Closed by a new
+  pre-codec `reject_malformed_checksum` guard in `src/gateway/fix/mod.rs`
+  (scans **every** tag-10 occurrence, not only the trailing one) and a new
+  `FixDecodeError::MalformedChecksum` variant routing to a session
+  `Reject (3)` (`SessionRejectReason=6` IncorrectDataFormat, `RefTagID=10`,
+  `src/gateway/fix/error.rs`), with an exhaustive `000..=999` mid-body sweep
+  test and the actual minimized crashing input committed byte-for-byte as
+  `fuzz/corpus/fix_decode/mid_body_checksum_overflow.fix` (asserted in both
+  the co-located `src/gateway/fix/mod.rs` unit tests and
+  `tests/fix_adversarial.rs`) — the fuzz gate did exactly what it exists to
+  do. The corresponding upstream `ironfix-tagvalue` `parse_checksum`
+  reachability is tracked against the existing IronFix#4-class report.
 - **The FIX arm of the parity/conformance suite** (#41) — extends the REST/WS
   parity fixtures with FIX: **order-entry parity REST ≡ FIX** (one
   identically-seeded fresh venue per surface, comparing `VenueEvent` streams

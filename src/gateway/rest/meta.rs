@@ -131,18 +131,61 @@ pub async fn issue_token(
 
 /// Maps a token-issuance [`AuthError`](crate::auth::AuthError) onto the request
 /// boundary error, **never leaking the bootstrap secret**: a disabled/mismatched
-/// gate is an unauthorized `401`, an unknown account a `404`, and everything
-/// else a redacted internal `500`.
+/// gate is an unauthorized `401`, an unknown OR revoked account a `404` (the two
+/// are deliberately indistinguishable, so the route is no revocation-state
+/// oracle), and everything else a redacted internal `500`.
 fn map_mint_error(error: crate::auth::AuthError) -> VenueError {
     use crate::auth::AuthError;
     match error {
         AuthError::BootstrapDisabled | AuthError::BootstrapMismatch => VenueError::Unauthorized,
-        AuthError::UnknownAccount => VenueError::NotFound("account".to_string()),
+        // A revoked account is refused a fresh token (the #042 P1 mint guard). It
+        // renders the SAME as an unknown account — a client-side `404`, never a
+        // `500` and never an ERROR-level "issuance failed" log — so the route
+        // exposes no way to tell "revoked" from "does not exist".
+        AuthError::UnknownAccount | AuthError::AccountRevoked => {
+            VenueError::NotFound("account".to_string())
+        }
         // Signing / lifetime / key-load failures are internal; the cause stays
         // in `tracing`, never on the wire.
         other => {
             tracing::error!(error = %other, "token issuance failed");
             VenueError::Overflow
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthError;
+
+    #[test]
+    fn test_map_mint_error_revoked_account_is_not_found_not_internal() {
+        // The #042 P1 mint guard makes `mint_for_account` return `AccountRevoked`
+        // for a revoked account. On the REST token route that MUST render as a
+        // client-side `404`, never the `other`-arm internal `500` — a revoked
+        // account is an expected refusal, not a server failure — and it is the SAME
+        // rendering as an unknown account, so the route is no revocation oracle.
+        assert!(matches!(
+            map_mint_error(AuthError::AccountRevoked),
+            VenueError::NotFound(_)
+        ));
+        assert!(matches!(
+            map_mint_error(AuthError::UnknownAccount),
+            VenueError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn test_map_mint_error_gate_failures_stay_unauthorized() {
+        // Regression guard: the new revoked arm does not disturb the gate mapping.
+        assert!(matches!(
+            map_mint_error(AuthError::BootstrapDisabled),
+            VenueError::Unauthorized
+        ));
+        assert!(matches!(
+            map_mint_error(AuthError::BootstrapMismatch),
+            VenueError::Unauthorized
+        ));
     }
 }

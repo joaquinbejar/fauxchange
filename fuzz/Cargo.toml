@@ -1,0 +1,55 @@
+# The `cargo-fuzz` / libfuzzer harness crate for `fauxchange` (#042, the v0.4
+# security gate — docs/08-threat-model.md §6, docs/TESTING.md §11/§14).
+#
+# This is a DELIBERATELY separate Cargo workspace (no `[workspace]` table is
+# needed here — `cargo-fuzz init`'s own template already omits one, and a
+# nested crate with no `workspace.workspace` key and no ancestor `[workspace]`
+# table forms its own standalone workspace rather than joining the parent's;
+# verified locally via `cargo metadata` against this exact layout). The root
+# `fauxchange` crate has no `[workspace]` table either (CLAUDE.md: "single
+# crate with one binary, not a workspace"), so `fuzz/` never becomes a member
+# of it and vice versa: `fuzz/` has its own `Cargo.lock`, and root-level
+# `cargo fmt --all --check` / `cargo clippy --all-targets --all-features` /
+# `cargo test` / `cargo build --release` / `cargo audit` / `cargo deny check`
+# (run from the repo root against the root manifest) never resolve or touch
+# this crate or its dependencies. The CI `fuzz` job builds/runs this crate
+# explicitly, with its own nightly toolchain pin
+# (.github/workflows/ci.yml `fuzz` job) — the crate MSRV / root
+# `rust-toolchain.toml` are untouched by that pin.
+#
+# Dependency audit note (rules/global_rules.md "adding a dependency"):
+# `libfuzzer-sys` 0.4 (MIT/Apache-2.0, maintained by the rust-fuzz project) is
+# the standard `cargo-fuzz` libFuzzer harness macro; it is the ONLY new
+# dependency here (no `arbitrary` — the FIX tag-value decode path already takes
+# raw `&[u8]`, so no structured-input derive is needed). `fauxchange` itself is
+# pulled in via a `path` dependency (this crate always builds against the exact
+# working-tree source, never a published version). Neither dependency reaches
+# the shipped `fauxchange` binary or crate — this whole crate is fuzz-only
+# tooling, excluded from `[package] include` and from `cargo package`/`cargo
+# publish` by living outside the parent crate's manifest entirely.
+[package]
+name = "fauxchange-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# The `#[no_main]` libFuzzer entrypoint macro (`fuzz_target!`).
+libfuzzer-sys = "0.4"
+# `BytesMut` — the exact buffer type `BoundedFrameDecoder` (the acceptor's own
+# framing layer, src/gateway/fix/acceptor.rs) reads from, so the harness feeds
+# it the identical buffer shape the real TCP read loop uses.
+bytes = "1"
+
+[dependencies.fauxchange]
+path = ".."
+
+[[bin]]
+name = "fix_decode"
+path = "fuzz_targets/fix_decode.rs"
+test = false
+doc = false
+bench = false

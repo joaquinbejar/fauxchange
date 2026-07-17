@@ -1226,8 +1226,9 @@ impl AppState {
     ///
     /// The registry-resolved mint errors: [`AuthError::BootstrapDisabled`] /
     /// [`AuthError::BootstrapMismatch`] (gate, checked before any account lookup),
-    /// [`AuthError::UnknownAccount`], [`AuthError::TokenLifetime`], or
-    /// [`AuthError::Signing`].
+    /// [`AuthError::UnknownAccount`], [`AuthError::AccountRevoked`] (a revoked
+    /// account is permanently refused a fresh token, mirroring the FIX-logon rule),
+    /// [`AuthError::TokenLifetime`], or [`AuthError::Signing`].
     pub fn mint_token(
         &self,
         account: &AccountId,
