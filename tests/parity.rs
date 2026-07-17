@@ -34,6 +34,7 @@ mod conformance;
 use axum::http::StatusCode;
 use serde_json::Value;
 
+use conformance::fix as cfix;
 use conformance::{
     AMPLE_RATE_LIMIT, CALL, CONTRACT, NORMALIZED_PLACEHOLDER, NORMALIZED_TS, STRIPPED_KEYS, Step,
     TRANSPORT_TS_KEY, add_order, assert_streams_parity, build_request, drain, drive_rest_orders,
@@ -1514,6 +1515,785 @@ async fn test_observation_parity_replayed_fill_matches_recorded_execution() {
         assert_eq!(
             replayed, live,
             "the replayed fill renders identically to the recorded one on the observation surface"
+        );
+    }
+}
+
+// ============================================================================
+// 8. Order-entry parity (REST ≡ FIX) — #041, the milestone's core acceptance
+// ============================================================================
+//
+// The per-surface topology (03 §7): one identically-seeded fresh venue per
+// surface (`cfix::rest_parity_venue` and `cfix::FixParityHarness`, both seeded
+// from `cfix::parity_accounts` — same account ids, same owner hashes, same default
+// lineage, same fixed clock), the SAME logical order submitted over each, then the
+// journaled `VenueEvent` streams compared under the SAME normalization rule
+// (`assert_streams_parity`) — protocol-only fields (FIX `MsgSeqNum`, transport
+// `venue_ts`, the per-surface `order_id`/`new_order_id`, and the FIX `ClOrdID`
+// echo, which normalizes as `client_order_id`) stripped; the venue identifiers
+// (`underlying_sequence`, `execution_id`, fills incl. per-leg `fee`, resting-book
+// state) compared verbatim.
+
+/// Runs a `Step` scenario over an identically-seeded REST venue and an
+/// identically-seeded FIX venue, returning `(rest_events, fix_events)` — the two
+/// surfaces' journaled `VenueEvent` streams for the same logical orders.
+async fn run_rest_fix_pair(steps: &[Step]) -> (Vec<VenueEvent>, Vec<VenueEvent>) {
+    let rest = cfix::rest_parity_venue();
+    drive_rest_orders(&rest, steps).await;
+    let rest_events = journaled_events(&rest, "BTC").await;
+
+    let harness = cfix::FixParityHarness::start().await;
+    let fix_events = cfix::drive_fix_orders(&harness, steps).await;
+
+    (rest_events, fix_events)
+}
+
+#[tokio::test]
+async fn test_order_entry_parity_place_rest_and_fix_normalize_equal() {
+    // A single resting place over one REST and one FIX venue: the normalized
+    // VenueEvent streams are equal, and the compared-verbatim `underlying_sequence`
+    // is already identical raw.
+    let steps = [Step::Place {
+        account: "trader-1",
+        side: "sell",
+        price: 50_000,
+        qty: 5,
+        tif: None,
+    }];
+    let (rest, fix) = run_rest_fix_pair(&steps).await;
+
+    assert_eq!(rest.len(), 1, "one REST place is one committed event");
+    assert_eq!(fix.len(), 1, "one FIX place is one committed event");
+    assert_streams_parity("rest", &rest, "fix", &fix);
+    assert_eq!(
+        rest[0].underlying_sequence, fix[0].underlying_sequence,
+        "underlying_sequence is compared verbatim and identical raw"
+    );
+}
+
+#[tokio::test]
+async fn test_order_entry_parity_partial_fill_and_per_leg_fees_normalize_equal() {
+    // Maker trader-1 rests 5; taker trader-2 crosses 2 → a partial fill (remainder 3
+    // rests). The crossing event carries two linked fill legs sharing `execution_id`,
+    // each with its own per-leg `fee`. Both surfaces normalize equal, so the fills —
+    // including the signed per-leg fees — agree verbatim across REST and FIX.
+    let steps = [
+        Step::Place {
+            account: "trader-1",
+            side: "sell",
+            price: 50_000,
+            qty: 5,
+            tif: None,
+        },
+        Step::Place {
+            account: "trader-2",
+            side: "buy",
+            price: 50_000,
+            qty: 2,
+            tif: None,
+        },
+    ];
+    let (rest, fix) = run_rest_fix_pair(&steps).await;
+
+    assert_eq!(rest.len(), 2, "place + crossing = two events");
+    assert_eq!(fix.len(), 2);
+    // The crossing carries the two linked legs (non-vacuous per-leg-fee coverage).
+    let fix_fills = match &fix[1].outcome {
+        VenueOutcome::Added { fills, .. } if !fills.is_empty() => fills,
+        other => panic!("the FIX crossing must carry fills, got {other:?}"),
+    };
+    assert_eq!(fix_fills.len(), 2, "one match, two linked legs");
+
+    assert_streams_parity("rest", &rest, "fix", &fix);
+    // The fills — including the signed per-leg `fee` — are in the compared-verbatim
+    // set, so streams-parity already proves REST and FIX render the identical fee for
+    // each leg (whatever the venue fee schedule; the default venue's is 0). Assert the
+    // per-leg fees agree across surfaces directly for clarity.
+    let rest_fills = match &rest[1].outcome {
+        VenueOutcome::Added { fills, .. } => fills,
+        other => panic!("the REST crossing must carry fills, got {other:?}"),
+    };
+    let rest_fees: Vec<_> = rest_fills.iter().map(|f| f.fee).collect();
+    let fix_fees: Vec<_> = fix_fills.iter().map(|f| f.fee).collect();
+    assert_eq!(
+        rest_fees, fix_fees,
+        "the per-leg fees agree verbatim across REST and FIX"
+    );
+    // The compared-verbatim join keys already agree raw across the two surfaces.
+    for (r, f) in rest.iter().zip(fix.iter()) {
+        assert_eq!(r.underlying_sequence, f.underlying_sequence);
+    }
+}
+
+#[tokio::test]
+async fn test_order_entry_parity_cancel_replace_idiom_normalizes_equal() {
+    // Cancel-replace as the documented cross-surface idiom — place → cancel →
+    // re-place — driven identically over REST (`POST`/`DELETE`) and FIX (`D`/`F`/`D`).
+    // Both journal [AddOrder, CancelOrder, AddOrder] and normalize equal. (A FIX `G`
+    // maps to a single `Replace` command REST cannot express, so the stream-parity
+    // comparison uses the cancel-then-replace idiom both surfaces share; `G`'s report
+    // shape is covered by the conformance script.)
+    let steps = [
+        Step::Place {
+            account: "trader-1",
+            side: "sell",
+            price: 50_000,
+            qty: 4,
+            tif: None,
+        },
+        Step::Cancel {
+            account: "trader-1",
+            target: 0,
+        },
+        Step::Place {
+            account: "trader-1",
+            side: "sell",
+            price: 50_500,
+            qty: 4,
+            tif: None,
+        },
+    ];
+    let (rest, fix) = run_rest_fix_pair(&steps).await;
+
+    assert_eq!(rest.len(), 3, "place + cancel + re-place = 3 events");
+    assert_eq!(fix.len(), 3);
+    assert!(
+        matches!(fix[1].command, VenueCommand::CancelOrder { .. }),
+        "the middle FIX command is a CancelOrder"
+    );
+    assert_streams_parity("rest", &rest, "fix", &fix);
+}
+
+#[tokio::test]
+async fn test_order_entry_parity_rejected_order_journals_nothing_on_both() {
+    // A Read-permission account's order is rejected on BOTH surfaces with the
+    // surface-appropriate rendering — REST `403 forbidden`, FIX `ExecutionReport (8)`
+    // `Rejected` (OrdRejReason authorization) — and NEITHER journals a command
+    // (identical authorization, §7 item 4). The empty journaled streams normalize
+    // equal: rejection parity.
+    let rest = cfix::rest_parity_venue();
+    let reader = token(&rest, "reader-1");
+    let (rest_status, rest_body) = send(
+        &rest,
+        build_request(
+            "POST",
+            &format!("{CONTRACT}/orders"),
+            Some(&reader),
+            Some(serde_json::json!({ "side": "buy", "price": 50_000, "quantity": 1 })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        rest_status,
+        StatusCode::FORBIDDEN,
+        "REST refuses a Read order"
+    );
+    assert_eq!(rest_body["code"], "forbidden");
+    let rest_events = journaled_events(&rest, "BTC").await;
+    assert!(
+        rest_events.is_empty(),
+        "a REST-rejected order journals no command"
+    );
+
+    let harness = cfix::FixParityHarness::start().await;
+    let mut reader_fix = cfix::FixClient::logon(harness.addr(), cfix::READER).await;
+    let reply = reader_fix.place_limit("rej-1", "1", 50_000, 1, "1").await;
+    let rejected = match cfix::find_msg(&reply, "8") {
+        Some(frame) => frame,
+        None => panic!("a Read FIX order must be an ExecutionReport(8) Rejected, got {reply:?}"),
+    };
+    assert_eq!(
+        cfix::field(rejected, "150").as_deref(),
+        Some("8"),
+        "ExecType Rejected"
+    );
+    assert_eq!(
+        cfix::field(rejected, "39").as_deref(),
+        Some("8"),
+        "OrdStatus Rejected"
+    );
+    assert!(
+        !cfix::any_msg_type(&reply, "3"),
+        "an application-order rejection is never a session Reject(3)"
+    );
+    let fix_events = journaled_events(harness.state(), "BTC").await;
+    assert!(
+        fix_events.is_empty(),
+        "a FIX-rejected order journals no command"
+    );
+
+    assert_streams_parity("rest", &rest_events, "fix", &fix_events);
+}
+
+#[tokio::test]
+async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
+    // The shared idempotency key `(account, client_order_id)` / `(account, ClOrdID)`:
+    // a byte-identical retry after an ambiguous ack returns the STORED TERMINAL RESULT
+    // and opens NO second order, on BOTH surfaces. The two surfaces dedup at DIFFERENT
+    // layers, which is a journaling-granularity difference, NOT an economic divergence:
+    //   * FIX dedups at the gateway (the session `ClOrdID → order_id` correlation), so
+    //     no second command reaches the sequencer — ONE journaled event.
+    //   * REST dedups inside the executor (`add_with_idempotency`) AFTER the write-ahead
+    //     journal, so the retry is journaled as a no-op replay — TWO events, the second
+    //     replaying the first's stored terminal with an untouched book.
+    // The ECONOMIC parity that matters holds on both: exactly one order is opened, and
+    // the retry returns the stored terminal result. (The sequence-namespace nuance —
+    // REST's retry consumes an `underlying_sequence`, FIX's does not — is reported to
+    // the lead for the architect to rule on the parity contract's scope.)
+    let rest = cfix::rest_parity_venue();
+    let trader = token(&rest, "trader-1");
+    let body = serde_json::json!({
+        "side": "sell", "price": 50_000, "quantity": 3, "client_order_id": "idem-key-1"
+    });
+    for attempt in 0..2 {
+        let (status, _) = send(
+            &rest,
+            build_request(
+                "POST",
+                &format!("{CONTRACT}/orders"),
+                Some(&trader),
+                Some(body.clone()),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "REST submit #{attempt} is accepted (the retry returns the stored result)"
+        );
+    }
+    let rest_events = journaled_events(&rest, "BTC").await;
+
+    let harness = cfix::FixParityHarness::start().await;
+    let mut trader_fix = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    // Same ClOrdID, new MsgSeqNum both times — the standard retry after a dropped ack.
+    let _ = trader_fix
+        .place_limit("idem-key-1", "2", 50_000, 3, "1")
+        .await;
+    let _ = trader_fix
+        .place_limit("idem-key-1", "2", 50_000, 3, "1")
+        .await;
+    let fix_events = journaled_events(harness.state(), "BTC").await;
+
+    // REST journals the retry as a post-journal no-op replay (executor dedup): two
+    // events, the second replaying the first's stored terminal with an untouched book.
+    assert_eq!(
+        rest_events.len(),
+        2,
+        "REST journals original + deduped-replay retry"
+    );
+    assert_eq!(
+        rest_events[1].outcome, rest_events[0].outcome,
+        "the REST retry replays the stored terminal result (no second order)"
+    );
+    // FIX dedups before the sequencer (gateway ClOrdID correlation): one journaled
+    // event, the resend never reaching the actor.
+    assert_eq!(
+        fix_events.len(),
+        1,
+        "FIX dedups the retry before the sequencer"
+    );
+    // The economic parity that matters: the ONE order opened is IDENTICAL across
+    // surfaces, and neither retry opened a second order — the shared idempotency key
+    // returns the stored terminal result on both.
+    assert_eq!(
+        rest_events[0].outcome, fix_events[0].outcome,
+        "the one opened order is identical across REST and FIX (idempotency parity)"
+    );
+}
+
+/// An `AddOrder` whose STP-configured book cancels one resting leg — the STP-outcome
+/// shape, parameterised by the aggressor / resting order ids so two per-surface
+/// events can be built that differ only in the stripped ids.
+fn stp_event(aggressor: &str, resting: &str) -> VenueEvent {
+    VenueEvent::new(
+        SequenceNumber::new(9),
+        EventTimestamp::new(1_700_000_000_000),
+        VenueCommand::AddOrder {
+            symbol: sym(),
+            order_id: VenueOrderId::new(aggressor),
+            account: AccountId::new("trader-1"),
+            owner: Hash32([0x22; 32]),
+            client_order_id: None,
+            side: SeamSide::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(50_000)),
+            quantity: 2,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::CancelMaker,
+        },
+        VenueOutcome::Added {
+            fills: vec![],
+            resting_quantity: 0,
+            stp_cancelled: vec![CancelledLeg {
+                order_id: VenueOrderId::new(resting),
+                owner: Hash32([0x22; 32]),
+                reason: CancelReason::SelfTradePrevention,
+            }],
+        },
+    )
+}
+
+#[test]
+fn test_order_entry_parity_stp_cancelled_outcome_normalizes_equal_across_surfaces() {
+    // A LIVE STP rejection is not wire-expressible at v0.1: neither the REST place
+    // DTO nor the FIX `NewOrderSingle (D)` carries an STP mode — per-account STP is
+    // venue config, and the ONE shared `add_order_command` builder stamps
+    // `stp_mode: None` for both surfaces (src/gateway/rest/support.rs). So an STP-mode
+    // order is *identically inexpressible*. What #041 asserts is that the STP-cancelled
+    // OUTCOME normalizes IDENTICALLY across surfaces: the cancelled leg's `order_id` is
+    // a stripped protocol placeholder while its `owner` + `reason` are compared
+    // verbatim, so two per-surface events that differ only in the stripped ids
+    // normalize equal.
+    let rest_like = stp_event("rest-aggressor", "rest-resting");
+    let fix_like = stp_event("fix-aggressor", "fix-resting");
+    assert_eq!(
+        normalize_event(&rest_like),
+        normalize_event(&fix_like),
+        "the STP-cancelled outcome normalizes identically across surfaces"
+    );
+    assert_ne!(
+        serde_json::to_value(&rest_like).ok(),
+        serde_json::to_value(&fix_like).ok(),
+        "raw, the two events differ in the stripped ids (the difference was real)"
+    );
+}
+
+#[test]
+fn test_ws_is_excluded_from_order_entry_parity() {
+    // Order-entry parity is REST ≡ FIX only. WS has NO order-entry client message, so
+    // every order-entry-shaped WS frame is rejected (non-terminal — the socket stays
+    // open). WS remains an OBSERVATION surface (its `fill` renders the same committed
+    // event, asserted in section 9), so its exclusion here is scope, not a gap.
+    for frame in [
+        r#"{"action":"place_order","side":"buy","price":50000,"quantity":1}"#,
+        r#"{"action":"cancel_order","order_id":"x"}"#,
+        r#"{"action":"replace_order","order_id":"x","price":50100,"quantity":2}"#,
+        r#"{"side":"buy","price":50000,"quantity":10}"#,
+    ] {
+        match parse_frame(frame) {
+            FrameOutcome::Reject(error) => assert!(
+                !error.terminal,
+                "an order-entry WS frame is a non-terminal reject: {frame}"
+            ),
+            other => panic!("WS order-entry frame {frame} must be rejected, got {other:?}"),
+        }
+    }
+}
+
+// ============================================================================
+// 9. Observation parity (REST/WS/FIX) — one committed fill, three projections
+// ============================================================================
+
+/// Collects reply frames from `client` until a `Trade` `ExecutionReport (8)` is
+/// seen or a bounded number of drains elapse (the New + Trade reports may arrive in
+/// separate reads).
+async fn collect_until_trade(
+    client: &mut cfix::FixClient,
+    mut frames: Vec<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    for _ in 0..5 {
+        if frames
+            .iter()
+            .any(|f| cfix::fix_report_projection(f).is_some())
+        {
+            break;
+        }
+        frames.extend(client.drain().await);
+    }
+    frames
+}
+
+#[tokio::test]
+async fn test_one_committed_fill_renders_identically_on_rest_ws_and_fix() {
+    // ONE committed fill; assert its REST `ExecutionRecord`, WS `fill`, and FIX
+    // `ExecutionReport (8)` agree on the join keys. All three are projections of the
+    // SAME committed event, driven over the live FIX order path and observed on all
+    // three surfaces of the one serving venue.
+    let harness = cfix::FixParityHarness::start().await;
+    let state = harness.state();
+    let mut rx = state.subscriptions().subscribe();
+
+    // Maker trader-1 rests a sell; taker trader-2 fully crosses it.
+    let mut maker = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let _ = maker.place_limit("obs-maker", "2", 50_000, 5, "1").await;
+    let mut taker = cfix::FixClient::logon(harness.addr(), cfix::TRADER2).await;
+    let taker_reports = taker.place_limit("obs-taker", "1", 50_000, 5, "1").await;
+    let taker_reports = collect_until_trade(&mut taker, taker_reports).await;
+
+    // The FIX projection: the taker's Trade ExecutionReport(8).
+    let fix_keys = match taker_reports
+        .iter()
+        .find_map(|f| cfix::fix_report_projection(f))
+    {
+        Some(keys) => keys,
+        None => panic!("the crossing must emit a taker FIX Trade report: {taker_reports:?}"),
+    };
+
+    // The WS projection: the anonymised taker fill print.
+    let messages = drain(&mut rx);
+    let taker_fill = match find_taker_fill(&messages) {
+        Some(fill) => fill,
+        None => panic!("the crossing must emit a taker WS fill"),
+    };
+    let ws_keys = match ws_fill_join_keys(&taker_fill) {
+        Some(keys) => keys,
+        None => panic!("the taker fill must yield join keys"),
+    };
+
+    // The REST projection: the account-scoped ExecutionRecord for the taker leg.
+    let taker_token = token(state, "trader-2");
+    let uri = format!("/api/v1/executions/{}", ws_keys.execution_id);
+    let (status, record) = send(state, build_request("GET", &uri, Some(&taker_token), None)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the taker ExecutionRecord must be readable: {record}"
+    );
+    let rest_keys = match execution_record_join_keys(&record) {
+        Some(keys) => keys,
+        None => panic!("the ExecutionRecord must yield join keys: {record}"),
+    };
+
+    // REST ≡ WS on ALL join keys (including `venue_ts`).
+    assert_eq!(
+        ws_keys, rest_keys,
+        "one fill renders identically on REST and WS (all join keys)"
+    );
+    // FIX carries `execution_id`, `liquidity`, `underlying_sequence`, `side`,
+    // `quantity`, `price` — every join key EXCEPT `venue_ts` (the FIX dialect has no
+    // venue-timestamp tag, so that key is REST≡WS only).
+    assert_eq!(
+        fix_keys.execution_id, ws_keys.execution_id,
+        "FIX ExecID(17) == the shared execution_id"
+    );
+    assert_eq!(
+        fix_keys.liquidity, ws_keys.liquidity,
+        "FIX LastLiquidityInd(851) == liquidity"
+    );
+    assert_eq!(
+        fix_keys.underlying_sequence, ws_keys.underlying_sequence,
+        "FIX SecondaryExecID(527) == underlying_sequence"
+    );
+    assert_eq!(fix_keys.side, ws_keys.side, "FIX Side(54) == side");
+    assert_eq!(
+        fix_keys.quantity, ws_keys.quantity,
+        "FIX LastQty(32) == quantity"
+    );
+    assert_eq!(
+        fix_keys.price, ws_keys.price,
+        "FIX LastPx(31) == price cents"
+    );
+
+    // Sanity: the values we drove.
+    assert_eq!(rest_keys.underlying_sequence, 1);
+    assert_eq!(rest_keys.price, 50_000);
+    assert_eq!(rest_keys.quantity, 5);
+    assert_eq!(rest_keys.side, "buy");
+    assert_eq!(rest_keys.liquidity, "taker");
+}
+
+// ============================================================================
+// 10. FIX conformance script (#041) — session admin + order + MD happy path
+//     AND every context-sensitive reject row of 03 §8, with reason tags +
+//     Text(58) redaction.
+// ============================================================================
+
+/// Collects reply frames from `client` until an `ExecutionReport (8)` with the given
+/// `ExecType (150)` is seen or a bounded number of drains elapse.
+async fn collect_reports(
+    client: &mut cfix::FixClient,
+    mut frames: Vec<Vec<u8>>,
+    exec_type: &str,
+) -> Vec<Vec<u8>> {
+    for _ in 0..5 {
+        if frames.iter().any(|f| {
+            cfix::msg_type(f).as_deref() == Some("8")
+                && cfix::field(f, "150").as_deref() == Some(exec_type)
+        }) {
+            break;
+        }
+        frames.extend(client.drain().await);
+    }
+    frames
+}
+
+#[tokio::test]
+async fn test_fix_conformance_script_session_admin_order_and_market_data_happy_path() {
+    // The coherent happy-path script on one serving venue: session admin (A / 0 / 1 /
+    // 2 / 5) + order entry (D / G / F → 8) + market data (V → W). Each concurrent
+    // session is a DISTINCT account, so no session hosts two connections and the
+    // per-(account, comp_id) sequence store is never contended.
+    let harness = cfix::FixParityHarness::start().await;
+    let addr = harness.addr();
+
+    // Session admin (A): a raw logon so the ack fields are asserted (credential-free).
+    let logon =
+        cfix::attempt_logon(addr, cfix::ADMIN.sender, cfix::ADMIN.user, cfix::ADMIN.pw).await;
+    let ack = match cfix::find_msg(&logon, "A") {
+        Some(ack) => ack,
+        None => panic!("Logon(A) must be acked, got {logon:?}"),
+    };
+    assert_eq!(
+        cfix::field(ack, "108").as_deref(),
+        Some("30"),
+        "HeartBtInt echoed"
+    );
+    assert!(
+        cfix::field(ack, "553").is_none() && cfix::field(ack, "554").is_none(),
+        "the Logon(A) ack carries NO credential"
+    );
+
+    // TRADER1 session: TestRequest(1) → Heartbeat(0), then D → 8 New, G → 8 Replaced,
+    // F → 8 Canceled — the order-entry happy path.
+    let mut trader = cfix::FixClient::logon(addr, cfix::TRADER1).await;
+
+    let hb = trader.test_request("PING-CONF").await;
+    let hb0 = match cfix::find_msg(&hb, "0") {
+        Some(hb0) => hb0,
+        None => panic!("TestRequest(1) must yield a Heartbeat(0), got {hb:?}"),
+    };
+    assert_eq!(
+        cfix::field(hb0, "112").as_deref(),
+        Some("PING-CONF"),
+        "the Heartbeat(0) echoes the TestReqID"
+    );
+
+    let d = trader.place_limit("conf-rest", "2", 50_000, 5, "1").await;
+    let new = match cfix::find_msg(&d, "8") {
+        Some(new) => new,
+        None => panic!("D must yield an ExecutionReport(8), got {d:?}"),
+    };
+    assert_eq!(
+        cfix::field(new, "150").as_deref(),
+        Some("0"),
+        "ExecType New"
+    );
+    assert_eq!(
+        cfix::field(new, "39").as_deref(),
+        Some("0"),
+        "OrdStatus New"
+    );
+
+    let g = trader
+        .replace("conf-rest", "conf-repl", "2", 50_500, 5)
+        .await;
+    let g = collect_reports(&mut trader, g, "5").await;
+    let replaced = match g.iter().find(|f| {
+        cfix::msg_type(f).as_deref() == Some("8") && cfix::field(f, "150").as_deref() == Some("5")
+    }) {
+        Some(replaced) => replaced,
+        None => panic!("G must yield an ExecutionReport(8) Replaced, got {g:?}"),
+    };
+    assert_eq!(
+        cfix::field(replaced, "39").as_deref(),
+        Some("5"),
+        "OrdStatus Replaced"
+    );
+
+    let f = trader.cancel("conf-repl", "conf-cxl", "2").await;
+    let canceled = match cfix::find_msg(&f, "8") {
+        Some(canceled) => canceled,
+        None => panic!("F must yield an ExecutionReport(8), got {f:?}"),
+    };
+    assert_eq!(
+        cfix::field(canceled, "150").as_deref(),
+        Some("4"),
+        "ExecType Canceled"
+    );
+
+    // READER session: market data V (Bid+Offer) → W (the empty-book baseline still
+    // carries RptSeq(83)).
+    let mut reader = cfix::FixClient::logon(addr, cfix::READER).await;
+    let v = reader.market_data("MDR-CONF", &["0", "1"]).await;
+    let w = match cfix::find_msg(&v, "W") {
+        Some(w) => w,
+        None => panic!("V(Bid+Offer) must yield a W snapshot, got {v:?}"),
+    };
+    assert_eq!(
+        cfix::field(w, "262").as_deref(),
+        Some("MDR-CONF"),
+        "W echoes MDReqID"
+    );
+    assert!(cfix::field(w, "83").is_some(), "W carries RptSeq(83)");
+
+    // Session admin (2): a deliberate inbound MsgSeqNum gap → ResendRequest(2), on a
+    // dedicated TRADER2 session (so the gap never disturbs the order session).
+    let mut gapper = cfix::FixClient::logon(addr, cfix::TRADER2).await;
+    let gap_reply = gapper.send_out_of_order().await;
+    assert!(
+        cfix::any_msg_type(&gap_reply, "2"),
+        "an inbound MsgSeqNum gap yields a ResendRequest(2), got {gap_reply:?}"
+    );
+
+    // Session admin (5): a clean client Logout is acked with a Logout(5).
+    let logout_reply = trader.logout().await;
+    assert!(
+        cfix::any_msg_type(&logout_reply, "5"),
+        "a client Logout(5) is acked with a Logout(5), got {logout_reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_fix_conformance_script_reject_3_malformed_frame() {
+    // (Reject 3) A malformed application frame (a `NewOrderSingle (D)` missing the
+    // required `Side (54)`) is a SESSION-level Reject(3) with SessionRejectReason(373)
+    // and RefTagID(371) pointing at the missing tag — never an order-level 8/9. On a
+    // fresh venue so the session-level reject never entangles another row's sequence.
+    let harness = cfix::FixParityHarness::start().await;
+    let mut client = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let reply = client.order_missing_side("conf-bad").await;
+    let r3 = match cfix::find_msg(&reply, "3") {
+        Some(r3) => r3,
+        None => panic!("a D missing Side(54) must be a session Reject(3), got {reply:?}"),
+    };
+    assert!(
+        cfix::field(r3, "373").is_some(),
+        "Reject(3) carries a SessionRejectReason(373)"
+    );
+    assert_eq!(
+        cfix::field(r3, "371").as_deref(),
+        Some("54"),
+        "RefTagID(371) points at the missing Side(54)"
+    );
+}
+
+#[tokio::test]
+async fn test_fix_conformance_script_reject_8_conflicting_clordid_reuse() {
+    // (8 Rejected) A conflicting `ClOrdID` reuse (same key, different economics) is an
+    // ExecutionReport(8) Rejected with OrdRejReason(103)=6 (Duplicate Order) — the
+    // order-level idempotency-conflict reject, never a session Reject(3).
+    let harness = cfix::FixParityHarness::start().await;
+    let mut client = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let _ = client.place_limit("conf-reuse", "2", 40_000, 3, "1").await;
+    let conflict = client.place_limit("conf-reuse", "2", 40_000, 7, "1").await;
+    assert!(
+        !cfix::any_msg_type(&conflict, "3"),
+        "an idempotency conflict is never a session Reject(3)"
+    );
+    let rejected = match conflict.iter().find(|f| {
+        cfix::msg_type(f).as_deref() == Some("8") && cfix::field(f, "150").as_deref() == Some("8")
+    }) {
+        Some(rejected) => rejected,
+        None => panic!("a conflicting ClOrdID reuse must be an 8 Rejected, got {conflict:?}"),
+    };
+    assert_eq!(
+        cfix::field(rejected, "103").as_deref(),
+        Some("6"),
+        "OrdRejReason Duplicate Order"
+    );
+}
+
+#[tokio::test]
+async fn test_fix_conformance_script_reject_9_cancel_unknown_order() {
+    // (9) A cancel of an order the session never placed is an OrderCancelReject(9) with
+    // CxlRejReason(102)=1 (Unknown order), CxlRejResponseTo(434)=1, OrigClOrdID echoed.
+    let harness = cfix::FixParityHarness::start().await;
+    let mut client = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let reply = client.cancel("never-placed", "conf-cxl-unknown", "1").await;
+    assert!(
+        !cfix::any_msg_type(&reply, "3"),
+        "a cancel failure is never a session Reject(3)"
+    );
+    let r9 = match cfix::find_msg(&reply, "9") {
+        Some(r9) => r9,
+        None => {
+            panic!("a cancel of an unknown order must be an OrderCancelReject(9), got {reply:?}")
+        }
+    };
+    assert_eq!(
+        cfix::field(r9, "102").as_deref(),
+        Some("1"),
+        "CxlRejReason Unknown order"
+    );
+    assert_eq!(
+        cfix::field(r9, "434").as_deref(),
+        Some("1"),
+        "CxlRejResponseTo Order Cancel Request"
+    );
+    assert_eq!(
+        cfix::field(r9, "41").as_deref(),
+        Some("never-placed"),
+        "the OrigClOrdID is echoed"
+    );
+}
+
+#[tokio::test]
+async fn test_fix_conformance_script_reject_y_unsupported_market_data() {
+    // (Y) A trade-only `V` (no book side) is a MarketDataRequestReject(Y) with
+    // MDReqRejReason(281)=8 (Unsupported MDEntryType), never a bare session Reject(3),
+    // and its Text(58) leaks no internal state.
+    let harness = cfix::FixParityHarness::start().await;
+    let mut client = cfix::FixClient::logon(harness.addr(), cfix::READER).await;
+    let reply = client.market_data("MDR-TRADE", &["2"]).await;
+    assert!(
+        !cfix::any_msg_type(&reply, "3"),
+        "a MD reject is never a bare Reject(3)"
+    );
+    let y = match cfix::find_msg(&reply, "Y") {
+        Some(y) => y,
+        None => panic!("a trade-only V must be a MarketDataRequestReject(Y), got {reply:?}"),
+    };
+    assert_eq!(
+        cfix::field(y, "281").as_deref(),
+        Some("8"),
+        "MDReqRejReason Unsupported MDEntryType"
+    );
+    if let Some(text) = cfix::field(y, "58") {
+        // A safe, human-readable reason — never a panic string, an internal source
+        // path, or an unbounded dump of internal state.
+        assert!(
+            !text.contains("panic") && !text.contains("src/") && text.len() < 200,
+            "the Text(58) must be a safe, redacted reason, got {text:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_fix_conformance_script_reject_j_unsupported_application_message() {
+    // (j) A well-formed application MsgType the venue has no handler for (R,
+    // QuoteRequest) is a BusinessMessageReject(j) with BusinessRejectReason(380)=3 and
+    // RefMsgType(372)=R, never a bare session Reject(3).
+    let harness = cfix::FixParityHarness::start().await;
+    let mut client = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let reply = client.unsupported().await;
+    let j = match cfix::find_msg(&reply, "j") {
+        Some(j) => j,
+        None => {
+            panic!("an unsupported app MsgType must be a BusinessMessageReject(j), got {reply:?}")
+        }
+    };
+    assert_eq!(
+        cfix::field(j, "380").as_deref(),
+        Some("3"),
+        "BusinessRejectReason"
+    );
+    assert_eq!(
+        cfix::field(j, "372").as_deref(),
+        Some("R"),
+        "RefMsgType echoed"
+    );
+}
+
+#[tokio::test]
+async fn test_fix_conformance_script_logout_5_on_credential_failure_redacts_text() {
+    // (Logout 5) A logon-credential failure is refused with a Logout(5); the presented
+    // credential NEVER appears anywhere in the reply — Text(58) and every field are
+    // redacted. A ghost identity (unknown username / unbound CompID) so the row is
+    // fully isolated.
+    const BAD_USER: &str = "ghost-nonexistent-user";
+    const BAD_PW: &str = "totally-wrong-secret-DoNotLog";
+    let harness = cfix::FixParityHarness::start().await;
+    let reply = cfix::attempt_logon(harness.addr(), "GHOSTCLIENT", BAD_USER, BAD_PW).await;
+    assert!(
+        cfix::any_msg_type(&reply, "5"),
+        "a bad-credential logon is refused with a Logout(5), got {reply:?}"
+    );
+    for frame in &reply {
+        let text = String::from_utf8_lossy(frame);
+        assert!(
+            !text.contains(BAD_PW),
+            "the presented password must never appear in a reply frame"
         );
     }
 }

@@ -11,6 +11,21 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The FIX arm of the parity/conformance suite** (#41) — extends the REST/WS
+  parity fixtures with FIX: **order-entry parity REST ≡ FIX** (one
+  identically-seeded fresh venue per surface, comparing `VenueEvent` streams
+  under the explicit normalization rule — protocol-only fields normalized,
+  `underlying_sequence`/`execution_id`/fills/book state compared verbatim; cases
+  place / partial / cancel-replace / STP-shape / fees / reject / retry),
+  **observation parity REST/WS/FIX** on the fill join keys (a FIX
+  `ExecutionReport (8)` renders three of the four keys — `venue_ts` is REST/WS
+  only, recoverable via `execution_id`), and a **captured FIX conformance
+  script** asserting the happy path plus every context-sensitive reject row
+  (`3` / `8 Rejected` / `9` / `Y` / `j` / `Logout 5`) with reason/reference tags
+  and `Text (58)` redaction. WS is asserted out of order-entry parity, present in
+  observation. Tests only. Two documented cross-surface nuances tracked as
+  follow-ups: REST-vs-FIX idempotency sequence consumption (#103) and an optional
+  `TransactTime (60)` on the FIX report for four-of-four join keys (#104).
 - **FIX market data as a thin projection of the WS subscription manager** (#40) —
   `MarketDataRequest (V)` maps onto the **same**
   `OrderbookSubscriptionManager` (#14) the WS surface reads, so
