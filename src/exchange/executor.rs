@@ -91,6 +91,7 @@ use crate::exchange::snapshot::{
     IdempotencyRecord, InstrumentStatusCapture, RestingOrderCapture, SnapshotError,
 };
 use crate::exchange::symbol::Symbol;
+use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError, apply_to_underlying};
 use crate::models::{AccountId, ClientOrderId, LiquidityFlag, OrderType, VenueOrderId};
 
 // ============================================================================
@@ -178,7 +179,11 @@ pub struct MatchingExecutor {
 
 impl MatchingExecutor {
     /// Builds an executor for one underlying, with an empty hierarchy that
-    /// vivifies leaf books lazily on first use.
+    /// vivifies leaf books lazily on first use. No microstructure config is applied
+    /// (a bare book: no fee schedule, no STP, no contract-spec validation) — the
+    /// config-aware siblings [`new_with_registry_and_index`](Self::new_with_registry_and_index)
+    /// (live) and [`new_with_microstructure`](Self::new_with_microstructure) (replay)
+    /// carry the fee/STP/specs the determinism oracle scopes.
     #[must_use]
     pub fn new(underlying: impl Into<String>) -> Self {
         Self {
@@ -187,6 +192,38 @@ impl MatchingExecutor {
             venue_to_engine: HashMap::new(),
             idempotency: IdempotencyMap::new(),
         }
+    }
+
+    /// Builds an executor for one underlying with a **fresh** registry (its own
+    /// `UnderlyingOrderBook`) and the venue [`MicrostructureConfig`] applied at book
+    /// creation — the constructor journal recovery / replay uses so a book vivified
+    /// during replay inherits the identical fee schedule, STP mode, and contract
+    /// specs the live venue applied, and a fee/STP-sensitive scenario replays exactly
+    /// ([02 §5](../../../docs/02-matching-architecture.md#5-determinism),
+    /// [05 §4](../../../docs/05-microstructure-config.md#4-fee-schedules)).
+    ///
+    /// The config is applied **before any leaf is vivified** (the empty hierarchy is
+    /// created here, and the upstream setters propagate to every leaf created
+    /// afterwards), so recovery re-executes onto the identical leaf configuration.
+    ///
+    /// # Errors
+    ///
+    /// [`MicrostructureConfigError`] if the resolved contract specs are rejected by
+    /// the upstream `ContractSpecsBuilder` — unreachable for a resolver-validated
+    /// config, surfaced rather than unwrapped.
+    pub fn new_with_microstructure(
+        underlying: impl Into<String>,
+        microstructure: &MicrostructureConfig,
+    ) -> Result<Self, MicrostructureConfigError> {
+        let underlying = underlying.into();
+        let underlying_book = UnderlyingOrderBook::new(&underlying);
+        apply_to_underlying(&underlying_book, microstructure, &underlying)?;
+        Ok(Self {
+            underlying_book,
+            resting: HashMap::new(),
+            venue_to_engine: HashMap::new(),
+            idempotency: IdempotencyMap::new(),
+        })
     }
 
     /// Builds an executor for one underlying whose hierarchy shares a **venue-wide**
@@ -200,22 +237,35 @@ impl MatchingExecutor {
     /// `UnderlyingOrderBook::new_with_registry_and_index` (verified public at the
     /// locked 0.7.0 registry); matching is unchanged. This is the constructor
     /// [`crate::state::AppState`] wires per underlying.
-    #[must_use]
+    ///
+    /// The venue [`MicrostructureConfig`] is applied at book creation — **before any
+    /// leaf is vivified** — so every leaf inherits the identical fee schedule, STP
+    /// mode, and contract specs. This is the **same apply** the replay/recovery
+    /// constructor ([`new_with_microstructure`](Self::new_with_microstructure))
+    /// performs, so a fee/STP-sensitive scenario reconstructs exactly
+    /// ([02 §5](../../../docs/02-matching-architecture.md#5-determinism)).
+    ///
+    /// # Errors
+    ///
+    /// [`MicrostructureConfigError`] if the resolved contract specs are rejected by
+    /// the upstream `ContractSpecsBuilder` — unreachable for a resolver-validated
+    /// config, surfaced rather than unwrapped.
     pub fn new_with_registry_and_index(
         underlying: impl Into<String>,
         registry: Arc<InstrumentRegistry>,
         symbol_index: Arc<SymbolIndex>,
-    ) -> Self {
-        Self {
-            underlying_book: UnderlyingOrderBook::new_with_registry_and_index(
-                underlying,
-                registry,
-                symbol_index,
-            ),
+        microstructure: &MicrostructureConfig,
+    ) -> Result<Self, MicrostructureConfigError> {
+        let underlying = underlying.into();
+        let underlying_book =
+            UnderlyingOrderBook::new_with_registry_and_index(&underlying, registry, symbol_index);
+        apply_to_underlying(&underlying_book, microstructure, &underlying)?;
+        Ok(Self {
+            underlying_book,
             resting: HashMap::new(),
             venue_to_engine: HashMap::new(),
             idempotency: IdempotencyMap::new(),
-        }
+        })
     }
 
     /// The underlying ticker this executor serves.
@@ -1509,10 +1559,13 @@ fn slot_trade_after(leaf: &OptionOrderBook, before_seq: Option<u64>) -> Option<T
 /// The per-leg fee for a transaction, computed from the leaf's configured
 /// [`FeeSchedule`] (zero when none is configured). A maker rebate is negative.
 ///
-/// The upstream `calculate_fee` saturates its own internal `notional × bps`
-/// product; the `i128 → i64` narrowing here is **checked**, so an adversarial
-/// fee that does not fit `SignedCents` is a typed [`MoneyError::Overflow`] rather
-/// than a silent saturation. Unreachable for realistic option fees.
+/// Uses the upstream **checked** `try_calculate_fee`: the venue's checked-fee proof
+/// (`docs/05 §4.1`, the [`MicrostructureConfig`] resolver) makes its `Err(FeeOverflow)`
+/// branch provably unreachable for every admissible notional, so the map to
+/// [`MoneyError::Overflow`] is a seal-class fail-safe — never a clamp, panic, or
+/// unwrap. The `i128 → i64` narrowing that follows is likewise checked, so a fee
+/// that does not fit the persisted `SignedCents` is the same typed overflow rather
+/// than a silent truncation.
 fn per_leg_fee(
     schedule: Option<&FeeSchedule>,
     price_ticks: u128,
@@ -1525,7 +1578,9 @@ fn per_leg_fee(
             let notional = price_ticks
                 .checked_mul(u128::from(quantity))
                 .ok_or(MoneyError::Overflow)?;
-            let fee = schedule.calculate_fee(notional, is_maker);
+            let fee = schedule
+                .try_calculate_fee(notional, is_maker)
+                .map_err(|_| MoneyError::Overflow)?;
             let fee = i64::try_from(fee).map_err(|_| MoneyError::Overflow)?;
             Ok(SignedCents::new(fee))
         }
@@ -1561,10 +1616,15 @@ where
 /// underlying's book — the O(1) cross-underlying lookup wiring
 /// [`crate::state::AppState`] uses so `BTC` and `ETH` sequence concurrently
 /// without a shared writer lock
-/// ([010](../../../milestones/v0.1-backend-core/010-appstate-wiring.md)). Returns
-/// the bounded [`ActorHandle`] plus the task's [`JoinHandle`] for graceful
+/// ([010](../../../milestones/v0.1-backend-core/010-appstate-wiring.md)). The venue
+/// [`MicrostructureConfig`] is applied at book creation before any leaf is vivified.
+/// Returns the bounded [`ActorHandle`] plus the task's [`JoinHandle`] for graceful
 /// shutdown.
-#[must_use]
+///
+/// # Errors
+///
+/// [`MicrostructureConfigError`] if the resolved contract specs are rejected by the
+/// upstream `ContractSpecsBuilder` (unreachable for a resolver-validated config).
 pub fn spawn_matching_actor_with_registry_and_index<J, F, C>(
     config: ActorConfig,
     journal: J,
@@ -1572,7 +1632,8 @@ pub fn spawn_matching_actor_with_registry_and_index<J, F, C>(
     clock: C,
     registry: Arc<InstrumentRegistry>,
     symbol_index: Arc<SymbolIndex>,
-) -> (ActorHandle, JoinHandle<()>)
+    microstructure: &MicrostructureConfig,
+) -> Result<(ActorHandle, JoinHandle<()>), MicrostructureConfigError>
 where
     J: VenueJournal + Send + 'static,
     F: FanOut + Send + 'static,
@@ -1582,8 +1643,11 @@ where
         config.underlying.as_ref(),
         registry,
         symbol_index,
-    );
-    spawn_underlying_actor(config, journal, executor, fan_out, clock)
+        microstructure,
+    )?;
+    Ok(spawn_underlying_actor(
+        config, journal, executor, fan_out, clock,
+    ))
 }
 
 #[cfg(test)]

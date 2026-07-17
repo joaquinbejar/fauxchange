@@ -482,15 +482,17 @@ where
             }
             // Any confirmed-not-committed / integrity failure reuses `N` (nothing
             // executed, book untouched). `SchemaTooNew` / `Backend` / `Corruption` /
-            // `ResourceLimit` are read/decode-path errors never returned on the
-            // durable append path, but the match stays exhaustive and conservative —
-            // an unexpected failure never advances.
+            // `ResourceLimit` / `ConfigRejected` are read/decode / recovery-path
+            // errors never returned on the durable append path, but the match stays
+            // exhaustive and conservative — an unexpected failure never advances.
             Err(JournalError::AppendFailed(_))
             | Err(JournalError::Conflict { .. })
             | Err(JournalError::Corruption { .. })
             | Err(JournalError::SchemaTooNew { .. })
             | Err(JournalError::Backend { .. })
-            | Err(JournalError::ResourceLimit { .. }) => WriteAhead::Reuse,
+            | Err(JournalError::ResourceLimit { .. })
+            | Err(JournalError::ConfigRejected { .. })
+            | Err(JournalError::PriceOutOfBand { .. }) => WriteAhead::Reuse,
         }
     }
 }

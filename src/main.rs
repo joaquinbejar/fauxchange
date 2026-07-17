@@ -148,6 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clock
         .to_venue_clock_config(fauxchange::simulation::DEFAULT_CLOCK_START_MS);
     let seed = config.determinism.seed;
+    // The resolved, validated venue microstructure (#044) — extracted into an owned
+    // local (like `assets` / `lineage`) so it survives the prompt `drop(config)`
+    // after seeding. Applied to every book at creation and recorded in the run
+    // manifest fingerprint.
+    let microstructure = config.microstructure.clone();
     let app_config = AppStateConfig::new(underlyings)
         .with_lineage(lineage)
         .with_clock(venue_clock)
@@ -155,7 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_auth(auth)
         .with_assets(assets)
         .with_db(db)
-        .with_serving(false);
+        .with_serving(false)
+        .with_microstructure(microstructure);
     let state = AppState::new(app_config)?;
 
     // The bounded seeding phase: apply the manifest in fixed order (accounts,
