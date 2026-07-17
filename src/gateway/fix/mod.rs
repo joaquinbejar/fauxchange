@@ -25,12 +25,14 @@ pub mod codec;
 pub mod enums;
 pub mod error;
 pub mod execution;
+pub mod fsm;
 pub mod header;
 pub mod limits;
 pub mod marketdata;
 pub mod order;
 pub mod price;
 pub mod session;
+pub mod store;
 
 use codec::FieldBag;
 use limits::{MAX_FIELDS_PER_MESSAGE, truncate_untrusted};
@@ -46,10 +48,17 @@ pub use enums::{
     SubscriptionRequestType, TimeInForce,
 };
 pub use error::{FixDecodeError, FixRejectRoute, SessionRejectReason};
+pub use fsm::{
+    SessionConfig, SessionError, SessionFsm, SessionPhase, VenueFixSession, VenueFixSessionFactory,
+};
 pub use header::{StandardHeader, UtcTimestamp};
 pub use price::{
     CENTS_SCALE, PriceScale, PriceSeamError, parse_decimal_to_cents, parse_signed_decimal_to_cents,
     render_cents_to_decimal, render_signed_cents_to_decimal,
+};
+pub use store::{
+    FixSessionStore, InMemoryFixSessionStore, ResetTrigger, SequenceResetEvent, SessionCounters,
+    SessionKey, SessionStoreError, StoredOutbound,
 };
 
 /// The pinned dialect version this gateway speaks — versioned with the wire

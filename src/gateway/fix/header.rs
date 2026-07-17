@@ -46,6 +46,40 @@ impl UtcTimestamp {
         }
     }
 
+    /// Formats a Unix-epoch **milliseconds** instant as a FIX UTC timestamp
+    /// `YYYYMMDD-HH:MM:SS.sss` (millisecond precision) — the form
+    /// `SendingTime (52)` carries on venue-originated frames.
+    ///
+    /// Infallible: the output is always a well-formed FIX UTC timestamp (it
+    /// round-trips through [`Self::parse`]). Hand-rolled via Howard Hinnant's
+    /// `civil_from_days` (the same algorithm the REST layer's RFC3339 formatter
+    /// uses) so the venue needs no date-library dependency. The `ms` is a read of
+    /// the **injected venue clock**, so a fixed-seed run stamps identically.
+    #[must_use]
+    pub fn from_epoch_ms(ms: u64) -> Self {
+        let secs = ms / 1_000;
+        let millis = ms % 1_000;
+        let days = (secs / 86_400) as i64;
+        let rem = secs % 86_400;
+        let (hour, minute, second) = (rem / 3_600, (rem % 3_600) / 60, rem % 60);
+
+        // civil_from_days: days since 1970-01-01 -> (year, month, day).
+        let z = days + 719_468;
+        let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+        let doe = z - era * 146_097; // [0, 146096]
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let year = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+        let mp = (5 * doy + 2) / 153; // [0, 11]
+        let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+        let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+        let year = if month <= 2 { year + 1 } else { year };
+
+        Self(format!(
+            "{year:04}{month:02}{day:02}-{hour:02}:{minute:02}:{second:02}.{millis:03}"
+        ))
+    }
+
     /// Returns the timestamp's exact wire string.
     #[must_use]
     #[inline]

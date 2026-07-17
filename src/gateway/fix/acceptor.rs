@@ -89,6 +89,21 @@ const ACCEPT_RETRY_PAUSE: Duration = Duration::from_millis(5);
 /// writer is aborted and the socket force-closed.
 const WRITER_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
+/// The cadence at which [`run_session`] delivers [`FixSession::on_tick`] — the
+/// granularity the session's own heartbeat / logon-timeout / revocation checks run
+/// at (the session compares venue-clock instants, so this is only the polling
+/// resolution, not the protocol interval itself).
+const SESSION_TICK: Duration = Duration::from_millis(500);
+
+/// The ceiling on a single inline dispatch. #038's logon `on_message` runs an
+/// Argon2id verify (on the blocking pool) and a registry lookup; this bound closes
+/// the #038 obligation — a dispatch that neither the session nor `spawn_blocking`
+/// completes within the bound must not pin the connection slot / live-session gauge
+/// past the read-idle timeout or block graceful drain, so it is **raced against the
+/// shutdown signal and force-timed-out** here. Generous relative to an Argon2id
+/// verify at the pinned OWASP parameters, tight relative to a stall.
+const MAX_DISPATCH: Duration = Duration::from_secs(5);
+
 // ============================================================================
 // The dispatch seam — where #038's session FSM plugs in
 // ============================================================================
@@ -144,6 +159,21 @@ pub trait FixSession: Send + 'static {
         error: &FixDecodeError,
         out: &SessionOutbound,
     ) -> impl std::future::Future<Output = SessionControl> + Send;
+
+    /// A periodic wall-clock tick (every [`SESSION_TICK`]) that lets the session
+    /// drive its own **negotiated** protocol cadence off the venue clock — the
+    /// heartbeat interval, the `TestRequest` liveness probe, the logon timeout, and
+    /// the per-tick revocation drop (#038). It is decoupled from the read-idle
+    /// timeout (connection hygiene, this file's) — the tick fires whether or not
+    /// bytes arrive. The default is a no-op (the #037 [`StubSession`] has no
+    /// cadence).
+    fn on_tick(
+        &mut self,
+        out: &SessionOutbound,
+    ) -> impl std::future::Future<Output = SessionControl> + Send {
+        let _ = out;
+        std::future::ready(SessionControl::Continue)
+    }
 }
 
 /// Whether a [`FixSession`] callback wants the connection to continue or close.
@@ -684,19 +714,45 @@ async fn run_session<S: FixSession>(
     let mut decoder = BoundedFrameDecoder::new(config.max_frame_bytes);
     let mut buf = BytesMut::with_capacity(READ_CHUNK_BYTES.min(config.max_frame_bytes));
 
+    // The session cadence tick (#038): the session drives its own negotiated
+    // heartbeat / logon-timeout / revocation checks off it. The first tick fires
+    // one interval in (not immediately), so a just-accepted session is not ticked
+    // before it can send its logon.
+    let mut tick = tokio::time::interval(SESSION_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.reset();
+
     'serve: loop {
         // Drain every complete frame currently buffered before reading more.
         loop {
             match decoder.decode(&mut buf) {
                 Ok(Some(frame)) => {
-                    // NOTE (#038 obligation, see the `FixSession` trait docs): this
-                    // `.await` is inline and unraced — the acceptor does not bound or
-                    // cancel an in-flight dispatch. Harmless with the instant-returning
-                    // #037 stub; #038's Argon2id-verifying `on_message` MUST be bounded
-                    // (race against shutdown + a max-dispatch timeout here, or a
-                    // per-impl `tokio::time::timeout`), else a stalled dispatch holds
-                    // the slot/gauge past the idle timeout and blocks graceful drain.
-                    let control = dispatch(&mut session, &frame, &outbound).await;
+                    // #038 obligation, closed here: the dispatch `.await` is BOUNDED —
+                    // raced against the shutdown signal and a hard `MAX_DISPATCH`
+                    // timeout, so #038's Argon2id-verifying `on_message` (whose verify
+                    // runs on the blocking pool) can never pin the connection slot /
+                    // live-session gauge past the read-idle timeout or block graceful
+                    // drain. On shutdown or timeout the in-flight dispatch future is
+                    // dropped (any `spawn_blocking` it awaited finishes on the blocking
+                    // pool and is reclaimed) and the session closes.
+                    let control = tokio::select! {
+                        biased;
+                        _ = shutdown.changed() => break 'serve,
+                        dispatched = tokio::time::timeout(
+                            MAX_DISPATCH,
+                            dispatch(&mut session, &frame, &outbound),
+                        ) => match dispatched {
+                            Ok(control) => control,
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    %peer,
+                                    max_dispatch_ms = MAX_DISPATCH.as_millis(),
+                                    "fix dispatch exceeded the max-dispatch bound; closing session"
+                                );
+                                break 'serve;
+                            }
+                        },
+                    };
                     // Enforce the outbound-mailbox DoS bound regardless of what the
                     // session did with the send result: a latched overflow closes.
                     if outbound.overflowed() {
@@ -754,6 +810,31 @@ async fn run_session<S: FixSession>(
             _ = shutdown.changed() => {
                 // Venue shutdown (value changed or sender dropped): tear down.
                 break 'serve;
+            }
+            // The session cadence tick (#038): the session emits any due heartbeat
+            // / test request / logout and may ask to close (logon timeout, missed
+            // heartbeat, revocation). Bounded like the frame dispatch.
+            _ = tick.tick() => {
+                let control = tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => break 'serve,
+                    ticked = tokio::time::timeout(MAX_DISPATCH, session.on_tick(&outbound)) => {
+                        match ticked {
+                            Ok(control) => control,
+                            Err(_elapsed) => break 'serve,
+                        }
+                    }
+                };
+                if outbound.overflowed() {
+                    tracing::warn!(
+                        %peer,
+                        "fix outbound mailbox full; closing session (bounded-mailbox DoS control)"
+                    );
+                    break 'serve;
+                }
+                if control == SessionControl::Close {
+                    break 'serve;
+                }
             }
             // Read-idle timeout — connection hygiene this issue owns (the socket
             // loop, NOT #038's negotiated protocol heartbeat): a connection that

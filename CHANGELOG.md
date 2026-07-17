@@ -11,6 +11,49 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The FIX 4.4 session layer — acceptor-side logon auth, the account ↔ CompID
+  binding, checked non-wrapping sequence counters, heartbeat cadence, and an
+  account-keyed session store with resend / reset** (in-memory backend; session
+  state survives a *reconnect*, and a PostgreSQL backend for process-restart
+  persistence is deferred to
+  [#95](https://github.com/joaquinbejar/fauxchange/issues/95)) (#38) in the new
+  `src/gateway/fix/fsm.rs` (the `SessionFsm` + `VenueFixSession` /
+  `VenueFixSessionFactory`) and `src/gateway/fix/store.rs` (the `FixSessionStore`
+  swap seam + `InMemoryFixSessionStore`), with the `main.rs` wiring swapping the
+  #037 stub for the real session, two validated `[fix]` knobs
+  (`logon_timeout_secs`, `max_heart_bt_int_secs`), and
+  `tests/fix_session.rs` + new `tests/property.rs` cases
+  ([038](milestones/v0.4-fix-gateway/038-fix-session-layer.md),
+  [03 §5.2 / §6](docs/03-protocol-surfaces.md#52-session-management--the-acceptor-fsm-and-checked-counters),
+  [ADR-0007](docs/adr/0007-fix-credentials-and-account-model.md),
+  [ADR-0010](docs/adr/0010-fix-session-account-binding.md)). IronFix models the
+  **initiator** only (`Session<S>` cannot receive-logon/send-ack) and wraps its
+  `SequenceManager` with `fetch_add`, so the acceptor FSM
+  (`Listen → AwaitingLogon → Authenticating → Active`, + resend / close), the
+  **checked** `MsgSeqNum` counters (overflow → a typed `SequenceExhausted` that
+  **seals** the session, never a silent wrap), and the durable store are new
+  venue work. **One permission model, no second auth system**: a `Logon (A)`
+  verifies plaintext `Username (553)` / `Password (554)` against the venue account
+  registry's Argon2id hash (run under `tokio::task::spawn_blocking` — a CPU-bound
+  verify never stalls the accept loop or drain) and maps to the **same**
+  `AccountId` / `Permission` a JWT resolves; session admin needs no permission,
+  trading (`D`/`F`/`G`/`q`) needs `Trade`, market data / status (`V`/`H`) needs
+  `Read`, and there is **no FIX `Admin` row**. The immutable account ↔
+  `(SenderCompID, TargetCompID)` binding is checked after credential verify: a
+  tuple bound to a *different* account (or an unbound tuple) is rejected at logon
+  (`Logout 5`, `SessionBindingViolation`) **before** `Active`; `Account (1)` on an
+  order must equal the authenticated account (else a session `Reject 3` — no
+  delegation); revocation drops the live session and refuses future logons; the
+  venue's `Logon` ack is hand-built **without** `553` / `554` (no credential ever
+  emitted, and none logged or echoed in a `Text 58`). The account-keyed store
+  (keyed on `(account_id, comp_id_tuple)`, the #029 swap-store shape) persists the
+  counters, a bounded resend log, and a `SequenceReset` session-event audit trail
+  so a reconnect resumes numbering and a `ResetSeqNumFlag=Y` / `SequenceReset (4)`
+  resets **only within the bound account**. The #037 dispatch-unboundedness
+  obligation is closed: the acceptor now **races each dispatch against the
+  shutdown signal and a hard max-dispatch timeout** and delivers a periodic
+  `on_tick` for the negotiated heartbeat / logon-timeout / per-tick revocation
+  drop.
 - **The FIX 4.4 TCP acceptor — the raw-TCP accept loop, per-connection
   lifecycle, and DoS controls over IronFix's `FixCodec`** (#37) in the new
   `src/gateway/fix/acceptor.rs`, the `[fix]` config section

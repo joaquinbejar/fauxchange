@@ -136,6 +136,27 @@ pub const FIX_MIN_IDLE_TIMEOUT_SECS: u64 = 1;
 /// ceiling so a typo cannot disable the hygiene bound outright.
 pub const FIX_MAX_IDLE_TIMEOUT_SECS: u64 = 86_400;
 
+/// Default FIX logon window in **seconds** (`[fix] logon_timeout_secs`) — how long
+/// the acceptor session FSM waits in `AwaitingLogon` for a `Logon (A)` before
+/// closing the connection (#038, [03 §5.2](../docs/03-protocol-surfaces.md#52-session-management--the-acceptor-fsm-and-checked-counters)).
+pub const DEFAULT_FIX_LOGON_TIMEOUT_SECS: u64 = 10;
+/// The inclusive minimum for `[fix] logon_timeout_secs` — at least `1` second.
+pub const FIX_MIN_LOGON_TIMEOUT_SECS: u64 = 1;
+/// The inclusive maximum for `[fix] logon_timeout_secs` (`300` = 5 min) — a coarse
+/// ceiling so a typo cannot let an un-authenticated socket linger.
+pub const FIX_MAX_LOGON_TIMEOUT_SECS: u64 = 300;
+
+/// Default FIX maximum negotiated heartbeat in **seconds**
+/// (`[fix] max_heart_bt_int_secs`) — the largest `HeartBtInt (108)` the acceptor
+/// accepts at logon; a larger (or zero) proposal is refused (#038).
+pub const DEFAULT_FIX_MAX_HEART_BT_INT_SECS: u32 = 60;
+/// The inclusive minimum for `[fix] max_heart_bt_int_secs` — at least `1` second
+/// (a `0` ceiling would refuse every heartbeat proposal).
+pub const FIX_MIN_MAX_HEART_BT_INT_SECS: u32 = 1;
+/// The inclusive maximum for `[fix] max_heart_bt_int_secs` (`3_600` = 1h) — a
+/// coarse ceiling so a client cannot negotiate an effectively-dead session.
+pub const FIX_MAX_MAX_HEART_BT_INT_SECS: u32 = 3_600;
+
 /// The inclusive ceiling on the **product** `connection_cap × max_frame_bytes`
 /// (`1` GiB) — the worst-case aggregate per-connection read-buffer reservation
 /// across all live sessions. Each knob is range-checked independently, but nothing
@@ -626,6 +647,14 @@ pub struct FixConfig {
     /// (connection hygiene against a silent-socket Slowloris; refined by the #038
     /// negotiated heartbeat).
     pub idle_timeout_secs: u64,
+    /// The logon window in **seconds** (`[fix] logon_timeout_secs`) — how long the
+    /// session FSM waits for a `Logon (A)` before closing an un-authenticated
+    /// connection (#038).
+    pub logon_timeout_secs: u64,
+    /// The maximum negotiated `HeartBtInt (108)` in **seconds**
+    /// (`[fix] max_heart_bt_int_secs`) — a logon proposing a larger (or zero)
+    /// heartbeat interval is refused (#038).
+    pub max_heart_bt_int_secs: u32,
 }
 
 /// The `[persistence]` section: the optional durable backend toggle.
@@ -1050,6 +1079,8 @@ struct RawConfig {
     fix_mailbox_depth: Option<String>,
     fix_max_frame_bytes: Option<String>,
     fix_idle_timeout_secs: Option<String>,
+    fix_logon_timeout_secs: Option<String>,
+    fix_max_heart_bt_int_secs: Option<String>,
     database_url: Option<String>,
     db_pool_max_connections: Option<String>,
     db_slow_acquire_ms: Option<String>,
@@ -1075,6 +1106,8 @@ impl RawConfig {
             fix_mailbox_depth: Some(DEFAULT_FIX_MAILBOX_DEPTH.to_string()),
             fix_max_frame_bytes: Some(DEFAULT_FIX_MAX_FRAME_BYTES.to_string()),
             fix_idle_timeout_secs: Some(DEFAULT_FIX_IDLE_TIMEOUT_SECS.to_string()),
+            fix_logon_timeout_secs: Some(DEFAULT_FIX_LOGON_TIMEOUT_SECS.to_string()),
+            fix_max_heart_bt_int_secs: Some(DEFAULT_FIX_MAX_HEART_BT_INT_SECS.to_string()),
             database_url: None,
             db_pool_max_connections: Some(DEFAULT_DB_POOL_MAX_CONNECTIONS.to_string()),
             db_slow_acquire_ms: Some(DEFAULT_DB_SLOW_ACQUIRE_MS.to_string()),
@@ -1112,6 +1145,12 @@ impl RawConfig {
         }
         if other.fix_idle_timeout_secs.is_some() {
             self.fix_idle_timeout_secs = other.fix_idle_timeout_secs;
+        }
+        if other.fix_logon_timeout_secs.is_some() {
+            self.fix_logon_timeout_secs = other.fix_logon_timeout_secs;
+        }
+        if other.fix_max_heart_bt_int_secs.is_some() {
+            self.fix_max_heart_bt_int_secs = other.fix_max_heart_bt_int_secs;
         }
         if other.database_url.is_some() {
             self.database_url = other.database_url;
@@ -1183,6 +1222,21 @@ impl RawConfig {
             FIX_MIN_IDLE_TIMEOUT_SECS,
             FIX_MAX_IDLE_TIMEOUT_SECS,
         )?;
+        let fix_logon_timeout_secs = parse_fix_u64(
+            "logon_timeout_secs",
+            self.fix_logon_timeout_secs,
+            DEFAULT_FIX_LOGON_TIMEOUT_SECS,
+            FIX_MIN_LOGON_TIMEOUT_SECS,
+            FIX_MAX_LOGON_TIMEOUT_SECS,
+        )?;
+        let fix_max_heart_bt_int_secs = u32::try_from(parse_fix_u64(
+            "max_heart_bt_int_secs",
+            self.fix_max_heart_bt_int_secs,
+            u64::from(DEFAULT_FIX_MAX_HEART_BT_INT_SECS),
+            u64::from(FIX_MIN_MAX_HEART_BT_INT_SECS),
+            u64::from(FIX_MAX_MAX_HEART_BT_INT_SECS),
+        )?)
+        .unwrap_or(FIX_MAX_MAX_HEART_BT_INT_SECS);
         // Bound the PRODUCT `connection_cap × max_frame_bytes` (each knob is
         // range-checked alone; nothing else caps their worst-case aggregate
         // per-connection read-buffer reservation). A typed error refuses an absurd
@@ -1234,6 +1288,8 @@ impl RawConfig {
                 mailbox_depth: fix_mailbox_depth,
                 max_frame_bytes: fix_max_frame_bytes,
                 idle_timeout_secs: fix_idle_timeout_secs,
+                logon_timeout_secs: fix_logon_timeout_secs,
+                max_heart_bt_int_secs: fix_max_heart_bt_int_secs,
             },
             persistence: PersistenceConfig {
                 database_url: self.database_url.map(Secret::new),
@@ -1406,6 +1462,8 @@ fn raw_from_env<F: Fn(&str) -> Option<String>>(get: F) -> RawConfig {
         fix_mailbox_depth: None,
         fix_max_frame_bytes: None,
         fix_idle_timeout_secs: None,
+        fix_logon_timeout_secs: None,
+        fix_max_heart_bt_int_secs: None,
         database_url: pick("DATABASE_URL"),
         db_pool_max_connections: pick("FAUXCHANGE_DB_MAX_CONNECTIONS"),
         db_slow_acquire_ms: pick("FAUXCHANGE_DB_SLOW_ACQUIRE_MS"),
@@ -1828,6 +1886,14 @@ impl FileConfig {
             .as_ref()
             .and_then(|section| section.idle_timeout_secs)
             .map(|value| value.to_string());
+        let fix_logon_timeout_secs = fix
+            .as_ref()
+            .and_then(|section| section.logon_timeout_secs)
+            .map(|value| value.to_string());
+        let fix_max_heart_bt_int_secs = fix
+            .as_ref()
+            .and_then(|section| section.max_heart_bt_int_secs)
+            .map(|value| value.to_string());
         // Bind the clock section once so its mode and both mode knobs read the same
         // optional table (a moved-out field cannot be read twice).
         let clock = self.clock;
@@ -1856,6 +1922,8 @@ impl FileConfig {
             fix_mailbox_depth,
             fix_max_frame_bytes,
             fix_idle_timeout_secs,
+            fix_logon_timeout_secs,
+            fix_max_heart_bt_int_secs,
             database_url,
             db_pool_max_connections,
             db_slow_acquire_ms,
@@ -1924,6 +1992,10 @@ struct FileFix {
     max_frame_bytes: Option<usize>,
     #[serde(default)]
     idle_timeout_secs: Option<u64>,
+    #[serde(default)]
+    logon_timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_heart_bt_int_secs: Option<u32>,
 }
 
 /// `[persistence]` — an unrecognised inner key aborts startup. Not `Debug`

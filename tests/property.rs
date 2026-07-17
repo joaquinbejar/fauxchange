@@ -1238,3 +1238,125 @@ proptest! {
         }
     }
 }
+
+// ============================================================================
+// #038 FIX session properties: monotonic sequence + account-keyed reset isolation
+// ============================================================================
+
+use fauxchange::gateway::fix::session::TestRequest as FixTestRequest;
+use fauxchange::gateway::fix::{
+    FixSessionStore, InMemoryFixSessionStore, ResetTrigger, SequenceResetEvent, SessionConfig,
+    SessionCounters, SessionFsm, SessionKey,
+};
+use std::sync::Arc;
+
+/// A `Trade` FSM admitted to `Active` over a fresh in-memory session store.
+fn active_session_fsm() -> SessionFsm {
+    let store: Arc<dyn FixSessionStore> = Arc::new(InMemoryFixSessionStore::new());
+    let mut fsm = SessionFsm::new(
+        SessionConfig {
+            logon_timeout_ms: 10_000,
+            max_heart_bt_int_secs: 60,
+        },
+        store,
+        0,
+    );
+    let logon_header = StandardHeader::new(
+        CompId::new("CLIENT").expect("comp"),
+        CompId::new("VENUE").expect("comp"),
+        SeqNum::new(1),
+        UtcTimestamp::parse(52, "20240329-12:00:00.000").expect("ts"),
+    );
+    fsm.on_inbound(&logon_header, 0);
+    fsm.admit_logon(
+        AccountId::new("acct"),
+        vec![Permission::Trade],
+        0,
+        30,
+        false,
+        1,
+        0,
+    )
+    .expect("admit");
+    fsm
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// A session's outbound `MsgSeqNum` is **strictly increasing** across an
+    /// arbitrary number of emitted frames — the checked counter never repeats,
+    /// stalls, or wraps ([03 §5.2](../docs/03-protocol-surfaces.md)).
+    #[test]
+    fn fix_session_sender_msg_seq_num_strictly_monotonic(rounds in 1usize..40) {
+        let mut fsm = active_session_fsm();
+        let mut last = fsm.counters().next_sender_seq;
+        for round in 0..rounds {
+            // A TestRequest at the expected inbound seq forces one outbound Heartbeat.
+            let expected = fsm.counters().next_target_seq;
+            let test = DecodedMessage::TestRequest(FixTestRequest {
+                header: StandardHeader::new(
+                    CompId::new("CLIENT").expect("comp"),
+                    CompId::new("VENUE").expect("comp"),
+                    SeqNum::new(expected),
+                    UtcTimestamp::parse(52, "20240329-12:00:00.000").expect("ts"),
+                ),
+                test_req_id: format!("TR-{round}"),
+            });
+            fsm.handle_active(test, 0, false)
+                .map_err(|e| TestCaseError::fail(format!("handle: {e:?}")))?;
+            let now = fsm.counters().next_sender_seq;
+            prop_assert!(now > last, "sender seq must strictly increase: {now} !> {last}");
+            last = now;
+        }
+    }
+
+    /// A `SequenceReset` recorded on one account's session key **never** changes
+    /// another account's counters or audit trail — the store is keyed on
+    /// `(account_id, comp_id_tuple)` ([ADR-0010](../docs/adr/0010-fix-session-account-binding.md)).
+    #[test]
+    fn fix_reset_never_crosses_into_another_accounts_state(
+        reset_to in 1u64..100_000,
+        other_seq in 1u64..100_000,
+    ) {
+        let store = InMemoryFixSessionStore::new();
+        let account_a = SessionKey::new(AccountId::new("account-a"), "CLIENT-A", "VENUE");
+        let account_b = SessionKey::new(AccountId::new("account-b"), "CLIENT-B", "VENUE");
+
+        store
+            .save_counters(&account_b, SessionCounters { next_sender_seq: other_seq, next_target_seq: other_seq })
+            .map_err(|e| TestCaseError::fail(format!("save b: {e:?}")))?;
+
+        store
+            .record_reset(
+                &account_a,
+                SequenceResetEvent {
+                    at_ms: 0,
+                    trigger: ResetTrigger::SequenceReset,
+                    old_next_sender_seq: 1,
+                    old_next_target_seq: 1,
+                    new_next_sender_seq: 1,
+                    new_next_target_seq: reset_to,
+                },
+                SessionCounters { next_sender_seq: 1, next_target_seq: reset_to },
+            )
+            .map_err(|e| TestCaseError::fail(format!("reset a: {e:?}")))?;
+
+        // Account B's counters and audit trail are untouched.
+        let b_after = store
+            .load_counters(&account_b)
+            .map_err(|e| TestCaseError::fail(format!("load b: {e:?}")))?;
+        prop_assert_eq!(b_after.next_sender_seq, other_seq);
+        prop_assert_eq!(b_after.next_target_seq, other_seq);
+        let b_events = store
+            .reset_events(&account_b)
+            .map_err(|e| TestCaseError::fail(format!("events b: {e:?}")))?;
+        prop_assert!(b_events.is_empty());
+
+        // Account A took the reset.
+        let a_after = store
+            .load_counters(&account_a)
+            .map_err(|e| TestCaseError::fail(format!("load a: {e:?}")))?;
+        prop_assert_eq!(a_after.next_target_seq, reset_to);
+    }
+}
