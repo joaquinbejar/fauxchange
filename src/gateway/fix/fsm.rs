@@ -53,13 +53,18 @@ use crate::state::AppState;
 use super::codec::{FieldWriter, tags};
 use super::enums::{
     CxlRejResponseTo, ExecType, MassCancelResponse, OrdStatus, OrdType, OrderSide,
-    TimeInForce as FixTif,
+    SubscriptionRequestType, TimeInForce as FixTif,
 };
 use super::error::SessionRejectReason;
 use super::execution::{
     BusinessMessageReject, ExecutionReport, OrderCancelReject, OrderMassCancelReport,
 };
 use super::header::{StandardHeader, UtcTimestamp};
+use super::marketdata::{
+    IncrementalEntry, MarketDataIncrementalRefresh, MarketDataRequest, MarketDataRequestReject,
+    MarketDataSnapshotFullRefresh, SnapshotEntry,
+};
+use super::md_projection::{self, RequestedSides};
 use super::order::{
     NewOrderSingle, OrderCancelReplaceRequest, OrderCancelRequest, OrderStatusRequest,
 };
@@ -69,6 +74,8 @@ use super::store::{
 };
 use super::{DecodedMessage, FixBody, session};
 use crate::exchange::event::SequenceNumber;
+use crate::models::WsMessage;
+use tokio::sync::broadcast;
 
 use super::acceptor::{FixSession, FixSessionFactory, SessionControl, SessionOutbound};
 
@@ -91,6 +98,37 @@ const CXL_REJ_REASON_NOT_AUTHORIZED: u16 = 2;
 /// A short, **non-secret** reason string for a permission-denied application
 /// message — safe to echo in a `Text (58)` (it names a policy, not a credential).
 const TEXT_NOT_AUTHORIZED: &str = "insufficient permission";
+
+/// `MDReqRejReason (281) = 1` — Duplicate `MDReqID (262)`: a snapshot request
+/// reusing the id of an already-active subscription (FIX 4.4).
+const MD_REJ_REASON_DUPLICATE_REQ_ID: u16 = 1;
+
+/// `MDReqRejReason (281) = 2` — Insufficient bandwidth: the per-session
+/// market-data subscription set is at its [`MAX_MD_SYMBOLS_PER_SESSION`] ceiling.
+const MD_REJ_REASON_INSUFFICIENT_BANDWIDTH: u16 = 2;
+
+/// `MDReqRejReason (281) = 3` — Insufficient permissions: a `V` on a session that
+/// does not hold `Read`. Every authenticated account normally grants `Read`
+/// (`Trade`/`Admin` imply it), so this only fires for an empty permission set.
+const MD_REJ_REASON_INSUFFICIENT_PERMISSIONS: u16 = 3;
+
+/// `MDReqRejReason (281) = 8` — Unsupported `MDEntryType (269)`: the request asked
+/// for no book side (a Trade-tape-only `V`), which the FIX MD orderbook surface
+/// does not serve (the trade-tape / quote projection over FIX MD is deferred,
+/// [fix-dialect §2.3](../../../docs/specs/fix-dialect.md#23-market-data-subscription-surfaces-03-54)).
+const MD_REJ_REASON_UNSUPPORTED_ENTRY_TYPE: u16 = 8;
+
+/// The ceiling on the per-session market-data subscription set — a memory DoS
+/// bound so a long-lived session cannot grow an unbounded symbol map (the FIX
+/// analogue of the WS `MAX_SUBSCRIPTIONS_PER_CONNECTION`). A `V` that would exceed
+/// it is rejected whole with `Y` (`MDReqRejReason = 2`), never partially applied.
+const MAX_MD_SYMBOLS_PER_SESSION: usize = 256;
+
+/// The ceiling on market-data frames drained onto the outbound mailbox in one
+/// dispatch/tick cycle — bounds the work a single burst can do; the remainder
+/// stays buffered on the broadcast for the next cycle (and a slow reader lags and
+/// re-snapshots, never stalling the producer).
+const MAX_MD_FRAMES_PER_CYCLE: usize = 512;
 
 /// The per-session tuning derived from the validated `[fix]` config section.
 #[derive(Debug, Clone, Copy)]
@@ -658,22 +696,16 @@ impl SessionFsm {
             return Ok(ActiveDisposition::Reacted(reaction));
         }
 
-        // The message is consumed at the session level regardless of the order
-        // path's outcome; the async router emits its reports/rejects on the same
-        // outbound counter.
+        // The message is consumed at the session level regardless of the async
+        // path's outcome; the async router emits its reports/rejects/market data on
+        // the same outbound counter.
         self.consume_inbound()?;
 
-        if is_order_entry_message(&message) {
-            // D/F/G/q/H → the async order router (#039).
-            return Ok(ActiveDisposition::Route(Box::new(message)));
-        }
-
-        // Market data (`V`) is admitted here; the W/X routing lands in #040.
-        tracing::debug!(
-            msg_type = super::message_type_str(&message),
-            "fix market-data request admitted at the session boundary (routing lands in #040)"
-        );
-        Ok(ActiveDisposition::Reacted(Reaction::cont()))
+        // D/F/G/q/H → the async order router (#039); `V` → the async market-data
+        // router (#040). Both need `AppState` (the sequenced order path / the shared
+        // subscription manager), which the socket-free FSM does not hold, so both
+        // are routed to the async [`VenueFixSession`].
+        Ok(ActiveDisposition::Route(Box::new(message)))
     }
 
     /// Routes an in-order session-admin (or defensively, an unexpected
@@ -796,8 +828,17 @@ impl SessionFsm {
                 })?;
                 Ok(Reaction::emit(vec![frame]))
             }
-            // `H`/`V` require only `Read`, which every authenticated session holds,
-            // so they are never permission-denied here.
+            // `V` requires `Read`; a session without it (an empty permission set)
+            // is refused in the market-data context — a `Y`, never a silent drop or
+            // a bare `Reject (3)` (03 §8).
+            DecodedMessage::MarketDataRequest(request) => self.emit_md_request_reject(
+                request.md_req_id.clone(),
+                MD_REJ_REASON_INSUFFICIENT_PERMISSIONS,
+                Some(TEXT_NOT_AUTHORIZED.to_string()),
+                now_ms,
+            ),
+            // `H` requires only `Read`; a denied read has no order context to answer
+            // and is not order-entry, so it continues without a frame.
             _ => Ok(Reaction::cont()),
         }
     }
@@ -847,6 +888,85 @@ impl SessionFsm {
             frames.push(frame);
         }
         Ok(Reaction::emit(frames))
+    }
+
+    /// Emits one sequenced, resend-persisted `MarketDataSnapshotFullRefresh (W)` —
+    /// the `orderbook_snapshot` twin (#040). `rpt_seq` is the per-instrument
+    /// `instrument_sequence` (a **distinct** namespace from the frame's own
+    /// `MsgSeqNum (34)`, which `emit` stamps and stores for session resend).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure while emitting.
+    pub(crate) fn emit_md_snapshot(
+        &mut self,
+        md_req_id: String,
+        symbol: Symbol,
+        rpt_seq: SequenceNumber,
+        entries: Vec<SnapshotEntry>,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, SessionError> {
+        self.emit(now_ms, |header| {
+            MarketDataSnapshotFullRefresh {
+                header,
+                md_req_id,
+                symbol,
+                rpt_seq,
+                entries,
+            }
+            .encode()
+        })
+    }
+
+    /// Emits one sequenced, resend-persisted `MarketDataIncrementalRefresh (X)` —
+    /// the `orderbook_delta` twin (#040), carrying the same per-instrument
+    /// `instrument_sequence` as `rpt_seq`.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure while emitting.
+    pub(crate) fn emit_md_incremental(
+        &mut self,
+        md_req_id: String,
+        rpt_seq: SequenceNumber,
+        entries: Vec<IncrementalEntry>,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, SessionError> {
+        self.emit(now_ms, |header| {
+            MarketDataIncrementalRefresh {
+                header,
+                md_req_id,
+                rpt_seq,
+                entries,
+            }
+            .encode()
+        })
+    }
+
+    /// Emits a `MarketDataRequestReject (Y)` for an unsupported/invalid
+    /// `MarketDataRequest (V)` — the market-data-context reject (never a bare
+    /// `Reject (3)`, 03 §8). `Text (58)` names a policy, never a secret.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure while emitting.
+    pub(crate) fn emit_md_request_reject(
+        &mut self,
+        md_req_id: String,
+        reason: u16,
+        text: Option<String>,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let frame = self.emit(now_ms, |header| {
+            MarketDataRequestReject {
+                header,
+                md_req_id,
+                md_req_rej_reason: reason,
+                text,
+            }
+            .encode()
+        })?;
+        Ok(Reaction::emit(vec![frame]))
     }
 
     /// Emits an order-context `ExecutionReport (8)` `Rejected` for a runtime
@@ -1578,9 +1698,46 @@ impl OrderFingerprint {
     }
 }
 
+/// One symbol's live market-data subscription state (#040): the `MDReqID (262)`
+/// the client subscribed it under, the requested book sides, and the snapshot
+/// depth. Keyed by [`Symbol`] in [`MdSubscription::symbols`].
+#[derive(Debug, Clone)]
+struct MdSymbolSub {
+    /// The `MDReqID (262)` of the `V` that subscribed this symbol — echoed on every
+    /// `W`/`X` for it.
+    md_req_id: String,
+    /// Which book sides (Bid / Offer) the request asked for.
+    sides: RequestedSides,
+    /// The requested snapshot depth (`MarketDepth (264) = 0` ⇒ full book / `None`).
+    depth: Option<usize>,
+    /// The last `instrument_sequence` already reflected in the client's stream — the
+    /// delivered `W` baseline, then each emitted `X`. An `orderbook_delta` at or
+    /// below it is already in the client's snapshot and is dropped, so the FIX and
+    /// WS streams are identical at the subscribe boundary and `RptSeq (83)` stays
+    /// **strictly increasing** across the `W → X` boundary (mirrors the WS filter,
+    /// `src/gateway/ws/mod.rs`).
+    baseline: u64,
+}
+
+/// The session's live FIX market-data subscription (#040): one venue-wide
+/// broadcast receiver (created lazily on the first `V`) and the per-symbol
+/// subscription set, bounded at [`MAX_MD_SYMBOLS_PER_SESSION`].
+///
+/// FIX MD is a thin projection of the **same** [`crate::subscription::OrderbookSubscriptionManager`]
+/// the WS surface reads: the receiver carries the committed `orderbook_delta`
+/// stream, and each `X` is drained from it in `MsgSeqNum` order onto the same
+/// bounded outbound mailbox. A lagged receiver re-snapshots (the WS gap contract),
+/// never stalling the producer.
+struct MdSubscription {
+    /// The venue-wide market-data broadcast receiver for this connection.
+    receiver: broadcast::Receiver<WsMessage>,
+    /// The per-symbol subscription set (`Symbol → MDReqID + sides + depth`).
+    symbols: HashMap<Symbol, MdSymbolSub>,
+}
+
 /// The real per-connection FIX session — the [`FixSession`] the acceptor drives,
-/// wrapping the synchronous [`SessionFsm`] with the async credential verify and
-/// the async order-path routing (#039).
+/// wrapping the synchronous [`SessionFsm`] with the async credential verify, the
+/// async order-path routing (#039), and the market-data projection (#040).
 pub struct VenueFixSession {
     peer: SocketAddr,
     state: Arc<AppState>,
@@ -1594,6 +1751,9 @@ pub struct VenueFixSession {
     /// `ClOrdID → placed order` for this session's cancel/replace/status
     /// correlation (bounded at [`MAX_TRACKED_ORDERS_PER_SESSION`]).
     placed: HashMap<ClientOrderId, PlacedOrder>,
+    /// The live market-data subscription (`None` until the first `MarketDataRequest
+    /// (V)`), #040.
+    market_data: Option<MdSubscription>,
 }
 
 impl VenueFixSession {
@@ -1615,6 +1775,7 @@ impl VenueFixSession {
             leases,
             lease: None,
             placed: HashMap::new(),
+            market_data: None,
         }
     }
 
@@ -1863,9 +2024,10 @@ impl VenueFixSession {
         self.fsm.emit_report_specs(vec![spec], now_ms)
     }
 
-    /// Routes a permitted, attributed order-entry message onto the sequenced path
+    /// Routes a permitted, attributed application message onto its async path
     /// (`handle_active` has already gated permission + attribution and consumed the
-    /// inbound seq).
+    /// inbound seq): order entry (`D`/`F`/`G`/`q`/`H`) onto the sequenced path
+    /// (#039), and market data (`V`) onto the shared subscription manager (#040).
     async fn route_order(
         &mut self,
         message: DecodedMessage,
@@ -1879,7 +2041,8 @@ impl VenueFixSession {
             }
             DecodedMessage::OrderMassCancelRequest(_) => self.fsm.emit_mass_cancel_rejected(now_ms),
             DecodedMessage::OrderStatusRequest(status) => self.route_status(status, now_ms),
-            // `handle_active` only routes order-entry messages here (unreachable).
+            DecodedMessage::MarketDataRequest(request) => self.route_market_data(request, now_ms),
+            // `handle_active` only routes application messages here (unreachable).
             _ => Ok(Reaction::cont()),
         }
     }
@@ -2199,6 +2362,320 @@ impl VenueFixSession {
         };
         self.render_tracked_status(&placed, now_ms)
     }
+
+    // ------------------------------------------------------------------------
+    // Market-data routing (#040) — a thin projection of the shared #014 manager
+    // ------------------------------------------------------------------------
+
+    /// `MarketDataRequest (V)` → a subscription onto the **same**
+    /// [`OrderbookSubscriptionManager`](crate::subscription::OrderbookSubscriptionManager)
+    /// the WS surface reads. A snapshot request emits one `W` baseline per symbol
+    /// and streams `X` deltas; an unsubscribe tears the symbols down. An
+    /// unsupported request is a `MarketDataRequestReject (Y)`, never a bare
+    /// `Reject (3)` (03 §8). `handle_active` has already gated `Read` + consumed
+    /// the inbound seq.
+    fn route_market_data(
+        &mut self,
+        request: MarketDataRequest,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        match request.subscription_request_type {
+            SubscriptionRequestType::SnapshotPlusUpdates => {
+                self.subscribe_market_data(request, now_ms)
+            }
+            SubscriptionRequestType::Unsubscribe => self.unsubscribe_market_data(&request),
+        }
+    }
+
+    /// Whether an `MDReqID (262)` already backs a live subscription on this session
+    /// (a duplicate id is rejected with `Y`).
+    fn md_req_id_active(&self, md_req_id: &str) -> bool {
+        self.market_data
+            .as_ref()
+            .is_some_and(|md| md.symbols.values().any(|sub| sub.md_req_id == md_req_id))
+    }
+
+    /// Subscribes the request's symbols (`SubscriptionRequestType = 1`), emitting
+    /// one `W` snapshot baseline per symbol. Validates the request first — a
+    /// no-book-side (trade-tape-only) request, a duplicate `MDReqID`, or a request
+    /// past the per-session subscription ceiling is a `Y`, never a partial subscribe.
+    fn subscribe_market_data(
+        &mut self,
+        request: MarketDataRequest,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let sides = RequestedSides::from_entry_types(&request.entry_types);
+        // A `V` that requests no book side (only a Trade tape) is not served by the
+        // FIX MD orderbook surface — reject with `Y`, never silently drop it.
+        if !sides.any() {
+            return self.fsm.emit_md_request_reject(
+                request.md_req_id,
+                MD_REJ_REASON_UNSUPPORTED_ENTRY_TYPE,
+                Some("only Bid/Offer market data is served over FIX".to_string()),
+                now_ms,
+            );
+        }
+        // Duplicate `MDReqID`: an id already backing a live subscription.
+        if self.md_req_id_active(&request.md_req_id) {
+            return self.fsm.emit_md_request_reject(
+                request.md_req_id,
+                MD_REJ_REASON_DUPLICATE_REQ_ID,
+                Some("duplicate MDReqID".to_string()),
+                now_ms,
+            );
+        }
+        // Bandwidth ceiling: the request would grow the subscription set past the
+        // per-session cap (count only symbols not already tracked).
+        let current = self.market_data.as_ref().map_or(0, |md| md.symbols.len());
+        let new_symbols = request
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                self.market_data
+                    .as_ref()
+                    .is_none_or(|md| !md.symbols.contains_key(*symbol))
+            })
+            .count();
+        if current.saturating_add(new_symbols) > MAX_MD_SYMBOLS_PER_SESSION {
+            return self.fsm.emit_md_request_reject(
+                request.md_req_id,
+                MD_REJ_REASON_INSUFFICIENT_BANDWIDTH,
+                Some("market-data subscription limit reached".to_string()),
+                now_ms,
+            );
+        }
+
+        let depth = market_depth_to_option(request.market_depth);
+
+        // Subscribe to the venue-wide broadcast BEFORE reading any snapshot, so no
+        // committed delta between the snapshot read and the receiver's creation is
+        // lost — the client de-dups by `instrument_sequence`, exactly as on WS.
+        if self.market_data.is_none() {
+            self.market_data = Some(MdSubscription {
+                receiver: self.state.subscriptions().subscribe(),
+                symbols: HashMap::new(),
+            });
+        }
+
+        // Register each symbol and emit its `W` baseline snapshot. The subscription's
+        // `baseline` is seeded to the delivered `W`'s `instrument_sequence`, so the
+        // first `X` the drain emits is strictly after it (the race-window delta
+        // already folded into the snapshot is not re-sent as a redundant `X`).
+        let mut frames = Vec::with_capacity(request.symbols.len());
+        for symbol in &request.symbols {
+            let snapshot = self.state.subscriptions().orderbook_snapshot(symbol, depth);
+            let projection = md_projection::snapshot_projection(&snapshot, sides);
+            let baseline = projection.as_ref().map_or(0, |(sequence, _)| *sequence);
+            if let Some(md) = self.market_data.as_mut() {
+                md.symbols.insert(
+                    symbol.clone(),
+                    MdSymbolSub {
+                        md_req_id: request.md_req_id.clone(),
+                        sides,
+                        depth,
+                        baseline,
+                    },
+                );
+            }
+            if let Some((sequence, entries)) = projection {
+                let frame = self.fsm.emit_md_snapshot(
+                    request.md_req_id.clone(),
+                    symbol.clone(),
+                    SequenceNumber::new(sequence),
+                    entries,
+                    now_ms,
+                )?;
+                frames.push(frame);
+            }
+        }
+        Ok(Reaction::emit(frames))
+    }
+
+    /// Unsubscribes the request's symbols (`SubscriptionRequestType = 2`). FIX MD
+    /// has no unsubscribe ack — the client simply stops receiving `W`/`X`; the
+    /// receiver is torn down once the subscription set is empty.
+    fn unsubscribe_market_data(
+        &mut self,
+        request: &MarketDataRequest,
+    ) -> Result<Reaction, SessionError> {
+        if let Some(md) = self.market_data.as_mut() {
+            for symbol in &request.symbols {
+                md.symbols.remove(symbol);
+            }
+            if md.symbols.is_empty() {
+                self.market_data = None;
+            }
+        }
+        Ok(Reaction::cont())
+    }
+
+    /// Drains the committed market-data broadcast into sequenced `X` frames for the
+    /// subscribed symbols (bounded at [`MAX_MD_FRAMES_PER_CYCLE`] per cycle). A
+    /// lagged receiver recovers by a fresh `W` per subscription (the WS gap
+    /// contract); a closed broadcast (venue shutdown) tears the subscription down.
+    fn drain_market_data(&mut self, now_ms: u64) -> Result<Vec<Vec<u8>>, SessionError> {
+        // Phase 1: pull the pending messages, borrowing only the receiver.
+        let mut pending: Vec<WsMessage> = Vec::new();
+        let mut lagged = false;
+        {
+            let Some(md) = self.market_data.as_mut() else {
+                return Ok(Vec::new());
+            };
+            loop {
+                if pending.len() >= MAX_MD_FRAMES_PER_CYCLE {
+                    break;
+                }
+                match md.receiver.try_recv() {
+                    Ok(message) => pending.push(message),
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                        // A structural bound (not timing-dependent): a gap means the
+                        // whole cycle re-snapshots and discards `pending` regardless,
+                        // so stop draining now rather than spin on the receiver.
+                        lagged = true;
+                        break;
+                    }
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        self.market_data = None;
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        }
+
+        // Phase 2 — recovery: a lagged receiver dropped committed deltas, so the
+        // `RptSeq` stream has a gap. Per the WS gap contract, recover by a fresh `W`
+        // baseline per subscription and discard the post-gap deltas — never a
+        // `ResendRequest` (that repairs only session `MsgSeqNum`, a distinct
+        // namespace).
+        if lagged {
+            return self.resnapshot_subscriptions(now_ms);
+        }
+
+        // Phase 3: project each committed `orderbook_delta` onto an `X` for a
+        // subscribed symbol, in order, onto the same outbound counter.
+        let mut frames = Vec::new();
+        for message in pending {
+            let WsMessage::OrderbookDelta {
+                symbol,
+                sequence,
+                changes,
+            } = &message
+            else {
+                // fill / trade / price prints are not the orderbook projection (#040).
+                continue;
+            };
+            let Some((baseline, sides, md_req_id)) = self
+                .market_data
+                .as_ref()
+                .and_then(|md| md.symbols.get(symbol))
+                .map(|sub| (sub.baseline, sub.sides, sub.md_req_id.clone()))
+            else {
+                continue; // not a symbol this session subscribed
+            };
+            // Baseline filter (mirrors `src/gateway/ws/mod.rs`): a delta at or below
+            // the last-reflected `instrument_sequence` is already in the client's
+            // snapshot / prior `X` — drop it so the FIX and WS streams are identical
+            // and `RptSeq` strictly increases across the `W → X` boundary.
+            if *sequence <= baseline {
+                continue;
+            }
+            // Advance the baseline for every subscribed-symbol delta we advance past
+            // (seen, exactly as WS does), whether or not it projects to a requested
+            // side.
+            if let Some(md) = self.market_data.as_mut()
+                && let Some(entry) = md.symbols.get_mut(symbol)
+            {
+                entry.baseline = *sequence;
+            }
+            let entries = md_projection::incremental_entries(symbol, changes, sides);
+            if entries.is_empty() {
+                continue; // the delta touched no requested side
+            }
+            let frame = self.fsm.emit_md_incremental(
+                md_req_id,
+                SequenceNumber::new(*sequence),
+                entries,
+                now_ms,
+            )?;
+            frames.push(frame);
+        }
+        Ok(frames)
+    }
+
+    /// Emits a fresh `W` snapshot for every live subscription — the market-data gap
+    /// recovery (a lagged broadcast) and the WS re-snapshot contract's FIX twin.
+    fn resnapshot_subscriptions(&mut self, now_ms: u64) -> Result<Vec<Vec<u8>>, SessionError> {
+        let subs: Vec<(Symbol, MdSymbolSub)> = match self.market_data.as_ref() {
+            Some(md) => md
+                .symbols
+                .iter()
+                .map(|(symbol, sub)| (symbol.clone(), sub.clone()))
+                .collect(),
+            None => return Ok(Vec::new()),
+        };
+        tracing::debug!(
+            peer = %self.peer,
+            subscriptions = subs.len(),
+            "fix market-data receiver lagged; re-snapshotting (fresh W, not a resend)"
+        );
+        let mut frames = Vec::with_capacity(subs.len());
+        for (symbol, sub) in subs {
+            let snapshot = self
+                .state
+                .subscriptions()
+                .orderbook_snapshot(&symbol, sub.depth);
+            if let Some((sequence, entries)) =
+                md_projection::snapshot_projection(&snapshot, sub.sides)
+            {
+                let frame = self.fsm.emit_md_snapshot(
+                    sub.md_req_id,
+                    symbol.clone(),
+                    SequenceNumber::new(sequence),
+                    entries,
+                    now_ms,
+                )?;
+                frames.push(frame);
+                // Re-baseline the live subscription to the fresh `W`'s sequence, so a
+                // subsequent `X` is strictly after the new snapshot (WS re-snapshot
+                // semantics).
+                if let Some(md) = self.market_data.as_mut()
+                    && let Some(entry) = md.symbols.get_mut(&symbol)
+                {
+                    entry.baseline = sequence;
+                }
+            }
+        }
+        Ok(frames)
+    }
+
+    /// Appends any pending market-data frames onto a step's [`Reaction`] so `W`/`X`
+    /// ride the same bounded outbound mailbox as the session/order replies, sharing
+    /// one monotonic outbound `MsgSeqNum`. A closing step or a session with no live
+    /// subscription is left untouched.
+    fn append_market_data(
+        &mut self,
+        result: Result<Reaction, SessionError>,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let mut reaction = result?;
+        if reaction.control == SessionControl::Close || self.market_data.is_none() {
+            return Ok(reaction);
+        }
+        let md_frames = self.drain_market_data(now_ms)?;
+        reaction.frames.extend(md_frames);
+        Ok(reaction)
+    }
+}
+
+/// Maps `MarketDepth (264)` to the snapshot depth: `0` = full book (`None`), else
+/// the top `N` levels.
+fn market_depth_to_option(market_depth: u32) -> Option<usize> {
+    if market_depth == 0 {
+        None
+    } else {
+        Some(market_depth as usize)
+    }
 }
 
 impl FixSession for VenueFixSession {
@@ -2236,6 +2713,9 @@ impl FixSession for VenueFixSession {
             }
             SessionPhase::Closing => Ok(Reaction::close_silent()),
         };
+        // Drain any pending market-data deltas onto the same outbound counter, so a
+        // subscribed session sees `X` on any inbound activity (and on `on_tick`).
+        let result = self.append_market_data(result, now_ms);
         self.flush(result, out)
     }
 
@@ -2259,6 +2739,9 @@ impl FixSession for VenueFixSession {
         let now_ms = self.now_ms();
         let revoked = self.revoked();
         let result = self.fsm.on_tick(now_ms, revoked);
+        // The steady-state market-data pump: a passive subscriber (one that sends no
+        // frames) receives its `X` deltas on the session cadence tick.
+        let result = self.append_market_data(result, now_ms);
         self.flush(result, out)
     }
 }
@@ -2795,6 +3278,439 @@ mod tests {
             decode(&reaction.frames()[0]),
             Ok(DecodedMessage::Logout(_))
         ));
+    }
+
+    // ---- Market data (#040) ------------------------------------------------
+
+    fn market_data_request(
+        seq: u64,
+        entry_types: Vec<super::super::enums::MdEntryType>,
+    ) -> DecodedMessage {
+        DecodedMessage::MarketDataRequest(MarketDataRequest {
+            header: header(CLIENT, VENUE, seq),
+            md_req_id: "MDR-1".to_string(),
+            subscription_request_type: SubscriptionRequestType::SnapshotPlusUpdates,
+            market_depth: 0,
+            entry_types,
+            symbols: vec![Symbol::parse("BTC-20240329-50000-C").expect("symbol")],
+        })
+    }
+
+    #[test]
+    fn test_market_data_request_routes_from_a_read_session() {
+        // `V` requires `Read`; a Read session admits it and routes it to the async
+        // market-data path (the subscription/W-X rendering needs `AppState`).
+        let mut fsm = active_fsm(store(), vec![Permission::Read]);
+        use super::super::enums::MdEntryType;
+        match fsm
+            .handle_active(
+                market_data_request(2, vec![MdEntryType::Bid, MdEntryType::Offer]),
+                0,
+                false,
+            )
+            .expect("ok")
+        {
+            ActiveDisposition::Route(message) => {
+                assert!(matches!(*message, DecodedMessage::MarketDataRequest(_)));
+            }
+            other => panic!("expected Route(MarketDataRequest), got {other:?}"),
+        }
+        // Consumed at the session level like any application message.
+        assert_eq!(fsm.counters().next_target_seq, 3);
+    }
+
+    #[test]
+    fn test_market_data_request_without_read_is_a_market_data_reject() {
+        // A session with an empty permission set (no `Read`) is refused in the
+        // market-data context — a `Y` (MDReqRejReason = 3), never a bare `Reject (3)`.
+        let mut fsm = active_fsm(store(), Vec::new());
+        use super::super::enums::MdEntryType;
+        let reaction = reacted(
+            fsm.handle_active(market_data_request(2, vec![MdEntryType::Bid]), 0, false)
+                .expect("ok"),
+        );
+        match decode(&reaction.frames()[0]) {
+            Ok(DecodedMessage::MarketDataRequestReject(reject)) => {
+                assert_eq!(reject.md_req_id, "MDR-1");
+                assert_eq!(
+                    reject.md_req_rej_reason,
+                    MD_REJ_REASON_INSUFFICIENT_PERMISSIONS
+                );
+            }
+            other => panic!("expected MarketDataRequestReject, got {other:?}"),
+        }
+        // Still consumed at the session level.
+        assert_eq!(fsm.counters().next_target_seq, 3);
+    }
+
+    #[test]
+    fn test_emit_md_snapshot_encodes_a_decodable_w_carrying_rpt_seq() {
+        let mut fsm = active_fsm(store(), vec![Permission::Read]);
+        let frame = fsm
+            .emit_md_snapshot(
+                "MDR-1".to_string(),
+                Symbol::parse("BTC-20240329-50000-C").expect("symbol"),
+                SequenceNumber::new(42),
+                vec![SnapshotEntry {
+                    entry_type: super::super::enums::MdEntryType::Bid,
+                    price: Cents::new(49_995),
+                    size: 10,
+                }],
+                0,
+            )
+            .expect("emit W");
+        match decode(&frame) {
+            Ok(DecodedMessage::MarketDataSnapshotFullRefresh(w)) => {
+                assert_eq!(
+                    w.rpt_seq.get(),
+                    42,
+                    "RptSeq(83) carries the instrument_sequence"
+                );
+                assert_eq!(w.entries.len(), 1);
+                assert_eq!(w.entries[0].price, Cents::new(49_995));
+            }
+            other => panic!("expected W, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_emit_md_incremental_encodes_a_decodable_x_with_resulting_quantity() {
+        let mut fsm = active_fsm(store(), vec![Permission::Read]);
+        let sym = Symbol::parse("BTC-20240329-50000-C").expect("symbol");
+        let frame = fsm
+            .emit_md_incremental(
+                "MDR-1".to_string(),
+                SequenceNumber::new(43),
+                vec![IncrementalEntry {
+                    update_action: super::super::enums::MdUpdateAction::Delete,
+                    entry_type: super::super::enums::MdEntryType::Offer,
+                    symbol: sym,
+                    price: Cents::new(50_005),
+                    size: 0,
+                }],
+                0,
+            )
+            .expect("emit X");
+        match decode(&frame) {
+            Ok(DecodedMessage::MarketDataIncrementalRefresh(x)) => {
+                assert_eq!(x.rpt_seq.get(), 43);
+                assert_eq!(
+                    x.entries[0].size, 0,
+                    "0 = level removed (resulting quantity)"
+                );
+            }
+            other => panic!("expected X, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_market_depth_to_option_maps_zero_to_full_book() {
+        assert_eq!(market_depth_to_option(0), None);
+        assert_eq!(market_depth_to_option(5), Some(5));
+    }
+
+    // ---- Market data (#040): the session-level subscription DoS bounds, the
+    // baseline filter, and the re-snapshot re-baseline, driven on a real
+    // `VenueFixSession` over a live `AppState`'s shared subscription manager.
+
+    /// A minimal serving `AppState` (dev auth, no accounts — the market-data path
+    /// admits the FSM directly, so no logon over the wire).
+    fn md_state() -> Arc<AppState> {
+        let auth = crate::state::AuthConfig::dev().expect("dev auth");
+        AppState::new(
+            crate::state::AppStateConfig::new(["BTC"])
+                .with_serving(true)
+                .with_auth(auth),
+        )
+        .expect("AppState")
+    }
+
+    /// A `VenueFixSession` admitted straight to `Active` with `Read` (no logon
+    /// round-trip), so the market-data router can be driven directly.
+    fn active_session(state: Arc<AppState>) -> VenueFixSession {
+        let store: Arc<dyn FixSessionStore> =
+            Arc::new(super::super::store::InMemoryFixSessionStore::new());
+        let peer = "127.0.0.1:9000".parse().expect("peer addr");
+        let leases = Arc::new(SessionLeaseRegistry::new());
+        let mut session = VenueFixSession::new(peer, state, store, config(), leases);
+        let logon_header = header(CLIENT, VENUE, 1);
+        session.fsm.on_inbound(&logon_header, 0);
+        session
+            .fsm
+            .admit_logon(
+                AccountId::new("acct-1"),
+                vec![Permission::Read],
+                0,
+                30,
+                false,
+                1,
+                0,
+            )
+            .expect("admit");
+        session
+    }
+
+    /// The `i`-th distinct valid contract symbol (a unique strike per index).
+    fn md_symbol(i: usize) -> Symbol {
+        Symbol::parse(&format!("BTC-20240329-{}-C", 50_000 + i)).expect("symbol")
+    }
+
+    fn md_symbols(n: usize) -> Vec<Symbol> {
+        (0..n).map(md_symbol).collect()
+    }
+
+    fn md_request_msg(
+        seq: u64,
+        md_req_id: &str,
+        sub_type: SubscriptionRequestType,
+        symbols: Vec<Symbol>,
+    ) -> MarketDataRequest {
+        use super::super::enums::MdEntryType;
+        MarketDataRequest {
+            header: header(CLIENT, VENUE, seq),
+            md_req_id: md_req_id.to_string(),
+            subscription_request_type: sub_type,
+            market_depth: 0,
+            entry_types: vec![MdEntryType::Bid, MdEntryType::Offer],
+            symbols,
+        }
+    }
+
+    /// A committed user-driven resting ask on `BTC-20240329-50000-C` — folded into
+    /// the shared manager to bump the per-instrument sequence and broadcast a delta.
+    fn committed_ask(order_id: &str, price: u64) -> crate::exchange::VenueEvent {
+        use crate::exchange::{EventTimestamp, VenueCommand, VenueEvent, VenueOutcome};
+        let command = VenueCommand::AddOrder {
+            symbol: Symbol::parse("BTC-20240329-50000-C").expect("symbol"),
+            order_id: VenueOrderId::new(order_id),
+            account: AccountId::new("acct"),
+            owner: crate::exchange::Hash32([1; 32]),
+            client_order_id: None,
+            side: crate::exchange::Side::Sell,
+            order_type: crate::models::OrderType::Limit,
+            limit_price: Some(Cents::new(price)),
+            quantity: 1,
+            time_in_force: SeamTif::Gtc,
+            stp_mode: crate::exchange::STPMode::None,
+        };
+        VenueEvent::new(
+            SequenceNumber::new(1),
+            EventTimestamp::new(1_700_000_000_000),
+            command,
+            VenueOutcome::Added {
+                fills: vec![],
+                resting_quantity: 1,
+                stp_cancelled: vec![],
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_market_data_over_cap_request_rejects_before_registering() {
+        // A single `V` whose symbol count exceeds the per-session ceiling is a
+        // `Y (281=2)`, and NOTHING is registered — the whole `V` is rejected before
+        // the subscribe loop (no partial subscription, no receiver created).
+        let state = md_state();
+        let mut session = active_session(Arc::clone(&state));
+        let over_cap = md_symbols(MAX_MD_SYMBOLS_PER_SESSION + 1);
+        let reaction = session
+            .route_market_data(
+                md_request_msg(
+                    2,
+                    "MDR-BIG",
+                    SubscriptionRequestType::SnapshotPlusUpdates,
+                    over_cap,
+                ),
+                0,
+            )
+            .expect("route");
+        assert_eq!(reaction.frames().len(), 1, "one Y, no W");
+        match decode(&reaction.frames()[0]) {
+            Ok(DecodedMessage::MarketDataRequestReject(y)) => {
+                assert_eq!(y.md_req_rej_reason, MD_REJ_REASON_INSUFFICIENT_BANDWIDTH);
+            }
+            other => panic!("expected Y, got {other:?}"),
+        }
+        assert!(
+            session.market_data.is_none(),
+            "an over-cap V registers no subscription"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_market_data_unsubscribe_frees_a_subscription_slot() {
+        // Filling the cap, one more is rejected; an unsubscribe frees a slot so a
+        // later subscribe succeeds.
+        let state = md_state();
+        let mut session = active_session(Arc::clone(&state));
+        let full = md_symbols(MAX_MD_SYMBOLS_PER_SESSION);
+        let filled = session
+            .route_market_data(
+                md_request_msg(
+                    2,
+                    "MDR-1",
+                    SubscriptionRequestType::SnapshotPlusUpdates,
+                    full.clone(),
+                ),
+                0,
+            )
+            .expect("fill");
+        assert_eq!(
+            filled.frames().len(),
+            MAX_MD_SYMBOLS_PER_SESSION,
+            "one W per symbol"
+        );
+
+        let extra = md_symbol(MAX_MD_SYMBOLS_PER_SESSION);
+        let rejected = session
+            .route_market_data(
+                md_request_msg(
+                    3,
+                    "MDR-2",
+                    SubscriptionRequestType::SnapshotPlusUpdates,
+                    vec![extra.clone()],
+                ),
+                0,
+            )
+            .expect("over cap");
+        match decode(&rejected.frames()[0]) {
+            Ok(DecodedMessage::MarketDataRequestReject(y)) => {
+                assert_eq!(y.md_req_rej_reason, MD_REJ_REASON_INSUFFICIENT_BANDWIDTH);
+            }
+            other => panic!("expected Y at the cap, got {other:?}"),
+        }
+
+        session
+            .route_market_data(
+                md_request_msg(
+                    4,
+                    "MDR-3",
+                    SubscriptionRequestType::Unsubscribe,
+                    vec![full[0].clone()],
+                ),
+                0,
+            )
+            .expect("unsubscribe");
+
+        let resub = session
+            .route_market_data(
+                md_request_msg(
+                    5,
+                    "MDR-4",
+                    SubscriptionRequestType::SnapshotPlusUpdates,
+                    vec![extra],
+                ),
+                0,
+            )
+            .expect("resubscribe");
+        assert!(
+            resub.frames().iter().any(|f| matches!(
+                decode(f),
+                Ok(DecodedMessage::MarketDataSnapshotFullRefresh(_))
+            )),
+            "the freed slot admits a new subscribe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_market_data_drain_drops_deltas_at_or_below_baseline() {
+        // The baseline filter (mirrors WS): after a `W` at the baseline sequence, a
+        // delta at or below it is dropped (already in the client's snapshot), and the
+        // first `X` is strictly after it — so `RptSeq` strictly increases across the
+        // `W → X` boundary and there is no redundant `X` at the baseline.
+        let state = md_state();
+        let mut session = active_session(Arc::clone(&state));
+        let sym = md_symbol(0);
+        session
+            .route_market_data(
+                md_request_msg(
+                    2,
+                    "MDR-1",
+                    SubscriptionRequestType::SnapshotPlusUpdates,
+                    vec![sym.clone()],
+                ),
+                0,
+            )
+            .expect("subscribe");
+        // Simulate a delivered `W` at sequence 3 (three folded mutations).
+        session
+            .market_data
+            .as_mut()
+            .expect("md")
+            .symbols
+            .get_mut(&sym)
+            .expect("sub")
+            .baseline = 3;
+        // Commit four deltas → the manager broadcasts instrument_sequence 1,2,3,4.
+        for i in 1..=4u64 {
+            state
+                .subscriptions()
+                .on_committed_event(&committed_ask(&format!("o{i}"), 50_000 + i));
+        }
+        let frames = session.drain_market_data(0).expect("drain");
+        assert_eq!(
+            frames.len(),
+            1,
+            "only the delta strictly above the baseline emits an X"
+        );
+        match decode(&frames[0]) {
+            Ok(DecodedMessage::MarketDataIncrementalRefresh(x)) => {
+                assert_eq!(
+                    x.rpt_seq.get(),
+                    4,
+                    "the first X is strictly after the baseline"
+                );
+            }
+            other => panic!("expected X, got {other:?}"),
+        }
+        assert_eq!(
+            session.market_data.as_ref().expect("md").symbols[&sym].baseline,
+            4,
+            "the baseline advanced to the emitted X's sequence"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_market_data_resnapshot_rebaselines_each_subscription() {
+        // A session-level lagged receiver recovers by a fresh `W` per subscription
+        // AND re-baselines to it — so a subsequent `X` is strictly after the new `W`.
+        let state = md_state();
+        let mut session = active_session(Arc::clone(&state));
+        let sym = md_symbol(0);
+        session
+            .route_market_data(
+                md_request_msg(
+                    2,
+                    "MDR-1",
+                    SubscriptionRequestType::SnapshotPlusUpdates,
+                    vec![sym.clone()],
+                ),
+                0,
+            )
+            .expect("subscribe");
+        // Fold three deltas → the manager's instrument_sequence is now 3.
+        for i in 1..=3u64 {
+            state
+                .subscriptions()
+                .on_committed_event(&committed_ask(&format!("o{i}"), 50_000 + i));
+        }
+        let frames = session.resnapshot_subscriptions(0).expect("resnapshot");
+        assert_eq!(frames.len(), 1, "one fresh W per subscription");
+        match decode(&frames[0]) {
+            Ok(DecodedMessage::MarketDataSnapshotFullRefresh(w)) => {
+                assert_eq!(
+                    w.rpt_seq.get(),
+                    3,
+                    "the fresh W re-baselines at the current sequence"
+                );
+            }
+            other => panic!("expected a fresh W, got {other:?}"),
+        }
+        assert_eq!(
+            session.market_data.as_ref().expect("md").symbols[&sym].baseline,
+            3,
+            "the subscription re-baselines to the fresh W's sequence"
+        );
     }
 
     #[test]

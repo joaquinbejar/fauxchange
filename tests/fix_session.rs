@@ -38,6 +38,9 @@ const TRADER_SENDER: &str = "TRADERCLIENT";
 const READER_USER: &str = "reader-fix";
 const READER_PW: &str = "reader-plaintext-pw-DoNotLog-888";
 const READER_SENDER: &str = "READERCLIENT";
+const NOPERM_USER: &str = "noperm-fix";
+const NOPERM_PW: &str = "noperm-plaintext-pw-DoNotLog-999";
+const NOPERM_SENDER: &str = "NOPERMCLIENT";
 
 // ============================================================================
 // Harness
@@ -73,6 +76,15 @@ impl Harness {
                 sender_comp_id: READER_SENDER.to_string(),
                 target_comp_id: VENUE.to_string(),
             }),
+            // An authenticated account with an EMPTY permission set — it logs on but
+            // holds neither Read nor Trade, so its `V` is refused in the market-data
+            // context (a `Y`, MDReqRejReason = 3).
+            AccountProvision::new(AccountId::new("noperm-1"), Hash32([6; 32]), Vec::new())
+                .with_fix_login(NOPERM_USER, NOPERM_PW)
+                .with_comp_ids(CompIdBinding {
+                    sender_comp_id: NOPERM_SENDER.to_string(),
+                    target_comp_id: VENUE.to_string(),
+                }),
         ];
         Self::start_with(accounts, u32::MAX).await
     }
@@ -188,6 +200,31 @@ fn cancel_frame(
 ) -> Vec<u8> {
     let body = format!(
         "35=F\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x0141={orig_cl_ord_id}\x0111={cl_ord_id}\x0155=BTC-20240329-50000-C\x0154=1\x01"
+    );
+    frame_with_body(body.as_bytes())
+}
+
+/// A `MarketDataRequest (V)`: `sub_type` (`1`=snap+updates / `2`=unsubscribe),
+/// `depth` (`0`=full book), and the `MDEntryType (269)` group values (`0`=Bid /
+/// `1`=Offer / `2`=Trade) for one symbol.
+#[allow(clippy::too_many_arguments)]
+fn market_data_request_frame(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    md_req_id: &str,
+    sub_type: &str,
+    depth: u32,
+    entry_types: &[&str],
+    symbol: &str,
+) -> Vec<u8> {
+    let mut group = String::new();
+    for entry_type in entry_types {
+        group.push_str(&format!("269={entry_type}\x01"));
+    }
+    let body = format!(
+        "35=V\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x01262={md_req_id}\x01263={sub_type}\x01264={depth}\x01267={count}\x01{group}146=1\x0155={symbol}\x01",
+        count = entry_types.len(),
     );
     frame_with_body(body.as_bytes())
 }
@@ -566,6 +603,241 @@ async fn test_crossing_order_reports_trade_with_join_keys_and_commission() {
         Some("2"),
         "LastLiquidityInd = Taker"
     );
+}
+
+/// Logs a session in as `(user, pw, sender)` and drains the credential-free ack.
+async fn logon_as(addr: SocketAddr, user: &str, pw: &str, sender: &str) -> TcpStream {
+    let mut client = connect(addr).await;
+    client
+        .write_all(&logon_frame(sender, VENUE, 1, user, pw, false))
+        .await
+        .expect("logon");
+    let ack = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert!(any_msg_type(&ack, "A"), "the logon is admitted");
+    client
+}
+
+#[tokio::test]
+async fn test_market_data_subscribe_snapshots_then_streams_a_delta_with_rpt_seq() {
+    // #040: a reader `V` (Bid+Offer) receives a `W` baseline immediately, then a
+    // user-driven book change on another session streams an `X` carrying the same
+    // per-instrument `instrument_sequence` as `RptSeq (83)` — observation parity
+    // and the FIX MD orderbook projection end to end.
+    let harness = Harness::start().await;
+    let mut reader = logon_as(harness.addr, READER_USER, READER_PW, READER_SENDER).await;
+    reader
+        .write_all(&market_data_request_frame(
+            READER_SENDER,
+            VENUE,
+            2,
+            "MDR-1",
+            "1",
+            0,
+            &["0", "1"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("subscribe");
+    let snapshot = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    let w = snapshot
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("W"))
+        .expect("a W snapshot in reply to V");
+    assert_eq!(
+        field(w, "262").as_deref(),
+        Some("MDR-1"),
+        "W echoes MDReqID"
+    );
+    assert_eq!(
+        field(w, "55").as_deref(),
+        Some("BTC-20240329-50000-C"),
+        "W carries the symbol"
+    );
+    assert!(field(w, "83").is_some(), "W carries RptSeq(83)");
+
+    // A trader rests a limit order — a user-driven book delta that streams as `X`.
+    let mut trader = logon_trader(harness.addr).await;
+    trader
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "mm-rest-1",
+            "2",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("resting order");
+    let _ = recv_frames(&mut trader, Duration::from_secs(3)).await;
+
+    // The reader receives the `X` on the session cadence tick.
+    let incremental = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    let x = incremental
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("X"))
+        .expect("an X incremental after the book delta");
+    assert_eq!(
+        field(x, "262").as_deref(),
+        Some("MDR-1"),
+        "X echoes MDReqID"
+    );
+    assert!(field(x, "83").is_some(), "X carries RptSeq(83)");
+    // The resting sell at 500.00 appears as an Offer (269=1) at the resulting size.
+    assert_eq!(
+        field(x, "269").as_deref(),
+        Some("1"),
+        "the ask level is an Offer"
+    );
+    assert_eq!(
+        field(x, "270").as_deref(),
+        Some("500.00"),
+        "MDEntryPx decimal"
+    );
+    assert_eq!(
+        field(x, "271").as_deref(),
+        Some("3"),
+        "MDEntrySize = resting qty"
+    );
+    // The MD `RptSeq(83)` and the session `MsgSeqNum(34)` are distinct namespaces.
+    assert_ne!(
+        field(x, "83"),
+        field(x, "34"),
+        "RptSeq(83) is the instrument_sequence, not the session MsgSeqNum(34)"
+    );
+    // The baseline filter: the X's RptSeq is STRICTLY greater than the W's — no
+    // redundant X at the baseline, RptSeq strictly increases across the W→X boundary.
+    let w_seq: u64 = field(w, "83")
+        .and_then(|v| v.parse().ok())
+        .expect("W RptSeq");
+    let x_seq: u64 = field(x, "83")
+        .and_then(|v| v.parse().ok())
+        .expect("X RptSeq");
+    assert!(
+        x_seq > w_seq,
+        "X RptSeq({x_seq}) must be strictly after the W baseline({w_seq})"
+    );
+    // Exactly one X for the single book change (no redundant delta at the baseline).
+    let x_count = incremental
+        .iter()
+        .filter(|f| msg_type(f).as_deref() == Some("X"))
+        .count();
+    assert_eq!(x_count, 1, "one book change → exactly one X");
+}
+
+#[tokio::test]
+async fn test_market_data_trade_only_request_is_a_market_data_reject() {
+    // A `V` asking only for the trade tape (MDEntryType 2) requests no book side, so
+    // the FIX MD orderbook surface rejects it with `Y` (MDReqRejReason = 8), never a
+    // bare session `Reject (3)`.
+    let harness = Harness::start().await;
+    let mut reader = logon_as(harness.addr, READER_USER, READER_PW, READER_SENDER).await;
+    reader
+        .write_all(&market_data_request_frame(
+            READER_SENDER,
+            VENUE,
+            2,
+            "MDR-TRADE",
+            "1",
+            0,
+            &["2"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("subscribe");
+    let reply = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    assert!(
+        !any_msg_type(&reply, "3"),
+        "never a bare Reject(3): {reply:?}"
+    );
+    let y = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("Y"))
+        .expect("a MarketDataRequestReject Y");
+    assert_eq!(field(y, "262").as_deref(), Some("MDR-TRADE"));
+    assert_eq!(
+        field(y, "281").as_deref(),
+        Some("8"),
+        "Unsupported MDEntryType"
+    );
+}
+
+#[tokio::test]
+async fn test_market_data_request_without_read_permission_is_a_market_data_reject() {
+    // A session holding no permission (neither Read nor Trade) is refused market
+    // data with `Y` (MDReqRejReason = 3), never a bare session `Reject (3)`.
+    let harness = Harness::start().await;
+    let mut client = logon_as(harness.addr, NOPERM_USER, NOPERM_PW, NOPERM_SENDER).await;
+    client
+        .write_all(&market_data_request_frame(
+            NOPERM_SENDER,
+            VENUE,
+            2,
+            "MDR-NOPERM",
+            "1",
+            0,
+            &["0", "1"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("subscribe");
+    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert!(
+        !any_msg_type(&reply, "3"),
+        "never a bare Reject(3): {reply:?}"
+    );
+    let y = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("Y"))
+        .expect("a MarketDataRequestReject Y");
+    assert_eq!(field(y, "262").as_deref(), Some("MDR-NOPERM"));
+    assert_eq!(
+        field(y, "281").as_deref(),
+        Some("3"),
+        "Insufficient permissions"
+    );
+}
+
+#[tokio::test]
+async fn test_market_data_duplicate_md_req_id_is_a_market_data_reject() {
+    // A second `V` reusing a live `MDReqID` is a duplicate → `Y` (MDReqRejReason=1).
+    let harness = Harness::start().await;
+    let mut reader = logon_as(harness.addr, READER_USER, READER_PW, READER_SENDER).await;
+    // First `V` subscribes and returns a `W`.
+    reader
+        .write_all(&market_data_request_frame(
+            READER_SENDER,
+            VENUE,
+            2,
+            "MDR-DUP",
+            "1",
+            0,
+            &["0", "1"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("first subscribe");
+    let first = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    assert!(any_msg_type(&first, "W"), "the first V is a W: {first:?}");
+    // Second `V` reuses the same MDReqID → a duplicate reject.
+    reader
+        .write_all(&market_data_request_frame(
+            READER_SENDER,
+            VENUE,
+            3,
+            "MDR-DUP",
+            "1",
+            0,
+            &["0", "1"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("duplicate subscribe");
+    let reply = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    let saw_dup = reply
+        .iter()
+        .any(|f| msg_type(f).as_deref() == Some("Y") && field(f, "281").as_deref() == Some("1"));
+    assert!(saw_dup, "the duplicate MDReqID is a Y(281=1): {reply:?}");
 }
 
 #[tokio::test]

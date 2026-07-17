@@ -29,6 +29,7 @@ pub mod fsm;
 pub mod header;
 pub mod limits;
 pub mod marketdata;
+pub mod md_projection;
 pub mod order;
 pub mod order_flow;
 pub mod price;
