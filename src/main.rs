@@ -10,9 +10,12 @@
 //! phase**: the venue is assembled in the seeding phase, the scenario manifest
 //! ([`Config::seed`](fauxchange::config::Config)) is applied in fixed order
 //! ([`fauxchange::seed::apply_seed_phase`]), and the venue flips to serving before
-//! it binds. The fuller bootstrap sequence — structured/JSON log output
-//! (observability #06) and the WS/FIX gateways + background tasks — lands with the
-//! modules that own it; this file grows with them.
+//! it binds. As of #037 it also spawns the **FIX 4.4 acceptor** when `[fix]
+//! enabled` is set (the raw-TCP accept loop over IronFix's `FixCodec`, with a
+//! logging stub at the dispatch seam the #038 session FSM replaces); the acceptor
+//! is disabled by default and drained on shutdown. The fuller bootstrap sequence —
+//! structured/JSON log output (observability #06) and the remaining background
+//! tasks — lands with the modules that own it; this file grows with them.
 //!
 //! **Security posture.** The embedded dev JWT keypair is refused in a released
 //! image unless dev mode is set (`FAUXCHANGE_DEV=1`), via the
@@ -37,9 +40,12 @@
 //!   the scenario seed manifest (#024) applied by the bounded seeding phase.
 //! - `FAUXCHANGE_DEV` — `1`/`true` admits the dev JWT keypair for local use.
 
+use std::sync::Arc;
+
 use fauxchange::auth::{DevMode, JwtAuth};
 use fauxchange::config::Config;
 use fauxchange::db::{DatabasePool, DbPoolConfig};
+use fauxchange::gateway::fix::{FixAcceptor, FixAcceptorConfig, StubSessionFactory};
 use fauxchange::gateway::rest;
 use fauxchange::seed;
 use fauxchange::state::{AppState, AppStateConfig, AuthConfig};
@@ -124,6 +130,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // into the registry, rather than living for the whole process lifetime (it was
     // previously read again at `rest::serve` at the very end).
     let http_addr = config.server.http_addr;
+    // `FixConfig` is `Copy`, so the FIX gateway settings are lifted into an owned
+    // local BEFORE `config` is dropped (below) — the acceptor is spawned after the
+    // venue flips to serving.
+    let fix_config = config.fix;
     let lineage = config.determinism.lineage_id();
     let assets = seed::asset_configs(manifest);
     let manifest_summary = manifest.summary(); // secret-free counts only
@@ -169,12 +179,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Weak`-backed task also self-terminates when the last `Arc<AppState>` drops.
     let clock_driver = fauxchange::state::spawn_clock_cadence_driver(&state);
 
+    // The FIX 4.4 gateway (#037): spawn the acceptor ONLY when `[fix].enabled`, so
+    // a released image never opens a raw-TCP port answering the #037 stub by
+    // default. The acceptor reaches auth / rate-limit / the sequencer through
+    // `Arc<AppState>` (the `StubSessionFactory` seam the #038 session FSM replaces);
+    // the gateway depends on `AppState`, never the reverse. Its bounded connection
+    // cap, per-session mailbox, and max-frame-length caps are the validated `[fix]`
+    // DoS controls. A `watch` shutdown signal drains the in-flight sessions when the
+    // REST server returns (process shutdown).
+    let fix_shutdown = if fix_config.enabled {
+        let acceptor = FixAcceptor::bind(FixAcceptorConfig::from_config(&fix_config)).await?;
+        let addr = acceptor.local_addr();
+        let factory = Arc::new(StubSessionFactory::new(Arc::clone(&state)));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(acceptor.serve(factory, shutdown_rx));
+        tracing::info!(
+            %addr,
+            "FIX 4.4 gateway enabled (stub dispatch; the session FSM is #038)"
+        );
+        Some(shutdown_tx)
+    } else {
+        tracing::info!("FIX 4.4 gateway disabled ([fix] enabled = false)");
+        None
+    };
+
     let result = rest::serve(state, http_addr).await;
 
     // The REST server drained: stop the clock driver promptly. It also exits on its
     // dropped `Weak`, but the explicit abort gives immediate, deterministic shutdown.
     if let Some(driver) = clock_driver {
         driver.abort();
+    }
+
+    // The REST server returned (shutdown / listener error): signal the FIX acceptor
+    // to stop accepting and drain its in-flight sessions.
+    if let Some(shutdown_tx) = fix_shutdown {
+        let _ = shutdown_tx.send(true);
     }
     result?;
     Ok(())

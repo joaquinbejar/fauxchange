@@ -8,10 +8,11 @@
 //! hand-written encode/decode over `ironfix-tagvalue`'s `Decoder`/`Encoder`
 //! (`ironfix-derive` is `todo!()`, so the structs are hand-written by design),
 //! requiredness/group/enum validation, and the checked decimal-`Price` ↔
-//! integer-`Cents` [`price`] seam. The TCP acceptor (#037), the session FSM and
-//! durable sequence store (#038), the order-path routing (#039), and the
-//! market-data wiring (#040) build on this layer; it compiles standalone with
-//! tests and is not yet referenced by a live gateway.
+//! integer-`Cents` [`price`] seam. The TCP [`acceptor`] (#037) frames inbound
+//! bytes and decodes them through this vocabulary at a dispatch seam; the session
+//! FSM and durable sequence store (#038), the order-path routing (#039), and the
+//! market-data wiring (#040) plug into that seam. The acceptor is spawned by
+//! `main.rs` when `[fix] enabled` is set (disabled by default until #038 lands).
 //!
 //! Governed by `docs/03-protocol-surfaces.md`.
 
@@ -19,6 +20,7 @@ use ironfix_core::message::MsgType;
 use ironfix_dictionary::Version;
 use ironfix_tagvalue::Decoder;
 
+pub mod acceptor;
 pub mod codec;
 pub mod enums;
 pub mod error;
@@ -33,6 +35,11 @@ pub mod session;
 use codec::FieldBag;
 use limits::{MAX_FIELDS_PER_MESSAGE, truncate_untrusted};
 
+pub use acceptor::{
+    BoundedFrameDecoder, FixAcceptor, FixAcceptorConfig, FixSession, FixSessionFactory,
+    OutboundBusy, SessionControl, SessionOutbound, StubSession, StubSessionFactory,
+    message_type_str,
+};
 pub use enums::{
     CommType, CxlRejResponseTo, ExecType, LastLiquidityInd, MassCancelRequestType,
     MassCancelResponse, MdEntryType, MdUpdateAction, OrdStatus, OrdType, OrderSide,
