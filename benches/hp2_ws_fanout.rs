@@ -103,6 +103,7 @@ fn main() {
 
     runtime.block_on(async move {
         let mut baseline_p99: Option<u64> = None;
+        let mut worst_pct: f64 = 0.0;
         for &n in &ns_to_sweep {
             let (hist, rejected) = run_one_n(n, warmup_ops, measured_ops, seed).await;
             println!(
@@ -117,6 +118,7 @@ fn main() {
                 #[allow(clippy::cast_precision_loss)]
                 let pct = if base == 0 { 0.0 } else { 100.0 * delta as f64 / base as f64 };
                 println!("  p99 delta vs N=1 baseline: {delta:+} ns ({pct:+.1}%)");
+                worst_pct = worst_pct.max(pct.abs());
                 // Self-check only (see module doc) — the definitive cross-run
                 // regression gate is the `bench-regression` CI job (#53).
                 if flatness_assert {
@@ -131,7 +133,23 @@ fn main() {
                         p99_ns = q.p99_ns,
                     );
                 }
+
             }
+        }
+        println!(
+            "\n[HP-2] flatness verdict: worst |p99 delta| across N was {worst_pct:.1}% \
+             (tolerance: {flatness_tolerance_pct:.0}%)"
+        );
+        if worst_pct <= flatness_tolerance_pct {
+            println!(
+                "[HP-2] PASS — HP-1 p99 stays flat in N within tolerance (docs/07 §4 DESIGN TARGET holds)"
+            );
+        } else {
+            println!(
+                "[HP-2] WARN — a swept-N p99 moved more than the stated tolerance; \
+                 not a hard failure (no bench-regression gate is armed yet, #053), \
+                 but worth a second run before trusting this as a genuine trend"
+            );
         }
     });
 }

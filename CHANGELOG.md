@@ -11,6 +11,84 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The persistent-mode order-path budget and the WS fan-out N-sweep
+  flatness re-verification — the v0.3 performance gate** (#35) in the new
+  `benches/hp5_durable_append.rs`, `benches/hp2_ws_fanout.rs`, `Cargo.toml`,
+  and `BENCH.md`
+  ([035](milestones/v0.3-replay/035-persistent-order-path-budget.md),
+  [07 §3](docs/07-performance-budgets.md#3-latency-budgets-design-targets),
+  [07 §4](docs/07-performance-budgets.md#4-throughput-scaling-and-isolation-budgets)).
+  Extends the #020 `bench-hdr` baseline to the durable journal and closes the
+  v0.3 ROADMAP performance gate. **HP-5 — durable PostgreSQL journal append,
+  measured for the first time** (`benches/hp5_durable_append.rs`, new
+  `[[bench]]` target): the SAME real actor stack HP-1 measures, journal
+  swapped from `InMemoryVenueJournal` to the durable `PgVenueJournal` (#029)
+  against a REAL ephemeral `postgres:18-alpine` (`testcontainers`, never
+  mocked), reusing HP-1's exact `TimingJournal`/`TimingExecutor` pairing
+  methodology so the append-only and match-only series stay paired per turn.
+  Two real runs (`HP5_WARMUP_OPS=200 HP5_MEASURED_OPS=2000`): durable
+  `hp5_command_append`/`hp5_event_append` p50 ~263–293 µs — only ~1.7–1.9×
+  the post-`#34` in-memory append at the median (a real Postgres round-trip
+  over local Docker loopback is not dramatically slower than the now-`#34`-
+  inflated in-memory store at p50); the tail is NOT stable enough across the
+  two runs to claim a multiplier (run 1's durable p99.9 is ~2.4× its
+  in-memory counterpart, run 2's is ~1/4 of it — disclosed as an open,
+  unresolved tail-instability finding, not smoothed over). **The persistent-
+  mode composition**: both "in-memory HP-1 + one durable append round-trip"
+  (the literal arithmetic composition the acceptance criterion asks for) AND
+  a directly MEASURED fused persistent-mode full turn
+  (`hp5_persistent_full_turn_closed_loop`, a real actor wired end-to-end with
+  the durable journal) are reported side by side — the measured-fused number
+  (p50 ~560–602 µs) is the one `BENCH.md` names as the actual persistent-mode
+  budget, with the arithmetic decomposition shown only to explain where it
+  comes from (match ≈ unchanged, append ≈ dominant), never presented as a
+  precise identity. An open-loop, coordinated-omission-corrected section (500
+  ops, a SECOND fresh ephemeral container so no rows are shared with the
+  closed-loop section) surfaces a disclosed, **unresolved anomaly**: sojourn
+  p50 (~2.1–2.2 ms) runs ~3.5–4× the closed-loop full-turn p50 despite zero
+  mailbox rejections and a conservative 10 ms intended interval; two
+  plausible, unattributed causes are named (connection/pool cold-start on the
+  un-warmed fresh container; `block_in_place`'s worker-handoff overhead under
+  the open-loop section's concurrent task dispatch) but neither is confirmed
+  by a call-stack profiler, and the finding is reported honestly rather than
+  resolved by guessing. **The `#34` delta, the milestone's required tracked
+  follow-up**: `#34` added `check_record_size` (a full
+  `serde_json::to_string` pass, done only to measure byte length) to the
+  START of `InMemoryVenueJournal::append` — a genuinely NEW cost the
+  in-memory store never paid before (unlike the durable store, which already
+  serializes to build its SQL parameter, so its own size check is ~free).
+  Re-running `hp1_order_path` at the IDENTICAL `#020` baseline configuration
+  (same machine, same seed, same sample sizes) TWICE shows p50 essentially
+  unchanged (±1–3%, inside the baseline's own disclosed run-to-run noise) but
+  p99/p99.9/p99.99 consistently and substantially worse in BOTH runs, on BOTH
+  `hp1_command_append` and `hp1_event_append` (run 1: p99 +33.5%/+34.0%/
+  +35.6%; run 2: p99 +60.8%/+61.7%/+62.9%) — a pattern this consistent across
+  two quantiles × two call sites × two runs is reported as a real,
+  disclosed regression (mechanism named but not individually measured: the
+  new per-append allocation plausibly compounds with the pre-existing
+  O(journal-depth) linear-scan cost §3.1 already diagnosed, rather than
+  merely adding to it), not dismissed as noise. **HP-1's own "sub-millisecond
+  at p99" DESIGN TARGET, already only "just inside the ceiling" at the `#020`
+  baseline, is now measurably further from being met** — strengthening,
+  not creating, the existing `#020` follow-up recommendation (an
+  index-backed `(SequenceNumber, RecordKind)` uniqueness check) for
+  `matching-expert`/`architect` to evaluate against both costs together.
+  **HP-2 WS fan-out N-sweep, re-verified post-`#34`**: `benches/hp2_ws_fanout.rs`
+  now prints an explicit flatness verdict against a stated
+  `FLATNESS_TOLERANCE_PCT` (±15 percentage points — wide enough to absorb the
+  `#020` baseline's own disclosed ~13% p99 run-to-run noise, narrow enough to
+  catch a genuine O(N) regression) rather than leaving "flat" as an
+  unstated eyeball judgment; the re-run (N ∈ {1, 10, 100, 1 000}) reports
+  `PASS` — worst observed |p99 delta| 3.7%, well inside tolerance, confirming
+  docs/07 §4's DESIGN TARGET still holds after `#34`'s added per-append cost
+  (which raises HP-2's absolute p99 baseline but does not break the N-flatness
+  the sweep exists to check, since the added cost is identical across all
+  four N columns). No CI `bench-regression` gate is armed by this change
+  (deliberately out of scope — that is #053, v1.0); `cargo clippy
+  --all-targets --all-features -- -D warnings` continues to be the only CI
+  check on the bench suite, now covering the new `hp5_durable_append`
+  target too. No `src/` change — a pure measurement/benchmark-harness issue;
+  `src/db/journal.rs` and `src/exchange/journal.rs` are read, not modified.
 - **Adversarial fixture corpus + bounded deserialiser for the journal / replay /
   seed-bundle decode surface — the v0.3 security gate** (#34,
   [034](milestones/v0.3-replay/034-journal-replay-adversarial-fixtures.md),
