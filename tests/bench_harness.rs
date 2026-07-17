@@ -9,11 +9,14 @@
 //! reimplementation that could silently drift from what the benches actually
 //! run.
 
+#[path = "../benches/support/fix_fixtures.rs"]
+mod fix_fixtures;
 #[path = "../benches/support/hdr.rs"]
 mod hdr;
 
 use std::time::Duration;
 
+use fauxchange::gateway::fix::{DecodedMessage, FixBody, decode};
 use hdr::{Quantiles, new_histogram, record_duration};
 
 /// A uniform `1..=1_000_000` (ns) distribution: `p50` should land near
@@ -149,4 +152,32 @@ fn test_hdr_report_return_value_matches_from_histogram() {
     let expected = Quantiles::from_histogram(&hist);
     let reported = hdr::report("test_scenario", &hist);
     assert_eq!(reported, expected);
+}
+
+/// HP-3 (#043) fixture smoke test: the bench must never silently measure a
+/// reject path. `benches/support/fix_fixtures.rs::new_order_single_frame`
+/// already panics internally if this fails; this test additionally proves the
+/// decoded value round-trips to the identical fixture (not just "decodes to
+/// *something*").
+#[test]
+fn test_hp3_new_order_single_fixture_decodes_to_itself() {
+    let fixture = fix_fixtures::new_order_single_fixture();
+    let frame = fix_fixtures::new_order_single_frame();
+    match decode(&frame) {
+        Ok(DecodedMessage::NewOrderSingle(back)) => assert_eq!(back, fixture),
+        other => panic!("HP-3 D fixture must decode to NewOrderSingle, got {other:?}"),
+    }
+}
+
+/// The `ExecutionReport (8)` encode fixture round-trips through the real
+/// decode path too, so the encode bench's fixed input is provably not a
+/// degenerate/rejectable message either.
+#[test]
+fn test_hp3_execution_report_fixture_round_trips() {
+    let report = fix_fixtures::execution_report_fixture();
+    let bytes = FixBody::encode(&report);
+    match decode(&bytes) {
+        Ok(DecodedMessage::ExecutionReport(back)) => assert_eq!(back, report),
+        other => panic!("HP-3 8 fixture must round-trip through decode, got {other:?}"),
+    }
 }

@@ -119,3 +119,66 @@ pub async fn run_open_loop(
     let rejected_count = rejected.load(Ordering::Relaxed);
     (hist, rejected_count)
 }
+
+/// The coordinated-omission-corrected open-loop runner for a **pure,
+/// synchronous** operation that has no bounded-mailbox / rejection concept —
+/// HP-3's `decode`/`encode` calls are plain function calls, not an
+/// `ActorHandle::submit` round-trip, so [`run_open_loop`]'s
+/// `VenueCommand`/rejection-counting shape does not fit; this is the same
+/// fixed-schedule, sojourn-time-recording generator with that shape
+/// generalised away.
+///
+/// Each call to `op` is dispatched as its own task at (or as soon as possible
+/// after) its intended send time, independent of whether earlier calls have
+/// completed — recording `completion − intended`, never `completion −
+/// actual_send`, exactly like [`run_open_loop`]. Spawning onto the Tokio
+/// worker pool this way is itself a faithful model of the real acceptor
+/// (`src/gateway/fix/acceptor.rs`), which runs `decode`/`encode` inline inside
+/// each connection's own per-connection async task: several connections'
+/// frames arriving concurrently means several `decode` calls genuinely
+/// contending for worker threads, exactly what dispatching each call as an
+/// independent task recreates. At a light dispatch rate the workers never
+/// queue and sojourn time should track the closed-loop service time; at a
+/// high enough rate this generator's own concurrent scheduling pressure
+/// becomes visible as inflated sojourn time — a real, disclosed effect of
+/// worker contention, not an artifact of the generator.
+pub async fn run_open_loop_pure<F>(ops: usize, interval: Duration, op: F) -> Histogram<u64>
+where
+    F: Fn() + Clone + Send + 'static,
+{
+    let sojourn = Arc::new(Mutex::new(new_histogram()));
+    let start = Instant::now();
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for i in 0..ops {
+        let offset = u32::try_from(i).unwrap_or(u32::MAX);
+        let intended = start + interval.saturating_mul(offset);
+        wait_until(intended).await;
+
+        let op = op.clone();
+        let sojourn = Arc::clone(&sojourn);
+        join_set.spawn(async move {
+            op();
+            let elapsed = intended.elapsed();
+            if let Ok(mut hist) = sojourn.lock() {
+                record_duration(&mut hist, elapsed);
+            }
+        });
+    }
+
+    while join_set.join_next().await.is_some() {}
+
+    match Arc::try_unwrap(sojourn) {
+        Ok(mutex) => mutex
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        // Every spawned task has joined by this point, so every clone of
+        // `sojourn` has already been dropped and this branch is unreachable
+        // in practice; handled anyway rather than assumed (mirrors
+        // `run_open_loop`'s identical fallback above).
+        Err(shared) => match shared.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        },
+    }
+}

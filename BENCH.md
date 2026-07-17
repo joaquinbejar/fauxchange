@@ -2,9 +2,9 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, and a re-verified HP-2 N-sweep (`#035`); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035` addendum); 2026-07-18 (§5 only), on routinely-rebased working trees at those dates |
-| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
+| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), and the HP-3 FIX parse/encode budget (`#043`, §11); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only), on routinely-rebased working trees at those dates |
+| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
 > **Every number in this document is a DESIGN TARGET comparison, never an
@@ -49,6 +49,7 @@
 ```bash
 cargo bench --bench hp1_order_path
 cargo bench --bench hp2_ws_fanout
+cargo bench --bench hp3_fix_parse          # #043 — no Docker, no order path (pure decode/encode)
 cargo bench --bench hp5_durable_append     # needs a local Docker daemon (testcontainers)
 cargo bench --bench alloc_profile
 cargo bench --bench criterion_match_cost   # supplementary, NOT BENCH.md evidence (§7)
@@ -56,6 +57,7 @@ cargo bench --bench criterion_match_cost   # supplementary, NOT BENCH.md evidenc
 # Reduced-sample local runs (every knob is an env var):
 HP1_WARMUP_OPS=500 HP1_MEASURED_OPS=5000 HP1_OPEN_LOOP_OPS=500 cargo bench --bench hp1_order_path
 HP2_WARMUP_OPS=500 HP2_MEASURED_OPS=5000 cargo bench --bench hp2_ws_fanout
+HP3_WARMUP_OPS=500 HP3_MEASURED_OPS=5000 HP3_OPEN_LOOP_OPS=500 cargo bench --bench hp3_fix_parse
 HP5_WARMUP_OPS=50 HP5_MEASURED_OPS=200 HP5_OPEN_LOOP_OPS=50 cargo bench --bench hp5_durable_append
 ALLOC_WARMUP_OPS=1000 ALLOC_MEASURED_OPS=10000 cargo bench --bench alloc_profile
 ```
@@ -609,9 +611,11 @@ here only to show the target genuinely runs, not skipped to make the suite
 
 ## 8. What was not measured, and why
 
-- **HP-3 (FIX session parse)** — out of scope for #020; lands with v0.4 (#043)
-  once the FIX wire dialect is pinned, per docs/07 §3-HP3 and the #020
-  milestone's explicit "Out" scope.
+- **HP-3 (FIX parse/encode) — now measured (`#043`, §11)**, no longer an
+  omission: out of scope for `#020` (the FIX wire dialect was not yet pinned);
+  `#043` adds the real decode(`D`)/encode(`8`) quantiles, closed- and
+  open-loop, once the dialect landed (#036) — see §11 for the numbers and the
+  open-loop-overhead disclosure there in particular.
 - **HP-4 (market-maker requote)** — out of scope for #020; lands v0.5 (#050).
 - **HP-5, durable/PostgreSQL journal append — now measured (`#035`, §5)**, no
   longer an omission: out of scope for `#020` (in-memory journal mode only),
@@ -695,19 +699,24 @@ superseded by §5's real measurements, `#035`), not duplicated here.
 ## 10. Files
 
 - `benches/hp1_order_path.rs`, `benches/hp2_ws_fanout.rs`,
-  `benches/hp5_durable_append.rs` (`#035`), `benches/alloc_profile.rs`,
-  `benches/criterion_match_cost.rs` — the five registered `[[bench]]` targets
-  (`harness = false`), `Cargo.toml`.
+  `benches/hp3_fix_parse.rs` (`#043`), `benches/hp5_durable_append.rs`
+  (`#035`), `benches/alloc_profile.rs`, `benches/criterion_match_cost.rs` —
+  the six registered `[[bench]]` targets (`harness = false`), `Cargo.toml`.
 - `benches/support/` — the reusable `bench-hdr` harness: `hdr.rs` (the
   `hdrhistogram` quantile report — unit-tested via `tests/bench_harness.rs`),
   `workload.rs` (the seeded, deterministic command-stream builder),
   `timing.rs` (the paired `TimingExecutor`/`TimingJournal` instrumentation
   seams, reused unchanged by `hp5_durable_append` against the durable
   journal), `openloop.rs` (the coordinated-omission-corrected load
-  generator).
-- `tests/bench_harness.rs` — 5 unit tests proving the histogram/quantile
-  plumbing itself is correct against known distributions (uniform, constant,
-  bimodal, empty, and a `report`-return-value consistency check).
+  generator; `#043` adds `run_open_loop_pure` alongside the original
+  `ActorHandle`-shaped `run_open_loop`), `fix_fixtures.rs` (`#043` — the
+  fixed, golden-shaped `NewOrderSingle (D)` / `ExecutionReport (8)`
+  fixtures HP-3 measures).
+- `tests/bench_harness.rs` — 7 unit tests: the original 5 proving the
+  histogram/quantile plumbing itself is correct against known distributions
+  (uniform, constant, bimodal, empty, and a `report`-return-value consistency
+  check), plus 2 added by `#043` proving the HP-3 `D`/`8` fixtures decode to
+  themselves (never a silent reject-path measurement).
 - `tests/docker_smoke.rs` (#027) — the Docker e2e smoke test that measures §9's
   cold-bring-up number and proves the one-order REST → WS-fill round-trip
   against the real container.
@@ -715,3 +724,137 @@ superseded by §5's real measurements, `#035`), not duplicated here.
   (`InMemoryVenueJournal`, `check_record_size`) — the two journal
   implementations §3.6 and §5 measure; neither changed in `#035` (a pure
   measurement issue, no `src/` change).
+
+## 11. HP-3 — FIX parse/encode, pure venue overhead (`#043`)
+
+`benches/hp3_fix_parse.rs`: a framed inbound `NewOrderSingle (D)` →
+`fauxchange::gateway::fix::decode` → typed struct, and the reverse — a typed
+`ExecutionReport (8)` → `FixBody::encode` → wire frame. Both calls are the
+EXACT functions the live acceptor's `dispatch` seam calls
+(`src/gateway/fix/acceptor.rs`: `super::decode(frame)`), not a
+reimplementation. Neither span touches matching, the order path, the actor,
+or the journal — this is pure wire-seam venue overhead
+([07 §2](docs/07-performance-budgets.md#2-hot-paths), [07
+§5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention)'s
+match/overhead separation), never fused with HP-1's numbers. Fixtures
+(`benches/support/fix_fixtures.rs`) are the IDENTICAL `D`/`8` shapes that
+`tests/golden_fix.rs` golden-tests against `tests/golden/fix/new_order_single_D.txt`
+/ `tests/golden/fix/execution_report_8.txt` (#036) — reused, not
+reconstructed, so the bench cannot silently drift from the pinned dialect;
+`tests/bench_harness.rs` adds two unit tests proving both fixtures decode to
+themselves (never a reject-path measurement).
+
+Run conditions are identical to §1 (same host, same toolchain, no Postgres/
+Docker needed — this bench is pure in-process CPU work) plus the FIX-specific
+pinned crate versions (from `Cargo.lock` on this branch): `ironfix-core`
+`0.3.0`, `ironfix-tagvalue` `0.3.0`, `ironfix-dictionary` `0.3.0`,
+`ironfix-transport` `0.3.0`, `tokio-util` `0.7.18`, `bytes` `1.12.1`.
+
+### 11.1 Closed-loop, 5 000 warmup + 100 000 measured ops (discarded warmup)
+
+Three real, independent `cargo bench --bench hp3_fix_parse` runs on this
+machine, identical configuration, disclosed side by side rather than
+collapsed into one (the same "show the variance, don't hide it" convention
+§3.1/§3.6 use):
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| `hp3_decode_d_closed_loop` p50 | 875 ns | 875 ns | 750 ns |
+| `hp3_decode_d_closed_loop` p99 | 2 251 ns | 1 125 ns | 1 084 ns |
+| `hp3_decode_d_closed_loop` p99.9 | 2 543 ns | 1 250 ns | 1 167 ns |
+| `hp3_decode_d_closed_loop` p99.99 | 20 047 ns | 7 375 ns | 2 793 ns |
+| `hp3_decode_d_closed_loop` min / max | 750 / 99 839 ns | 708 / 41 567 ns | 666 / 23 423 ns |
+| `hp3_encode_8_closed_loop` p50 | 417 ns | 458 ns | 458 ns |
+| `hp3_encode_8_closed_loop` p99 | 583 ns | 625 ns | 625 ns |
+| `hp3_encode_8_closed_loop` p99.9 | 667 ns | 750 ns | 667 ns |
+| `hp3_encode_8_closed_loop` p99.99 | 792 ns | 6 419 ns | 875 ns |
+| `hp3_encode_8_closed_loop` min / max | 333 / 10 127 ns | 375 / 17 055 ns | 333 / 5 335 ns |
+
+**Interpretation — DESIGN TARGET grounding, not yet a stated number.**
+docs/07 §3-HP3 has, until now, deliberately carried NO numeric budget for
+HP-3 ("Budget stated once the FIX wire dialect is pinned … the bench lands
+with v0.4, not before, so the number is grounded in the real message
+schema"). This is that grounding measurement: across three independent runs,
+decode `p50` is **sub-microsecond** (750–875 ns) with a low-single-digit-µs
+`p99`/`p99.9` tail (1.08–2.54 µs), while encode is **sub-microsecond through
+`p99.9`** (417–750 ns) — both one to two orders of magnitude inside even a
+generous "sub-millisecond" reading, and
+decode is consistently ~1.6–2× the cost of encode (a `FieldBag::collect` +
+per-tag UTF-8/parse pass on untrusted bytes is real work the encoder's
+straight-line field-write does not do). `p99.99` is the one quantile that
+moves meaningfully run to run (decode: 2 793 ns – 20 047 ns; encode:
+792 ns – 6 419 ns) — at 100 000 samples this quantile is resolved by roughly
+the 10 slowest samples, so a single OS-scheduler preemption on this shared,
+un-pinned developer laptop (background process, GC-style pause, whatever) can
+move it by an order of magnitude without the underlying decode/encode code
+doing anything different; this is disclosed exactly as HP-1's own p99.99
+run-to-run variance is (§3.1, §3.5). **Stating the actual numeric HP-3
+budget in `docs/07-performance-budgets.md` §3-HP3 is an `architect` follow-up
+against this grounding data** — outside this bench's own scope (measure and
+report, not set the design-doc target), consistent with how #020 refined
+HP-1's target only once real quantiles existed.
+
+### 11.2 Open-loop, coordinated-omission corrected, 3 000 ops at a ~2 ms intended interval
+
+`support::openloop::run_open_loop_pure` (new in `#043`, extending
+`benches/support/openloop.rs` alongside the pre-existing `ActorHandle`-shaped
+`run_open_loop`): each call is dispatched as its own Tokio task at a fixed,
+up-front `intended = start + i × interval` schedule, independent of whether
+earlier calls have completed, recording `completion − intended` (sojourn
+time), never `completion − actual_send` — the identical CO-correction
+`run_open_loop` uses, generalised off `ActorHandle::submit` because
+`decode`/`encode` have no bounded mailbox to reject against (there is no
+"rejected count" for this hot path — every dispatched call always completes).
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| `hp3_decode_d_open_loop_sojourn` p50 | 11 543 ns | 11 007 ns | 11 295 ns |
+| `hp3_decode_d_open_loop_sojourn` p99 | 32 863 ns | 23 919 ns | 22 463 ns |
+| `hp3_decode_d_open_loop_sojourn` p99.9 | 87 999 ns | 61 023 ns | 62 975 ns |
+| `hp3_decode_d_open_loop_sojourn` p99.99 | 339 967 ns | 87 231 ns | 226 303 ns |
+| `hp3_encode_8_open_loop_sojourn` p50 | 9 503 ns | 10 375 ns | 10 591 ns |
+| `hp3_encode_8_open_loop_sojourn` p99 | 28 639 ns | 21 759 ns | 21 375 ns |
+| `hp3_encode_8_open_loop_sojourn` p99.9 | 117 183 ns | 52 031 ns | 47 135 ns |
+| `hp3_encode_8_open_loop_sojourn` p99.99 | 1 510 399 ns | 741 375 ns | 65 599 ns |
+
+**Interpretation — an honest, disclosed harness-overhead effect, not a
+decode/encode regression.** The open-loop sojourn p50 (~9.5–11.5 µs across
+both spans) is **~13–25× the closed-loop p50** (§11.1: 750–875 ns decode,
+417–458 ns encode) — a MUCH larger gap than HP-1's own open-loop section saw
+relative to its closed-loop number (§3.5: 26 µs vs 15 µs, under 2×). The
+reason is scale, not queueing: HP-1's actor turn costs hundreds of
+microseconds, so `run_open_loop`'s own per-call dispatch overhead (Tokio task
+spawn + scheduling latency until a worker actually polls the task, `JoinSet`
+bookkeeping, a `Mutex`-guarded histogram write, two `Instant` reads) is
+negligible next to it. HP-3's decode/encode cost under a microsecond, so that
+SAME dispatch overhead — unchanged code, reused as-is from `run_open_loop`'s
+pattern in the new `run_open_loop_pure` — is now the dominant contributor to
+the reported sojourn time. **Read §11.2 as measuring "Tokio task-spawn +
+schedule + op" cost, not an isolated decode/encode figure** — §11.1's
+closed-loop numbers are the right DESIGN TARGET comparison for the wire-seam
+cost itself; §11.2 remains genuinely useful as the honest answer to "what
+does a FIX frame's dispatch-to-completion sojourn look like under an
+independent-arrival-schedule load," which is a real and different question
+from "how expensive is one decode call." The `p99.99` column is, again, a
+single-sample artifact at 3 000 samples (encode run 1: 1.51 ms driven by one
+outlier — a plausible one-off scheduling stall on this shared, un-pinned
+host, not a repeatable finding, mirroring §3.5's identical disclosure at
+comparable sample counts) and should not be read as a stable figure.
+
+### 11.3 What this bench does and does not prove
+
+- **Proves**: `fauxchange::gateway::fix::decode` (p50 sub-microsecond, p99/p99.9
+  a low-single-digit-µs tail) and `ExecutionReport`'s `FixBody::encode`
+  (sub-microsecond through p99.9) are one to two orders of magnitude inside a
+  sub-millisecond reading on this host — real measured numbers from the ACTUAL
+  acceptor code path (not a reimplementation), reusing the pinned #036 golden
+  fixtures.
+- **Does not prove**: a production SLA (this is one un-pinned developer
+  laptop, §1's own disclosed limitation, not a dedicated bench rig); a stated
+  HP-3 numeric budget in `docs/07-performance-budgets.md` (an `architect`
+  follow-up against this data, §11.1); or a clean isolation of decode/encode
+  cost under open-loop dispatch (§11.2's harness-overhead disclosure).
+- **CI regression gate**: not armed by this change — `#043` is scope-limited
+  to landing the measured baseline; the CI `bench-regression` gate arms
+  before v1.0 (#053, [07 §6](docs/07-performance-budgets.md#6-ci-regression-gate)),
+  same as every other hot path in this document.
