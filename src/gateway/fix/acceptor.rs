@@ -947,6 +947,7 @@ pub fn message_type_str(message: &DecodedMessage) -> &'static str {
         DecodedMessage::ExecutionReport(_) => execution::ExecutionReport::MSG_TYPE,
         DecodedMessage::OrderCancelReject(_) => execution::OrderCancelReject::MSG_TYPE,
         DecodedMessage::OrderMassCancelReport(_) => execution::OrderMassCancelReport::MSG_TYPE,
+        DecodedMessage::BusinessMessageReject(_) => execution::BusinessMessageReject::MSG_TYPE,
         DecodedMessage::MarketDataRequest(_) => marketdata::MarketDataRequest::MSG_TYPE,
         DecodedMessage::MarketDataSnapshotFullRefresh(_) => {
             marketdata::MarketDataSnapshotFullRefresh::MSG_TYPE

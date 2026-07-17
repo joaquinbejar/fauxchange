@@ -11,6 +11,43 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **FIX order entry mapped onto the sequenced order path with context-sensitive
+  rejects** (#39) — the order-submitting messages `NewOrderSingle (D)` /
+  `OrderCancelRequest (F)` / `OrderCancelReplaceRequest (G)` translate to the
+  **same** `VenueCommand` the REST handler produces and submit through the same
+  single-writer `AppState::submit` seam (**parity by construction** — a new shared
+  `add_order_command` builder both gateways call, so an order over FIX and over
+  REST derive the byte-identical command, fills, resting state, and
+  `underlying_sequence`, [03 §7](docs/03-protocol-surfaces.md#7-protocol-parity-guarantees)).
+  `OrderMassCancelRequest (q)` renders an honest `OrderMassCancelReport (r)`
+  `Rejected` (venue-wide mass-cancel routing is not yet wired — the per-underlying
+  submit path does not route a mass cancel, as the REST cancel-all handler returns
+  `400`; tracked as [#97](https://github.com/joaquinbejar/fauxchange/issues/97)),
+  and `OrderStatusRequest (H)` is a committed-fills status read (no submit). The new
+  `src/gateway/fix/order_flow.rs` renders committed `VenueEvent`/`Fill` legs as
+  `ExecutionReport (8)` (`New` on accept; `Trade` with `PartiallyFilled`/`Filled`
+  per fill leg carrying `SecondaryExecID (527)` = `underlying_sequence`,
+  per-leg `Commission (12)`+`CommType (13)=3`, and `LastLiquidityInd (851)`;
+  `Canceled` for a killed `IOC`/`FOK`/market remainder), and the `SessionFsm`
+  gains the async order router on `VenueFixSession`. **Rejects are
+  context-sensitive** through the existing `src/error.rs` seam: a `D` failure is
+  `ExecutionReport (8) Rejected` (`OrdRejReason (103)`), an `F`/`G` failure is
+  `OrderCancelReject (9)` (`CxlRejReason (102)` + `CxlRejResponseTo (434)`), an
+  unsupported application `MsgType` is the new typed `BusinessMessageReject (j)`,
+  and only a session-protocol failure is a bare `Reject (3)` — never `3` for an
+  application failure. Cross-protocol idempotency rides the `ClOrdID` (the
+  account-scoped key the executor dedups on); `Trade` permission + the sliding
+  rate limiter gate every mutating op in message context (a throttled `D` →
+  `8 Rejected`, never `3`); **no control-plane message is exposed on FIX**. Adds
+  `UtcTimestamp::to_epoch_ms` (the `ExpireTime (126)` → `Gtd(ms)` inverse), a
+  `business_message_reject_j` golden, a REST≡FIX command-parity proptest, a
+  FIX-arriving-order determinism test, and the end-to-end reject-matrix /
+  per-leg-fee / idempotent-retry conformance suite
+  ([039](milestones/v0.4-fix-gateway/039-fix-order-flow.md),
+  [03 §5.3 / §8](docs/03-protocol-surfaces.md#53-order-entry-and-execution-reports),
+  [specs/fix-dialect.md §2.2 / §4 / §5](docs/specs/fix-dialect.md#22-order-entry-and-execution),
+  [ADR-0006](docs/adr/0006-venue-command-envelope-and-single-writer-journal.md),
+  [ADR-0009](docs/adr/0009-lossless-venue-envelope-outcomes.md)).
 - **The FIX 4.4 session layer — acceptor-side logon auth, the account ↔ CompID
   binding, checked non-wrapping sequence counters, heartbeat cadence, and an
   account-keyed session store with resend / reset** (in-memory backend; session

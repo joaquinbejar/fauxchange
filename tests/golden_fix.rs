@@ -18,7 +18,7 @@ use fauxchange::gateway::fix::enums::{
 };
 use fauxchange::gateway::fix::error::SessionRejectReason;
 use fauxchange::gateway::fix::execution::{
-    ExecutionReport, OrderCancelReject, OrderMassCancelReport,
+    BusinessMessageReject, ExecutionReport, OrderCancelReject, OrderMassCancelReport,
 };
 use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
 use fauxchange::gateway::fix::marketdata::{
@@ -321,6 +321,18 @@ fn test_golden_order_mass_cancel_report_r() {
         ],
     });
     assert_golden_fix("order_mass_cancel_report_r.txt", &msg);
+}
+
+#[test]
+fn test_golden_business_message_reject_j() {
+    let msg = DecodedMessage::BusinessMessageReject(BusinessMessageReject {
+        header: venue_header(19),
+        ref_seq_num: SequenceNumber::new(42),
+        ref_msg_type: "AE".to_string(),
+        business_reject_reason: 3,
+        text: Some("unsupported message type".to_string()),
+    });
+    assert_golden_fix("business_message_reject_j.txt", &msg);
 }
 
 #[test]

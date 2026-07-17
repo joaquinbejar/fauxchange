@@ -13,11 +13,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::VenueError;
 use crate::exchange::{
-    Cents, EventTimestamp, ExecutionFilter, ExecutionsStore, LineageId, SequenceNumber,
-    Side as SeamSide, Symbol, TimeInForce as SeamTif,
+    Cents, EventTimestamp, ExecutionFilter, ExecutionsStore, Hash32, LineageId, STPMode,
+    SequenceNumber, Side as SeamSide, Symbol, TimeInForce as SeamTif, VenueCommand,
 };
 use crate::models::{
-    AccountId, LiquidityFlag, OptionStyle, Side as DtoSide, TimeInForce as DtoTif, VenueOrderId,
+    AccountId, ClientOrderId, ExecutionRecord, LiquidityFlag, OptionStyle, OrderType,
+    Side as DtoSide, TimeInForce as DtoTif, VenueOrderId,
 };
 use crate::state::AppState;
 
@@ -145,27 +146,69 @@ pub(crate) fn owner_for(
         .ok_or(VenueError::Unauthorized)
 }
 
-/// The immediate fills of a just-submitted aggressing order: the **taker** legs
-/// recorded on the shared executions store at this command's sequence, keyed by
-/// the order's venue id.
+/// Builds the `VenueCommand::AddOrder` a placement submits — the **one shared
+/// order-command construction** both the REST order-entry handlers and the FIX
+/// `NewOrderSingle (D)` translation call, so an order arriving on either surface
+/// derives the byte-identical command (parity by construction,
+/// [03 §7](../../../docs/03-protocol-surfaces.md#7-protocol-parity-guarantees)).
+///
+/// The caller resolves the surface-specific inputs to the matching-seam newtypes
+/// first — [`seam_side`] / [`seam_tif`] for the wire enums, [`owner_for`] for the
+/// STP owner, [`mint_order_id`] for the provisional venue order id — and this
+/// stamps the fixed `stp_mode: None` (per-account STP is venue config, not carried
+/// on the order in either dialect).
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn add_order_command(
+    symbol: Symbol,
+    order_id: VenueOrderId,
+    account: AccountId,
+    owner: Hash32,
+    client_order_id: Option<ClientOrderId>,
+    side: SeamSide,
+    order_type: OrderType,
+    limit_price: Option<Cents>,
+    quantity: u64,
+    time_in_force: SeamTif,
+) -> VenueCommand {
+    VenueCommand::AddOrder {
+        symbol,
+        order_id,
+        account,
+        owner,
+        client_order_id,
+        side,
+        order_type,
+        limit_price,
+        quantity,
+        time_in_force,
+        stp_mode: STPMode::None,
+    }
+}
+
+/// The **taker** [`ExecutionRecord`] legs of a just-submitted aggressing order:
+/// the fills recorded on the shared executions store at this command's sequence,
+/// keyed by the order's venue id.
 ///
 /// The actor fans committed fills into the shared store **synchronously** inside
 /// its turn, before the receipt is returned ([02 §6](../../../docs/02-matching-architecture.md)),
-/// so a read here after `submit().await` observes exactly this order's fills.
-/// Returns each leg's `(price, quantity)` in journal order.
+/// so a read here after `submit().await` observes exactly this order's fills. The
+/// full record (execution id, price, quantity, and signed per-leg fee) is what
+/// the FIX `ExecutionReport (8)` rendering needs; the REST handler projects only
+/// `(price, quantity)` via [`immediate_fills`]. Returned in journal order.
 #[must_use]
-pub(crate) fn immediate_fills(
+pub(crate) fn immediate_execution_records(
     state: &Arc<AppState>,
     account: &AccountId,
     order_id: &VenueOrderId,
     sequence: SequenceNumber,
-) -> Vec<(Cents, u64)> {
+) -> Vec<ExecutionRecord> {
     let records = match state
         .executions()
         .list(account, &ExecutionFilter::default())
     {
         Ok(records) => records,
-        // The in-memory store never errors; a defensive empty keeps the handler
+        // The in-memory store never errors; a defensive empty keeps the caller
         // total without an `unwrap`.
         Err(_) => return Vec::new(),
     };
@@ -176,6 +219,43 @@ pub(crate) fn immediate_fills(
                 && record.underlying_sequence == sequence
                 && record.liquidity == LiquidityFlag::Taker
         })
+        .collect()
+}
+
+/// Every **taker** fill leg the account has on `order_id`, across all sequences —
+/// the `OrderStatusRequest (H)` read (a status folds an order's whole fill
+/// history, not one command's sequence). Returned in journal order.
+#[must_use]
+pub(crate) fn taker_legs_for_order(
+    state: &Arc<AppState>,
+    account: &AccountId,
+    order_id: &VenueOrderId,
+) -> Vec<ExecutionRecord> {
+    let records = match state
+        .executions()
+        .list(account, &ExecutionFilter::default())
+    {
+        Ok(records) => records,
+        Err(_) => return Vec::new(),
+    };
+    records
+        .into_iter()
+        .filter(|record| record.order_id == *order_id && record.liquidity == LiquidityFlag::Taker)
+        .collect()
+}
+
+/// The immediate fills of a just-submitted aggressing order as `(price,
+/// quantity)` legs in journal order — the REST-handler projection of
+/// [`immediate_execution_records`].
+#[must_use]
+pub(crate) fn immediate_fills(
+    state: &Arc<AppState>,
+    account: &AccountId,
+    order_id: &VenueOrderId,
+    sequence: SequenceNumber,
+) -> Vec<(Cents, u64)> {
+    immediate_execution_records(state, account, order_id, sequence)
+        .into_iter()
         .map(|record| (record.price_cents, record.quantity))
         .collect()
 }

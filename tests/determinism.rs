@@ -81,11 +81,16 @@ use fauxchange::exchange::{
     TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal,
     VenueOutcome, recover, validate_venue_expiry,
 };
+use fauxchange::gateway::fix::enums::{OrdType as FixOrdType, OrderSide, TimeInForce as FixTif};
+use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
+use fauxchange::gateway::fix::order::NewOrderSingle;
+use fauxchange::gateway::fix::order_flow::to_add_command;
 use fauxchange::simulation::{
     ClockMode, JournalStream, RunManifest, ScenarioBundle, SessionConfig, WalkTypeConfig,
     replay_bundle, replay_streams, synthesize_chain,
 };
-use fauxchange::{AccountId, OrderType, VenueError};
+use fauxchange::{AccountId, ClientOrderId, OrderType, VenueError, VenueOrderId};
+use ironfix_core::types::{CompId, SeqNum};
 
 const UNDERLYING: &str = "BTC";
 const CALL: &str = "BTC-20240329-50000-C";
@@ -2057,4 +2062,87 @@ fn test_seed_isolation_for_venue_owned_derivations() {
         other.execution_id(UNDERLYING, seq, 0),
         "distinct seeds mint disjoint execution ids"
     );
+}
+
+// ============================================================================
+// FIX order arrival is a sequenced-path input (#039): same journal → same fills
+// ============================================================================
+
+/// A `NewOrderSingle (D)` typed message for the FIX determinism scenario.
+fn fix_new_order(raw_symbol: &str, side: OrderSide, price: u64, quantity: u64) -> NewOrderSingle {
+    NewOrderSingle {
+        header: StandardHeader::new(
+            CompId::new("CLIENT").expect("comp"),
+            CompId::new("FAUXCHANGE").expect("comp"),
+            SeqNum::new(2),
+            UtcTimestamp::from_epoch_ms(0),
+        ),
+        cl_ord_id: ClientOrderId::new("fix-taker-1"),
+        account: None,
+        symbol: sym(raw_symbol),
+        side,
+        transact_time: UtcTimestamp::from_epoch_ms(0),
+        ord_type: FixOrdType::Limit,
+        price: Some(Cents::new(price)),
+        order_qty: quantity,
+        time_in_force: FixTif::Gtc,
+        expire_time: None,
+    }
+}
+
+/// An order that arrives over FIX is translated to the **same** `VenueCommand` the
+/// REST handler produces (`to_add_command`), so it is an ordinary sequenced-path
+/// input: the same journal replays to identical fills, events, and top-of-book —
+/// the sequenced-path determinism obligation for a FIX-arriving order (#039,
+/// [TESTING.md §5](../docs/TESTING.md#5-determinism--replay-tests)).
+#[test]
+fn test_fix_arriving_order_replays_to_identical_fills_events_and_top_of_book() {
+    let lineage = LineageId::new("fauxchange");
+
+    // seq0: a resting maker ask (3 @ 50_000), added via the ordinary command path.
+    let maker = add(
+        &lineage,
+        0,
+        CALL,
+        "maker",
+        0x11,
+        Side::Sell,
+        50_000,
+        3,
+        TimeInForce::Gtc,
+    );
+    // seq1: the aggressing buy arrives over FIX — translated to the identical
+    // AddOrder the REST `D` twin produces, then submitted onto the same path.
+    let fix_order = fix_new_order(CALL, OrderSide::Buy, 50_000, 2);
+    let order_id: VenueOrderId = lineage.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0);
+    let taker = to_add_command(
+        &fix_order,
+        order_id,
+        AccountId::new("fix-taker"),
+        Hash32([0x22; 32]),
+    )
+    .expect("fix D translates to an AddOrder");
+
+    let commands = vec![maker, taker];
+    let recording = record(&commands, &lineage, &witnesses());
+
+    // The FIX-arriving order crossed and captured fills.
+    let taker_event = &recording.events[1];
+    match &taker_event.outcome {
+        VenueOutcome::Added { fills, .. } => {
+            assert_eq!(fills.len(), 2, "one crossing match = maker + taker legs");
+            // The taker leg carries the FIX-arriving account.
+            let taker_leg = fills
+                .iter()
+                .find(|leg| leg.account == AccountId::new("fix-taker"))
+                .expect("the FIX taker leg");
+            assert_eq!(taker_leg.price, Cents::new(50_000));
+            assert_eq!(taker_leg.quantity, 2);
+        }
+        other => panic!("expected the FIX order to fill, got {other:?}"),
+    }
+
+    // Same journal → identical events, fills, and top-of-book on replay.
+    let replay = replay(&recording);
+    assert_replay_equals(&recording, &replay);
 }

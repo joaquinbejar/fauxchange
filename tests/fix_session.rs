@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fauxchange::auth::{AccountProvision, AccountStore, CompIdBinding, RateLimitKey};
-use fauxchange::exchange::Hash32;
+use fauxchange::exchange::{ExecutionsStore, Hash32};
 use fauxchange::gateway::fix::{
     FixAcceptor, FixAcceptorConfig, FixSessionStore, InMemoryFixSessionStore, SessionConfig,
     VenueFixSessionFactory,
@@ -158,6 +158,45 @@ fn new_order_frame(sender: &str, target: &str, seq: u64) -> Vec<u8> {
     let body = format!(
         "35=D\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x0111=cl-1\x0155=BTC-20240329-50000-C\x0154=1\x0160=20240329-12:00:00.000\x0140=1\x0138=1\x01"
     );
+    frame_with_body(body.as_bytes())
+}
+
+/// A `NewOrderSingle (D)` limit order (`side` `1`=Buy/`2`=Sell, decimal `price`).
+#[allow(clippy::too_many_arguments)]
+fn limit_order_frame(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    cl_ord_id: &str,
+    side: &str,
+    price: &str,
+    qty: u64,
+) -> Vec<u8> {
+    let body = format!(
+        "35=D\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x0111={cl_ord_id}\x0155=BTC-20240329-50000-C\x0154={side}\x0160=20240329-12:00:00.000\x0140=2\x0144={price}\x0138={qty}\x0159=1\x01"
+    );
+    frame_with_body(body.as_bytes())
+}
+
+/// An `OrderCancelRequest (F)` referencing `orig_cl_ord_id`.
+fn cancel_frame(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    orig_cl_ord_id: &str,
+    cl_ord_id: &str,
+) -> Vec<u8> {
+    let body = format!(
+        "35=F\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x0141={orig_cl_ord_id}\x0111={cl_ord_id}\x0155=BTC-20240329-50000-C\x0154=1\x01"
+    );
+    frame_with_body(body.as_bytes())
+}
+
+/// A well-formed application message with an unsupported `MsgType` (`R`,
+/// QuoteRequest — recognised by FIX 4.4, unhandled by the venue dialect).
+fn unsupported_app_frame(sender: &str, target: &str, seq: u64) -> Vec<u8> {
+    let body =
+        format!("35=R\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x01");
     frame_with_body(body.as_bytes())
 }
 
@@ -377,10 +416,9 @@ async fn test_read_logon_is_refused_order_entry_order_level() {
     assert_eq!(field(report, "39").as_deref(), Some("8"));
 }
 
-#[tokio::test]
-async fn test_trade_logon_admits_order_at_the_session_boundary() {
-    let harness = Harness::start().await;
-    let mut client = connect(harness.addr).await;
+/// Logs a trader in and drains the credential-free `Logon (A)` ack.
+async fn logon_trader(addr: SocketAddr) -> TcpStream {
+    let mut client = connect(addr).await;
     client
         .write_all(&logon_frame(
             TRADER_SENDER,
@@ -392,16 +430,436 @@ async fn test_trade_logon_admits_order_at_the_session_boundary() {
         ))
         .await
         .expect("logon");
-    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
-    // A Trade session's order is admitted (routing lands in #039), so no reject.
+    let ack = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert!(any_msg_type(&ack, "A"), "the trader logon is admitted");
+    client
+}
+
+#[tokio::test]
+async fn test_new_order_single_market_against_empty_book_reports_new_then_canceled() {
+    // The #038 "admitted at the session boundary" no-op is now the #039 order path:
+    // a permitted market order against an empty book is ACCEPTED (New) then its
+    // remainder killed (Canceled) — never a bare session Reject(3), and never a
+    // Rejected(8) (the order was valid, just unfillable).
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
     client
         .write_all(&new_order_frame(TRADER_SENDER, VENUE, 2))
         .await
         .expect("order");
-    let reply = recv_frames(&mut client, Duration::from_millis(600)).await;
+    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
     assert!(
-        !any_msg_type(&reply, "8") && !any_msg_type(&reply, "3"),
-        "a permitted order is not rejected at the session boundary, got {reply:?}"
+        !any_msg_type(&reply, "3"),
+        "an application order is never a session Reject(3), got {reply:?}"
+    );
+    let reports: Vec<&Vec<u8>> = reply
+        .iter()
+        .filter(|f| msg_type(f).as_deref() == Some("8"))
+        .collect();
+    assert!(!reports.is_empty(), "the order path emits ExecutionReports");
+    // New (ExecType 150=0) on accept, Canceled (150=4) for the killed remainder.
+    assert_eq!(
+        field(reports[0], "150").as_deref(),
+        Some("0"),
+        "New on accept"
+    );
+    assert!(
+        reports
+            .iter()
+            .any(|f| field(f, "150").as_deref() == Some("4")),
+        "the unfilled market remainder is Canceled"
+    );
+    assert!(
+        !reports
+            .iter()
+            .any(|f| field(f, "150").as_deref() == Some("8")),
+        "an accepted-but-unfillable order is not Rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_resting_limit_order_reports_new() {
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
+    // A non-crossing limit rests → a single New report, LeavesQty = the order qty.
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "rest-1",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("order");
+    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let report = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("8"))
+        .expect("an ExecutionReport");
+    assert_eq!(field(report, "150").as_deref(), Some("0"), "ExecType New");
+    assert_eq!(field(report, "39").as_deref(), Some("0"), "OrdStatus New");
+    assert_eq!(field(report, "151").as_deref(), Some("3"), "LeavesQty = 3");
+    assert_eq!(field(report, "14").as_deref(), Some("0"), "CumQty = 0");
+}
+
+#[tokio::test]
+async fn test_crossing_order_reports_trade_with_join_keys_and_commission() {
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
+    // A resting sell, then a crossing buy (STP is None, so a same-account cross
+    // fills) — the taker reports a Trade with the cross-surface join keys.
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "maker-1",
+            "2",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("maker");
+    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            "taker-1",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("taker");
+    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let trade = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("F"))
+        .expect("a Trade ExecutionReport");
+    // ExecType=Trade(F), OrdStatus=Filled(2), the full fill.
+    assert_eq!(field(trade, "39").as_deref(), Some("2"), "OrdStatus Filled");
+    assert_eq!(field(trade, "32").as_deref(), Some("3"), "LastQty = 3");
+    assert_eq!(field(trade, "31").as_deref(), Some("500.00"), "LastPx");
+    assert_eq!(field(trade, "14").as_deref(), Some("3"), "CumQty = 3");
+    assert_eq!(field(trade, "151").as_deref(), Some("0"), "LeavesQty = 0");
+    // SecondaryExecID(527) = the underlying_sequence (the cross-surface join key);
+    // it is present and numeric.
+    let secondary = field(trade, "527").expect("SecondaryExecID(527)");
+    assert!(
+        secondary.parse::<u64>().is_ok(),
+        "527 is numeric: {secondary}"
+    );
+    // The per-leg fee rides Commission(12) + CommType(13)=3, LastLiquidityInd(851).
+    assert!(field(trade, "12").is_some(), "Commission(12) present");
+    assert_eq!(
+        field(trade, "13").as_deref(),
+        Some("3"),
+        "CommType absolute"
+    );
+    assert_eq!(
+        field(trade, "851").as_deref(),
+        Some("2"),
+        "LastLiquidityInd = Taker"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_of_unknown_order_is_order_cancel_reject_9() {
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
+    // A cancel referencing an OrigClOrdID the session never placed → 9, not a
+    // bare Reject(3), with CxlRejReason(102)=1 (Unknown order) and
+    // CxlRejResponseTo(434)=1 (Order Cancel Request).
+    client
+        .write_all(&cancel_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "never-placed",
+            "cxl-1",
+        ))
+        .await
+        .expect("cancel");
+    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert!(
+        !any_msg_type(&reply, "3"),
+        "a cancel failure is never a session Reject(3), got {reply:?}"
+    );
+    let reject = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("9"))
+        .expect("an OrderCancelReject(9)");
+    assert_eq!(field(reject, "102").as_deref(), Some("1"), "Unknown order");
+    assert_eq!(
+        field(reject, "434").as_deref(),
+        Some("1"),
+        "CxlRejResponseTo = Order Cancel Request"
+    );
+    assert_eq!(
+        field(reject, "41").as_deref(),
+        Some("never-placed"),
+        "the OrigClOrdID is echoed"
+    );
+}
+
+#[tokio::test]
+async fn test_unsupported_application_message_is_business_message_reject_j() {
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
+    // A well-formed application MsgType the venue has no handler for (R,
+    // QuoteRequest) → BusinessMessageReject(j), never a bare session Reject(3).
+    client
+        .write_all(&unsupported_app_frame(TRADER_SENDER, VENUE, 2))
+        .await
+        .expect("unsupported");
+    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let reject = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("j"))
+        .unwrap_or_else(|| panic!("expected a BusinessMessageReject(j), got {reply:?}"));
+    // BusinessRejectReason(380)=3 (Unsupported Message Type), RefMsgType(372)=R.
+    assert_eq!(field(reject, "380").as_deref(), Some("3"));
+    assert_eq!(field(reject, "372").as_deref(), Some("R"));
+}
+
+#[tokio::test]
+async fn test_malformed_frame_is_a_session_reject_3() {
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
+    // A structurally-invalid order (a NewOrderSingle missing the required Side(54))
+    // is a session-level Reject(3) with a RefTagID — NOT an order-level 8/9 (a
+    // malformed field is a session-protocol failure, fix-dialect §5).
+    let body = format!(
+        "35=D\x0149={TRADER_SENDER}\x0156={VENUE}\x0134=2\x0152=20240329-12:00:00.000\x0111=nodside\x0155=BTC-20240329-50000-C\x0160=20240329-12:00:00.000\x0140=2\x0144=500.00\x0138=1\x0159=1\x01"
+    );
+    client
+        .write_all(&frame_with_body(body.as_bytes()))
+        .await
+        .expect("bad order");
+    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert!(
+        any_msg_type(&reply, "3"),
+        "a malformed order field is a session Reject(3), got {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_idempotent_resend_of_the_same_clordid_does_not_open_a_second_order() {
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
+    // A resting maker sell of 4, then a taker buy of 2 (ClOrdID "dup") that fills 2
+    // — recording exactly two execution legs (maker + taker).
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "maker-4",
+            "2",
+            "500.00",
+            4,
+        ))
+        .await
+        .expect("maker");
+    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            "dup",
+            "1",
+            "500.00",
+            2,
+        ))
+        .await
+        .expect("taker");
+    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert_eq!(
+        harness.state.executions().len(),
+        2,
+        "the first crossing records two legs (maker + taker)"
+    );
+
+    // Resend the byte-identical taker (same ClOrdID + payload): the executor
+    // deduplicates on (account, ClOrdID), so it returns the stored terminal
+    // outcome WITHOUT opening a second order — no second fill against the maker's
+    // remaining 2, so the executions store still holds exactly two legs.
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            "dup",
+            "1",
+            "500.00",
+            2,
+        ))
+        .await
+        .expect("resend");
+    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert_eq!(
+        harness.state.executions().len(),
+        2,
+        "a resent D with the same ClOrdID does not open a second order (idempotent)"
+    );
+}
+
+#[tokio::test]
+async fn test_idempotent_resend_after_fill_re_renders_real_state_and_keeps_correlation() {
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
+    // Maker sell 2 @ 500, taker buy 3 @ 500 (ClOrdID "dup") → fills 2, rests 1.
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "maker-p",
+            "2",
+            "500.00",
+            2,
+        ))
+        .await
+        .expect("maker");
+    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            "dup",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("taker");
+    let first = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert!(
+        first
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("F")),
+        "the first D partially fills (a Trade), got {first:?}"
+    );
+    assert_eq!(harness.state.executions().len(), 2);
+
+    // Resend the byte-identical taker (same ClOrdID "dup", NEW MsgSeqNum 4 — the
+    // standard retry after a dropped ack; the transport dup-seq guard does not
+    // catch it). It must re-render the REAL order's state, not a fabricated New.
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            "dup",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("resend");
+    let resend = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let report = resend
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("8"))
+        .unwrap_or_else(|| panic!("expected a status ExecutionReport, got {resend:?}"));
+    // (a) The resend re-renders the REAL partially-filled state (CumQty=2), NEVER a
+    // fabricated New/CumQty=0.
+    assert_eq!(
+        field(report, "39").as_deref(),
+        Some("1"),
+        "resend shows PartiallyFilled, not a fabricated New"
+    );
+    assert_eq!(
+        field(report, "14").as_deref(),
+        Some("2"),
+        "resend CumQty is the real 2, not 0"
+    );
+    assert_ne!(
+        field(report, "150").as_deref(),
+        Some("0"),
+        "resend must not be a fabricated ExecType=New"
+    );
+    // (d) No second order/command: still exactly two execution legs, no phantom fill.
+    assert_eq!(
+        harness.state.executions().len(),
+        2,
+        "the resend opened no second order (no phantom submit)"
+    );
+
+    // (b)+(c) The correlation still points at the REAL order: a cancel of "dup"
+    // targets it (8 Canceled), never a lost-correlation OrderCancelReject(9).
+    client
+        .write_all(&cancel_frame(TRADER_SENDER, VENUE, 5, "dup", "cxl-dup"))
+        .await
+        .expect("cancel");
+    let cancel_reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    assert!(
+        cancel_reply
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("4")),
+        "the cancel of the resent ClOrdID targets the real order (8 Canceled), got {cancel_reply:?}"
+    );
+    assert!(
+        !any_msg_type(&cancel_reply, "9"),
+        "the resend did not lose the real correlation"
+    );
+}
+
+#[tokio::test]
+async fn test_conflicting_clordid_reuse_is_rejected_duplicate_order() {
+    let harness = Harness::start().await;
+    let mut client = logon_trader(harness.addr).await;
+    // Place a resting order, then reuse its ClOrdID with DIFFERENT economics
+    // (a different quantity) — a conflicting reuse, rejected 8/Duplicate Order,
+    // never overwriting the real correlation.
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "reused",
+            "1",
+            "400.00",
+            3,
+        ))
+        .await
+        .expect("first");
+    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            "reused",
+            "1",
+            "400.00",
+            7, // different quantity → conflicting payload for the same ClOrdID
+        ))
+        .await
+        .expect("conflict");
+    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let reject = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("8"))
+        .unwrap_or_else(|| panic!("expected an 8 Rejected, got {reply:?}"));
+    // OrdRejReason(103)=6 (Duplicate Order); no phantom submit occurred.
+    assert_eq!(
+        field(reject, "103").as_deref(),
+        Some("6"),
+        "Duplicate Order"
+    );
+    assert!(
+        harness.state.executions().is_empty(),
+        "a resting-order conflict records no fills and no phantom order"
     );
 }
 

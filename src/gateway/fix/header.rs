@@ -86,6 +86,85 @@ impl UtcTimestamp {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Parses the validated wire form back to a Unix-epoch **milliseconds**
+    /// instant — the inverse of [`Self::from_epoch_ms`], used to fold an
+    /// `ExpireTime (126)` into the `Gtd(ms)` order-path seam (#039).
+    ///
+    /// Millisecond precision: a `.ssssss` / `.sssssssss` fraction is truncated to
+    /// milliseconds (the venue clock is ms-resolution). Returns `None` for an
+    /// instant before the Unix epoch (an expiry in the past is not representable
+    /// as a `u64` ms) or on the unreachable arithmetic-overflow path — the caller
+    /// maps `None` to a typed [`crate::error::VenueError::InvalidOrder`], never a
+    /// panic. Correct for every well-formed FIX UTC timestamp; the stored string
+    /// is structurally validated by [`Self::parse`], so the digit reads below
+    /// cannot fail on a constructed value.
+    #[must_use]
+    pub fn to_epoch_ms(&self) -> Option<u64> {
+        let bytes = self.0.as_bytes();
+        // The base form `YYYYMMDD-HH:MM:SS` is validated to be exactly 17 bytes
+        // with digits at these fixed offsets (see `is_valid_utc_timestamp`).
+        let digits = |range: std::ops::Range<usize>| -> Option<i64> {
+            let mut value: i64 = 0;
+            for &b in bytes.get(range)? {
+                if !b.is_ascii_digit() {
+                    return None;
+                }
+                value = value.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+            Some(value)
+        };
+        let year = digits(0..4)?;
+        let month = digits(4..6)?;
+        let day = digits(6..8)?;
+        let hour = digits(9..11)?;
+        let minute = digits(12..14)?;
+        let second = digits(15..17)?;
+        // Optional fractional seconds: the first three digits are milliseconds.
+        let millis = match bytes.len() {
+            17 => 0,
+            _ => digits(18..21)?,
+        };
+
+        let days = days_from_civil(year, month, day)?;
+        let secs = days
+            .checked_mul(86_400)?
+            .checked_add(hour.checked_mul(3_600)?)?
+            .checked_add(minute.checked_mul(60)?)?
+            .checked_add(second)?;
+        // An expiry before the Unix epoch is not representable as a `u64` ms.
+        if secs < 0 {
+            return None;
+        }
+        u64::try_from(secs)
+            .ok()?
+            .checked_mul(1_000)?
+            .checked_add(u64::try_from(millis).ok()?)
+    }
+}
+
+/// Days since the Unix epoch for a proleptic-Gregorian civil date, via Howard
+/// Hinnant's `days_from_civil` (the exact inverse of the `civil_from_days` used
+/// by [`UtcTimestamp::from_epoch_ms`]). Checked so a pathological year cannot
+/// overflow `i64`.
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    let y = if month <= 2 {
+        year.checked_sub(1)?
+    } else {
+        year
+    };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era.checked_mul(400)?; // [0, 399]
+    let mp = if month > 2 { month - 3 } else { month + 9 }; // [0, 11]
+    let doy = (153i64.checked_mul(mp)?.checked_add(2)? / 5).checked_add(day - 1)?; // [0, 365]
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe / 4)?
+        .checked_sub(yoe / 100)?
+        .checked_add(doy)?; // [0, 146096]
+    era.checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)
 }
 
 /// Returns `true` iff `value` is a well-formed FIX UTC timestamp:
@@ -239,6 +318,27 @@ mod tests {
                 other => panic!("expected reject for {bad:?}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_utc_timestamp_to_epoch_ms_is_the_inverse_of_from_epoch_ms() {
+        for ms in [0u64, 1_000, 1_711_713_600_000, 1_711_713_600_500] {
+            let ts = UtcTimestamp::from_epoch_ms(ms);
+            assert_eq!(ts.to_epoch_ms(), Some(ms), "round trip failed for {ms} ms");
+        }
+    }
+
+    #[test]
+    fn test_utc_timestamp_to_epoch_ms_parses_a_known_instant() {
+        // 2024-03-29T12:00:00.000Z is 1_711_713_600_000 ms since the epoch.
+        let ts = UtcTimestamp::parse(126, "20240329-12:00:00.000").expect("parse");
+        assert_eq!(ts.to_epoch_ms(), Some(1_711_713_600_000));
+        // Second precision (no fraction) reads as whole seconds.
+        let ts = UtcTimestamp::parse(126, "20240329-12:00:00").expect("parse");
+        assert_eq!(ts.to_epoch_ms(), Some(1_711_713_600_000));
+        // Sub-millisecond precision truncates to milliseconds.
+        let ts = UtcTimestamp::parse(126, "20240329-12:00:00.123456").expect("parse");
+        assert_eq!(ts.to_epoch_ms(), Some(1_711_713_600_123));
     }
 
     #[test]
