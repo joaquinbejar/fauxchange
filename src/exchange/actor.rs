@@ -481,14 +481,16 @@ where
                 }
             }
             // Any confirmed-not-committed / integrity failure reuses `N` (nothing
-            // executed, book untouched). `SchemaTooNew` / `Backend` / `Corruption`
-            // are never returned on the durable append path, but the match stays
-            // exhaustive and conservative — an unexpected failure never advances.
+            // executed, book untouched). `SchemaTooNew` / `Backend` / `Corruption` /
+            // `ResourceLimit` are read/decode-path errors never returned on the
+            // durable append path, but the match stays exhaustive and conservative —
+            // an unexpected failure never advances.
             Err(JournalError::AppendFailed(_))
             | Err(JournalError::Conflict { .. })
             | Err(JournalError::Corruption { .. })
             | Err(JournalError::SchemaTooNew { .. })
-            | Err(JournalError::Backend { .. }) => WriteAhead::Reuse,
+            | Err(JournalError::Backend { .. })
+            | Err(JournalError::ResourceLimit { .. }) => WriteAhead::Reuse,
         }
     }
 }
@@ -1399,5 +1401,102 @@ mod tests {
             Ok(()) => {}
             Err(e) => panic!("actor task did not shut down cleanly: {e}"),
         }
+    }
+
+    // ---- write-path per-record ceiling (#034 P1: write ≤ read symmetry) --------
+
+    /// A [`CommandExecutor`] whose captured outcome is deliberately **over the
+    /// per-record byte ceiling** — a synthetic stand-in for a monster sweep (an
+    /// event with thousands of fills), built cheaply from one huge `Rejected` reason
+    /// so the test needs no real book depth.
+    struct OversizedOutcomeExecutor {
+        calls: Arc<AtomicU32>,
+    }
+
+    impl CommandExecutor for OversizedOutcomeExecutor {
+        fn execute(&mut self, _context: ExecutionContext<'_>) -> VenueOutcome {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            VenueOutcome::Rejected {
+                reason: "x".repeat(crate::exchange::MAX_JOURNAL_RECORD_BYTES),
+            }
+        }
+    }
+
+    #[test]
+    fn test_actor_seals_on_oversized_post_mutation_event() {
+        // A command executes to an over-ceiling EVENT: the write-ahead command (tiny)
+        // commits, matching runs, but the paired-event append is REFUSED by the write
+        // ceiling (a `ResourceLimit`) — so the actor takes the EXISTING post-mutation
+        // seal path (loud `JournalUnavailable`), never silently writing an event that
+        // would then brick every future recovery/replay of the stream.
+        let calls = Arc::new(AtomicU32::new(0));
+        let executor = OversizedOutcomeExecutor {
+            calls: Arc::clone(&calls),
+        };
+        let (fan_out, emits) = CountingFanOut::new();
+        let mut actor = UnderlyingActor::new(config(16), journal(), executor, fan_out, CLOCK);
+
+        match actor.handle(cancel("a")) {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("expected a JournalUnavailable seal, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "matching ran before the event append"
+        );
+        assert_eq!(
+            emits.load(Ordering::SeqCst),
+            0,
+            "no fan-out for an unjournaled event"
+        );
+        // The underlying is SEALED: further commands are rejected without executing.
+        match actor.handle(cancel("b")) {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("expected a sealed JournalUnavailable, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a sealed underlying never executes again"
+        );
+    }
+
+    #[test]
+    fn test_actor_reuses_sequence_on_oversized_command() {
+        // An over-ceiling write-ahead COMMAND (a crafted giant field — commands carry
+        // no fills, so this is ~unreachable in practice) is refused AT append: nothing
+        // executes, the book is untouched, `N` is REUSED, and the underlying is NOT
+        // sealed. The next legitimate command commits at the reused `N`.
+        let (executor, exec_calls) = CountingExecutor::new();
+        let mut actor = UnderlyingActor::new(config(16), journal(), executor, NoopFanOut, CLOCK);
+
+        let huge = VenueCommand::CancelOrder {
+            symbol: sym("BTC-20240329-50000-C"),
+            order_id: VenueOrderId::new("x".repeat(crate::exchange::MAX_JOURNAL_RECORD_BYTES)),
+            account: AccountId::new("acct-1"),
+        };
+        match actor.handle(huge) {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("expected a JournalUnavailable (command reused), got {other:?}"),
+        }
+        assert_eq!(
+            exec_calls.load(Ordering::SeqCst),
+            0,
+            "an over-ceiling command never executes"
+        );
+        assert_eq!(
+            actor.journal().last_sequence(),
+            None,
+            "nothing was journaled"
+        );
+
+        // The reused N=0 now commits for a legitimate command (not sealed).
+        let receipt = match actor.handle(cancel("ok")) {
+            Ok(r) => r,
+            Err(e) => panic!("the reused sequence must commit: {e}"),
+        };
+        assert_eq!(receipt.underlying_sequence, SequenceNumber::new(0));
+        assert_eq!(exec_calls.load(Ordering::SeqCst), 1);
     }
 }

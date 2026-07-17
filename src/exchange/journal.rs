@@ -294,6 +294,194 @@ pub enum JournalError {
         /// The non-secret operation label naming the failed durable call.
         operation: &'static str,
     },
+    /// A deserialiser **resource ceiling** was exceeded on the read/decode path —
+    /// a single record over [`MAX_JOURNAL_RECORD_BYTES`] (`limit =
+    /// `"record_bytes"``), or a recovery read over [`MAX_JOURNAL_RECORDS`] records
+    /// (`limit = `"stream_records"``) or [`MAX_JOURNAL_STREAM_BYTES`] bytes (`limit =
+    /// `"stream_bytes"``). The oversized input is **refused at the ceiling**, never
+    /// buffered or decoded unboundedly — the bounded-record-size and
+    /// no-unbounded-allocation guarantees of the semi-trusted-operator (A-7)
+    /// deserialiser surface ([08 §4](../../../docs/08-threat-model.md#4-untrusted-input-hardening),
+    /// #034). The **write path enforces the same per-record ceiling** (both stores),
+    /// so no record the venue durably writes can trip the `record_bytes` read
+    /// refusal — it fires only on **external tampering / a hostile bundle**, its
+    /// actual threat model (see [`MAX_JOURNAL_RECORD_BYTES`]).
+    #[error("journal deserialiser {limit} ceiling exceeded: {found} over {ceiling}")]
+    ResourceLimit {
+        /// Which ceiling tripped — `"record_bytes"`, `"stream_records"`, or
+        /// `"stream_bytes"`.
+        limit: &'static str,
+        /// The observed value (bytes for a record / a stream read, records for a
+        /// stream count).
+        found: usize,
+        /// The enforced ceiling.
+        ceiling: usize,
+    },
+}
+
+/// The **per-record byte ceiling** for a `venue.v1` journal record — enforced
+/// **symmetrically at write and at read** so it is a load-bearing safety invariant,
+/// not just a read-side filter ([08 §4](../../../docs/08-threat-model.md#4-untrusted-input-hardening), #034).
+///
+/// **The write ≤ read symmetry invariant (load-bearing).** The **append** path on
+/// **both** stores ([`InMemoryVenueJournal::append`], [`crate::db::PgVenueJournal`])
+/// refuses a record whose serialized form exceeds this ceiling, and the **read**
+/// path refuses the same. Because both use this *one* constant, **no record the
+/// venue ever durably writes can trip the read refusal** — a durably-written record
+/// is always ≤ the ceiling, so it always reads back. The read `record_bytes`
+/// refusal therefore fires **only on external tampering or a hostile bundle**
+/// (records the venue never wrote), which is its actual threat model. An
+/// over-ceiling record is caught **at write time** through the single-writer actor's
+/// existing semantics ([ADR-0006 §3](../../../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)):
+/// an over-ceiling write-ahead **command** (tiny — commands carry no fills, so this
+/// is ~unreachable) is rejected and its sequence reused; an over-ceiling
+/// post-mutation **event** **seals** the underlying loudly
+/// ([`crate::error::VenueError::JournalUnavailable`]) rather than being written and
+/// then silently bricking every future recovery/replay/export of that stream.
+///
+/// **Rationale for the value (fill-aware).** A record's size is dominated by an
+/// event's fills; a single `venue.v1` fill leg serializes to ~230 bytes (the
+/// committed `add_order_event.json` golden), and an `Added` event's size ≈
+/// `fills × ~230 B` + small overhead. Nothing upstream bounds fills-per-event (only
+/// one order's *quantity* is bounded), so the ceiling must clear a realistic heavy
+/// sweep: `2 MiB / 230 B ≈ 9_000 fill legs ≈ one aggressing order crossing ~4_500
+/// resting orders in a single turn` — ~25× a heavy ~180-order sweep (~360 legs,
+/// ~83 KiB, ~4 % of the ceiling), far beyond any realistic test/CI book depth. An
+/// event beyond `2 MiB` **seals at write time** (loud fail-stop); it can never brick
+/// replay because it is never durably written. Enforced on the durable read path,
+/// the portable scenario-bundle path, and **both** write paths.
+pub const MAX_JOURNAL_RECORD_BYTES: usize = 2 * 1024 * 1024;
+
+/// The **per-read record-count ceiling** on the durable read path — a single
+/// recovery read (`read_from`) loads at most this many records, so a hostile /
+/// pathologically long stream cannot exhaust memory on restart (the durable OOM
+/// vector deferred from #029, [08 §4](../../../docs/08-threat-model.md#4-untrusted-input-hardening)).
+///
+/// **Rationale + seam.** `1_000_000` records is generous for a test/CI venue
+/// session; a durable read is bounded **before** the row fetch by a cheap
+/// `count(*)` pre-check (paired with [`MAX_JOURNAL_STREAM_BYTES`]), so `fetch_all`
+/// never allocates an unbounded result set. A stream legitimately longer than this
+/// must be read **in pages / streamed** — the durable `read_from` is the documented
+/// seam for a future paged/streaming reader; today it **refuses** rather than
+/// truncates (a truncated read would be a silent partial recovery), returning
+/// [`JournalError::ResourceLimit`] (`stream_records`). This is an aggregate-volume
+/// bound (the data stays intact and recoverable via paging), distinct from the
+/// per-record symmetry invariant.
+pub const MAX_JOURNAL_RECORDS: usize = 1_000_000;
+
+/// The **per-read total-byte ceiling** on the durable read path — a single recovery
+/// read buffers at most this many bytes of payload, closing the *compounded*
+/// allocation gap ([08 §4](../../../docs/08-threat-model.md#4-untrusted-input-hardening), #034):
+/// even with the count and per-record bounds, `MAX_JOURNAL_RECORDS × MAX_JOURNAL_RECORD_BYTES`
+/// is multi-terabyte, so the read is additionally bounded on total bytes.
+///
+/// **Rationale + seam.** `1 GiB` comfortably holds a full `MAX_JOURNAL_RECORDS`-row
+/// session at kilobyte-scale records (`1_000_000 × ~1 KiB ≈ 1 GiB`) while firmly
+/// bounding the single-read allocation (vs. the unbounded tens-of-GB the pre-#034
+/// `fetch_all` allowed). It is enforced by a cheap `sum(octet_length(payload))`
+/// pre-check **before** the row fetch, so an over-budget stream is refused before
+/// any large allocation; a larger recorded run is read via the paging/streaming
+/// seam, not silently mis-read.
+pub const MAX_JOURNAL_STREAM_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Decodes one journal record from its serialized `payload`, enforcing the
+/// [`MAX_JOURNAL_RECORD_BYTES`] ceiling **before** the (potentially expensive)
+/// `serde_json` decode — the bounded deserialiser the durable read path uses so an
+/// oversized record is a typed [`JournalError::ResourceLimit`], never an unbounded
+/// allocation ([08 §4](../../../docs/08-threat-model.md#4-untrusted-input-hardening), #034).
+///
+/// # Errors
+///
+/// - [`JournalError::ResourceLimit`] (`limit = "record_bytes"`) if `payload`
+///   exceeds the per-record ceiling;
+/// - [`JournalError::Backend`] (`operation = "journal record decode"`) if the
+///   bounded payload is not a well-formed `venue.v1` record.
+pub fn decode_journal_record(payload: &str) -> Result<JournalRecord, JournalError> {
+    if payload.len() > MAX_JOURNAL_RECORD_BYTES {
+        return Err(JournalError::ResourceLimit {
+            limit: "record_bytes",
+            found: payload.len(),
+            ceiling: MAX_JOURNAL_RECORD_BYTES,
+        });
+    }
+    serde_json::from_str::<JournalRecord>(payload).map_err(|_| JournalError::Backend {
+        operation: "journal record decode",
+    })
+}
+
+/// Enforces the [`MAX_JOURNAL_RECORD_BYTES`] ceiling on an **already-decoded**
+/// record — the write path (both stores) and the portable-bundle path measure the
+/// record's `venue.v1` serialized byte size through this one check, so the write ≤
+/// read symmetry invariant holds ([`MAX_JOURNAL_RECORD_BYTES`]).
+///
+/// # Errors
+///
+/// - [`JournalError::ResourceLimit`] (`limit = "record_bytes"`) if the record's
+///   serialized form exceeds the per-record ceiling;
+/// - [`JournalError::Backend`] (`operation = "journal record size check"`) if the
+///   record cannot be serialized — the check **fails closed** (refuses), never
+///   fails open by proceeding past an unmeasurable record (unreachable for
+///   `venue.v1`, but the deserialiser must never accept what it cannot bound).
+pub fn check_record_size(record: &JournalRecord) -> Result<(), JournalError> {
+    let bytes = match serde_json::to_string(record) {
+        Ok(json) => json.len(),
+        Err(_) => {
+            return Err(JournalError::Backend {
+                operation: "journal record size check",
+            });
+        }
+    };
+    if bytes > MAX_JOURNAL_RECORD_BYTES {
+        return Err(JournalError::ResourceLimit {
+            limit: "record_bytes",
+            found: bytes,
+            ceiling: MAX_JOURNAL_RECORD_BYTES,
+        });
+    }
+    Ok(())
+}
+
+/// Enforces the [`MAX_JOURNAL_RECORDS`] per-read record-count ceiling — a read whose
+/// stream holds more than the ceiling is **refused** (never truncated: a truncated
+/// read would be a silent partial recovery), closing the #029-deferred unbounded-read
+/// OOM vector. Pure so the count bound is unit-testable without a million-row
+/// database; the durable read runs it against a cheap `count(*)` **before** the row
+/// fetch, so the fetch allocation is bounded.
+///
+/// # Errors
+///
+/// [`JournalError::ResourceLimit`] (`limit = "stream_records"`) if `count` exceeds
+/// [`MAX_JOURNAL_RECORDS`].
+pub fn enforce_stream_ceiling(count: usize) -> Result<(), JournalError> {
+    if count > MAX_JOURNAL_RECORDS {
+        return Err(JournalError::ResourceLimit {
+            limit: "stream_records",
+            found: count,
+            ceiling: MAX_JOURNAL_RECORDS,
+        });
+    }
+    Ok(())
+}
+
+/// Enforces the [`MAX_JOURNAL_STREAM_BYTES`] per-read total-byte ceiling — a read
+/// whose stream sums to more than the ceiling is **refused** before the row fetch
+/// allocates, closing the compounded allocation gap. Pure so the byte bound is
+/// unit-testable without a gigabyte of rows; the durable read runs it against a
+/// cheap `sum(octet_length(payload))` **before** the fetch.
+///
+/// # Errors
+///
+/// [`JournalError::ResourceLimit`] (`limit = "stream_bytes"`) if `bytes` exceeds
+/// [`MAX_JOURNAL_STREAM_BYTES`].
+pub fn enforce_stream_bytes_ceiling(bytes: usize) -> Result<(), JournalError> {
+    if bytes > MAX_JOURNAL_STREAM_BYTES {
+        return Err(JournalError::ResourceLimit {
+            limit: "stream_bytes",
+            found: bytes,
+            ceiling: MAX_JOURNAL_STREAM_BYTES,
+        });
+    }
+    Ok(())
 }
 
 /// The append-only journal contract, named to match the upstream
@@ -397,6 +585,13 @@ impl VenueJournal for InMemoryVenueJournal {
     }
 
     fn append(&mut self, record: JournalRecord) -> Result<(), JournalError> {
+        // Write-side per-record ceiling (the write ≤ read symmetry invariant): a
+        // record over `MAX_JOURNAL_RECORD_BYTES` is refused AT write, so nothing the
+        // venue durably holds can ever trip the read `record_bytes` refusal. The
+        // actor surfaces this through its existing semantics — an over-ceiling
+        // write-ahead command reuses `N`; an over-ceiling post-mutation event seals
+        // the underlying (loud), never a silent write-then-brick.
+        check_record_size(&record)?;
         let sequence = record.sequence();
         let kind = record.kind();
         if let Some(existing) = self
@@ -644,5 +839,185 @@ mod tests {
             Err(_) => {}
             Ok(parsed) => panic!("expected a missing-schema decode error, parsed {parsed:?}"),
         }
+    }
+
+    // ---- bounded deserialiser (#034) -------------------------------------
+
+    #[test]
+    fn test_journal_deser_rejects_oversized_record() {
+        // A record whose serialized payload exceeds the per-record ceiling is
+        // refused AT the ceiling — never decoded — with a typed ResourceLimit
+        // (`record_bytes`), so a hostile oversized record cannot drive an unbounded
+        // decode allocation (docs/08 §4).
+        let oversized = "\"".to_string() + &"a".repeat(MAX_JOURNAL_RECORD_BYTES) + "\"";
+        assert!(oversized.len() > MAX_JOURNAL_RECORD_BYTES);
+        match decode_journal_record(&oversized) {
+            Err(JournalError::ResourceLimit {
+                limit,
+                found,
+                ceiling,
+            }) => {
+                assert_eq!(limit, "record_bytes");
+                assert!(found > ceiling);
+                assert_eq!(ceiling, MAX_JOURNAL_RECORD_BYTES);
+            }
+            other => panic!("expected a record_bytes ResourceLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_journal_record_accepts_a_within_ceiling_record() {
+        // A legitimate (small) record decodes cleanly through the bounded helper.
+        let record = command_record(7);
+        let payload = match serde_json::to_string(&record) {
+            Ok(payload) => payload,
+            Err(e) => panic!("serialize failed: {e}"),
+        };
+        assert!(payload.len() <= MAX_JOURNAL_RECORD_BYTES);
+        match decode_journal_record(&payload) {
+            Ok(decoded) => assert_eq!(decoded, record),
+            Err(e) => panic!("a within-ceiling record must decode: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_journal_record_rejects_malformed_bytes_as_backend() {
+        // Well-formed-size but malformed bytes are a typed Backend decode error,
+        // never a panic.
+        match decode_journal_record("{not json") {
+            Err(JournalError::Backend { operation }) => {
+                assert_eq!(operation, "journal record decode");
+            }
+            other => panic!("expected a Backend decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_record_size_bounds_an_already_decoded_record() {
+        // A within-ceiling decoded record passes; the ceiling constant is generous
+        // above the largest legitimate record (a small cancel here).
+        let record = command_record(1);
+        assert!(check_record_size(&record).is_ok());
+        // Sanity: the ceiling is the fill-aware 2 MiB bound.
+        assert_eq!(MAX_JOURNAL_RECORD_BYTES, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_journal_stream_ceiling_refuses_over_ceiling_count() {
+        // The per-read count bound (the #029 unbounded-read OOM vector) — a count AT
+        // the ceiling is allowed; one OVER it is a typed ResourceLimit
+        // (`stream_records`), never a truncated silent partial read. Pure, so it is
+        // proven without a million-row database (the durable read's pre-fetch
+        // `count(*)` bounding query enforces the same bound before `fetch_all`).
+        assert!(enforce_stream_ceiling(MAX_JOURNAL_RECORDS).is_ok());
+        match enforce_stream_ceiling(MAX_JOURNAL_RECORDS + 1) {
+            Err(JournalError::ResourceLimit {
+                limit,
+                found,
+                ceiling,
+            }) => {
+                assert_eq!(limit, "stream_records");
+                assert_eq!(found, MAX_JOURNAL_RECORDS + 1);
+                assert_eq!(ceiling, MAX_JOURNAL_RECORDS);
+            }
+            other => panic!("expected a stream_records ResourceLimit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_journal_stream_bytes_ceiling_refuses_over_budget_bytes() {
+        // The per-read TOTAL-byte bound (the compounded allocation gap) — boundary
+        // exact, pure (a gigabyte of rows is deliberately unreachable in CI; the
+        // durable read's pre-fetch `sum(octet_length)` enforces this before fetch).
+        assert!(enforce_stream_bytes_ceiling(MAX_JOURNAL_STREAM_BYTES).is_ok());
+        match enforce_stream_bytes_ceiling(MAX_JOURNAL_STREAM_BYTES + 1) {
+            Err(JournalError::ResourceLimit {
+                limit,
+                found,
+                ceiling,
+            }) => {
+                assert_eq!(limit, "stream_bytes");
+                assert_eq!(found, MAX_JOURNAL_STREAM_BYTES + 1);
+                assert_eq!(ceiling, MAX_JOURNAL_STREAM_BYTES);
+            }
+            other => panic!("expected a stream_bytes ResourceLimit, got {other:?}"),
+        }
+    }
+
+    /// A record built around a huge string field whose serialized form is over the
+    /// per-record ceiling — for the write-path ceiling tests.
+    fn oversized_record(seq: u64) -> JournalRecord {
+        let huge = "a".repeat(MAX_JOURNAL_RECORD_BYTES + 32);
+        JournalRecord::command(
+            SequenceNumber::new(seq),
+            EventTimestamp::new(1),
+            VenueCommand::CancelOrder {
+                symbol: sym("BTC-20240329-50000-C"),
+                order_id: crate::models::VenueOrderId::new(huge),
+                account: AccountId::new("acct-1"),
+            },
+        )
+    }
+
+    #[test]
+    fn test_append_refuses_oversized_record_at_the_write_ceiling() {
+        // The write-side ceiling (the write ≤ read symmetry invariant): the in-memory
+        // store REFUSES a record over the per-record ceiling AT append, so nothing it
+        // durably holds can ever trip the read `record_bytes` refusal.
+        let mut journal = InMemoryVenueJournal::new(header());
+        match journal.append(oversized_record(0)) {
+            Err(JournalError::ResourceLimit {
+                limit,
+                found,
+                ceiling,
+            }) => {
+                assert_eq!(limit, "record_bytes");
+                assert!(found > ceiling);
+                assert_eq!(ceiling, MAX_JOURNAL_RECORD_BYTES);
+            }
+            other => panic!("expected a write-ceiling record_bytes ResourceLimit, got {other:?}"),
+        }
+        // The over-ceiling record was NOT stored.
+        assert!(journal.is_empty(), "an over-ceiling record is never stored");
+    }
+
+    #[test]
+    fn test_write_read_ceiling_symmetry_a_maximal_record_round_trips_in_memory() {
+        // The load-bearing invariant: because the write and read ceilings are the
+        // SAME constant, any record the store ACCEPTS at write (≤ ceiling) reads back
+        // — a maximal within-ceiling record round-trips. A near-ceiling record (just
+        // under the bound) writes and reads; the over-ceiling one is refused at write
+        // (above), so it can never reach a read.
+        let mut journal = InMemoryVenueJournal::new(header());
+        // A record close to, but under, the ceiling (a large-but-legal order id).
+        let big = "a".repeat(MAX_JOURNAL_RECORD_BYTES / 2);
+        let record = JournalRecord::command(
+            SequenceNumber::new(0),
+            EventTimestamp::new(1),
+            VenueCommand::CancelOrder {
+                symbol: sym("BTC-20240329-50000-C"),
+                order_id: crate::models::VenueOrderId::new(big),
+                account: AccountId::new("acct-1"),
+            },
+        );
+        assert!(
+            check_record_size(&record).is_ok(),
+            "the record is within the ceiling"
+        );
+        journal
+            .append(record.clone())
+            .expect("a within-ceiling record writes");
+        let read = journal
+            .read_from(SequenceNumber::START)
+            .expect("in-memory read is infallible");
+        assert_eq!(read, vec![record], "a written record always reads back");
+    }
+
+    #[test]
+    fn test_check_record_size_fails_closed_is_covered_by_the_serialize_contract() {
+        // `check_record_size` fails CLOSED on a serialize error (never size-0-proceed).
+        // A `venue.v1` record always serializes, so the fail-open path is unreachable
+        // via the type; this documents the contract and exercises the ok path.
+        assert!(check_record_size(&command_record(3)).is_ok());
     }
 }

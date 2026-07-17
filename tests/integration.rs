@@ -27,9 +27,10 @@ use fauxchange::OrderType;
 use fauxchange::db::{DatabasePool, DbError, DbPoolConfig, PgVenueJournal};
 use fauxchange::exchange::{
     ActorConfig, ExecutionsStore, FixedClock, Hash32, InMemoryExecutionsStore,
-    InMemoryPositionsStore, JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook,
-    MatchingExecutor, PositionsStore, RecordKind, SequenceNumber, Side, StoreFanOut, Symbol,
-    TimeInForce, TopOfBook, UnderlyingActor, VenueJournal, recover,
+    InMemoryPositionsStore, JournalError, JournalHeader, JournalRecord, LineageId,
+    MAX_JOURNAL_RECORD_BYTES, MarkPriceBook, MatchingExecutor, PositionsStore, RecordKind,
+    SequenceNumber, Side, StoreFanOut, Symbol, TimeInForce, TopOfBook, UnderlyingActor,
+    VenueJournal, recover,
 };
 
 const UNDERLYING: &str = "BTC";
@@ -890,6 +891,158 @@ async fn test_record_over_durable_venue_then_replay_bundle_matches_goldens() {
             "the reconstructed positions fold matches the live golden for {account:?}"
         );
     }
+
+    drop(container);
+}
+
+/// #034 security gate — the durable read path REFUSES an oversized stored record
+/// (a hostile operator with DB write access, the A-7 surface): the `octet_length`
+/// `CASE` in `read_from` returns NULL for an over-ceiling payload (so the huge blob
+/// never leaves Postgres), and the read fails with a typed
+/// `JournalError::ResourceLimit { limit: "record_bytes" }` — no unbounded fetch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_durable_journal_read_rejects_oversized_record() {
+    let (container, db) = start_pg().await;
+
+    // Seed a header + one oversized record row directly via runtime-checked
+    // parameterised queries (no macro, so no offline data needed).
+    sqlx::query(
+        "INSERT INTO journal_headers (underlying, lineage_id, schema_version) VALUES ($1, $2, $3)",
+    )
+    .bind(JOURNAL_UNDERLYING)
+    .bind("run-1")
+    .bind("venue.v1")
+    .execute(db.pool())
+    .await
+    .expect("seed header");
+    let oversized = "x".repeat(MAX_JOURNAL_RECORD_BYTES + 1024);
+    sqlx::query("INSERT INTO journal_records (underlying, underlying_sequence, kind, payload) VALUES ($1, $2, $3, $4)")
+        .bind(JOURNAL_UNDERLYING)
+        .bind(0_i64)
+        .bind("command")
+        .bind(&oversized)
+        .execute(db.pool())
+        .await
+        .expect("insert oversized row");
+
+    let journal =
+        PgVenueJournal::open_for_recovery(&db, JOURNAL_UNDERLYING).expect("reopen durable journal");
+    match journal.read_from(SequenceNumber::START) {
+        Err(JournalError::ResourceLimit {
+            limit,
+            found,
+            ceiling,
+        }) => {
+            assert_eq!(limit, "record_bytes");
+            assert!(
+                found > ceiling,
+                "the durable read reports the over-ceiling size"
+            );
+            assert_eq!(ceiling, MAX_JOURNAL_RECORD_BYTES);
+        }
+        other => {
+            panic!("expected a record_bytes ResourceLimit from the durable read, got {other:?}")
+        }
+    }
+
+    drop(container);
+}
+
+/// #034 P1 — the durable write ≤ read ceiling SYMMETRY invariant: a near-ceiling
+/// record WRITES (under the write ceiling) and always READS back, while an
+/// over-ceiling record is REFUSED at write (typed `ResourceLimit`) so it never
+/// reaches the store to brick a future read. Because write and read use the SAME
+/// constant, the read `record_bytes` refusal fires only on external tampering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_durable_journal_write_read_ceiling_symmetry() {
+    let (container, db) = start_pg().await;
+    let lineage = LineageId::new("run-1");
+    let mut journal =
+        PgVenueJournal::open(&db, JOURNAL_UNDERLYING, JournalHeader::new(lineage.clone()))
+            .expect("open durable journal");
+
+    // A record close to, but under, the per-record ceiling WRITES and READS back.
+    let big = "a".repeat(MAX_JOURNAL_RECORD_BYTES / 2);
+    let near = JournalRecord::command(
+        SequenceNumber::new(0),
+        EventTimestamp::new(1),
+        VenueCommand::CancelOrder {
+            symbol: journal_sym(),
+            order_id: VenueOrderId::new(big),
+            account: AccountId::new("acct-1"),
+        },
+    );
+    journal
+        .append(near.clone())
+        .expect("a within-ceiling record writes durably");
+    let read = journal
+        .read_from(SequenceNumber::START)
+        .expect("a durably-written record reads back");
+    assert_eq!(
+        read,
+        vec![near],
+        "write ≤ read symmetry: a written record always reads"
+    );
+
+    // An over-ceiling record is REFUSED at write — it never reaches the store, so it
+    // can never trip the read refusal (which then only fires on external tampering).
+    let huge = JournalRecord::command(
+        SequenceNumber::new(1),
+        EventTimestamp::new(1),
+        VenueCommand::CancelOrder {
+            symbol: journal_sym(),
+            order_id: VenueOrderId::new("x".repeat(MAX_JOURNAL_RECORD_BYTES)),
+            account: AccountId::new("acct-1"),
+        },
+    );
+    match journal.append(huge) {
+        Err(JournalError::ResourceLimit { limit, .. }) => assert_eq!(limit, "record_bytes"),
+        other => panic!("expected a write-ceiling record_bytes ResourceLimit, got {other:?}"),
+    }
+    assert_eq!(
+        journal
+            .read_from(SequenceNumber::START)
+            .expect("read")
+            .len(),
+        1,
+        "the over-ceiling record was refused at write, never stored"
+    );
+
+    drop(container);
+}
+
+/// #034 — the pre-fetch bounding query (count + bytes) runs against real Postgres,
+/// computes correctly, and does NOT false-refuse a legitimate stream (the refusal
+/// boundaries at 1M rows / 1 GiB are deliberately unreachable in CI and are proven
+/// boundary-exact by the pure `enforce_stream_ceiling` / `enforce_stream_bytes_ceiling`
+/// unit tests; this proves the query integrates and passes a normal stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_durable_journal_read_pre_check_passes_a_legitimate_stream() {
+    let (container, db) = start_pg().await;
+    let lineage = LineageId::new("run-1");
+    let mut journal =
+        PgVenueJournal::open(&db, JOURNAL_UNDERLYING, JournalHeader::new(lineage.clone()))
+            .expect("open durable journal");
+
+    for seq in 0..5 {
+        let record = JournalRecord::command(
+            SequenceNumber::new(seq),
+            EventTimestamp::new(1),
+            journal_add(&lineage, seq, Side::Sell, 50_000 + seq, 1),
+        );
+        journal.append(record).expect("a legitimate append commits");
+    }
+    let read = journal
+        .read_from(SequenceNumber::START)
+        .expect("a legitimate stream reads (the pre-fetch bounding query passes it)");
+    assert_eq!(
+        read.len(),
+        5,
+        "the pre-check never false-refuses a legitimate stream"
+    );
 
     drop(container);
 }

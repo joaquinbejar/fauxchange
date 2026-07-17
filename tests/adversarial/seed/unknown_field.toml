@@ -1,0 +1,5 @@
+[instruments.BTC]
+opening_price_cents = 5000000
+expirations = ["20261231"]
+strikes = [50000]
+bogus_field = true

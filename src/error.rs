@@ -174,7 +174,10 @@ impl From<ReplayError> for VenueError {
             ReplayError::JournalCorruption { .. }
             | ReplayError::SchemaRefused { .. }
             | ReplayError::VersionMismatch { .. }
-            | ReplayError::BundleDecode(_) => VenueError::InvalidOrder(err.to_string()),
+            | ReplayError::BundleDecode(_)
+            // An oversized / over-ceiling bundle is a client-input validation failure;
+            // the message carries only non-secret size/count detail, safe to echo.
+            | ReplayError::ResourceLimit { .. } => VenueError::InvalidOrder(err.to_string()),
             ReplayError::Backend { .. } => VenueError::JournalUnavailable,
         }
     }

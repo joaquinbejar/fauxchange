@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                octet_length(payload) AS \"len!\",\n                CASE WHEN octet_length(payload) <= $3 THEN payload END AS payload\n            FROM journal_records\n            WHERE underlying = $1 AND underlying_sequence >= $2\n            ORDER BY id\n            LIMIT $4\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "len!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "payload",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Int4",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "4545f31261823584697ab7efa507248081c77bb74acf54b6ec17638d0e398de0"
+}

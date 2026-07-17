@@ -93,7 +93,8 @@ use utoipa::ToSchema;
 use crate::exchange::{
     ExecutionsStore, FanOut, InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal,
     JournalError, JournalHeader, JournalRecord, MarkPriceBook, MatchingExecutor, Recovered,
-    SequenceNumber, StoreFanOut, Symbol, TopOfBook, VenueEvent, VenueJournal, recover,
+    SequenceNumber, StoreFanOut, Symbol, TopOfBook, VenueEvent, VenueJournal, check_record_size,
+    recover,
 };
 use crate::models::{ReplayReportResponse, UnderlyingReplaySummary};
 use crate::simulation::manifest::RunManifest;
@@ -102,6 +103,20 @@ use crate::simulation::manifest::RunManifest;
 /// event; a bundle whose `schema` is not this is a typed
 /// [`ReplayError::VersionMismatch`].
 pub const SCENARIO_BUNDLE_SCHEMA: &str = "scenario-bundle.v1";
+
+/// The **total byte ceiling** for an on-disk / portable scenario bundle, enforced
+/// by [`ScenarioBundle::from_json`] **before** `serde_json` parses it (#034,
+/// [08 §4](../../docs/08-threat-model.md#4-untrusted-input-hardening)).
+///
+/// **Rationale.** The REST `POST /api/v1/replay/bundle` path is bounded by the
+/// gateway's **1 MiB request-body cap**, but the **on-disk** bundle path (loading a
+/// recorded scenario file) has **no** such transport cap — the semi-trusted-operator
+/// (A-7) surface — so the deserialiser bounds it here: a hostile bundle file is
+/// refused before it is buffered/parsed, never an unbounded allocation. `64 MiB` is
+/// generous for a legitimate multi-underlying recorded scenario yet firmly bounds a
+/// hostile file; per-record ([`crate::exchange::MAX_JOURNAL_RECORD_BYTES`]) and
+/// per-stream ceilings bound the records within.
+pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 
 // ============================================================================
 // Typed replay error
@@ -161,6 +176,24 @@ pub enum ReplayError {
         /// The non-secret operation label naming the failed durable call.
         operation: &'static str,
     },
+    /// A hostile / oversized bundle input exceeded a deserialiser **resource
+    /// ceiling** — the whole on-disk bundle over [`MAX_BUNDLE_BYTES`]
+    /// (`limit = "bundle_bytes"`), a single record over
+    /// [`MAX_JOURNAL_RECORD_BYTES`](crate::exchange::MAX_JOURNAL_RECORD_BYTES)
+    /// (`limit = "record_bytes"`), or a durable stream over the per-read record
+    /// or byte ceilings (`limit = "stream_records"` / `"stream_bytes"`) —
+    /// refused **before** unbounded buffering/allocation, never a panic
+    /// ([08 §4](../../docs/08-threat-model.md#4-untrusted-input-hardening), #034).
+    #[error("scenario bundle {limit} ceiling exceeded: {found} over {ceiling}")]
+    ResourceLimit {
+        /// Which ceiling tripped — `"bundle_bytes"`, `"record_bytes"`,
+        /// `"stream_records"`, or `"stream_bytes"`.
+        limit: &'static str,
+        /// The observed value (bytes or record count).
+        found: usize,
+        /// The enforced ceiling.
+        ceiling: usize,
+    },
 }
 
 impl ReplayError {
@@ -187,6 +220,17 @@ impl ReplayError {
             JournalError::AppendFailed(detail) | JournalError::Ambiguous(detail) => {
                 Self::BundleDecode(format!("underlying {underlying}: {detail}"))
             }
+            // A record/stream ceiling tripped while building a replay input from a
+            // durable stream — surfaced verbatim as the bundle resource-limit reject.
+            JournalError::ResourceLimit {
+                limit,
+                found,
+                ceiling,
+            } => Self::ResourceLimit {
+                limit,
+                found,
+                ceiling,
+            },
         }
     }
 }
@@ -233,12 +277,18 @@ impl JournalStream {
     }
 
     /// Rebuilds an in-memory [`VenueJournal`] from this stream, enforcing the
-    /// `(sequence, kind)` uniqueness key as it appends — a duplicate key with a
-    /// **differing** payload is a decode-level [`ReplayError::BundleDecode`], never
-    /// a panic.
+    /// **per-record byte ceiling** and the `(sequence, kind)` uniqueness key as it
+    /// appends — an oversized record is a typed [`ReplayError::ResourceLimit`]
+    /// (`record_bytes`) and a duplicate key with a **differing** payload is a
+    /// decode-level [`ReplayError::BundleDecode`], never a panic (#034,
+    /// [08 §4](../../docs/08-threat-model.md#4-untrusted-input-hardening)).
     fn build_journal(&self) -> Result<InMemoryVenueJournal, ReplayError> {
         let mut journal = InMemoryVenueJournal::new(self.header.clone());
         for record in &self.records {
+            // Per-record ceiling on the portable-bundle path (the durable path bounds
+            // the same via `octet_length`): a hostile oversized record is refused.
+            check_record_size(record)
+                .map_err(|error| ReplayError::from_journal(&self.underlying, error))?;
             journal
                 .append(record.clone())
                 .map_err(|error| ReplayError::from_journal(&self.underlying, error))?;
@@ -294,8 +344,21 @@ impl ScenarioBundle {
     ///
     /// # Errors
     ///
-    /// [`ReplayError::BundleDecode`] if the bytes are not a well-formed bundle.
+    /// - [`ReplayError::ResourceLimit`] (`limit = "bundle_bytes"`) if the input
+    ///   exceeds [`MAX_BUNDLE_BYTES`] — refused **before** it is parsed, so a hostile
+    ///   on-disk bundle cannot drive an unbounded parse allocation;
+    /// - [`ReplayError::BundleDecode`] if the (bounded) bytes are not a well-formed
+    ///   bundle.
     pub fn from_json(json: &str) -> Result<Self, ReplayError> {
+        // Bound the on-disk bundle BEFORE parsing (the on-disk path has no transport
+        // cap, unlike the 1 MiB REST body) — no unbounded allocation (#034).
+        if json.len() > MAX_BUNDLE_BYTES {
+            return Err(ReplayError::ResourceLimit {
+                limit: "bundle_bytes",
+                found: json.len(),
+                ceiling: MAX_BUNDLE_BYTES,
+            });
+        }
         serde_json::from_str(json).map_err(|error| ReplayError::BundleDecode(error.to_string()))
     }
 }

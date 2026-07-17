@@ -72,8 +72,8 @@ pub use self::clock::{
 };
 pub use self::manifest::{DEFAULT_MICROSTRUCTURE_FINGERPRINT, DependencyVersions, RunManifest};
 pub use self::replay::{
-    JournalStream, RecordingController, ReplayError, ReplayReport, SCENARIO_BUNDLE_SCHEMA,
-    ScenarioBundle, UnderlyingReplay, replay_bundle, replay_streams,
+    JournalStream, MAX_BUNDLE_BYTES, RecordingController, ReplayError, ReplayReport,
+    SCENARIO_BUNDLE_SCHEMA, ScenarioBundle, UnderlyingReplay, replay_bundle, replay_streams,
 };
 pub use self::session::{
     DEFAULT_CHAIN_SIZE, DEFAULT_SKEW_SLOPE, DEFAULT_SMILE_CURVE, DEFAULT_SPREAD, SessionConfig,

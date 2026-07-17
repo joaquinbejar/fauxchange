@@ -11,6 +11,54 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Adversarial fixture corpus + bounded deserialiser for the journal / replay /
+  seed-bundle decode surface — the v0.3 security gate** (#34,
+  [034](milestones/v0.3-replay/034-journal-replay-adversarial-fixtures.md),
+  [08 §4](docs/08-threat-model.md#4-untrusted-input-hardening),
+  [08 §6](docs/08-threat-model.md#6-fuzzing-and-adversarial-testing),
+  [TESTING.md §14](docs/TESTING.md#14-security-testing)). A committed corpus under
+  `tests/adversarial/` (`journal/` records, `bundle/` scenario bundles, `seed/`
+  manifests) is fed to the **real** deserialisers by `tests/adversarial.rs`, each
+  asserting the **specific** typed reject (`JournalError` / `ReplayError` /
+  `ConfigError` — never a blanket `is_err()`) with **no panic**, **no unbounded
+  allocation**, and **no partial apply** (a hostile stream discards the whole
+  replay — no `ReplayReport`, hence no reconstructed stores). Classes: oversized,
+  truncated, field/tag injection, duplicate/missing fields, out-of-range economic
+  fields (negative cents, overflow quantity), malformed symbols, a hostile bundle
+  manifest, a newer bundle/journal `schema_version` (refused), and a tampered stored
+  event → `JournalCorruption { underlying, sequence }` (the integrity oracle) driven
+  from tampered bytes on disk. The corpus is committed as files so it seeds the
+  coverage-guided `cargo fuzz` targets in v1.0 (#52).
+- **A bounded, no-unbounded-allocation deserialiser with a write ≤ read ceiling
+  symmetry invariant** (#34) closing an unbounded-`fetch_all` OOM-on-restart vector
+  in #29's shipped read path, found during #34's threat-surface mapping. New named
+  ceilings with typed rejects (`JournalError::ResourceLimit` /
+  `ReplayError::ResourceLimit`):
+  - a **per-record byte** ceiling (`MAX_JOURNAL_RECORD_BYTES` = **2 MiB**, a
+    fill-aware value: an event's size ≈ `fills × ~230 B`, so 2 MiB clears
+    ~9,000 fill legs ≈ one order crossing ~4,500 resting orders — ~25× a heavy
+    ~180-order sweep) enforced **symmetrically at write and read on both stores**.
+    **The load-bearing property:** because write and read use the *same* constant,
+    no record the venue durably writes can trip the read `record_bytes` refusal — so
+    the read refusal fires only on **external tampering / a hostile bundle**, and an
+    over-ceiling event **seals the underlying loudly at write time** (the existing
+    post-mutation seal, ADR-0006 §3) instead of being written and then permanently
+    bricking recovery/replay/export of that stream. (An earlier draft enforced the
+    read ceiling at 64 KiB with **no** write check — a legitimate heavy sweep would
+    write fine and then brick replay forever; the symmetry + fill-aware value fix
+    that.)
+  - a **per-read record-count** ceiling (`MAX_JOURNAL_RECORDS` = 1,000,000) **and** a
+    **per-read total-byte** ceiling (`MAX_JOURNAL_STREAM_BYTES` = 1 GiB), enforced by
+    a cheap `count(*)` + `sum(octet_length(payload))` **pre-fetch bounding query**
+    that refuses an over-budget stream **before** `fetch_all` allocates (closing the
+    compounded gap where the fetch buffered rows before any check ran); a `LIMIT` +
+    per-row `octet_length` `CASE` (an over-ceiling payload is returned as NULL, so
+    the blob never leaves Postgres) remain as defense-in-depth. An over-budget stream
+    is **refused** (never truncated into a silent partial recovery); paging/streaming
+    is the documented forward seam.
+  - a **total on-disk-bundle byte** ceiling (`MAX_BUNDLE_BYTES` = 64 MiB) enforced
+    before `serde_json` parses an on-disk bundle (the on-disk path has no 1 MiB
+    REST-body transport cap).
 - **The determinism guarantee, written down and made enforceable — the v0.3
   capstone** (#33) as documentation + a consolidated test-oracle, no new runtime
   behaviour ([033](milestones/v0.3-replay/033-determinism-guarantee-oracle.md),
