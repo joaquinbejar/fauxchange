@@ -236,6 +236,31 @@ hdrhistogram = { version = "7", default-features = false }
 # and `Bencher::iter` are called. Dev-only: never reaches the shipped binary.
 # MIT/Apache-2.0, maintained by the bheisler/criterion project.
 criterion = { version = "0.8", default-features = false }
+# `benches/alloc_profile.rs`'s global-allocator instrumentation (#020,
+# self-review finding #112 on #75: the bench's original hand-rolled
+# `CountingAllocator` carried a local `unsafe impl GlobalAlloc`, violating the
+# repo's absolute no-`unsafe`-anywhere rule — an inline `// SAFETY:` comment is
+# not a governance decision, per CLAUDE.md / rules/global_rules.md / ADR-0008).
+# `stats_alloc::StatsAlloc<System>` is a drop-in `GlobalAlloc` wrapper whose
+# `unsafe impl GlobalAlloc` is VENDORED inside the crate; `fauxchange`'s own
+# code only ever calls the crate's fully safe API (`StatsAlloc::system()` —
+# a stable, non-nightly-gated `const fn` — and `Region::new`/`Region::change`),
+# so this bench needs zero `unsafe` of its own. `src/lib.rs` keeps
+# `#![forbid(unsafe_code)]` unconditionally; this is a dev-dependency of a
+# separate, independent bench binary — it never reaches the shipped crate or
+# the container image. Audit note: `stats_alloc` 0.1.10 is a small (~200
+# line), single-file, dependency-free (zero transitive deps — verified via the
+# `Cargo.lock` diff: only `stats_alloc` itself is added) MIT-licensed crate by
+# neoeinstein (github.com/neoeinstein/stats_alloc); `cargo audit` / `cargo
+# deny` (#019) gate it like every other dependency and are clean. Reporting
+# format: `Stats { allocations, deallocations, reallocations, bytes_allocated,
+# bytes_deallocated, bytes_reallocated }` — a finer breakdown than the old
+# hand-rolled counter (which folded `realloc` into the "alloc" bucket
+# unconditionally and always added the FULL new size to `bytes_alloc`, even
+# when a realloc shrank the allocation); the swap is a strictly more accurate
+# accounting, so the recorded `allocs/op` / `bytes_alloc/op` numbers in
+# `BENCH.md` §5 were re-measured (not carried over) — see that section's note.
+stats_alloc = { version = "0.1.10", default-features = false }
 
 [[bench]]
 name = "hp1_order_path"

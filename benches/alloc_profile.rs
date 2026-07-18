@@ -5,11 +5,16 @@
 //!
 //! ## Method
 //!
-//! Installs a `#[global_allocator]` [`CountingAllocator`] wrapping
-//! `std::alloc::System` with `AtomicU64` alloc/dealloc/byte counters — stable
-//! Rust, no nightly `#[feature]` needed. Because a global allocator can only
-//! be set **once per binary**, this is deliberately its own bench target,
-//! never sharing a process with `hp1_order_path` / `hp2_ws_fanout`.
+//! Installs [`stats_alloc::StatsAlloc<System>`] as the `#[global_allocator]`
+//! — a `std::alloc::System` wrapper with atomic alloc/dealloc/realloc/byte
+//! counters — stable Rust, no nightly `#[feature]` needed. `fauxchange`'s
+//! `src/lib.rs` keeps `#![forbid(unsafe_code)]` unconditionally; this bench
+//! needs no `unsafe` of its own because `stats_alloc`'s `unsafe impl
+//! GlobalAlloc` is vendored inside that (dev-only, bench-scoped) crate — see
+//! the audit note on the `stats_alloc` dependency in `Cargo.toml`. Because a
+//! global allocator can only be set **once per binary**, this is deliberately
+//! its own bench target, never sharing a process with `hp1_order_path` /
+//! `hp2_ws_fanout`.
 //!
 //! Two sections, reported separately, because they measure two genuinely
 //! different things:
@@ -38,15 +43,25 @@
 //! the book/maps have grown past their initial capacity) is the strongest
 //! evidence available on stable Rust without a call-stack profiler; a non-zero
 //! count after warmup is the regression signal this bench exists to catch.
+//! `allocs_per_op` counts `allocations + reallocations` (a realloc is a
+//! distinct allocator event, tracked separately by `stats_alloc::Stats`, but
+//! folded into the same "did the allocator do work" count this bench has
+//! always reported); `bytes_per_op` is `bytes_allocated` alone, which
+//! `stats_alloc` computes as the true net-growth bytes of every alloc and
+//! realloc (a realloc that shrinks an allocation adds to `bytes_deallocated`
+//! instead — a more accurate accounting than counting a realloc's full new
+//! size as "allocated" regardless of direction).
 //!
 //! `harness = false`; run: `cargo bench --bench alloc_profile`.
 
 #[path = "support/mod.rs"]
 mod support;
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::System;
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+
+use stats_alloc::{Stats, StatsAlloc};
 
 use fauxchange::exchange::{
     ActorConfig, EventTimestamp, FixedClock, InMemoryExecutionsStore, InMemoryPositionsStore,
@@ -56,76 +71,14 @@ use fauxchange::exchange::{
 
 use support::workload::{UNDERLYING, build_workload};
 
-/// A `GlobalAlloc` wrapper around `System` that counts allocations,
-/// deallocations, and bytes moved. Bench-only instrumentation, confined to
-/// this file — never part of the shipped crate (`fauxchange`'s `src/lib.rs`
-/// keeps `#![forbid(unsafe_code)]` unconditionally; this is a separate,
-/// independent bench binary, and `unsafe` here is the `GlobalAlloc` trait's
-/// own requirement, not a workaround).
-struct CountingAllocator {
-    allocs: AtomicU64,
-    deallocs: AtomicU64,
-    bytes_alloc: AtomicU64,
-    bytes_dealloc: AtomicU64,
-}
-
-impl CountingAllocator {
-    const fn new() -> Self {
-        Self {
-            allocs: AtomicU64::new(0),
-            deallocs: AtomicU64::new(0),
-            bytes_alloc: AtomicU64::new(0),
-            bytes_dealloc: AtomicU64::new(0),
-        }
-    }
-
-    fn snapshot(&self) -> (u64, u64, u64, u64) {
-        (
-            self.allocs.load(Ordering::Relaxed),
-            self.deallocs.load(Ordering::Relaxed),
-            self.bytes_alloc.load(Ordering::Relaxed),
-            self.bytes_dealloc.load(Ordering::Relaxed),
-        )
-    }
-}
-
-// SAFETY: every method below delegates to `System` (the platform default
-// allocator) with the exact `Layout` (and, for `realloc`, the exact new size)
-// it was given, adding only an atomic counter increment around the delegated
-// call. `System` already upholds the `GlobalAlloc` safety contract, and
-// forwarding its arguments unchanged preserves it.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.allocs.fetch_add(1, Ordering::Relaxed);
-        self.bytes_alloc
-            .fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.deallocs.fetch_add(1, Ordering::Relaxed);
-        self.bytes_dealloc
-            .fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        self.allocs.fetch_add(1, Ordering::Relaxed);
-        self.bytes_alloc
-            .fetch_add(new_size as u64, Ordering::Relaxed);
-        unsafe { System.realloc(ptr, layout, new_size) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        self.allocs.fetch_add(1, Ordering::Relaxed);
-        self.bytes_alloc
-            .fetch_add(layout.size() as u64, Ordering::Relaxed);
-        unsafe { System.alloc_zeroed(layout) }
-    }
-}
-
+/// The instrumented global allocator for this bench binary. `stats_alloc`'s
+/// own `unsafe impl GlobalAlloc` is vendored inside that crate (a dev-only,
+/// bench-scoped dependency — see the audit note on `stats_alloc` in
+/// `Cargo.toml`); this file, like every other file in this crate, contains
+/// zero `unsafe`. `StatsAlloc::system()` is a stable, non-nightly-gated
+/// `const fn`.
 #[global_allocator]
-static ALLOC: CountingAllocator = CountingAllocator::new();
+static ALLOC: StatsAlloc<System> = StatsAlloc::system();
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -134,28 +87,23 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn report_window(
-    label: &str,
-    before: (u64, u64, u64, u64),
-    after: (u64, u64, u64, u64),
-    ops: usize,
-) {
-    let allocs = after.0.saturating_sub(before.0);
-    let deallocs = after.1.saturating_sub(before.1);
-    let bytes_alloc = after.2.saturating_sub(before.2);
-    let bytes_dealloc = after.3.saturating_sub(before.3);
+fn report_window(label: &str, before: Stats, after: Stats, ops: usize) {
+    let delta = after - before;
+    let alloc_events = (delta.allocations + delta.reallocations) as u64;
     #[allow(clippy::cast_precision_loss)]
-    let allocs_per_op = allocs as f64 / ops.max(1) as f64;
+    let allocs_per_op = alloc_events as f64 / ops.max(1) as f64;
     #[allow(clippy::cast_precision_loss)]
-    let bytes_per_op = bytes_alloc as f64 / ops.max(1) as f64;
+    let bytes_per_op = delta.bytes_allocated as f64 / ops.max(1) as f64;
 
     println!("\n[alloc-profile] {label}: {ops} measured ops");
-    println!("  allocs         : {allocs}");
-    println!("  deallocs       : {deallocs}");
-    println!("  bytes_alloc    : {bytes_alloc}");
-    println!("  bytes_dealloc  : {bytes_dealloc}");
-    println!("  allocs/op      : {allocs_per_op:.3}");
-    println!("  bytes_alloc/op : {bytes_per_op:.1}");
+    println!("  allocations           : {}", delta.allocations);
+    println!("  reallocations         : {}", delta.reallocations);
+    println!("  deallocations         : {}", delta.deallocations);
+    println!("  bytes_allocated       : {}", delta.bytes_allocated);
+    println!("  bytes_deallocated     : {}", delta.bytes_deallocated);
+    println!("  bytes_reallocated_net : {}", delta.bytes_reallocated);
+    println!("  allocs/op             : {allocs_per_op:.3}");
+    println!("  bytes_alloc/op        : {bytes_per_op:.1}");
 }
 
 fn main() {
@@ -193,12 +141,12 @@ fn main() {
             let _ = actor.handle(command);
         }
 
-        let before = ALLOC.snapshot();
+        let before = ALLOC.stats();
         let n = workload.len();
         for command in workload {
             let _ = actor.handle(command);
         }
-        let after = ALLOC.snapshot();
+        let after = ALLOC.stats();
         report_window(
             "UnderlyingActor::handle (direct, no tokio)",
             before,
@@ -240,12 +188,12 @@ fn main() {
             let _ = handle.submit(command).await;
         }
 
-        let before = ALLOC.snapshot();
+        let before = ALLOC.stats();
         let n = workload.len();
         for command in workload {
             let _ = handle.submit(command).await;
         }
-        let after = ALLOC.snapshot();
+        let after = ALLOC.stats();
         report_window(
             "ActorHandle::submit (async mailbox + oneshot reply)",
             before,

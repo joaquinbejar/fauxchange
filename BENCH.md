@@ -2,8 +2,8 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`)                                             |
-| Recorded    | 2026-07-16                                                           |
+| Status      | First baseline (`#020`); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note) |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-18 (§5 only)                       |
 | Commit      | `de07a26dfba97f598d43818048e74fa43822ceb8` + this branch's uncommitted `#020` changes (`stack/20-bench-hdr`) |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
@@ -28,7 +28,7 @@
 | Toolchain | `rustc 1.97.0 (2d8144b78 2026-07-07)`, stable, matches `rust-toolchain.toml` |
 | Build | `cargo bench` (always `--release`; the `bench` Cargo profile) |
 | `RUSTFLAGS` | unset |
-| Allocator | system allocator (macOS `libmalloc`); `alloc_profile`'s `CountingAllocator` wraps `std::alloc::System`, it does not swap the allocator |
+| Allocator | system allocator (macOS `libmalloc`); `alloc_profile`'s `stats_alloc::StatsAlloc<System>` wraps `std::alloc::System`, it does not swap the allocator |
 | fauxchange crate version | `0.0.1` |
 | Pinned upstream crates | `option-chain-orderbook` `0.7.0`, `orderbook-rs` `0.10.5`, `pricelevel` `0.8.4`, `optionstratlib` `0.17.3` (from `Cargo.lock` on this branch) |
 | `hdrhistogram` / `criterion` | `7.5.4` / `0.8.2` (from `Cargo.lock`) |
@@ -256,15 +256,44 @@ since it is identical across all four columns.
 
 docs/07 §4: "the steady-state turn (append → match → append → enqueue)
 targets zero heap allocation on the common path." `benches/alloc_profile.rs`
-installs a `#[global_allocator]` `CountingAllocator` (a `std::alloc::System`
-wrapper with `AtomicU64` counters — stable Rust, no nightly feature) and
-reports the delta across a 50 000-op measured window (after 5 000 warmup ops,
-same seeded workload as HP-1) in two sections.
+installs `stats_alloc::StatsAlloc<System>` as the `#[global_allocator]` — a
+`std::alloc::System` wrapper with atomic alloc/dealloc/realloc/byte counters
+— and reports the delta across a 50 000-op measured window (after 5 000
+warmup ops, same seeded workload as HP-1) in two sections.
+
+> **Methodology note (updated after `#75`/`#112`).** The first baseline
+> (recorded 2026-07-16, see the git history of this file) used a hand-rolled
+> `CountingAllocator` with a local `unsafe impl GlobalAlloc`, which a
+> self-review flagged as a **critical violation of the repo's absolute
+> no-`unsafe`-anywhere rule** (CLAUDE.md / rules/global_rules.md / ADR-0008;
+> an inline `// SAFETY:` comment is not a governance decision). The bench now
+> uses `stats_alloc` (MIT, zero transitive dependencies, dev-only, bench-scoped
+> — audit note on the `Cargo.toml` dependency), whose `unsafe impl GlobalAlloc`
+> is vendored inside that crate; `fauxchange`'s own code — including this bench
+> — contains zero `unsafe`. `stats_alloc` also tracks `realloc` more precisely
+> than the old counter did (a realloc's byte delta is attributed to growth
+> *or* shrinkage instead of always adding the full new size to "bytes
+> allocated"), so the numbers below were **re-measured, not carried over**;
+> see the run-to-run variance disclosure below before reading the table as a
+> tight point estimate.
 
 | Section | allocs/op | bytes_alloc/op |
 |---|---|---|
-| `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **78.153** | 11 526.3 |
-| `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **63.189** | 11 301.2 |
+| `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **77.374** | 10 881.6 |
+| `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **82.657** | 11 102.3 |
+
+**Run-to-run variance, disclosed.** Three consecutive runs at the identical
+default configuration (`ALLOC_WARMUP_OPS=5000 ALLOC_MEASURED_OPS=50000`) on
+this host produced allocs/op of 62.577 / 79.710 / 77.374 (direct) and
+61.630 / 79.153 / 82.657 (async) — a wider spread than this document's other
+sections disclose, run to run. The table above reports the third (most
+recent) run; the other two are named here rather than discarded. This is
+consistent with — though not directly measured as caused by — early-lifetime
+container-growth timing (e.g. `DashMap`'s default randomized hasher shifting
+exactly when an internal shard's table resizes within a fixed 50 000-op
+window that starts from a freshly constructed actor each run), the same
+general class of "container still growing" effect §3.4 isolates for the
+journal specifically; not investigated further here.
 
 **Method and what this does / does not prove.** This is a **process-wide**
 allocation-pressure profile of the measured loop (every allocation on any
@@ -274,14 +303,13 @@ thread during the window), not a call-stack-scoped instrumentation of
 such tool was used; **this bench does not attribute allocations to a
 specific call site**, and no claim below should be read as one. What it
 proves: **the steady-state turn is measurably far from the zero-allocation
-DESIGN TARGET** — roughly 78 (direct) / 63 (async) allocations per submitted
-command, not the `0` the target names. (The async-submit section allocating
-*fewer* than the direct section, despite adding a real `oneshot::channel()`
-+ `mpsc` send per call, is itself notable — plausibly because the direct
-section's workload starts a fresh journal at 0 records while the async
-section's workload runs immediately after it in the same process on a
-*second* fresh actor at a *different* point in the run, so the two are not
-perfectly controlled against each other; not investigated further here.)
+DESIGN TARGET** — roughly 60–80 allocations per submitted command in both
+sections, not the `0` the target names. (The earlier baseline read the
+async-submit section as allocating *fewer* than the direct section and called
+that "notable"; across these three repeat runs the two sections are close
+enough, and swap ordering run to run, that no reliable direction — async
+higher or lower than direct — is claimed here; the given-workload deltas
+above are within the same run-to-run noise band shown for both sections.)
 Structurally-plausible, **unattributed** candidate contributors, named from
 reading the code (not measured individually, so not claimed as the
 explanation): `VenueCommand::clone()` for the write-ahead journal record
