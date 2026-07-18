@@ -55,9 +55,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::microstructure::error::LatencyConfigError;
+use crate::rng::{SplitMix64, fnv1a_64, mix64};
 
 // ============================================================================
-// Seeded keyed PRNG — SplitMix64 over an FNV-1a-folded stream key
+// Seeded keyed PRNG — the shared SplitMix64 sub-stream, latency-keyed
 // ============================================================================
 
 /// The domain tag mixed into every latency stream key, separating the latency
@@ -66,21 +67,6 @@ use crate::microstructure::error::LatencyConfigError;
 /// `(run_seed, key)` but different domains never correlate.
 const LATENCY_SUBSTREAM_DOMAIN: u64 = 0x_4661_7578_4C61_7443; // "FauxLatC"
 
-/// The FNV-1a 64-bit offset basis — the deterministic string hash folding a
-/// `session_id` into the stream key (a fixed function, never `std`'s
-/// process-randomised `RandomState`).
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-
-/// The FNV-1a 64-bit prime.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01B3;
-
-/// The SplitMix64 increment (the golden-ratio odd constant `⌊2^64 / φ⌋`).
-const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
-
-/// `2^53` — the divisor mapping a 53-bit mantissa slice into a unit-interval
-/// `f64` without precision loss.
-const F64_MANTISSA_SCALE: f64 = (1u64 << 53) as f64;
-
 /// The documented fail-safe delay a non-finite draw (an unreachable NaN, or a
 /// `lognormal` `exp` overflow under an absurd `sigma`) clamps to, so the `f64`
 /// boundary never leaks a non-finite value into a [`LatencyOffset`]. `u64::MAX`
@@ -88,79 +74,18 @@ const F64_MANTISSA_SCALE: f64 = (1u64 << 53) as f64;
 /// a value a sane config reaches.
 const NON_FINITE_CLAMP_US: u64 = u64::MAX;
 
-/// A deterministic FNV-1a 64-bit hash of `bytes` — folds a `session_id` string into
-/// the stream key. A fixed, portable function (no `std::hash::RandomState`).
+/// Derives the seeded latency sub-stream for one message identity from the shared
+/// [`SplitMix64`] primitive: the run seed and message `(session_id, msg_seq)` folded
+/// through the avalanche mix under the latency domain tag, so distinct messages get
+/// uncorrelated streams and the stream is independent of the price walk and every
+/// other sub-stream. Byte-identical to the module's original inline folding — the
+/// primitive moved to [`crate::rng`], the latency keying stayed here.
 #[inline]
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET_BASIS;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
-}
-
-/// The SplitMix64 finaliser — the avalanche mix that turns a counter value into a
-/// well-distributed `u64`.
-#[inline]
-fn mix64(z: u64) -> u64 {
-    let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-/// A tiny, self-contained SplitMix64 generator — the seeded latency sub-stream.
-///
-/// Deliberately **not** a general RNG dependency: the draw runs per inbound message
-/// and must stay cheap and portable, and the venue already forbids unseeded RNG on
-/// the path. Seeded from `(run_seed, session_id, msg_seq)` via [`Self::keyed`].
-struct SplitMix64 {
-    state: u64,
-}
-
-impl SplitMix64 {
-    /// Derives an independent stream from the run seed and the message identity.
-    /// The three inputs are folded through the avalanche mix under the latency
-    /// domain tag, so distinct `(session_id, msg_seq)` pairs get uncorrelated
-    /// streams and the stream is independent of the price walk and other
-    /// sub-streams.
-    #[inline]
-    fn keyed(run_seed: u64, session_id: &str, msg_seq: u64) -> Self {
-        let mut acc = mix64(run_seed ^ LATENCY_SUBSTREAM_DOMAIN);
-        acc = mix64(acc ^ fnv1a_64(session_id.as_bytes()));
-        acc = mix64(acc ^ msg_seq);
-        Self { state: acc }
-    }
-
-    /// The next 64-bit output.
-    #[inline]
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(SPLITMIX_GAMMA);
-        mix64(self.state)
-    }
-
-    /// A `f64` in `[0, 1)` — the top 53 bits of one output scaled by `2^53`.
-    #[inline]
-    fn next_unit(&mut self) -> f64 {
-        ((self.next_u64() >> 11) as f64) / F64_MANTISSA_SCALE
-    }
-
-    /// A `f64` in `(0, 1)` — never `0` (so `ln` stays finite) and never `1`.
-    #[inline]
-    fn next_open_unit(&mut self) -> f64 {
-        (((self.next_u64() >> 11) as f64) + 1.0) / (F64_MANTISSA_SCALE + 1.0)
-    }
-
-    /// A standard-normal sample via the Box–Muller transform. Cheap (two outputs,
-    /// one `ln`/`sqrt`/`cos`) and finite by construction — `u1 ∈ (0, 1)` keeps
-    /// `ln(u1)` finite and negative, so the radius is a real number.
-    #[inline]
-    fn standard_normal(&mut self) -> f64 {
-        let u1 = self.next_open_unit();
-        let u2 = self.next_unit();
-        let radius = (-2.0_f64 * u1.ln()).sqrt();
-        radius * (std::f64::consts::TAU * u2).cos()
-    }
+fn keyed_latency(run_seed: u64, session_id: &str, msg_seq: u64) -> SplitMix64 {
+    let mut acc = mix64(run_seed ^ LATENCY_SUBSTREAM_DOMAIN);
+    acc = mix64(acc ^ fnv1a_64(session_id.as_bytes()));
+    acc = mix64(acc ^ msg_seq);
+    SplitMix64::from_state(acc)
 }
 
 /// Converts a drawn `f64` microsecond delay into a guarded `u64`, keeping the
@@ -437,16 +362,16 @@ impl LatencyConfig {
             LatencyConfig::Disabled => 0,
             LatencyConfig::Fixed { us } => us,
             LatencyConfig::Uniform { min_us, max_us } => {
-                let mut rng = SplitMix64::keyed(run_seed, session_id, msg_seq);
+                let mut rng = keyed_latency(run_seed, session_id, msg_seq);
                 draw_uniform(&mut rng, min_us, max_us)
             }
             LatencyConfig::Normal { mean_us, sigma } => {
-                let mut rng = SplitMix64::keyed(run_seed, session_id, msg_seq);
+                let mut rng = keyed_latency(run_seed, session_id, msg_seq);
                 let sample = mean_us as f64 + sigma * rng.standard_normal();
                 micros_from_f64(sample)
             }
             LatencyConfig::Lognormal { median_us, sigma } => {
-                let mut rng = SplitMix64::keyed(run_seed, session_id, msg_seq);
+                let mut rng = keyed_latency(run_seed, session_id, msg_seq);
                 let sample = (median_us as f64) * (sigma * rng.standard_normal()).exp();
                 micros_from_f64(sample)
             }

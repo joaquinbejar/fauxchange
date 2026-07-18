@@ -60,7 +60,7 @@
 //! | `market_maker`  | [`crate::market_maker::MarketMakerEngine`] (real) | #015 |
 //! | `simulator`     | [`crate::simulation::PriceSimulator`] (real) | #016 |
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -77,18 +77,19 @@ use crate::auth::{
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, InMemoryExecutionsStore,
-    InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus, JournalHeader, JournalSnapshot,
-    LineageId, MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, Symbol, TeeFanOut,
-    VenueCommand, check_price_band, spawn_matching_actor_with_registry_and_index,
+    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, ExpirationDate,
+    InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
+    JournalHeader, JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink,
+    MassCancelScope, Receipt, StoreFanOut, Symbol, TeeFanOut, VenueCommand, check_price_band,
+    spawn_matching_actor_with_registry_and_index,
 };
-use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
+use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
 use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
 use crate::models::AccountId;
 use crate::simulation::{
-    AssetConfig, ClockMode, CorrelationId, JournalStream, PriceSimulator, RecordingController,
-    ReplayError, ReplayReport, RunManifest, ScenarioBundle, SimClock, SimError, SimulationConfig,
-    SynthesizedChain, VenueClockConfig, VenueStepSink,
+    AssetConfig, ClockMode, CorrelationId, ExpiryPhase, ExpirySchedule, JournalStream,
+    PriceSimulator, RecordingController, ReplayError, ReplayReport, RunManifest, ScenarioBundle,
+    SimClock, SimError, SimulationConfig, SynthesizedChain, VenueClockConfig, VenueStepSink,
 };
 // The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
 // sibling of `crate::auth` / `crate::ohlc`), NOT a gateway. `AppState` owns the
@@ -527,6 +528,13 @@ pub struct AppState {
     /// as the config half of the determinism tuple: a replay applies the identical
     /// config, so a fee/STP-sensitive scenario reconstructs exactly.
     microstructure: Arc<MicrostructureConfig>,
+    /// The last operational lifecycle phase the scheduled-expiry driver (#047) drove
+    /// each `(underlying, expiration-day-ms)` to, so a repeated
+    /// [`run_expiry_roll`](Self::run_expiry_roll) only issues **forward** transitions
+    /// and never re-issues a settled expiration (avoiding an illegal regressive
+    /// `SetInstrumentStatus`). Live-only driver state; the sequenced commands it
+    /// issues are journaled and replay without it.
+    expiry_phases: std::sync::Mutex<std::collections::HashMap<(String, i64), ExpiryPhase>>,
 }
 
 /// The result of a venue-control clock advance fanned across the underlyings —
@@ -569,6 +577,18 @@ impl ClockAdvance {
         let committed = self.committed_count();
         committed != 0 && committed != self.per_underlying.len()
     }
+}
+
+/// The summary of one [`AppState::run_expiry_roll`] pass — how many expirations were
+/// advanced to each phase and how many sequenced commands were issued.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpiryRollReport {
+    /// Expirations advanced to `Settling` on this roll.
+    pub settling: usize,
+    /// Expirations advanced to `Expired` on this roll.
+    pub expired: usize,
+    /// Sequenced commands (`MassCancel` / `SetInstrumentStatus`) accepted this roll.
+    pub commands_issued: usize,
 }
 
 /// Whether `command` is **venue-global** — it names no single routable underlying
@@ -699,6 +719,14 @@ impl AppState {
         // each actor's `StoreFanOut` (both consume the SAME post-journal event).
         let subscriptions = Arc::new(OrderbookSubscriptionManager::new());
 
+        // The late-bound market-maker control hub (#047): created BEFORE the actors
+        // (which take it as their sequenced control sink) and bound to the engine
+        // once it is constructed with their handles. Installed only on the live path;
+        // the replay/recovery executors carry no sink, so a `MarketMakerControl`
+        // replays as an identical `ControlApplied` without a live engine.
+        let mm_control_hub = MarketMakerControlHub::new();
+        let mm_control_sink: Arc<dyn MarketMakerControlSink> = Arc::clone(&mm_control_hub) as _;
+
         let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::with_capacity(underlyings.len());
         for underlying in underlyings {
             let ticker: Arc<str> = Arc::from(underlying);
@@ -755,10 +783,10 @@ impl AppState {
                         Arc::clone(&registry),
                         Arc::clone(&symbol_index),
                         &microstructure,
-                        // The market-maker control apply seam (#47) is wired by the
-                        // persona layer (phase 2); the order path routes + journals
-                        // a `MarketMakerControl` today with no live sink installed.
-                        None,
+                        // The market-maker control apply seam (#047): a committed
+                        // `MarketMakerControl` pushes its knobs onto the engine
+                        // through the late-bound hub, inside the actor turn.
+                        Some(Arc::clone(&mm_control_sink)),
                     )?
                 }
                 None => {
@@ -771,7 +799,7 @@ impl AppState {
                         Arc::clone(&registry),
                         Arc::clone(&symbol_index),
                         &microstructure,
-                        None,
+                        Some(Arc::clone(&mm_control_sink)),
                     )?
                 }
             };
@@ -786,11 +814,21 @@ impl AppState {
         // handles — so generated liquidity is journaled and replayable, never a
         // direct book mutation. The sink's forwarder task is detached (its lifetime
         // is the `AppState`'s, like the actors').
-        let market_maker = Arc::new(MarketMakerEngine::new(
-            ActorCommandSink::new(handles.clone()),
-            lineage_id.clone(),
-            Quoter::default(),
-        ));
+        let market_maker = Arc::new(
+            MarketMakerEngine::new(
+                ActorCommandSink::new(handles.clone()),
+                lineage_id.clone(),
+                Quoter::default(),
+            )
+            // The run-level seed the persona-jitter sub-stream derives from (#047), so
+            // persona jitter is reproducible for a fixed seed and replays identically.
+            .with_run_seed(seed),
+        );
+
+        // Bind the control hub to the engine now that it exists: from here a
+        // sequenced `MarketMakerControl` applies its knobs live. The bind is
+        // synchronous and precedes serving, so no control reaches an unbound hub.
+        mm_control_hub.bind(Arc::clone(&market_maker));
 
         // The price simulator (#016): each walked (or overridden) price step routes
         // through a `VenueStepSink` onto the SAME per-underlying actors as client
@@ -834,6 +872,7 @@ impl AppState {
             correlation_counter: AtomicU64::new(0),
             recording: RecordingController::default(),
             microstructure,
+            expiry_phases: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -898,6 +937,105 @@ impl AppState {
     ) -> Result<Receipt, VenueError> {
         self.submit(VenueCommand::SetInstrumentStatus { symbol, status })
             .await
+    }
+
+    /// Drives **scheduled expiry / roll** at venue-clock `now_ms` (#047): enumerates
+    /// every vivified contract, groups by `(underlying, expiration)`, and issues the
+    /// sequenced lifecycle transitions each expiration is **due** for through
+    /// [`submit`](Self::submit) — a scoped `MassCancel` (incl. `GTC`) then
+    /// `SetInstrumentStatus(Settling)` at the operational expiry time, and
+    /// `SetInstrumentStatus(Expired)` at settlement, per `schedule`.
+    ///
+    /// The upstream `ExpiryScheduler` is a **schedule source only**; this driver
+    /// issues every transition as a journaled command so a roll replays identically
+    /// ([05 §10](../docs/05-microstructure-config.md#10-halt-scenarios)). It tracks the
+    /// last phase driven per expiration, so a repeated call only advances **forward**
+    /// (idempotent, never a regressive illegal transition). Groups and symbols are
+    /// iterated in sorted order, so the emitted command stream is deterministic. No
+    /// lock is held across the `submit` `.await`.
+    ///
+    /// `now_ms` is the **venue clock** instant (a venue service, never `SystemTime`).
+    pub async fn run_expiry_roll(
+        &self,
+        schedule: &ExpirySchedule,
+        now_ms: i64,
+    ) -> ExpiryRollReport {
+        // Group vivified contracts by (underlying, expiration-identity-ms) in sorted
+        // order for a deterministic issue sequence.
+        let mut groups: BTreeMap<(String, i64), (ExpirationDate, Vec<Symbol>)> = BTreeMap::new();
+        for raw in self.symbol_index.symbols() {
+            let Ok(parsed) = SymbolParser::parse(&raw) else {
+                continue;
+            };
+            let expiration = *parsed.expiration();
+            let key_ms = match &expiration {
+                ExpirationDate::DateTime(dt) => dt.timestamp_millis(),
+                // A relative `Days` expiry drives no calendar roll (it breaks replay)
+                // and is skipped here, never constructed or propagated.
+                ExpirationDate::Days(_) => continue, // days-expiry-allow: defensive read-arm
+            };
+            let Ok(symbol) = Symbol::parse(&raw) else {
+                continue;
+            };
+            let entry = groups
+                .entry((parsed.underlying().to_string(), key_ms))
+                .or_insert_with(|| (expiration, Vec::new()));
+            entry.1.push(symbol);
+        }
+
+        let mut report = ExpiryRollReport::default();
+        for ((underlying, key_ms), (expiration, mut symbols)) in groups {
+            let Some(target) = schedule.phase_at(&expiration, now_ms) else {
+                continue;
+            };
+            symbols.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            let last = {
+                let map = self
+                    .expiry_phases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                map.get(&(underlying.clone(), key_ms))
+                    .copied()
+                    .unwrap_or(ExpiryPhase::PreExpiry)
+            };
+            if target <= last {
+                continue;
+            }
+            let commands = schedule.transition_commands(&expiration, &symbols, last, target);
+            for command in commands {
+                match self.submit(command).await {
+                    Ok(_) => report.commands_issued += 1,
+                    Err(error) => {
+                        tracing::warn!(underlying = %underlying, error = %error, "expiry-roll command rejected");
+                    }
+                }
+            }
+            self.expiry_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((underlying, key_ms), target);
+            match target {
+                ExpiryPhase::Settling => report.settling += 1,
+                ExpiryPhase::Expired => report.expired += 1,
+                ExpiryPhase::PreExpiry => {}
+            }
+        }
+        report
+    }
+
+    /// Evicts every resting order whose intraday `Day` / `Gtd` time-in-force has
+    /// expired at venue-clock `now_ms` (#047) — a single journaled, venue-global
+    /// [`EvictExpiredOrders`](VenueCommand::EvictExpiredOrders) fanned to every hosted
+    /// underlying, so the sweep replays from its journaled `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// The same typed rejections as [`submit`](Self::submit) for a venue-global fan.
+    pub async fn evict_expired_orders(&self, now_ms: u64) -> Result<Receipt, VenueError> {
+        self.submit(VenueCommand::EvictExpiredOrders {
+            now_ms: EventTimestamp::new(now_ms),
+        })
+        .await
     }
 
     /// Fans a **venue-global** command (a `MarketMakerControl`, an

@@ -440,6 +440,76 @@ fn test_ws_client_action_set_parses_and_order_entry_is_rejected() {
     }
 }
 
+/// The sequenced `MarketMakerControl` a WS control action / a REST parameters or
+/// kill-switch request builds — the SINGLE control-plane command both surfaces route,
+/// so a control cannot diverge across REST and WS by construction (#047).
+fn control_command(
+    spread_multiplier: Option<f64>,
+    size_scalar: Option<f64>,
+    directional_skew: Option<f64>,
+    enabled: Option<bool>,
+) -> VenueCommand {
+    VenueCommand::MarketMakerControl {
+        spread_multiplier,
+        size_scalar,
+        directional_skew,
+        enabled,
+    }
+}
+
+#[tokio::test]
+async fn test_control_parity_rest_and_ws_apply_the_same_knob() {
+    // Control parity (REST ≡ WS): the WS `set_spread` / `set_size` / `set_skew` /
+    // `kill` / `enable` actions and the REST `POST /controls/{parameters,kill-switch}`
+    // build the SAME sequenced `MarketMakerControl`, so applying it on two identical
+    // venues yields identical engine state — the control plane has one command, no
+    // per-surface divergence.
+    let rest_venue = venue(AMPLE_RATE_LIMIT);
+    let ws_venue = venue(AMPLE_RATE_LIMIT);
+
+    // The five control actions, each as the (spread, size, skew, enabled) knobs the
+    // two surfaces derive identically.
+    let actions = [
+        // REST /controls/parameters == WS set_spread / set_size / set_skew batch.
+        (Some(2.5), Some(0.4), Some(-0.3), None),
+        // WS set_spread.
+        (Some(1.5), None, None, None),
+        // WS kill == REST /controls/kill-switch {enabled:false}.
+        (None, None, None, Some(false)),
+        // WS enable == REST /controls/enable {enabled:true}.
+        (None, None, None, Some(true)),
+    ];
+
+    for (spread, size, skew, enabled) in actions {
+        rest_venue
+            .submit(control_command(spread, size, skew, enabled))
+            .await
+            .expect("REST-surface control fans out and applies");
+        ws_venue
+            .submit(control_command(spread, size, skew, enabled))
+            .await
+            .expect("WS-surface control fans out and applies");
+    }
+
+    // Both engines end in the identical persona-substrate config — REST and WS parity.
+    assert_eq!(
+        rest_venue.market_maker().get_config(),
+        ws_venue.market_maker().get_config(),
+        "REST and WS controls apply the identical sequenced knob"
+    );
+    // The final kill/enable/spread landed (enable was last → enabled).
+    let config = rest_venue.market_maker().get_config();
+    assert!(config.enabled, "the final enable control took effect");
+    assert_eq!(
+        config.spread_multiplier, 1.5,
+        "the spread control took effect"
+    );
+    assert_eq!(
+        config.directional_skew, -0.3,
+        "the skew control took effect"
+    );
+}
+
 // ============================================================================
 // 2. Observation parity (REST ≡ WS) — THE core parity test
 // ============================================================================

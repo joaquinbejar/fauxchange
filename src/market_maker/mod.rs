@@ -40,7 +40,9 @@
 //! [`calculate_edge`]: Quoter::calculate_edge
 
 pub mod config;
+pub mod control_hub;
 pub mod engine;
+pub mod persona;
 pub mod pricer;
 pub mod quoter;
 pub mod sink;
@@ -48,9 +50,11 @@ pub mod sink;
 pub use self::config::{
     DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, MarketMakerConfig, MarketMakerEvent,
     SIZE_SCALAR_MAX, SIZE_SCALAR_MIN, SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN,
-    validate_control_value,
+    validate_control_knobs, validate_control_value,
 };
+pub use self::control_hub::MarketMakerControlHub;
 pub use self::engine::MarketMakerEngine;
+pub use self::persona::{PersonaConfig, PersonaError, PersonaJitter, PersonaJitterDraw};
 pub use self::pricer::{DEFAULT_IV, DEFAULT_RISK_FREE_RATE, OptionPricer};
 pub use self::quoter::{
     DEFAULT_BASE_SIZE, DEFAULT_BASE_SPREAD_BPS, QuoteInput, QuoteParams, Quoter,

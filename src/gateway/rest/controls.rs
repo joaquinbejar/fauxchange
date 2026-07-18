@@ -137,6 +137,14 @@ pub async fn update_parameters(
     Json(request): Json<UpdateParametersRequest>,
 ) -> Result<Json<UpdateParametersResponse>, VenueError> {
     require(&auth, Permission::Admin)?;
+    // Reject an out-of-range / NaN knob at the boundary (rule 4) so it never enters
+    // the journal; only validated controls are sequenced.
+    crate::market_maker::validate_control_knobs(
+        request.spread_multiplier,
+        request.size_scalar,
+        request.directional_skew,
+    )
+    .map_err(VenueError::InvalidOrder)?;
     state
         .submit(VenueCommand::MarketMakerControl {
             spread_multiplier: request.spread_multiplier,

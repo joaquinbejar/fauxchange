@@ -756,6 +756,15 @@ impl Connection {
         if !self.claims.has_permission(Permission::Admin) {
             return WsMessage::Error(VenueError::Forbidden(Permission::Admin).ws_error(request_id));
         }
+        // Reject an out-of-range / NaN knob at the boundary (rule 4) so it never
+        // enters the journal; only validated controls are sequenced.
+        if let Err(reason) = crate::market_maker::validate_control_knobs(
+            knobs.spread_multiplier,
+            knobs.size_scalar,
+            knobs.directional_skew,
+        ) {
+            return WsMessage::Error(VenueError::InvalidOrder(reason).ws_error(request_id));
+        }
         let command = VenueCommand::MarketMakerControl {
             spread_multiplier: knobs.spread_multiplier,
             size_scalar: knobs.size_scalar,

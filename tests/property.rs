@@ -955,6 +955,49 @@ proptest! {
             );
         }
     }
+
+    /// A larger `size_scalar` (within `[0.0, 1.0]`) never yields a smaller quote size
+    /// — resting-liquidity shaping is monotone (#047, [05 §9](../docs/05-microstructure-config.md#9-partial-fill-and-liquidity-shaping)).
+    /// A neutral (unskewed) persona is used so both legs scale identically, and the
+    /// size stays a deterministic function of `base_size * size_scalar` (floored at 1)
+    /// with no fill-probability draw anywhere on the path.
+    #[test]
+    fn mm_persona_size_scalar_scales_size(
+        spot in 1_000_000u64..10_000_000,
+        strike_ratio in 90u64..110,
+        days in 20.0f64..365.0,
+        iv in 0.2f64..1.0,
+        s_lo in 0.0f64..1.0,
+        s_delta in 0.0f64..1.0,
+        is_call in any::<bool>(),
+    ) {
+        let strike = (spot.saturating_mul(strike_ratio) / 100).max(1);
+        let s_hi = (s_lo + s_delta).min(1.0);
+        let style = if is_call { OptionStyle::Call } else { OptionStyle::Put };
+        // A large base size so scaling is visible above the size floor of 1.
+        let quoter = Quoter::new(fauxchange::market_maker::OptionPricer::default(), 100, 1_000);
+        let input = |scalar| QuoteInput {
+            spot_cents: spot,
+            strike_cents: strike,
+            days_to_expiry: days,
+            style,
+            spread_multiplier: 1.0,
+            size_scalar: scalar,
+            directional_skew: 0.0,
+            iv: Some(iv),
+        };
+        if let (Some(small), Some(large)) =
+            (quoter.generate_quote(&input(s_lo)), quoter.generate_quote(&input(s_hi)))
+        {
+            prop_assert!(
+                large.bid_size >= small.bid_size,
+                "a larger size_scalar must not shrink size: {} < {}",
+                large.bid_size,
+                small.bid_size
+            );
+            prop_assert!(large.bid_size >= 1 && large.ask_size >= 1, "size floored at 1");
+        }
+    }
 }
 
 // ============================================================================

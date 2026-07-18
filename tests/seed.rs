@@ -164,6 +164,22 @@ async fn test_seed_default_scenario_populates_chain_prices_personas_accounts() {
     assert_eq!(state.market_maker().registered_count("BTC"), 6);
     assert_eq!(state.market_maker().registered_count("ETH"), 2);
 
+    // #047 regression: the seed phase binds personas PER INSTRUMENT and leaves the
+    // engine's global config the NEUTRAL overlay (1.0/1.0/0.0), so a persona shapes a
+    // quote exactly once — it must NOT also write the default persona's knobs into the
+    // global config (which would double-shape: `persona.knob * config.knob`).
+    let config = state.market_maker().get_config();
+    assert_eq!(
+        config.spread_multiplier, 1.0,
+        "global spread overlay stays neutral"
+    );
+    assert_eq!(config.size_scalar, 1.0, "global size overlay stays neutral");
+    assert_eq!(
+        config.directional_skew, 0.0,
+        "global skew overlay stays neutral"
+    );
+    assert!(config.enabled, "quoting is enabled");
+
     // Accounts are present with their seeded permissions and FIX credential.
     let reader = state
         .accounts()

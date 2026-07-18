@@ -39,17 +39,25 @@ use std::sync::{Arc, PoisonError, RwLock};
 use tokio::sync::broadcast;
 
 use crate::exchange::{
-    Cents, ExpirationDate, LineageId, MARKET_MAKER_OWNER, OptionStyle, STPMode, Side, Symbol,
-    SymbolParser, TimeInForce, VenueCommand, market_maker_account,
+    Cents, ExpirationDate, LineageId, MARKET_MAKER_OWNER, MarketMakerControlKnobs,
+    MarketMakerControlSink, OptionStyle, STPMode, Side, Symbol, SymbolParser, TimeInForce,
+    VenueCommand, market_maker_account,
 };
 use crate::market_maker::config::{
     DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, MarketMakerConfig, MarketMakerEvent,
     SIZE_SCALAR_MAX, SIZE_SCALAR_MIN, SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN,
     validate_control_value,
 };
+use crate::market_maker::persona::{PersonaConfig, PersonaJitter, PersonaJitterDraw};
 use crate::market_maker::quoter::{QuoteInput, Quoter};
 use crate::market_maker::sink::CommandSink;
 use crate::models::{ExecutionId, OrderType, VenueOrderId};
+
+/// The default run-level seed the persona-jitter sub-stream derives from when a
+/// caller does not set one ([`MarketMakerEngine::with_run_seed`]) — mirrors the
+/// venue's `DEFAULT_SEED`. Kept local so the domain module never imports the
+/// application layer (`crate::state`).
+const DEFAULT_MM_RUN_SEED: u64 = 0;
 
 /// The bounded capacity of the market-maker event broadcast — a DoS control,
 /// never unbounded (rule 7). A slow subscriber lags and re-subscribes; the
@@ -77,6 +85,13 @@ struct QuotableInstrument {
     /// `smile_curve`-shaped IV here, so the maker's journaled quotes reflect the
     /// synthesised volatility smile.
     iv: Option<f64>,
+    /// The per-instrument persona (`None` ⇒ this instrument follows the engine's
+    /// global config knobs, the pre-#047 behaviour). When `Some`, the instrument
+    /// quotes with its persona's base spread / size and knobs, plus the seeded
+    /// per-`(persona, symbol)` jitter (#047, [05 §8](../../docs/05-microstructure-config.md#8-market-maker-personas)).
+    persona: Option<PersonaConfig>,
+    /// The persona's name, the jitter stream key (`None` when no persona is bound).
+    persona_name: Option<String>,
 }
 
 /// A resting market-maker quote leg, tracked for cancel-on-requote and for the
@@ -149,12 +164,18 @@ pub struct MarketMakerEngine {
     venue_now_ms: AtomicU64,
     /// The replay-mute flag: when set, price updates never cascade a requote.
     muted: AtomicBool,
+    /// The seeded persona-jitter sub-stream (#047): a pure function of the run seed
+    /// and `(persona, symbol)`, so a persona's quote-size / skew noise is
+    /// reproducible for a fixed seed and replays identically (rule 3).
+    jitter: PersonaJitter,
     /// The bounded event broadcast.
     event_tx: broadcast::Sender<MarketMakerEvent>,
 }
 
 impl MarketMakerEngine {
-    /// Builds an engine over `sink`, the run `lineage_id`, and `quoter`.
+    /// Builds an engine over `sink`, the run `lineage_id`, and `quoter`. The
+    /// persona-jitter sub-stream derives from [`DEFAULT_MM_RUN_SEED`] until
+    /// [`with_run_seed`](Self::with_run_seed) sets the real run seed.
     #[must_use]
     pub fn new(sink: Arc<dyn CommandSink>, lineage_id: LineageId, quoter: Quoter) -> Self {
         let (event_tx, _) = broadcast::channel(DEFAULT_EVENT_CHANNEL_CAPACITY);
@@ -170,8 +191,18 @@ impl MarketMakerEngine {
             next_order_seq: AtomicU64::new(0),
             venue_now_ms: AtomicU64::new(0),
             muted: AtomicBool::new(false),
+            jitter: PersonaJitter::new(DEFAULT_MM_RUN_SEED),
             event_tx,
         }
+    }
+
+    /// Sets the run-level seed the persona-jitter sub-stream derives from, returning
+    /// `self` so it composes with [`new`](Self::new). The venue passes its one
+    /// run-level seed here so persona jitter is reproducible for a fixed seed (rule 3).
+    #[must_use]
+    pub fn with_run_seed(mut self, run_seed: u64) -> Self {
+        self.jitter = PersonaJitter::new(run_seed);
+        self
     }
 
     /// Subscribes to the engine's bounded event broadcast.
@@ -221,6 +252,35 @@ impl MarketMakerEngine {
     /// override is a documented analytic `f64`, guarded downstream by the quoter's
     /// `f64`-boundary (a non-finite IV yields no quote, never a poisoned value).
     pub fn register_instrument_with_iv(&self, symbol: &Symbol, iv: Option<f64>) {
+        self.register_resolved(symbol, iv, None, None);
+    }
+
+    /// Registers a contract the maker will quote with a bound **persona** (#047):
+    /// the instrument quotes with the persona's base spread / size and range-validated
+    /// knobs, plus the seeded per-`(persona, symbol)` jitter, instead of the engine's
+    /// global config. `persona_name` is the jitter stream key, so `tight` vs
+    /// `wide_skewed` on the same symbol draw independent jitter
+    /// ([05 §8](../../docs/05-microstructure-config.md#8-market-maker-personas)).
+    /// Idempotent per symbol.
+    pub fn register_instrument_with_persona(
+        &self,
+        symbol: &Symbol,
+        iv: Option<f64>,
+        persona_name: &str,
+        persona: PersonaConfig,
+    ) {
+        self.register_resolved(symbol, iv, Some(persona), Some(persona_name.to_string()));
+    }
+
+    /// Shared registration: parses the symbol, guards the IV `f64` boundary, and
+    /// appends the [`QuotableInstrument`] (idempotent per symbol).
+    fn register_resolved(
+        &self,
+        symbol: &Symbol,
+        iv: Option<f64>,
+        persona: Option<PersonaConfig>,
+        persona_name: Option<String>,
+    ) {
         let Ok(parsed) = SymbolParser::parse(symbol.as_str()) else {
             // A `Symbol` is already validated, so this is unreachable; fail safe.
             tracing::error!(
@@ -240,6 +300,8 @@ impl MarketMakerEngine {
             strike_cents,
             style: parsed.option_style(),
             iv,
+            persona,
+            persona_name,
         };
         let mut instruments = self
             .instruments
@@ -349,17 +411,58 @@ impl MarketMakerEngine {
         let Some(days_to_expiry) = self.days_to_expiry(&instrument.expiration) else {
             return;
         };
+        // Resolve the effective quoter + knobs. A persona-bound instrument (#047)
+        // quotes with its own base spread / size and knobs plus the seeded
+        // per-`(persona, symbol)` jitter; the engine's global config is then applied
+        // as a **runtime overlay** on top (so a WS/REST control still modulates every
+        // instrument, rule 4). An **unbound** instrument has a neutral base, so the
+        // overlay reduces to exactly the pre-#047 global-config behaviour with no
+        // jitter — backward compatible.
+        let (quoter, base_spread_multiplier, base_size_scalar, base_skew, jitter) =
+            match &instrument.persona {
+                Some(persona) => {
+                    let jitter = self.jitter.draw(
+                        instrument.persona_name.as_deref().unwrap_or("default"),
+                        instrument.symbol.as_str(),
+                    );
+                    // A per-instrument quoter carries this persona's base spread /
+                    // size (the `Quoter` is `Copy`, the pricer shared — no allocation).
+                    let quoter = Quoter::new(
+                        *self.quoter.pricer(),
+                        persona.base_spread_bps,
+                        persona.base_size,
+                    );
+                    (
+                        quoter,
+                        persona.spread_multiplier,
+                        persona.size_scalar,
+                        persona.directional_skew,
+                        jitter,
+                    )
+                }
+                // Neutral base + no jitter: the engine's own quoter with unit knobs.
+                None => (self.quoter, 1.0, 1.0, 0.0, PersonaJitterDraw::identity()),
+            };
+        // Overlay the global config: spread/size multiply, skew adds; each re-clamped
+        // to its documented range. Jitter only trims size (`size_factor <= 1`) and
+        // nudges skew, so the results stay in `[0, 1]` / `[-1, 1]`.
+        let spread_multiplier = (base_spread_multiplier * config.spread_multiplier)
+            .clamp(SPREAD_MULTIPLIER_MIN, SPREAD_MULTIPLIER_MAX);
+        let size_scalar =
+            (base_size_scalar * config.size_scalar * jitter.size_factor).clamp(0.0, 1.0);
+        let directional_skew = (base_skew + config.directional_skew + jitter.skew_delta)
+            .clamp(DIRECTIONAL_SKEW_MIN, DIRECTIONAL_SKEW_MAX);
         let input = QuoteInput {
             spot_cents,
             strike_cents: instrument.strike_cents,
             days_to_expiry,
             style: instrument.style,
-            spread_multiplier: config.spread_multiplier,
-            size_scalar: config.size_scalar,
-            directional_skew: config.directional_skew,
+            spread_multiplier,
+            size_scalar,
+            directional_skew,
             iv: instrument.iv,
         };
-        let Some(params) = self.quoter.generate_quote(&input) else {
+        let Some(params) = quoter.generate_quote(&input) else {
             tracing::warn!(
                 symbol = instrument.symbol.as_str(),
                 "skipping quote: non-finite theoretical value"
@@ -765,6 +868,67 @@ impl MarketMakerEngine {
         });
     }
 
+    /// Applies a **sequenced** market-maker control change (#047) — the seam the
+    /// single-writer executor invokes, inside the actor turn, for a committed
+    /// [`VenueCommand::MarketMakerControl`]
+    /// ([02 §4.1](../../docs/02-matching-architecture.md)).
+    ///
+    /// A control is fanned to **every** underlying's actor, so this is invoked once
+    /// per underlying for one change; it is therefore a **pure, idempotent state
+    /// write** — it updates the global config and broadcasts `ConfigChanged` only
+    /// when a value actually changed, and it **never** requotes or cancels
+    /// synchronously. The requotes a knob change induces enter the sequencer as their
+    /// **own** journaled `AddOrder` commands on the next price step, and the
+    /// replay/recovery path installs no sink, so re-execution derives the identical
+    /// event without a live engine (the determinism contract, rule 3).
+    ///
+    /// Each knob is validated defensively against its clamp; an out-of-range / `NaN`
+    /// value (which the gateway boundary should already have rejected) is skipped with
+    /// a `WARN`, leaving the config unchanged, so no poisoned value reaches quoting
+    /// (rule 4).
+    pub fn apply_sequenced_control(&self, knobs: MarketMakerControlKnobs) {
+        let mut changed = false;
+        {
+            let mut config = self.config.write().unwrap_or_else(PoisonError::into_inner);
+            if let Some(value) = knobs.spread_multiplier {
+                changed |= apply_knob(
+                    &mut config.spread_multiplier,
+                    "spread_multiplier",
+                    value,
+                    SPREAD_MULTIPLIER_MIN,
+                    SPREAD_MULTIPLIER_MAX,
+                );
+            }
+            if let Some(value) = knobs.size_scalar {
+                changed |= apply_knob(
+                    &mut config.size_scalar,
+                    "size_scalar",
+                    value,
+                    SIZE_SCALAR_MIN,
+                    SIZE_SCALAR_MAX,
+                );
+            }
+            if let Some(value) = knobs.directional_skew {
+                changed |= apply_knob(
+                    &mut config.directional_skew,
+                    "directional_skew",
+                    value,
+                    DIRECTIONAL_SKEW_MIN,
+                    DIRECTIONAL_SKEW_MAX,
+                );
+            }
+            if let Some(enabled) = knobs.enabled
+                && config.enabled != enabled
+            {
+                config.enabled = enabled;
+                changed = true;
+            }
+        }
+        if changed {
+            self.broadcast_config_change();
+        }
+    }
+
     /// Broadcasts the current configuration.
     fn broadcast_config_change(&self) {
         let config = self.get_config();
@@ -774,6 +938,37 @@ impl MarketMakerEngine {
             size_scalar: config.size_scalar,
             directional_skew: config.directional_skew,
         });
+    }
+}
+
+/// Validates and applies one sequenced control knob into `slot`, returning whether
+/// it changed. An out-of-range / `NaN` value is skipped with a `WARN` (the config is
+/// left unchanged), so no poisoned value reaches quoting (rule 4).
+#[inline]
+fn apply_knob(slot: &mut f64, field: &str, value: f64, min: f64, max: f64) -> bool {
+    match validate_control_value(field, value, min, max) {
+        Ok(valid) if *slot != valid => {
+            *slot = valid;
+            true
+        }
+        Ok(_) => false,
+        Err(reason) => {
+            tracing::warn!(field, %reason, "sequenced market-maker control out of range; ignoring");
+            false
+        }
+    }
+}
+
+/// The market maker is its own **sequenced control apply seam** (#047): a committed
+/// [`VenueCommand::MarketMakerControl`] pushes its knobs onto the engine through
+/// [`MarketMakerEngine::apply_sequenced_control`]. The engine's setters take `&self`
+/// (interior mutability), so an `Arc<MarketMakerEngine>` implements the trait and is
+/// shared by handle into every underlying's executor (via a late-bound hub, since the
+/// engine is built *after* the actors it drives).
+impl MarketMakerControlSink for MarketMakerEngine {
+    #[inline]
+    fn apply_control(&self, knobs: MarketMakerControlKnobs) {
+        self.apply_sequenced_control(knobs);
     }
 }
 
