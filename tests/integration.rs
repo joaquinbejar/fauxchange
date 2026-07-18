@@ -22,7 +22,7 @@ use tokio::sync::broadcast;
 // Persistence). These are `#[ignore]`d so the default `cargo test` stays green
 // without Docker; the CI `migrations` job runs them with `-- --ignored`.
 use fauxchange::OrderType;
-use fauxchange::db::{DatabasePool, DbPoolConfig, PgVenueJournal};
+use fauxchange::db::{DatabasePool, DbError, DbPoolConfig, PgVenueJournal};
 use fauxchange::exchange::{
     ActorConfig, FixedClock, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore, JournalError,
     JournalHeader, JournalRecord, LineageId, MarkPriceBook, MatchingExecutor, RecordKind,
@@ -445,6 +445,100 @@ async fn test_journal_refuses_newer_schema() {
     match recover(&journal, JOURNAL_UNDERLYING) {
         Err(JournalError::SchemaTooNew { found }) => assert_eq!(found, "venue.v2"),
         other => panic!("expected a SchemaTooNew refusal on the durable path, got {other:?}"),
+    }
+
+    drop(container);
+}
+
+/// `open` REFUSES to open a durable stream under a FRESH run lineage over a
+/// PRE-EXISTING stream: it reads the persisted header back and compares it, so a
+/// lineage disagreement is the typed `DbError::HeaderMismatch` (never a silently
+/// cached foreign header that would corrupt replay/recovery identity), while a
+/// re-open under the SAME lineage succeeds (#112, #84).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_open_refuses_fresh_lineage_over_existing_stream() {
+    let (container, db) = start_pg().await;
+
+    // First open persists lineage `run-1`'s header for the stream and caches it.
+    let first = PgVenueJournal::open(
+        &db,
+        JOURNAL_UNDERLYING,
+        JournalHeader::new(LineageId::new("run-1")),
+    )
+    .expect("first open persists the run-1 header");
+    assert_eq!(first.header().lineage_id, LineageId::new("run-1"));
+
+    // A restart under a FRESH lineage over the SAME durable stream is refused: the
+    // stored records belong to `run-1`, so caching `run-2` would silently corrupt
+    // replay identity. The header is read back and the mismatch is typed.
+    match PgVenueJournal::open(
+        &db,
+        JOURNAL_UNDERLYING,
+        JournalHeader::new(LineageId::new("run-2")),
+    ) {
+        Err(DbError::HeaderMismatch { stored, supplied }) => {
+            assert!(
+                stored.contains("run-1"),
+                "the refusal names the persisted lineage: {stored}"
+            );
+            assert!(
+                supplied.contains("run-2"),
+                "the refusal names the fresh lineage: {supplied}"
+            );
+        }
+        other => panic!("expected a HeaderMismatch refusal on a fresh lineage, got {other:?}"),
+    }
+
+    // Re-opening under the SAME lineage is fine (idempotent; the header matches).
+    let reopened = PgVenueJournal::open(
+        &db,
+        JOURNAL_UNDERLYING,
+        JournalHeader::new(LineageId::new("run-1")),
+    )
+    .expect("re-open under the same lineage succeeds");
+    assert_eq!(reopened.header().lineage_id, LineageId::new("run-1"));
+
+    drop(container);
+}
+
+/// The live-write `open` path (not just recovery) ALSO refuses a stream whose STORED
+/// envelope schema disagrees with this binary's — the same read-back/compare guard,
+/// so a newer-schema stream is never opened under a stale-schema header (#112, #84).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_open_refuses_foreign_schema_over_existing_stream() {
+    let (container, db) = start_pg().await;
+
+    // Seed a header written by a hypothetical LATER binary (schema `venue.v2`), via a
+    // runtime-checked parameterised query (no macro, so no offline data).
+    sqlx::query(
+        "INSERT INTO journal_headers (underlying, lineage_id, schema_version) VALUES ($1, $2, $3)",
+    )
+    .bind(JOURNAL_UNDERLYING)
+    .bind("run-1")
+    .bind("venue.v2")
+    .execute(db.pool())
+    .await
+    .expect("seed a newer-schema header");
+
+    // Opening the live write path under the current `venue.v1` schema is refused.
+    match PgVenueJournal::open(
+        &db,
+        JOURNAL_UNDERLYING,
+        JournalHeader::new(LineageId::new("run-1")),
+    ) {
+        Err(DbError::HeaderMismatch { stored, supplied }) => {
+            assert!(
+                stored.contains("venue.v2"),
+                "the refusal names the persisted schema: {stored}"
+            );
+            assert!(
+                supplied.contains("venue.v1"),
+                "the refusal names this binary's schema: {supplied}"
+            );
+        }
+        other => panic!("expected a HeaderMismatch on a schema disagreement, got {other:?}"),
     }
 
     drop(container);

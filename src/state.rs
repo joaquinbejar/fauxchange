@@ -128,7 +128,8 @@ pub enum AppStateError {
     #[error(transparent)]
     Auth(#[from] AuthError),
     /// The durable journal store could not be opened for an underlying (a header
-    /// row could not be ensured, or the venue was assembled outside a tokio
+    /// row could not be ensured or read back, the **persisted header disagreed**
+    /// with this run's lineage/schema, or the venue was assembled outside a tokio
     /// runtime). Only reachable when `DATABASE_URL` is set.
     #[error(transparent)]
     Db(#[from] DbError),

@@ -21,10 +21,12 @@ use crate::exchange::StoreError;
 /// A failure at the durable-persistence boundary — the typed error the
 /// [`crate::db`] repositories return **instead of** leaking `sqlx::Error`.
 ///
-/// Every variant carries only a **non-secret** label (a `&'static str` operation
-/// name or field), never the query text, the row data, or the `DATABASE_URL`. The
-/// full driver cause is logged server-side where the error is first mapped
-/// (`rules/global_rules.md` *Security*, [08 §7](../../docs/08-threat-model.md#7-secrets-handling)).
+/// Every variant carries only **non-secret** context — a `&'static str` operation
+/// or field label, or (for [`HeaderMismatch`](Self::HeaderMismatch)) the venue's own
+/// run lineage + envelope schema — never the query text, the row data, or the
+/// `DATABASE_URL`. The full driver cause is logged server-side where the error is
+/// first mapped (`rules/global_rules.md` *Security*,
+/// [08 §7](../../docs/08-threat-model.md#7-secrets-handling)).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DbError {
     /// The `PgPool` could not be opened from the configured `DATABASE_URL`
@@ -56,6 +58,23 @@ pub enum DbError {
     /// bug) — the DB-less path must use the in-memory backend, never this one.
     #[error("database backend unavailable: no open pool")]
     Unavailable,
+    /// The durable stream's **persisted** journal header disagrees with the header
+    /// this run supplied at
+    /// [`PgVenueJournal::open`](crate::db::PgVenueJournal::open) — a fresh run
+    /// lineage (or a differing envelope schema) opened over a **pre-existing**
+    /// durable stream. Opening is refused rather than caching a header that
+    /// disagrees with the stored records, which would silently corrupt
+    /// replay/recovery identity (every venue-minted id is namespaced by
+    /// `lineage_id`, [01 §6.1](../../docs/01-domain-model.md)). Carries only the
+    /// **non-secret** venue identity (run lineage + envelope schema), never row data
+    /// or the `DATABASE_URL`; the domain boundary redacts it to an internal `500`.
+    #[error("stored journal header ({stored}) does not match the supplied header ({supplied})")]
+    HeaderMismatch {
+        /// A non-secret description of the header persisted in the durable stream.
+        stored: String,
+        /// A non-secret description of the header this run supplied at open.
+        supplied: String,
+    },
 }
 
 impl From<DbError> for StoreError {

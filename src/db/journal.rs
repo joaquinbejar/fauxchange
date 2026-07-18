@@ -92,7 +92,8 @@ impl std::fmt::Debug for PgVenueJournal {
 impl PgVenueJournal {
     /// Opens the durable journal for an underlying on the **live write path**,
     /// ensuring the stream's header row exists for the run `header`
-    /// (`INSERT … ON CONFLICT (underlying) DO NOTHING`, idempotent) and caching it.
+    /// (`INSERT … ON CONFLICT (underlying) DO NOTHING`, idempotent), **reading the
+    /// persisted header back**, and verifying it equals `header` before caching it.
     ///
     /// This is the [`crate::state::AppState`] boot entry point (a fresh venue that
     /// persists durably going forward). Resuming a **non-empty** durable journal by
@@ -101,11 +102,22 @@ impl PgVenueJournal {
     /// **loud and safe** (a conflicting append is refused, never a silent overwrite),
     /// never a silent divergence.
     ///
+    /// The read-back + compare closes the silent-mismatch gap (#112): a fresh run
+    /// `lineage_id` (or a differing envelope `schema_version`) opened over a
+    /// **pre-existing** durable stream would otherwise cache the *caller's* header
+    /// while the stored records belong to the *old* lineage — corrupting
+    /// replay/recovery identity (ids are namespaced by `lineage_id`). Instead this
+    /// **refuses to open** with [`DbError::HeaderMismatch`], never caching a header
+    /// that disagrees with the persisted stream. A first-time open (no prior header)
+    /// persists the caller's header and reads it straight back, so it proceeds
+    /// normally.
+    ///
     /// # Errors
     ///
     /// [`DbError::Unavailable`] if constructed outside a tokio runtime (the
     /// sync→async bridge needs a runtime handle); [`DbError::Query`] if the header
-    /// row cannot be ensured.
+    /// row cannot be ensured or read back; [`DbError::HeaderMismatch`] if the
+    /// persisted header's `lineage_id` / `schema_version` disagrees with `header`.
     pub fn open(
         db: &DatabasePool,
         underlying: impl Into<String>,
@@ -114,14 +126,22 @@ impl PgVenueJournal {
         let handle = Handle::try_current().map_err(|_| DbError::Unavailable)?;
         let underlying = underlying.into();
         let pool = db.pool().clone();
-        // Ensure the header row for THIS run's lineage (idempotent no-op if present).
-        bridge(&handle, ensure_header(&pool, &underlying, &header))?;
+        // Ensure the header row for THIS run's lineage (idempotent no-op if present),
+        // then read it back and verify it matches — both inside ONE transaction, so
+        // the check is atomic and the actor never starts against a stream whose
+        // persisted identity disagrees with the header we would cache (#112).
+        let stored = bridge(
+            &handle,
+            ensure_and_verify_header(&pool, &underlying, &header),
+        )?;
         tracing::info!(underlying = %underlying, "durable journal opened (live write path)");
         Ok(Self {
             pool,
             handle,
             underlying,
-            header,
+            // Cache the STORED header: on a first-time open it equals `header`; on a
+            // resume it is the persisted header we just verified equals `header`.
+            header: stored,
         })
     }
 
@@ -336,13 +356,28 @@ impl VenueJournal for PgVenueJournal {
 // Header helpers
 // ============================================================================
 
-/// Ensures the header row for `underlying` exists for this run's `header`
-/// (idempotent — a no-op if a header is already present for the underlying).
-async fn ensure_header(
+/// Ensures the header row for `underlying` exists for this run's `supplied` header,
+/// then reads the **persisted** header back and verifies it equals `supplied` — the
+/// ensure and the read-back run in **one transaction**, so the check is atomic
+/// against a concurrent open and the caller never caches a header that disagrees
+/// with the stored stream (#112).
+///
+/// On a first-time open the supplied header is inserted and read straight back
+/// (equal by construction). On a resume over a **pre-existing** stream the persisted
+/// header is returned; if its `lineage_id` or `schema_version` disagrees with
+/// `supplied` the open is refused with [`DbError::HeaderMismatch`] rather than
+/// caching a header that disagrees with the durably-stored records.
+async fn ensure_and_verify_header(
     pool: &PgPool,
     underlying: &str,
-    header: &JournalHeader,
-) -> Result<(), DbError> {
+    supplied: &JournalHeader,
+) -> Result<JournalHeader, DbError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(query_err("begin journal header txn"))?;
+
+    // Idempotent no-op if a header is already present for the underlying.
     sqlx::query!(
         r#"
         INSERT INTO journal_headers (underlying, lineage_id, schema_version)
@@ -350,13 +385,65 @@ async fn ensure_header(
         ON CONFLICT (underlying) DO NOTHING
         "#,
         underlying,
-        header.lineage_id.as_str(),
-        header.schema_version,
+        supplied.lineage_id.as_str(),
+        supplied.schema_version,
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(query_err("ensure journal header"))?;
-    Ok(())
+
+    // Read the persisted header back inside the SAME transaction (read-your-writes:
+    // whether we just inserted it or it pre-existed, a row is present here).
+    let row = sqlx::query!(
+        r#"
+        SELECT lineage_id, schema_version FROM journal_headers WHERE underlying = $1
+        "#,
+        underlying,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(query_err("read journal header"))?;
+
+    let stored = match row {
+        Some(row) => JournalHeader {
+            schema_version: row.schema_version,
+            lineage_id: LineageId::new(row.lineage_id),
+        },
+        // The INSERT above guarantees a row within this transaction; its absence is a
+        // backend integrity fault, not a normal state — fail loudly, never proceed.
+        None => {
+            return Err(DbError::Query {
+                operation: "verify journal header",
+            });
+        }
+    };
+
+    // `JournalHeader` holds exactly `lineage_id` + `schema_version`, so this equality
+    // is precisely the (lineage, schema) comparison — a mismatch is refused.
+    if stored != *supplied {
+        // Non-secret venue identity only (run lineage + envelope schema) — logged
+        // server-side for the operator; the domain boundary redacts it to a `500`.
+        tracing::error!(
+            underlying = %underlying,
+            stored_lineage = %stored.lineage_id.as_str(),
+            supplied_lineage = %supplied.lineage_id.as_str(),
+            stored_schema = %stored.schema_version,
+            supplied_schema = %supplied.schema_version,
+            "durable journal header mismatch on open; refusing to open a fresh lineage/schema over a pre-existing stream"
+        );
+        // A mismatch means the row pre-existed (a matching INSERT would have made
+        // `stored == supplied`), so the ON CONFLICT DO NOTHING wrote nothing; dropping
+        // the transaction unwritten rolls back to exactly the prior durable state.
+        return Err(DbError::HeaderMismatch {
+            stored: describe_header(&stored),
+            supplied: describe_header(supplied),
+        });
+    }
+
+    tx.commit()
+        .await
+        .map_err(query_err("commit journal header txn"))?;
+    Ok(stored)
 }
 
 /// Reads the stored header for `underlying`, or [`DbError::ValueRange`] with field
@@ -394,6 +481,19 @@ where
     F: std::future::Future,
 {
     tokio::task::block_in_place(|| handle.block_on(future))
+}
+
+/// A **non-secret** one-line description of a journal header — the run lineage + the
+/// envelope schema — for the [`DbError::HeaderMismatch`] payload and the operator log
+/// on a refused open. This is an error/log string, never SQL, so `format!` is
+/// correct here (no query text is built from it).
+#[must_use]
+fn describe_header(header: &JournalHeader) -> String {
+    format!(
+        "lineage={} schema={}",
+        header.lineage_id.as_str(),
+        header.schema_version
+    )
 }
 
 /// The wire-cased DB token for a [`RecordKind`] — the projected `kind` column and
@@ -464,6 +564,28 @@ mod tests {
             JournalError::AppendFailed(_) => {}
             other => panic!("expected AppendFailed for a pool timeout, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_describe_header_names_lineage_and_schema_non_secret() {
+        // The `HeaderMismatch` payload / operator log carries only the venue's own
+        // run lineage + envelope schema — never a secret, never row data.
+        let described = describe_header(&JournalHeader::new(LineageId::new("run-7")));
+        assert!(described.contains("run-7"), "names the run lineage");
+        assert!(described.contains("venue.v1"), "names the envelope schema");
+    }
+
+    #[test]
+    fn test_header_mismatch_display_carries_both_headers() {
+        // The typed refusal names both sides so an operator can see WHICH lineage the
+        // stored records belong to versus what this run tried to open with.
+        let err = DbError::HeaderMismatch {
+            stored: describe_header(&JournalHeader::new(LineageId::new("run-1"))),
+            supplied: describe_header(&JournalHeader::new(LineageId::new("run-2"))),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("run-1"), "names the stored lineage");
+        assert!(rendered.contains("run-2"), "names the supplied lineage");
     }
 
     #[test]
