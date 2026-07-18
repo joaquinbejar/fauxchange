@@ -638,3 +638,272 @@ async fn test_no_password_appears_in_a_captured_log_over_a_logon_flow() {
         "a wrong password must never be logged"
     );
 }
+
+// ============================================================================
+// #96/#112 Bug 2 — per-SessionKey exclusivity lease (concurrent-logon race)
+// ============================================================================
+
+/// A `TestRequest (1)` at `seq` carrying `TestReqID (112) = id` — used to prove a
+/// live session still answers with a `Heartbeat (0)`.
+fn test_request_frame(sender: &str, target: &str, seq: u64, id: &str) -> Vec<u8> {
+    let body = format!(
+        "35=1\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x01112={id}\x01"
+    );
+    frame_with_body(body.as_bytes())
+}
+
+#[tokio::test]
+async fn test_second_concurrent_logon_for_the_same_key_is_refused_while_first_stays_active() {
+    let harness = Harness::start().await;
+    // The first session logs on and is admitted; its socket stays open (live).
+    let mut first = connect(harness.addr).await;
+    first
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            1,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("first logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut first, Duration::from_secs(3)).await, "A"),
+        "the first session is admitted"
+    );
+
+    // A SECOND connection presenting the SAME account + CompID tuple logs on
+    // concurrently — the lease is held by the first, so it is refused with a Logout
+    // and NEVER admitted.
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            1,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("second logon");
+    let second_reply = recv_frames(&mut second, Duration::from_secs(3)).await;
+    assert!(
+        any_msg_type(&second_reply, "5"),
+        "a concurrent second logon for the same key is a Logout(5), got {second_reply:?}"
+    );
+    assert!(
+        !any_msg_type(&second_reply, "A"),
+        "the second concurrent logon is never admitted"
+    );
+
+    // The FIRST session is still alive and serving: it answers a TestRequest with a
+    // Heartbeat (the lease did not disturb it).
+    first
+        .write_all(&test_request_frame(TRADER_SENDER, VENUE, 2, "PING"))
+        .await
+        .expect("test request");
+    let hb = recv_frames(&mut first, Duration::from_secs(3)).await;
+    assert!(
+        any_msg_type(&hb, "0"),
+        "the first session stays active and answers the TestRequest with a Heartbeat(0), got {hb:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_session_lease_is_released_on_disconnect_so_a_later_logon_succeeds() {
+    let harness = Harness::start().await;
+    let mut first = connect(harness.addr).await;
+    first
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            1,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("first logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut first, Duration::from_secs(3)).await, "A"),
+        "the first session is admitted"
+    );
+    // Abrupt disconnect — the RAII lease guard must release the key on teardown.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A later logon for the SAME key is admitted (the lease was released). Presenting
+    // seq 2 (the stored inbound expectation after the first logon consumed seq 1) so
+    // this exercises the lease, not the stale-seq guard.
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("second logon");
+    let reply = recv_frames(&mut second, Duration::from_secs(3)).await;
+    assert!(
+        any_msg_type(&reply, "A"),
+        "the lease released on disconnect lets the key re-admit, got {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_two_different_keys_hold_independent_leases() {
+    let harness = Harness::start().await;
+    // trader-1 and reader-1 are distinct accounts with distinct CompID tuples.
+    let mut trader = connect(harness.addr).await;
+    trader
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            1,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("trader logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut trader, Duration::from_secs(3)).await, "A"),
+        "the trader session is admitted"
+    );
+    // The reader logs on CONCURRENTLY under a different key — no lease conflict.
+    let mut reader = connect(harness.addr).await;
+    reader
+        .write_all(&logon_frame(
+            READER_SENDER,
+            VENUE,
+            1,
+            READER_USER,
+            READER_PW,
+            false,
+        ))
+        .await
+        .expect("reader logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut reader, Duration::from_secs(3)).await, "A"),
+        "a different key logs on concurrently, unaffected by the trader's lease"
+    );
+}
+
+// ============================================================================
+// #96/#112 Bug 1 — reconnect MsgSeqNum validation (replay of consumed messages)
+// ============================================================================
+
+#[tokio::test]
+async fn test_reconnect_at_a_stale_seq_without_reset_is_refused_no_replay() {
+    let harness = Harness::start().await;
+    // The first session advances the inbound expectation to 3 (logon@1 consumed →
+    // 2, then a TestRequest@2 consumed → 3).
+    let mut first = connect(harness.addr).await;
+    first
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            1,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    let _ = recv_frames(&mut first, Duration::from_secs(3)).await;
+    first
+        .write_all(&test_request_frame(TRADER_SENDER, VENUE, 2, "PING"))
+        .await
+        .expect("test request");
+    let _ = recv_frames(&mut first, Duration::from_secs(3)).await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Reconnect presenting a STALE seq 1 (below the stored expectation of 3) without
+    // ResetSeqNumFlag → refused with a Logout, never admitted: a backward jump would
+    // replay already-consumed messages.
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            1,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("stale logon");
+    let reply = recv_frames(&mut second, Duration::from_secs(3)).await;
+    assert!(
+        any_msg_type(&reply, "5"),
+        "a stale-seq reconnect is a Logout(5), got {reply:?}"
+    );
+    assert!(
+        !any_msg_type(&reply, "A"),
+        "a stale-seq reconnect is never admitted"
+    );
+}
+
+#[tokio::test]
+async fn test_reconnect_with_reset_seq_num_flag_at_seq_one_is_admitted() {
+    let harness = Harness::start().await;
+    // Advance the inbound expectation past 1 on a first session, then disconnect.
+    let mut first = connect(harness.addr).await;
+    first
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            1,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    let _ = recv_frames(&mut first, Duration::from_secs(3)).await;
+    first
+        .write_all(&test_request_frame(TRADER_SENDER, VENUE, 2, "PING"))
+        .await
+        .expect("test request");
+    let _ = recv_frames(&mut first, Duration::from_secs(3)).await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // A ResetSeqNumFlag=Y reconnect at seq 1 legitimately resets and IS admitted —
+    // the only sanctioned backward path (a stale seq 1 without the flag is refused,
+    // per test_reconnect_at_a_stale_seq_without_reset_is_refused_no_replay).
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            1,
+            TRADER_USER,
+            TRADER_PW,
+            true,
+        ))
+        .await
+        .expect("reset logon");
+    let reply = recv_frames(&mut second, Duration::from_secs(3)).await;
+    let ack = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("A"))
+        .expect("a reset Logon ack");
+    assert_eq!(
+        field(ack, "34").as_deref(),
+        Some("1"),
+        "ResetSeqNumFlag=Y makes the ack seq 1"
+    );
+    assert_eq!(
+        field(ack, "141").as_deref(),
+        Some("Y"),
+        "the ack echoes ResetSeqNumFlag"
+    );
+}

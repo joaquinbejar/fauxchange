@@ -35,8 +35,9 @@
 //! venue's own `Logon (A)` ack is hand-built **without** `553`/`554`, so no
 //! credential is ever emitted.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ironfix_core::types::{CompId, SeqNum};
 
@@ -367,9 +368,20 @@ impl SessionFsm {
         Ok(Reaction::emit_close(vec![frame]))
     }
 
-    /// Admits a verified, bound logon: resolves the session key, resumes (or
-    /// resets) the durable counters, moves to [`SessionPhase::Active`], and emits
-    /// the credential-free `Logon (A)` ack.
+    /// Admits a verified, bound logon: resolves the session key, **validates the
+    /// presented `MsgSeqNum` against the durable inbound expectation**, resumes (or
+    /// — only under `ResetSeqNumFlag=Y` — resets) the counters, moves to
+    /// [`SessionPhase::Active`] (or [`SessionPhase::AwaitingResend`] on a gap), and
+    /// emits the credential-free `Logon (A)` ack.
+    ///
+    /// Reconnect sequence validation (the auth/replay-integrity guard) compares the
+    /// logon's `logon_seq` to the stored `next_target_seq`: **equal** proceeds
+    /// in-order; **greater** admits and issues a `ResendRequest (2)` for the missing
+    /// range (leaving the counter in place); **less** (without `ResetSeqNumFlag`) is
+    /// a backward jump that would replay already-consumed messages and is rejected
+    /// with a `Logout`. The stored counter is **never** silently overwritten
+    /// downward — only `ResetSeqNumFlag=Y` moves it back, and that path journals a
+    /// `SequenceReset` audit event.
     ///
     /// # Errors
     ///
@@ -396,16 +408,40 @@ impl SessionFsm {
             sender.as_str().to_string(),
         );
 
+        // The durable inbound expectation a reconnect resumes from — read BEFORE any
+        // session state is bound, so a backward-jump reject leaves the store (and its
+        // counters) provably untouched.
+        let stored = self.store.load_counters(&key)?;
+
+        // Reconnect sequence validation (the auth/replay-integrity guard): a
+        // NON-reset logon presenting a `MsgSeqNum` BELOW the stored inbound
+        // expectation is a backward jump that would replay already-consumed
+        // messages. Reject it with a `Logout` and NEVER overwrite the stored counter
+        // downward — only `ResetSeqNumFlag=Y` may move it back (audited, below). The
+        // check runs before the identity is bound, so nothing is persisted for the
+        // rejected logon (`logout_close` emits at the default outbound seq and does
+        // not touch the durable store, as `self.key` is still `None`).
+        if !reset_flag && logon_seq < stored.next_target_seq {
+            tracing::warn!(
+                expected = stored.next_target_seq,
+                presented = logon_seq,
+                "fix reconnect MsgSeqNum below the stored expectation without ResetSeqNumFlag; rejecting"
+            );
+            return self.logout_close(now_ms, "MsgSeqNum too low");
+        }
+
         self.account = Some(account);
         self.permissions = permissions;
         self.session_epoch = session_epoch;
         self.heart_bt_int_ms = u64::from(heart_bt_int_secs).saturating_mul(1_000);
         self.key = Some(key.clone());
 
-        // Resume numbering from the durable store (a reconnect picks up where the
-        // prior session left off), or reset within THIS key only.
-        let mut counters = self.store.load_counters(&key)?;
+        // Resolve the inbound counter and whether a resend gap must be filled.
+        let mut counters = stored;
+        let mut gap_begin: Option<u64> = None;
         if reset_flag {
+            // `ResetSeqNumFlag=Y` — the ONLY path that may move the counter backward.
+            // It journals a `SequenceReset` audit event within THIS account key only.
             let event = SequenceResetEvent {
                 at_ms: now_ms,
                 trigger: ResetTrigger::LogonReset,
@@ -420,22 +456,48 @@ impl SessionFsm {
             counters.next_target_seq = super::store::FIRST_SEQ_NUM
                 .checked_add(1)
                 .ok_or(SessionError::SequenceExhausted)?;
-        } else {
-            // Anchor the inbound expectation to the logon's own MsgSeqNum + 1.
+        } else if logon_seq == counters.next_target_seq {
+            // In-order reconnect / first logon: the logon consumed the expected
+            // inbound seq, so advance the expectation past it.
             counters.next_target_seq = logon_seq
                 .checked_add(1)
                 .ok_or(SessionError::SequenceExhausted)?;
+        } else {
+            // `logon_seq > next_target_seq`: a gap (missed inbound messages, NOT a
+            // replay). Admit and ack, but leave the stored inbound expectation in
+            // place and request a resend of `[next_target_seq, ∞)` — the same
+            // machinery `handle_active` drives. The counter is NEVER advanced past
+            // the gap (that would silently drop the missing messages).
+            gap_begin = Some(counters.next_target_seq);
         }
         self.counters = counters;
         self.store.save_counters(&key, self.counters)?;
-        self.phase = SessionPhase::Active;
+        self.phase = if gap_begin.is_some() {
+            SessionPhase::AwaitingResend
+        } else {
+            SessionPhase::Active
+        };
 
         // The venue's Logon ack is hand-built WITHOUT Username(553)/Password(554):
-        // an acceptor never echoes the client's credential onto the wire.
+        // an acceptor never echoes the client's credential onto the wire. On a gap,
+        // a `ResendRequest (2)` for the missing range follows the ack, on the same
+        // checked outbound counter.
         let ack = self.emit(now_ms, |header| {
             encode_logon_ack(&header, heart_bt_int_secs, reset_flag)
         })?;
-        Ok(Reaction::emit(vec![ack]))
+        let mut frames = vec![ack];
+        if let Some(begin) = gap_begin {
+            let resend = self.emit(now_ms, |header| {
+                session::ResendRequest {
+                    header,
+                    begin_seq_no: SeqNum::new(begin),
+                    end_seq_no: SeqNum::new(0),
+                }
+                .encode()
+            })?;
+            frames.push(resend);
+        }
+        Ok(Reaction::emit(frames))
     }
 
     /// Handles a decoded message once [`Active`](SessionPhase::Active) — sequence
@@ -1046,12 +1108,104 @@ fn encode_logon_ack(header: &StandardHeader, heart_bt_int_secs: u32, reset_flag:
 // The async session wrapper — the acceptor `FixSession` seam
 // ============================================================================
 
+/// The set of FIX [`SessionKey`]s with a currently-live session — the per-key
+/// single-active-session lease registry that enforces logon exclusivity
+/// ([ADR-0010](../../../docs/adr/0010-fix-session-account-binding.md)).
+///
+/// Without it, two concurrent logons for the **same** authenticated
+/// `(account_id, comp_id_tuple)` would each [`load_counters`](FixSessionStore::load_counters),
+/// emit duplicate outbound `MsgSeqNum`s, and race a last-writer-wins
+/// [`save_counters`](FixSessionStore::save_counters) — a counter-corruption /
+/// message-loss hole. This registry admits at most one live session per key: a
+/// second concurrent logon finds the lease held and is refused with a `Logout`.
+///
+/// The lease is claimed at logon-admission time (once the account is authenticated
+/// and the CompID tuple is bound) and released on session end via the RAII
+/// [`SessionLease`] guard — reliably, even on an abrupt disconnect, because the
+/// guard drops when the per-connection [`VenueFixSession`] drops (the acceptor owns
+/// the session and drops it on every exit path). The live-lease set is inherently
+/// bounded by the venue connection cap (a lease is only ever held by a live
+/// session), so it needs no separate size bound. The single [`Mutex`] is held only
+/// across the O(1) set mutation, never across an `.await`.
+#[derive(Debug, Default)]
+pub struct SessionLeaseRegistry {
+    live: Mutex<HashSet<SessionKey>>,
+}
+
+impl SessionLeaseRegistry {
+    /// Builds an empty lease registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Atomically claims the single-active-session lease for `key`, returning an
+    /// RAII [`SessionLease`] on success, or `None` if a live session already holds
+    /// it (the caller then refuses the second logon). The claim is a single
+    /// check-then-insert under one lock, so two racing logons can never both win.
+    fn try_claim(self: &Arc<Self>, key: SessionKey) -> Option<SessionLease> {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `HashSet::insert` returns `false` when the key is already present — the
+        // key is already leased by a live session, so the claim is refused.
+        if live.insert(key.clone()) {
+            Some(SessionLease {
+                registry: Arc::clone(self),
+                key,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Releases the lease for `key` (invoked from [`SessionLease`]'s drop).
+    fn release(&self, key: &SessionKey) {
+        self.live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+    }
+
+    /// Whether a live session currently holds the lease for `key` (tests /
+    /// observability).
+    #[must_use]
+    pub fn is_live(&self, key: &SessionKey) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(key)
+    }
+}
+
+/// The RAII single-active-session lease for one [`SessionKey`] — releasing the key
+/// from the [`SessionLeaseRegistry`] when the owning [`VenueFixSession`] drops, so a
+/// later reconnect can re-admit even after an abrupt disconnect.
+#[derive(Debug)]
+pub struct SessionLease {
+    registry: Arc<SessionLeaseRegistry>,
+    key: SessionKey,
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        self.registry.release(&self.key);
+    }
+}
+
 /// The real per-connection FIX session — the [`FixSession`] the acceptor drives,
 /// wrapping the synchronous [`SessionFsm`] with the async credential verify.
 pub struct VenueFixSession {
     peer: SocketAddr,
     state: Arc<AppState>,
     fsm: SessionFsm,
+    /// The shared per-`SessionKey` single-active-session lease registry — claimed at
+    /// logon admission, released on drop.
+    leases: Arc<SessionLeaseRegistry>,
+    /// The held lease for this session's `SessionKey`, set once the logon is
+    /// admitted; its RAII drop releases the key so a later reconnect can re-admit.
+    lease: Option<SessionLease>,
 }
 
 impl VenueFixSession {
@@ -1062,10 +1216,17 @@ impl VenueFixSession {
         state: Arc<AppState>,
         store: Arc<dyn FixSessionStore>,
         config: SessionConfig,
+        leases: Arc<SessionLeaseRegistry>,
     ) -> Self {
         let accepted_at_ms = state.clock().now_ms().get();
         let fsm = SessionFsm::new(config, store, accepted_at_ms);
-        Self { peer, state, fsm }
+        Self {
+            peer,
+            state,
+            fsm,
+            leases,
+            lease: None,
+        }
     }
 
     /// The venue-clock instant (ms) — the same injected clock the sequenced path
@@ -1186,7 +1347,33 @@ impl VenueFixSession {
 
         let logon_seq = logon.header.msg_seq_num.value();
         let reset_flag = logon.reset_seq_num_flag.unwrap_or(false);
-        self.fsm.admit_logon(
+
+        // Per-`SessionKey` exclusivity (ADR-0010): claim the single-active-session
+        // lease for this authenticated `(account, CompID tuple)` BEFORE admitting.
+        // Two concurrent logons for the same key would otherwise each load the shared
+        // durable counters, emit duplicate outbound `MsgSeqNum`s, and race a
+        // last-writer-wins `save_counters`; the atomic claim admits exactly one, so
+        // a second concurrent logon is refused with a `Logout`. The lease key is
+        // built identically to the durable store key `admit_logon` resolves — the
+        // authenticated account plus the presented `(SenderCompID, TargetCompID)`.
+        let session_key = SessionKey::new(
+            account.id.clone(),
+            logon.header.sender_comp_id.as_str().to_string(),
+            logon.header.target_comp_id.as_str().to_string(),
+        );
+        let Some(lease) = self.leases.try_claim(session_key) else {
+            tracing::warn!(
+                peer = %self.peer,
+                "fix logon refused: a session for this account/CompID tuple is already active"
+            );
+            return self.fsm.logout_close(now_ms, "session already active");
+        };
+
+        // Admit (or, for a stale-seq reconnect, a `Logout` that still closes). On any
+        // earlier `?` error the local `lease` drops here and frees the key; on
+        // success it is held for the session's lifetime and released by the RAII
+        // guard's drop when the connection ends (covering an abrupt disconnect).
+        let reaction = self.fsm.admit_logon(
             account.id,
             account.permissions,
             account.revocation_epoch,
@@ -1194,7 +1381,9 @@ impl VenueFixSession {
             reset_flag,
             logon_seq,
             now_ms,
-        )
+        )?;
+        self.lease = Some(lease);
+        Ok(reaction)
     }
 }
 
@@ -1257,17 +1446,22 @@ impl FixSession for VenueFixSession {
 /// connection — the seam that replaces the #037 [`StubSessionFactory`](super::StubSessionFactory).
 ///
 /// It holds the shared [`AppState`] (auth / registry / clock the gateway reaches
-/// the venue through) and the shared durable [`FixSessionStore`]; the gateway
-/// depends on `AppState`, never the reverse.
+/// the venue through), the shared durable [`FixSessionStore`], and the shared
+/// [`SessionLeaseRegistry`] enforcing per-`SessionKey` logon exclusivity across
+/// every connection; the gateway depends on `AppState`, never the reverse.
 #[derive(Clone)]
 pub struct VenueFixSessionFactory {
     state: Arc<AppState>,
     store: Arc<dyn FixSessionStore>,
     config: SessionConfig,
+    /// The venue-wide single-active-session lease registry, shared by every session
+    /// this factory (and its clones) creates.
+    leases: Arc<SessionLeaseRegistry>,
 }
 
 impl VenueFixSessionFactory {
-    /// Wires a factory over the shared venue state, session store, and config.
+    /// Wires a factory over the shared venue state, session store, and config,
+    /// creating the venue-wide lease registry every created session shares.
     #[must_use]
     pub fn new(
         state: Arc<AppState>,
@@ -1278,6 +1472,7 @@ impl VenueFixSessionFactory {
             state,
             store,
             config,
+            leases: Arc::new(SessionLeaseRegistry::new()),
         }
     }
 }
@@ -1296,6 +1491,7 @@ impl FixSessionFactory for VenueFixSessionFactory {
             Arc::clone(&self.state),
             Arc::clone(&self.store),
             self.config,
+            Arc::clone(&self.leases),
         )
     }
 }
@@ -1424,6 +1620,214 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].trigger, ResetTrigger::LogonReset);
         assert_eq!(events[0].at_ms, 1_000);
+    }
+
+    // ---- Reconnect MsgSeqNum validation (#96/#112, Bug 1): a non-reset logon is
+    // validated against the STORED inbound expectation; the counter is never
+    // silently overwritten downward.
+
+    /// The durable [`SessionKey`] `admit_logon` resolves for the test account +
+    /// `header(CLIENT, VENUE, _)` tuple — used to pre-seed and inspect the store.
+    fn reconnect_key() -> SessionKey {
+        SessionKey::new(AccountId::new("acct-1"), CLIENT, VENUE)
+    }
+
+    /// Drives a fresh FSM through a NON-reset `admit_logon` at `logon_seq` against a
+    /// store pre-seeded to expect inbound `stored_target` (a prior session's state).
+    fn admit_reconnect(
+        stored_target: u64,
+        logon_seq: u64,
+    ) -> (
+        SessionFsm,
+        Arc<dyn FixSessionStore>,
+        Result<Reaction, SessionError>,
+    ) {
+        let store = store();
+        store
+            .save_counters(
+                &reconnect_key(),
+                SessionCounters {
+                    next_sender_seq: stored_target,
+                    next_target_seq: stored_target,
+                },
+            )
+            .expect("seed counters");
+        let mut fsm = SessionFsm::new(config(), Arc::clone(&store), 0);
+        fsm.on_inbound(&header(CLIENT, VENUE, logon_seq), 0);
+        let result = fsm.admit_logon(
+            AccountId::new("acct-1"),
+            vec![Permission::Trade],
+            0,
+            30,
+            false,
+            logon_seq,
+            0,
+        );
+        (fsm, store, result)
+    }
+
+    #[test]
+    fn test_reconnect_below_stored_seq_without_reset_is_rejected_and_never_overwrites() {
+        // Stored expectation is 5; a reconnect presenting seq 1 (no ResetSeqNumFlag)
+        // is a backward jump that would replay consumed messages → Logout, closing,
+        // and the stored inbound counter is NOT overwritten downward.
+        let (fsm, store, result) = admit_reconnect(5, 1);
+        let reaction = result.expect("admit returns a reaction");
+        assert_eq!(
+            reaction.control(),
+            SessionControl::Close,
+            "a stale-seq reconnect closes"
+        );
+        assert!(
+            matches!(decode(&reaction.frames()[0]), Ok(DecodedMessage::Logout(_))),
+            "a stale-seq reconnect is a Logout(5)"
+        );
+        assert_ne!(
+            fsm.phase(),
+            SessionPhase::Active,
+            "a stale-seq reconnect never reaches Active"
+        );
+        assert_eq!(
+            store
+                .load_counters(&reconnect_key())
+                .expect("load")
+                .next_target_seq,
+            5,
+            "the durable inbound expectation is untouched (no downward overwrite)"
+        );
+    }
+
+    #[test]
+    fn test_reconnect_at_stored_seq_proceeds_to_active() {
+        // Stored expectation is 5; a reconnect presenting exactly seq 5 is in-order.
+        let (fsm, store, result) = admit_reconnect(5, 5);
+        result.expect("admit ok");
+        assert_eq!(fsm.phase(), SessionPhase::Active);
+        assert_eq!(
+            fsm.counters().next_target_seq,
+            6,
+            "the in-order logon consumed seq 5"
+        );
+        assert_eq!(
+            store
+                .load_counters(&reconnect_key())
+                .expect("load")
+                .next_target_seq,
+            6
+        );
+    }
+
+    #[test]
+    fn test_reconnect_above_stored_seq_triggers_resend_request_and_awaits_resend() {
+        // Stored expectation is 5; a reconnect presenting seq 8 has a gap [5, 7].
+        let (fsm, store, result) = admit_reconnect(5, 8);
+        let reaction = result.expect("admit ok");
+        assert_eq!(
+            fsm.phase(),
+            SessionPhase::AwaitingResend,
+            "a gap logon awaits resend"
+        );
+        assert_eq!(
+            fsm.counters().next_target_seq,
+            5,
+            "the inbound expectation is NOT advanced past the gap"
+        );
+        assert_eq!(
+            store
+                .load_counters(&reconnect_key())
+                .expect("load")
+                .next_target_seq,
+            5
+        );
+        // The ack (credential-free, undecodable inbound) is followed by a
+        // ResendRequest beginning at the stored expectation.
+        assert_eq!(reaction.frames().len(), 2, "ack + resend request");
+        match decode(&reaction.frames()[1]) {
+            Ok(DecodedMessage::ResendRequest(r)) => {
+                assert_eq!(
+                    r.begin_seq_no.value(),
+                    5,
+                    "resend begins at the stored expectation"
+                );
+                assert_eq!(r.end_seq_no.value(), 0, "EndSeqNo 0 = to the latest");
+            }
+            other => panic!("expected a ResendRequest after the ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reset_flag_still_resets_even_below_stored_seq_and_audits() {
+        // Even with a high stored expectation (5), ResetSeqNumFlag=Y legitimately
+        // moves the counter back to 1 — the ONLY sanctioned backward path — reaches
+        // Active, and journals the reset for audit.
+        let store = store();
+        store
+            .save_counters(
+                &reconnect_key(),
+                SessionCounters {
+                    next_sender_seq: 5,
+                    next_target_seq: 5,
+                },
+            )
+            .expect("seed counters");
+        let mut fsm = SessionFsm::new(config(), Arc::clone(&store), 0);
+        fsm.on_inbound(&header(CLIENT, VENUE, 1), 0);
+        fsm.admit_logon(
+            AccountId::new("acct-1"),
+            vec![Permission::Trade],
+            0,
+            30,
+            true,
+            1,
+            1_000,
+        )
+        .expect("admit");
+        assert_eq!(fsm.phase(), SessionPhase::Active);
+        assert_eq!(
+            fsm.counters().next_target_seq,
+            2,
+            "the reset logon consumed inbound seq 1"
+        );
+        let events = fsm.reset_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].trigger, ResetTrigger::LogonReset);
+    }
+
+    // ---- Per-SessionKey exclusivity lease (#96/#112, Bug 2).
+
+    #[test]
+    fn test_session_lease_is_exclusive_per_key_and_released_on_drop() {
+        let registry = Arc::new(SessionLeaseRegistry::new());
+        let key_a = SessionKey::new(AccountId::new("acct-1"), CLIENT, VENUE);
+        let key_b = SessionKey::new(AccountId::new("acct-2"), CLIENT, VENUE);
+
+        let lease_a = registry
+            .try_claim(key_a.clone())
+            .expect("first claim for A");
+        assert!(registry.is_live(&key_a));
+        // A second concurrent claim for the SAME key is refused (no double-lease).
+        assert!(
+            registry.try_claim(key_a.clone()).is_none(),
+            "a live key cannot be leased twice"
+        );
+        // A DIFFERENT key is unaffected — it claims freely and concurrently.
+        let lease_b = registry
+            .try_claim(key_b.clone())
+            .expect("a different key claims freely");
+        assert!(registry.is_live(&key_b));
+
+        // Dropping A's lease releases the key so a later claim succeeds (reconnect).
+        drop(lease_a);
+        assert!(!registry.is_live(&key_a));
+        let lease_a2 = registry
+            .try_claim(key_a.clone())
+            .expect("re-claim after release");
+        assert!(registry.is_live(&key_a));
+
+        drop(lease_a2);
+        drop(lease_b);
+        assert!(!registry.is_live(&key_a));
+        assert!(!registry.is_live(&key_b));
     }
 
     #[test]
