@@ -11,6 +11,44 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Seeded latency injection on the virtual clock** (#45) — a new
+  `src/microstructure/latency.rs` surfacing `[microstructure.latency]` as a
+  validated `LatencyConfig` with a `model` selector
+  (`fixed` / `uniform` / `normal` / `lognormal`) and per-model parameters
+  (`us`; `min_us` / `max_us`; `mean_us` / `sigma`; `median_us` / `sigma`),
+  `#[serde(deny_unknown_fields)]` on the file surface
+  ([05 §3](docs/05-microstructure-config.md#3-latency-injection)). Every inbound
+  message draws a per-message delay against the configured distribution, seeded
+  per `(session_id, msg_seq)` from the one run-level seed via an **independent**
+  venue-owned sub-stream (a self-contained SplitMix64 keyed by an FNV-1a fold of
+  the session id under a fixed latency domain tag — no new RNG dependency, no
+  unseeded RNG). The draw is a pure function of its inputs (no clock, no shared
+  counter, no map-iteration order), so two runs with the same seed draw
+  identically and different seeds diverge. The delay is a **virtual-clock
+  offset** (`LatencyOffset`, #28's clock), not a real `tokio::time::sleep`. This
+  change lands the config, the seeded draw, and the offset; the **live
+  gateway-edge application** — the deterministic ingress-reorder buffer
+  ([03 §6.1](docs/03-protocol-surfaces.md#61-deterministic-ingress-ordering))
+  that consumes the offset to actually reshape *arrival order* into the
+  single-writer actor before the sequencer — is deferred to
+  [#111](https://github.com/joaquinbejar/fauxchange/issues/111). The determinism
+  tests already prove the load-bearing invariant (reordering arrivals only
+  permutes order, never mutates a command, and a fixed permuted order replays to
+  identical fills), so #111 wires the mechanism onto a proven contract. The
+  offset rides the reproducible timeline so a latency-injected run replays
+  identically. The
+  `normal` draw is clamped `≥ 0` and every draw is guarded finite before it
+  becomes an offset (NaN / Inf can never reach the surface). Startup validation
+  rejects a missing/negative parameter, a non-finite or negative `sigma`, and
+  `min_us > max_us` with a typed `LatencyConfigError` folded into
+  `MicrostructureConfigError::Latency`. The resolved config rides in the scenario
+  bundle and folds into the microstructure fingerprint, so a latency-injected
+  scenario is self-describing and a fingerprint mismatch refuses replay. Unlike
+  the price walk (journal-driven, `optionstratlib`'s sampler unseedable), the
+  latency sub-stream *is* seed-reproducible — the two are kept distinct in the
+  determinism tests (`test_injected_latency_changes_arrival_order_only`,
+  `test_latency_config_rides_the_bundle_and_gates_replay`).
+
 - **Fee schedule, self-trade prevention, and contract specs as declarative
   venue config — the v0.5 microstructure opener** (#44) — a new
   `src/microstructure/` config surface that exposes the **upstream**
