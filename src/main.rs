@@ -55,6 +55,20 @@ use fauxchange::state::{AppState, AppStateConfig, AuthConfig};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Subcommand dispatch: the `conformance` verb runs the packaged cross-surface
+    // parity + conformance harness (#051) instead of serving, so a consumer can
+    // gate a CI run on the venue's protocol correctness with ONE command. It is
+    // intercepted before `Config::load` (which is the serve path's layered CLI).
+    if std::env::args().nth(1).as_deref() == Some("conformance") {
+        return run_conformance(std::env::args().skip(2)).await;
+    }
+
+    serve().await
+}
+
+/// The default path: load the layered venue config, install tracing, seed the
+/// venue, and serve the REST/WS (and optional FIX) gateways.
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Load + validate the layered config BEFORE anything else — a bad address,
     // clock, seed, unknown key, or unknown flag fails the process fast here.
     let config = Config::load()?;
@@ -237,4 +251,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     result?;
     Ok(())
+}
+
+/// The `fauxchange conformance` subcommand: runs the packaged cross-surface
+/// parity and conformance harness over ephemeral in-process venues, prints the
+/// machine-readable JSON report to stdout (optionally also to `--out <path>`),
+/// and exits **non-zero on any surface failure** so a CI can gate on the
+/// process code.
+///
+/// Flags (`--flag value` / `--flag=value`): `--out <path>` writes the JSON report
+/// to a file in addition to stdout. An unknown flag fails fast (the same
+/// deny-unknown discipline the serve path applies). The report never carries a
+/// secret, a JWT, or a credential — failure detail is redacted at the source.
+async fn run_conformance(
+    args: impl Iterator<Item = String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A minimal, hand-rolled flag parse (no CLI crate promoted to a runtime dep),
+    // matching `src/config.rs`'s `--flag value` / `--flag=value` convention.
+    let mut out_path: Option<String> = None;
+    let mut iter = args;
+    while let Some(arg) = iter.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag.to_string(), Some(value.to_string())),
+            None => (arg, None),
+        };
+        match flag.as_str() {
+            "--out" => {
+                let value = match inline {
+                    Some(value) => value,
+                    None => iter
+                        .next()
+                        .ok_or("`--out` requires a path value".to_string())?,
+                };
+                out_path = Some(value);
+            }
+            other => return Err(format!("unknown conformance flag: {other}").into()),
+        }
+    }
+
+    // The subcommand installs its own tracing subscriber (the serve path's is not
+    // reached here); the harness logs its per-run summary through it.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
+
+    let report = fauxchange::conformance::run().await;
+    let json = serde_json::to_string_pretty(&report)?;
+
+    // The machine-readable report is the subcommand's DATA-PLANE output: an explicit
+    // stdout write (not `println!`, which the "tracing only" rule forbids in `src/`),
+    // so a CI can parse it. The human-facing summary + logs go to STDERR via
+    // `tracing`, so the two streams never interleave.
+    {
+        use std::io::Write as _;
+        writeln!(std::io::stdout().lock(), "{json}")
+            .map_err(|e| format!("write conformance report to stdout: {e}"))?;
+    }
+    if let Some(path) = &out_path {
+        std::fs::write(path, format!("{json}\n"))?;
+        tracing::info!(path = %path, "conformance report written");
+    }
+
+    let failed = report.failed_surfaces();
+    if report.passed() {
+        tracing::info!(
+            cases = report.totals.cases,
+            "conformance green across REST, WS, and FIX"
+        );
+    } else {
+        tracing::error!(
+            cases = report.totals.cases,
+            failed = report.totals.failed,
+            ?failed,
+            "conformance FAILED — see the report for the failing cases"
+        );
+    }
+
+    std::process::exit(report.exit_code());
 }
