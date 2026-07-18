@@ -446,6 +446,11 @@ path = "benches/hp5_durable_append.rs"
 harness = false
 
 [[bench]]
+name = "mm_requote_hdr"
+path = "benches/mm_requote_hdr.rs"
+harness = false
+
+[[bench]]
 name = "alloc_profile"
 path = "benches/alloc_profile.rs"
 harness = false

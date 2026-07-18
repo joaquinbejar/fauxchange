@@ -139,3 +139,21 @@ pub fn build_workload(n: usize, seed: u64, lineage: &LineageId) -> Vec<VenueComm
 
     commands
 }
+
+/// Builds a deterministic price stream of `n` values jittered around `base`
+/// within `±(jitter_range/2)`, reusing the same seeded [`Xorshift64`]
+/// generator [`build_workload`] uses — shared here so a new hot-path bench
+/// (HP-4's requote bench, `benches/mm_requote_hdr.rs`) does not need a second,
+/// independent PRNG for its own price-tick stream.
+#[must_use]
+pub fn jitter_stream(n: usize, seed: u64, base: u64, jitter_range: u64) -> Vec<u64> {
+    let mut rng = Xorshift64::new(seed);
+    let half = i64::try_from(jitter_range / 2).unwrap_or(0);
+    let base_i = i64::try_from(base).unwrap_or(i64::MAX);
+    (0..n)
+        .map(|_| {
+            let delta = i64::try_from(rng.next_range(jitter_range + 1)).unwrap_or(0) - half;
+            u64::try_from(base_i.saturating_add(delta)).unwrap_or(base)
+        })
+        .collect()
+}

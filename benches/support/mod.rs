@@ -16,19 +16,21 @@
 //! Never linked into the shipped `fauxchange` library — this is bench-only
 //! tooling, confined to `benches/` (never `src/`).
 //!
-//! `#![allow(dead_code)]`: this module is included, whole, into six
+//! `#![allow(dead_code)]`: this module is included, whole, into seven
 //! independent binaries (`hp1_order_path`, `hp2_ws_fanout`, `hp3_fix_parse`,
-//! `hp5_durable_append`, `alloc_profile`, `criterion_match_cost`, and
-//! `tests/bench_harness.rs`'s narrower `#[path]` pull of just `hdr.rs` /
-//! `fix_fixtures.rs`), and each one only calls the subset of this shared
-//! toolkit it actually needs — the same reason `tests/common/` helper modules
-//! conventionally carry this allow. `-D warnings` (the `clippy --all-targets`
-//! CI gate) would otherwise fail on, say, `hp2_ws_fanout` never calling
-//! [`timing::TimingExecutor`], which only `hp1_order_path` needs.
+//! `hp5_durable_append`, `alloc_profile`, `criterion_match_cost`,
+//! `mm_requote_hdr`, and `tests/bench_harness.rs`'s / `tests/requote_isolation.rs`'s
+//! narrower `#[path]` pull of just the submodules each needs), and each one
+//! only calls the subset of this shared toolkit it actually needs — the same
+//! reason `tests/common/` helper modules conventionally carry this allow.
+//! `-D warnings` (the `clippy --all-targets` CI gate) would otherwise fail on,
+//! say, `hp2_ws_fanout` never calling [`timing::TimingExecutor`], which only
+//! `hp1_order_path` needs.
 #![allow(dead_code)]
 
 pub mod fix_fixtures;
 pub mod hdr;
+pub mod mm_workload;
 pub mod openloop;
 pub mod timing;
 pub mod workload;

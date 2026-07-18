@@ -16,7 +16,7 @@
 //! its own bench target, never sharing a process with `hp1_order_path` /
 //! `hp2_ws_fanout`.
 //!
-//! Two sections, reported separately, because they measure two genuinely
+//! Three sections, reported separately, because they measure three genuinely
 //! different things:
 //!
 //! 1. **`UnderlyingActor::handle` directly** (no `tokio` runtime at all) — the
@@ -29,6 +29,16 @@
 //!    and a fresh `oneshot::channel()` per call is a real, separate cost of
 //!    the async submit API, not part of the "steady-state turn" claim itself.
 //!    Reported so the two are never conflated.
+//! 3. **`MarketMakerEngine::update_price` steady-state requote** (HP-4, #50,
+//!    [050](../milestones/v0.5-microstructure/050-requote-budget-isolation.md)):
+//!    the SAME persona-driven requote path `benches/mm_requote_hdr.rs`
+//!    measures for latency (price update → `requote_symbol` → edge calc →
+//!    `update_quote` → [`CommandSink::enqueue`]), here wired to a bare
+//!    counting sink (`support::mm_workload::CountingSink`, no channel, no
+//!    `tokio` runtime needed) so this section is a PURE compute-allocation
+//!    reading — a steady-state allocation here is a requote-path regression
+//!    this bench catches, per docs/07 §4's "zero heap allocation on the
+//!    common path" target, extended to HP-4's own common path.
 //!
 //! ## What this does and does not prove
 //!
@@ -68,8 +78,10 @@ use fauxchange::exchange::{
     InMemoryVenueJournal, JournalHeader, LineageId, MarkPriceBook, MatchingExecutor, NoopFanOut,
     StoreFanOut, TeeFanOut, UnderlyingActor, spawn_underlying_actor,
 };
+use fauxchange::market_maker::CommandSink;
 
-use support::workload::{UNDERLYING, build_workload};
+use support::mm_workload::{CountingSink, MM_UNDERLYING, build_engine};
+use support::workload::{UNDERLYING, build_workload, jitter_stream};
 
 /// The instrumented global allocator for this bench binary. `stats_alloc`'s
 /// own `unsafe impl GlobalAlloc` is vendored inside that crate (a dev-only,
@@ -111,9 +123,19 @@ fn main() {
 
     let warmup_ops = env_usize("ALLOC_WARMUP_OPS", 5_000);
     let measured_ops = env_usize("ALLOC_MEASURED_OPS", 50_000);
+    // Section 3 (HP-4, #50) uses its own, smaller default op counts: each
+    // `update_price` call requotes a whole 10-contract chain (10x the
+    // per-call work of one order-path `handle`/`submit` call in sections
+    // 1/2), so a comparable *total* amount of underlying work needs far fewer
+    // outer-loop iterations.
+    let mm_warmup_ops = env_usize("ALLOC_MM_WARMUP_OPS", 1_000);
+    let mm_measured_ops = env_usize("ALLOC_MM_MEASURED_OPS", 5_000);
     let seed = 0xA5A5_A5A5_A5A5_A5A5_u64;
 
-    println!("config: warmup_ops={warmup_ops} measured_ops={measured_ops}");
+    println!(
+        "config: warmup_ops={warmup_ops} measured_ops={measured_ops} \
+         mm_warmup_ops={mm_warmup_ops} mm_measured_ops={mm_measured_ops}"
+    );
 
     // ---- Section 1: `UnderlyingActor::handle` directly, no tokio at all -----
     {
@@ -203,4 +225,30 @@ fn main() {
 
         drop(handle);
     });
+
+    // ---- Section 3: `MarketMakerEngine::update_price` steady-state requote --
+    // ---- (HP-4, #50) — no tokio needed: `CountingSink::enqueue` is a bare
+    // ---- atomic increment, so this is a pure compute-allocation reading.
+    {
+        let sink: Arc<dyn CommandSink> = Arc::new(CountingSink::default());
+        let engine = build_engine(sink, "bench-alloc-mm");
+        let prices = jitter_stream(mm_warmup_ops + mm_measured_ops, seed, 5_000_000, 2_000);
+
+        for &price in &prices[..mm_warmup_ops] {
+            engine.update_price(MM_UNDERLYING, price);
+        }
+
+        let before = ALLOC.stats();
+        let n = prices.len() - mm_warmup_ops;
+        for &price in &prices[mm_warmup_ops..] {
+            engine.update_price(MM_UNDERLYING, price);
+        }
+        let after = ALLOC.stats();
+        report_window(
+            "MarketMakerEngine::update_price (steady-state requote, #50, 10-contract chain)",
+            before,
+            after,
+            n,
+        );
+    }
 }
