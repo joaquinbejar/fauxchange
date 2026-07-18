@@ -292,6 +292,55 @@ async fn test_journal_replay_reproduces_price_path_and_requotes() {
 }
 
 // ============================================================================
+// Causality: a requote is never sequenced before its causing SimStep
+// ============================================================================
+
+#[tokio::test]
+async fn test_requote_is_never_sequenced_before_its_causing_sim_step() {
+    let state = venue_with_walk();
+
+    // Walk a few steps: each is a journaled SimStep that, once sequenced, drives
+    // the market maker's requote AddOrders onto the SAME per-underlying journal.
+    for _ in 0..3 {
+        state.simulator().step_once();
+    }
+    let events = settle(&state, UNDERLYING, 3, 2).await;
+
+    // The journal is the single per-underlying total order (the determinism
+    // oracle). Locate the first SimStep in that order.
+    let first_sim = events
+        .iter()
+        .position(|event| matches!(event.command, VenueCommand::SimStep { .. }))
+        .expect("the session journaled at least one SimStep");
+
+    // The maker holds no price until a CONFIRMED SimStep drives it, so every
+    // market-maker requote command must be sequenced strictly after the first
+    // SimStep — a requote can never be journaled before its causing step. (Before
+    // the fix the SimStep and its derived requotes raced through two independent
+    // forwarders, so a requote could be journaled first.)
+    let requote_indices: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| is_market_maker_command(&event.command))
+        .map(|(idx, _)| idx)
+        .collect();
+    assert!(
+        !requote_indices.is_empty(),
+        "the SimStep drove the maker to journal at least one requote"
+    );
+    assert!(
+        requote_indices.iter().all(|&idx| idx > first_sim),
+        "every requote (indices {requote_indices:?}) is sequenced after the first SimStep (idx {first_sim})"
+    );
+    assert!(
+        events[..first_sim]
+            .iter()
+            .all(|event| !is_market_maker_command(&event.command)),
+        "no market-maker requote is sequenced before the first SimStep"
+    );
+}
+
+// ============================================================================
 // A programmatic set_price override is journaled the same way as a walk step
 // ============================================================================
 
