@@ -259,6 +259,32 @@ mod tests {
         assert!(PersonaConfig::try_new(100, 10, 1.0, 1.0, f64::NAN).is_err());
     }
 
+    /// Rejection-matrix entry (#49): each persona clamp refuses every out-of-range
+    /// value AND `NaN`/`±Inf` at construction, so a stored persona always carries
+    /// finite, in-range knobs (rule 4). The typed [`PersonaError`] is the same
+    /// message the load seam folds into `ConfigError::SeedInvalidPersona`.
+    #[test]
+    fn test_config_rejects_out_of_range_persona_knobs() {
+        // spread_multiplier ∈ [0.1, 10.0]: below, above, and non-finite are refused.
+        for bad in [0.05, 10.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = PersonaConfig::try_new(100, 10, bad, 1.0, 0.0)
+                .expect_err("out-of-range spread_multiplier is rejected");
+            assert!(err.reason().contains("spread_multiplier"), "reason: {err}");
+        }
+        // size_scalar ∈ [0.0, 1.0]: below, above, and non-finite are refused.
+        for bad in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let err = PersonaConfig::try_new(100, 10, 1.0, bad, 0.0)
+                .expect_err("out-of-range size_scalar is rejected");
+            assert!(err.reason().contains("size_scalar"), "reason: {err}");
+        }
+        // directional_skew ∈ [-1.0, 1.0]: below, above, and non-finite are refused.
+        for bad in [-1.5, 1.5, f64::NAN, f64::NEG_INFINITY] {
+            let err = PersonaConfig::try_new(100, 10, 1.0, 1.0, bad)
+                .expect_err("out-of-range directional_skew is rejected");
+            assert!(err.reason().contains("directional_skew"), "reason: {err}");
+        }
+    }
+
     #[test]
     fn test_default_persona_is_neutral() {
         let persona = PersonaConfig::default();

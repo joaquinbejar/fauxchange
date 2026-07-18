@@ -3220,6 +3220,55 @@ trade_per_window = 0
         }
     }
 
+    /// Rejection-matrix entry (#49): every out-of-range `[rate_limits]` knob is
+    /// refused by the co-located [`RateLimitConfig::validate`] with a typed
+    /// [`ConfigError::BadRateLimitValue`] — a non-positive window, a window past the
+    /// 24 h ceiling, and a non-positive per-tier budget. A nonsensical limiter never
+    /// serves a request.
+    #[test]
+    fn test_config_rejects_out_of_range_rate_limit() {
+        // A zero (non-positive) sliding window.
+        match (RateLimitConfig {
+            window_secs: 0,
+            ..RateLimitConfig::default()
+        })
+        .validate()
+        {
+            Err(ConfigError::BadRateLimitValue { field, .. }) => assert_eq!(field, "window_secs"),
+            other => panic!("a zero window must be BadRateLimitValue(window_secs), got {other:?}"),
+        }
+
+        // A window past the coarse 24 h ceiling.
+        match (RateLimitConfig {
+            window_secs: RATE_LIMIT_MAX_WINDOW_SECS + 1,
+            ..RateLimitConfig::default()
+        })
+        .validate()
+        {
+            Err(ConfigError::BadRateLimitValue { field, .. }) => assert_eq!(field, "window_secs"),
+            other => {
+                panic!(
+                    "an over-ceiling window must be BadRateLimitValue(window_secs), got {other:?}"
+                )
+            }
+        }
+
+        // A zero (non-positive) per-tier budget.
+        match (RateLimitConfig {
+            trade_per_window: 0,
+            ..RateLimitConfig::default()
+        })
+        .validate()
+        {
+            Err(ConfigError::BadRateLimitValue { field, .. }) => {
+                assert_eq!(field, "trade_per_window");
+            }
+            other => {
+                panic!("a zero budget must be BadRateLimitValue(trade_per_window), got {other:?}")
+            }
+        }
+    }
+
     #[test]
     fn test_rate_limits_rejects_unknown_key() {
         // `deny_unknown_fields` names the offending key inside `[rate_limits]`.

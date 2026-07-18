@@ -620,6 +620,60 @@ mod tests {
         );
     }
 
+    /// Rejection-matrix entry (#49): every out-of-range `[microstructure.latency]`
+    /// shape is refused at load with a typed [`LatencyConfigError`] (folded into
+    /// `ConfigError::Microstructure` at the config seam) — a non-finite `sigma`, a
+    /// negative delay, and an inverted `[min_us, max_us]` band. An invalid draw
+    /// distribution can never reach the arrival path.
+    #[test]
+    fn test_config_rejects_out_of_range_latency() {
+        // NaN / ±Inf sigma — a distribution shape must be finite.
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let error = FileLatency {
+                mean_us: Some(100),
+                sigma: Some(bad),
+                ..file(LatencyModel::Normal)
+            }
+            .resolve()
+            .expect_err("a non-finite sigma is rejected");
+            match error {
+                LatencyConfigError::SigmaNotFinite { value } => assert!(!value.is_finite()),
+                other => panic!("a non-finite sigma must be SigmaNotFinite, got {other:?}"),
+            }
+        }
+
+        // A negative microsecond delay — a delay cannot run backwards.
+        let error = FileLatency {
+            us: Some(-1),
+            ..file(LatencyModel::Fixed)
+        }
+        .resolve()
+        .expect_err("a negative delay is rejected");
+        assert_eq!(
+            error,
+            LatencyConfigError::NegativeMicros {
+                param: "us",
+                value: -1,
+            }
+        );
+
+        // An inverted uniform band (`min_us > max_us`) — an empty draw interval.
+        let error = FileLatency {
+            min_us: Some(500),
+            max_us: Some(100),
+            ..file(LatencyModel::Uniform)
+        }
+        .resolve()
+        .expect_err("min_us > max_us is rejected");
+        assert_eq!(
+            error,
+            LatencyConfigError::MinExceedsMax {
+                min_us: 500,
+                max_us: 100,
+            }
+        );
+    }
+
     // ---- draw bounds (per model) -------------------------------------------
 
     #[test]
