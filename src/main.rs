@@ -161,6 +161,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "AppState assembled and seeded; venue is serving"
     );
 
-    rest::serve(state, http_addr).await?;
+    // The venue clock-cadence driver (#028; self-review fix #112): spawn the owned
+    // background task that advances the shared venue clock off the sequenced path,
+    // so `venue_ts` progresses and the rate-limit window rolls for the whole life of
+    // the process. Realtime / accelerated only — a stepped clock advances via
+    // explicit `Clock` commands and spawns nothing (the driver returns `None`). The
+    // `Weak`-backed task also self-terminates when the last `Arc<AppState>` drops.
+    let clock_driver = fauxchange::state::spawn_clock_cadence_driver(&state);
+
+    let result = rest::serve(state, http_addr).await;
+
+    // The REST server drained: stop the clock driver promptly. It also exits on its
+    // dropped `Weak`, but the explicit abort gives immediate, deterministic shutdown.
+    if let Some(driver) = clock_driver {
+        driver.abort();
+    }
+    result?;
     Ok(())
 }

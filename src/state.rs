@@ -61,10 +61,13 @@
 //! | `simulator`     | [`crate::simulation::PriceSimulator`] (real) | #016 |
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use option_chain_orderbook::{InstrumentRegistry, SymbolIndex, SymbolParser};
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 use crate::auth::{
     AccountProvision, AccountRegistry, AccountStore, Argon2Hasher, AuthError, AuthService,
@@ -81,7 +84,7 @@ use crate::exchange::{
 use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
 use crate::models::AccountId;
 use crate::simulation::{
-    AssetConfig, CorrelationId, PriceSimulator, RunManifest, SimClock, SimulationConfig,
+    AssetConfig, ClockMode, CorrelationId, PriceSimulator, RunManifest, SimClock, SimulationConfig,
     VenueClockConfig, VenueStepSink,
 };
 // The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
@@ -106,6 +109,13 @@ pub const DEFAULT_SEED: u64 = 0;
 /// venue-minted id ([01 §6.1](../docs/01-domain-model.md)); the per-run unique
 /// lineage is minted at bootstrap (#022).
 pub const DEFAULT_LINEAGE_TOKEN: &str = "fauxchange";
+
+/// The default wall-clock cadence at which [`spawn_clock_cadence_driver`] advances
+/// the shared venue clock in realtime / accelerated mode. Fine enough that
+/// `venue_ts` stays fresh and the sliding rate-limit window (60 s) rolls smoothly,
+/// while cheap: each tick is a single atomic store **off** the sequenced path — no
+/// journal append, no book mutation. The live value becomes venue config (#046).
+pub const DEFAULT_CLOCK_CADENCE: Duration = Duration::from_millis(250);
 
 // ============================================================================
 // Construction parameters
@@ -1072,6 +1082,100 @@ impl AppState {
     }
 }
 
+// ============================================================================
+// The clock-cadence driver (#028; self-review fix #112)
+// ============================================================================
+
+/// Spawns the venue **clock-cadence driver** — the owned background task that
+/// advances the shared venue [`SimClock`] on a wall cadence in realtime /
+/// accelerated mode, so `venue_ts` progresses and the sliding rate-limit window
+/// rolls for the whole life of the running service.
+///
+/// Without it the venue clock never advances off the sequenced path: nothing calls
+/// [`SimClock::tick`](crate::simulation::SimClock::tick), so `now_ms` is frozen at
+/// the epoch, `venue_ts` is constant, and the rate-limit windows never roll for the
+/// entire process lifetime (the self-review gap tracked in #112). Stepped mode was
+/// never affected — it advances via explicit `Clock` commands — so only the default
+/// live modes (realtime / accelerated) were broken.
+///
+/// Returns `None` in [`ClockMode::Stepped`]: a stepped clock advances **only** on an
+/// explicit `Clock` [`VenueCommand`] (the #028 control coordinator
+/// [`AppState::advance_clock_step`] / [`AppState::advance_clock_to`], or a replay
+/// driver), never on a wall cadence, so no auto-advancing driver is spawned.
+///
+/// # Determinism
+///
+/// The driver drives **only** the venue clock: each tick is a single
+/// [`SimClock::tick`](crate::simulation::SimClock::tick), a wall read taken **off**
+/// the sequenced path that advances the clock's atomic instant. It mutates no book
+/// and appends no journal record — the journaled `Clock` advances that fan to the
+/// actors stay the #028 control-coordinator path, not a new sequenced path invented
+/// here. Reading the real wall clock in this off-path driver is the intended
+/// realtime time source, not a sequenced-path violation: the sequenced read
+/// [`SimClock::now_ms`](crate::simulation::SimClock::now_ms) stays a pure atomic
+/// load, and a replay reproduces `venue_ts` from the journaled values rather than
+/// re-reading the wall clock.
+///
+/// # Shutdown
+///
+/// The task holds only a [`Weak`] handle to [`AppState`] (mirroring
+/// [`spawn_rate_limit_sweeper`](crate::gateway::rest::spawn_rate_limit_sweeper)), so
+/// when the last strong `Arc<AppState>` drops (server shutdown) the next tick fails
+/// to upgrade and the loop exits cleanly — it never keeps the venue alive. `main.rs`
+/// additionally `abort`s the returned handle once the REST server drains, for prompt
+/// shutdown.
+#[must_use]
+pub fn spawn_clock_cadence_driver(state: &Arc<AppState>) -> Option<JoinHandle<()>> {
+    spawn_clock_cadence_driver_with_cadence(state, DEFAULT_CLOCK_CADENCE)
+}
+
+/// [`spawn_clock_cadence_driver`] with an explicit `cadence` — the seam tests drive
+/// on a short interval so the advance is observable without racing the default
+/// cadence.
+#[must_use]
+pub(crate) fn spawn_clock_cadence_driver_with_cadence(
+    state: &Arc<AppState>,
+    cadence: Duration,
+) -> Option<JoinHandle<()>> {
+    if matches!(state.clock().mode(), ClockMode::Stepped { .. }) {
+        tracing::info!(
+            "clock cadence driver: stepped mode advances only via explicit Clock \
+             commands; not spawning a wall-cadence driver"
+        );
+        return None;
+    }
+
+    let mode = state.clock().mode().as_token();
+    let weak: Weak<AppState> = Arc::downgrade(state);
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(cadence);
+        // Never burst-catch-up after a stall: a delayed tick just resumes the
+        // cadence (the wall-tracking advance is absolute, so a skipped tick is not
+        // lost time — the next tick jumps straight to the true wall instant).
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match weak.upgrade() {
+                // Advance ONLY the venue clock — a wall read off the sequenced path.
+                // `tick` is mode-aware (realtime / accelerated here); the returned
+                // instant is intentionally discarded. No book mutation, no journal.
+                Some(state) => {
+                    let _ = state.clock().tick();
+                }
+                // The last strong `Arc<AppState>` dropped: shut the driver down.
+                None => break,
+            }
+        }
+        tracing::debug!("clock cadence driver stopped");
+    });
+    tracing::info!(
+        cadence_ms = cadence.as_millis(),
+        mode,
+        "clock cadence driver spawned; venue clock advances off the sequenced path"
+    );
+    Some(handle)
+}
+
 impl std::fmt::Debug for AppState {
     /// A lightweight summary — deliberately not a `#[derive]` over the
     /// `DashMap`-backed registry/index/stores, whose derived `Debug` dumps entries
@@ -1342,5 +1446,84 @@ mod tests {
         let state = new_state(stepped_config(&["BTC"], 1_000, 500).with_seed(99));
         assert_eq!(state.manifest().seed, 99);
         assert_eq!(state.manifest().clock_mode, "stepped");
+    }
+
+    // ---- clock cadence driver (#028; self-review fix #112) ---------------
+
+    /// Polls the shared clock until it advances past `start`, or `budget` elapses,
+    /// returning the observed instant — so the assertion waits on the driver rather
+    /// than racing a fixed sleep.
+    async fn wait_for_advance(state: &Arc<AppState>, start: u64, budget: Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let now = state.clock().now_ms().get();
+            if now > start || tokio::time::Instant::now() >= deadline {
+                return now;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clock_cadence_driver_advances_the_venue_clock_in_accelerated() {
+        // The bug fixed by #112: in the running service nothing advanced the venue
+        // clock, so `venue_ts` was constant for the process lifetime. The cadence
+        // driver advances it off the sequenced path. A large multiplier makes even a
+        // couple of short cadence ticks of real wall time advance the virtual clock
+        // far past the epoch, so the assertion is robust to timing jitter.
+        let start = 1_000_000_000_000;
+        let state =
+            new_state(config(&["BTC"]).with_clock(VenueClockConfig::accelerated(start, 100_000)));
+        assert_eq!(
+            state.clock().now_ms().get(),
+            start,
+            "starts parked at the epoch"
+        );
+
+        let driver = match spawn_clock_cadence_driver_with_cadence(&state, Duration::from_millis(2))
+        {
+            Some(handle) => handle,
+            None => panic!("realtime/accelerated must spawn a cadence driver"),
+        };
+
+        let advanced = wait_for_advance(&state, start, Duration::from_secs(2)).await;
+        assert!(
+            advanced > start,
+            "the cadence driver advanced the venue clock off the sequenced path \
+             ({advanced} > {start})"
+        );
+
+        // Clean shutdown: aborting the driver stops the loop (it also exits on the
+        // dropped `Weak` when `state` drops at end of scope).
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn test_clock_cadence_driver_is_not_spawned_in_stepped_mode() {
+        // Stepped clocks advance ONLY on an explicit Clock command, never on a wall
+        // cadence: no driver is spawned, and the clock does not auto-advance.
+        let start = 5_000;
+        let state = new_state(stepped_config(&["BTC"], start, 500));
+        assert!(
+            spawn_clock_cadence_driver_with_cadence(&state, Duration::from_millis(2)).is_none(),
+            "stepped mode must spawn no wall-cadence driver"
+        );
+
+        // Give any (erroneously spawned) loop ample time to fire, then confirm the
+        // clock is still parked at the epoch — a stepped clock never auto-advances.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state.clock().now_ms().get(),
+            start,
+            "a stepped clock does not auto-advance without an explicit step"
+        );
+
+        // The explicit #028 control path still advances it by exactly the interval.
+        state.advance_clock_step().await;
+        assert_eq!(
+            state.clock().now_ms().get(),
+            start + 500,
+            "an explicit Clock advance still moves a stepped clock"
+        );
     }
 }
