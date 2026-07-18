@@ -9,14 +9,14 @@
 //! confirmed halt/resume (the applied outcome waits on the `Receipt`→`VenueOutcome`
 //! seam, `matching-expert`).
 //!
-//! **Venue-global controls (kill-switch / enable / parameters) are not yet
-//! routable.** They translate to a [`VenueCommand::MarketMakerControl`], a
-//! venue-global command the per-underlying `AppState::submit` does not route
-//! (its broadcast routing is a control-plane issue, per the `AppState::submit`
-//! contract). The handlers still build the sequenced command and submit it — so
-//! they are forward-compatible and honest: they surface the not-yet-routable
-//! error rather than fabricate success. The `GET` status reads return the
-//! placeholder default until the market-maker engine (#015) is wired.
+//! **Venue-global controls (kill-switch / enable / parameters)** translate to a
+//! [`VenueCommand::MarketMakerControl`], which [`AppState::submit`] **fans out** to
+//! every underlying's actor, each journaling it (#47) — so the control is sequenced
+//! and replayable. The live persona apply (mapping the knobs onto the market-maker
+//! engine on the sequenced path) is wired by the persona layer (#47 phase 2); until
+//! then the command is journaled and dispatched to the apply seam with no live sink
+//! installed. The `GET` status reads return the placeholder default until the
+//! market-maker engine surfaces live state.
 
 use std::sync::Arc;
 
@@ -54,13 +54,13 @@ pub async fn get_controls() -> Json<SystemControlResponse> {
 }
 
 /// Set the master kill switch — a **Sequenced** `MarketMakerControl` requiring
-/// `Admin`. Venue-global routing is not yet wired (see module docs).
+/// `Admin`. The venue-global control fans out to every underlying's actor (#47).
 #[utoipa::path(
     post, path = "/api/v1/controls/kill-switch", tag = "controls",
     request_body = KillSwitchRequest,
     responses(
         (status = 200, description = "Kill switch set", body = KillSwitchResponse),
-        (status = 400, description = "Venue-global control routing not yet wired"),
+        (status = 404, description = "No hosted underlyings for the venue-global control"),
         (status = 403, description = "Missing Admin permission"),
     ),
     security(("bearer_jwt" = [])),
@@ -87,13 +87,13 @@ pub async fn kill_switch(
 }
 
 /// Enable market-maker quoting — a **Sequenced** `MarketMakerControl` requiring
-/// `Admin`. Venue-global routing is not yet wired.
+/// `Admin`. The venue-global control fans out to every underlying's actor (#47).
 #[utoipa::path(
     post, path = "/api/v1/controls/enable", tag = "controls",
     request_body = KillSwitchRequest,
     responses(
         (status = 200, description = "Enable state set", body = KillSwitchResponse),
-        (status = 400, description = "Venue-global control routing not yet wired"),
+        (status = 404, description = "No hosted underlyings for the venue-global control"),
         (status = 403, description = "Missing Admin permission"),
     ),
     security(("bearer_jwt" = [])),
@@ -120,13 +120,13 @@ pub async fn set_enabled(
 }
 
 /// Update market-maker parameters — a **Sequenced** `MarketMakerControl`
-/// requiring `Admin`. Venue-global routing is not yet wired.
+/// requiring `Admin`. The venue-global control fans out to every underlying (#47).
 #[utoipa::path(
     post, path = "/api/v1/controls/parameters", tag = "controls",
     request_body = UpdateParametersRequest,
     responses(
         (status = 200, description = "Parameters updated", body = UpdateParametersResponse),
-        (status = 400, description = "Venue-global control routing not yet wired"),
+        (status = 404, description = "No hosted underlyings for the venue-global control"),
         (status = 403, description = "Missing Admin permission"),
     ),
     security(("bearer_jwt" = [])),
@@ -176,10 +176,10 @@ pub async fn list_instrument_controls() -> Json<InstrumentsListResponse> {
 /// halt (`Halted`), per the §10 mapping.
 ///
 /// The response reports the command was **accepted and sequenced** (with its
-/// `underlying_sequence`), **not** that the halt/resume took effect: the current
-/// executor maps `SetInstrumentStatus` to a not-yet-applied outcome and the
+/// `underlying_sequence`), **not** that the halt/resume took effect: the executor
+/// applies the transition to the sequenced instrument-status registry (#47), but the
 /// [`Receipt`](crate::exchange::Receipt) cannot see that outcome, so an applied
-/// confirmation waits on the `Receipt`→`VenueOutcome` seam (`matching-expert`).
+/// confirmation waits on the `Receipt`→`VenueOutcome` surfacing seam.
 ///
 /// The `{symbol}` path segment is the canonical contract symbol
 /// `UNDERLYING-YYYYMMDD-STRIKE-STYLE`; the trailing `-C`/`-P` is the style, so a

@@ -66,6 +66,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use option_chain_orderbook::utils::format_expiration_yyyymmdd;
 use option_chain_orderbook::{
     FeeSchedule, InstrumentRegistry, OptionOrderBook, SymbolIndex, SymbolParser, TradeResult,
     UnderlyingOrderBook,
@@ -78,12 +79,14 @@ use crate::exchange::actor::{
     spawn_underlying_actor,
 };
 use crate::exchange::boundary::{
-    Hash32, InstrumentStatus, OptionStyle, OrderId, STPMode, Side, TimeInForce,
+    Hash32, InstrumentStatus, OptionStyle, OrderId, STPMode, Side, TimeInForce, TimestampMs,
 };
 use crate::exchange::envelope::{
-    AddOutcome, CancelReason, CancelledLeg, Fill, VenueCommand, VenueOutcome,
+    AddOutcome, CancelReason, CancelledLeg, Fill, MassCancelScope, MassCancelType, VenueCommand,
+    VenueOutcome,
 };
-use crate::exchange::event::SequenceNumber;
+use crate::exchange::event::{EventTimestamp, SequenceNumber};
+use crate::exchange::instrument_status::InstrumentStatusRegistry;
 use crate::exchange::journal::VenueJournal;
 use crate::exchange::money::{Cents, MoneyError, SignedCents};
 use crate::exchange::snapshot::{
@@ -116,6 +119,56 @@ pub struct TopOfBook {
 }
 
 // ============================================================================
+// Market-maker control seam (filled by the persona layer — #47 phase 2)
+// ============================================================================
+
+/// The clamped market-maker control knobs a [`VenueCommand::MarketMakerControl`]
+/// carries — the payload the sequenced apply seam hands the persona layer. Each
+/// field is `None` when the command leaves that knob unchanged; the values are
+/// **dimensionless** `f64` multipliers, not money ([01 §3](../../../docs/01-domain-model.md)).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarketMakerControlKnobs {
+    /// New global spread multiplier, when changing it.
+    pub spread_multiplier: Option<f64>,
+    /// New global size scalar, when changing it.
+    pub size_scalar: Option<f64>,
+    /// New global directional skew, when changing it.
+    pub directional_skew: Option<f64>,
+    /// New master-enabled (kill / enable) state, when changing it.
+    pub enabled: Option<bool>,
+}
+
+/// The **sequenced apply seam** for a [`VenueCommand::MarketMakerControl`] — the
+/// hook the single-writer executor invokes, inside the actor turn, to push a
+/// control change onto the market maker so the knob takes effect on the sequenced
+/// path ([02 §4.1](../../../docs/02-matching-architecture.md#41-venue-wide-commands-marketmakercontrol--clock--simstep),
+/// [03 §10](../../../docs/03-protocol-surfaces.md)).
+///
+/// **#47 phase 1 defines the seam; the persona layer (#47 phase 2, `simulation-expert`)
+/// implements it** over the `MarketMakerEngine` — mapping the knobs onto its
+/// `set_spread_multiplier` / `set_size_scalar` / `set_directional_skew` /
+/// `set_enabled` setters. The engine's setters are `&self` (interior mutability),
+/// so an `Arc<MarketMakerEngine>` can implement this trait and be shared, by
+/// handle, into every underlying's executor.
+///
+/// ## What the seam MUST NOT do (the determinism contract)
+///
+/// `apply_control` may update the engine's persona knobs (a plain state write) but
+/// **must not** re-enter the sequencer or synchronously emit orders: the requotes a
+/// control change induces enter the sequencer as their **own** journaled `AddOrder`
+/// commands on the next price step, so a replay reproduces them from the journal.
+/// The apply is a **live-only side effect** excluded from the captured
+/// [`VenueOutcome::ControlApplied`], and the recovery/replay path installs **no**
+/// sink (the fresh reconstruction executors carry `None`), so re-execution derives
+/// the identical `ControlApplied` event without ever driving a live engine
+/// ([02 §5](../../../docs/02-matching-architecture.md#5-determinism)).
+pub trait MarketMakerControlSink: Send + Sync {
+    /// Applies a market-maker control change on the sequenced path. Invoked once
+    /// per committed [`VenueCommand::MarketMakerControl`], inside the actor turn.
+    fn apply_control(&self, knobs: MarketMakerControlKnobs);
+}
+
+// ============================================================================
 // Resting-order registry entry
 // ============================================================================
 
@@ -125,13 +178,15 @@ pub struct TopOfBook {
 ///
 /// The `symbol` resolves the leaf the order rests on for the snapshot cut (#009):
 /// a capture reads each order's *current* resting quantity back from that leaf,
-/// and a restore clears the leaf before re-adding.
+/// and a restore clears the leaf before re-adding. The `side` lets a
+/// [`MassCancelType::BySide`] sweep filter without a book read.
 #[derive(Debug, Clone)]
 struct RestingRecord {
     symbol: Symbol,
     venue_order_id: VenueOrderId,
     account: AccountId,
     owner: Hash32,
+    side: Side,
 }
 
 /// The captured legs of one engine match result, plus the taker's total filled
@@ -175,6 +230,17 @@ pub struct MatchingExecutor {
     /// and it is captured/restored as the fourth store of a snapshot cut
     /// ([01 §6.1](../../../docs/01-domain-model.md)).
     idempotency: IdempotencyMap,
+    /// The venue-owned, **sequenced** per-instrument status registry (#47): a
+    /// `SetInstrumentStatus` command transitions it and an `AddOrder` reads it to
+    /// gate a non-`Active` instrument, both on this single-writer path, so it is a
+    /// deterministic function of the journal.
+    instrument_status: InstrumentStatusRegistry,
+    /// The **optional** market-maker control apply seam (#47 phase 2): installed
+    /// on the live order path so a `MarketMakerControl` command pushes its knobs
+    /// onto the market maker, and left `None` on the replay/recovery reconstruction
+    /// path (the requotes it induces are journaled as their own `AddOrder`
+    /// commands, so re-execution needs no live engine).
+    mm_control: Option<Arc<dyn MarketMakerControlSink>>,
 }
 
 impl MatchingExecutor {
@@ -186,12 +252,33 @@ impl MatchingExecutor {
     /// carry the fee/STP/specs the determinism oracle scopes.
     #[must_use]
     pub fn new(underlying: impl Into<String>) -> Self {
+        Self::from_book(UnderlyingOrderBook::new(underlying))
+    }
+
+    /// Builds an executor around an already-constructed (and, where applicable,
+    /// microstructure-configured) upstream hierarchy, with empty registries and no
+    /// market-maker control seam installed. The shared init for every constructor,
+    /// so a new sequenced store is added in exactly one place.
+    #[must_use]
+    fn from_book(underlying_book: UnderlyingOrderBook) -> Self {
         Self {
-            underlying_book: UnderlyingOrderBook::new(underlying),
+            underlying_book,
             resting: HashMap::new(),
             venue_to_engine: HashMap::new(),
             idempotency: IdempotencyMap::new(),
+            instrument_status: InstrumentStatusRegistry::new(),
+            mm_control: None,
         }
+    }
+
+    /// Installs the market-maker control apply seam (#47 phase 2), returning `self`
+    /// so it composes with a constructor. The live [`crate::state::AppState`] wiring
+    /// injects the engine-backed sink here; the replay/recovery constructors leave
+    /// it `None`.
+    #[must_use]
+    pub fn with_mm_control_sink(mut self, sink: Arc<dyn MarketMakerControlSink>) -> Self {
+        self.mm_control = Some(sink);
+        self
     }
 
     /// Builds an executor for one underlying with a **fresh** registry (its own
@@ -218,12 +305,7 @@ impl MatchingExecutor {
         let underlying = underlying.into();
         let underlying_book = UnderlyingOrderBook::new(&underlying);
         apply_to_underlying(&underlying_book, microstructure, &underlying)?;
-        Ok(Self {
-            underlying_book,
-            resting: HashMap::new(),
-            venue_to_engine: HashMap::new(),
-            idempotency: IdempotencyMap::new(),
-        })
+        Ok(Self::from_book(underlying_book))
     }
 
     /// Builds an executor for one underlying whose hierarchy shares a **venue-wide**
@@ -260,12 +342,7 @@ impl MatchingExecutor {
         let underlying_book =
             UnderlyingOrderBook::new_with_registry_and_index(&underlying, registry, symbol_index);
         apply_to_underlying(&underlying_book, microstructure, &underlying)?;
-        Ok(Self {
-            underlying_book,
-            resting: HashMap::new(),
-            venue_to_engine: HashMap::new(),
-            idempotency: IdempotencyMap::new(),
-        })
+        Ok(Self::from_book(underlying_book))
     }
 
     /// The underlying ticker this executor serves.
@@ -342,6 +419,7 @@ impl MatchingExecutor {
     /// Registers a newly-resting order so a future match can recover its maker
     /// identity, a cancel/replace can find its engine id, and a snapshot cut can
     /// resolve the leaf it rests on (#009).
+    #[allow(clippy::too_many_arguments)]
     fn register_resting(
         &mut self,
         engine_id: OrderId,
@@ -349,6 +427,7 @@ impl MatchingExecutor {
         venue_order_id: VenueOrderId,
         account: AccountId,
         owner: Hash32,
+        side: Side,
     ) {
         self.venue_to_engine
             .insert(venue_order_id.clone(), engine_id);
@@ -359,6 +438,7 @@ impl MatchingExecutor {
                 venue_order_id,
                 account,
                 owner,
+                side,
             },
         );
     }
@@ -496,6 +576,21 @@ impl MatchingExecutor {
             Ok(leaf) => leaf,
             Err(reason) => return VenueOutcome::Rejected { reason },
         };
+
+        // Instrument-status gate (#47): an order into a non-`Active` instrument is
+        // rejected here, on the sequenced path, so a halted/settling/expired book
+        // refuses new orders identically live and on replay. The status comes from
+        // the venue-owned sequenced registry (a point lookup keyed on the symbol),
+        // so the rejection is a deterministic function of the journaled
+        // `SetInstrumentStatus` stream — no wall clock, RNG, or iteration order.
+        if !self.instrument_status.is_accepting_orders(symbol) {
+            return VenueOutcome::Rejected {
+                reason: instrument_not_active_reason(
+                    symbol,
+                    self.instrument_status.status_of(symbol),
+                ),
+            };
+        }
 
         match order_type {
             OrderType::Market => self.execute_market(
@@ -667,6 +762,7 @@ impl MatchingExecutor {
                 venue_order_id.clone(),
                 account.clone(),
                 owner,
+                side,
             );
         }
 
@@ -692,11 +788,9 @@ impl MatchingExecutor {
         side: Side,
         quantity: u64,
     ) -> VenueOutcome {
-        if !leaf.status().is_accepting_orders() {
-            return VenueOutcome::Rejected {
-                reason: "instrument is not accepting orders".to_string(),
-            };
-        }
+        // The instrument-status gate is enforced once, up front, in
+        // `execute_add_order` (both the limit and market paths flow through it), so
+        // by here the instrument is `Active` and accepting orders.
         leaf.arm_trade_capture(true);
 
         // Empty-book fast path (single-writer safe): no opposite-side depth means
@@ -957,6 +1051,167 @@ impl MatchingExecutor {
             cancelled: true,
             add,
         }
+    }
+
+    // ---- lifecycle + sweep commands (#47) --------------------------------
+
+    /// Applies a [`VenueCommand::SetInstrumentStatus`] transition to the
+    /// venue-owned sequenced registry, validated against the **upstream**
+    /// lifecycle state machine ([`InstrumentStatus::can_transition`], never a venue
+    /// reimplementation).
+    ///
+    /// The target leaf is vivified through the same idempotent `get_or_create_*`
+    /// path an `AddOrder` uses (mirroring the upstream `submit_set_instrument_status`
+    /// resolution), so replay rebuilds identical structural state; a malformed or
+    /// cross-underlying symbol, or an illegal transition, is captured as a
+    /// [`VenueOutcome::Rejected`] with a deterministic reason.
+    fn execute_set_instrument_status(
+        &mut self,
+        symbol: &Symbol,
+        status: InstrumentStatus,
+    ) -> VenueOutcome {
+        // Validate + vivify the target leaf (cross-underlying / parse guard).
+        if let Err(reason) = self.resolve_leaf_vivify(symbol) {
+            return VenueOutcome::Rejected { reason };
+        }
+        match self.instrument_status.try_transition(symbol, status) {
+            Ok(applied) => VenueOutcome::InstrumentStatusChanged {
+                symbol: symbol.clone(),
+                status: applied,
+            },
+            Err(error) => VenueOutcome::Rejected {
+                reason: error.to_string(),
+            },
+        }
+    }
+
+    /// Executes a [`VenueCommand::MassCancel`] within this underlying: selects the
+    /// resting orders matching `scope` + `cancel_type` from the venue registry,
+    /// cancels each through the **upstream** single-order cancel primitive
+    /// ([`OptionOrderBook::cancel_order`], never a reimplemented sweep), and records
+    /// each removal as an ordered [`CancelledLeg`]
+    /// ([ADR-0009 §4](../../../docs/adr/0009-lossless-venue-envelope-outcomes.md)).
+    ///
+    /// The venue registry — not the upstream count-only aggregate — is the source
+    /// of the per-order `(venue_order_id, owner)` identity the FIX
+    /// `OrderMassCancelReport` + per-order `ExecutionReport`s need. The affected
+    /// list is **sorted by venue order id**, a deterministic sweep order
+    /// independent of map-iteration order, so a replay reproduces it exactly.
+    fn execute_mass_cancel(
+        &mut self,
+        scope: &MassCancelScope,
+        cancel_type: &MassCancelType,
+    ) -> VenueOutcome {
+        // Resolve the scope's expiration to its canonical `YYYYMMDD` once (an
+        // `Expiration` / `Strike` scope); a malformed scope expiry is a rejected
+        // command (deterministic — a pure function of the command).
+        let scope_expiry = match scope {
+            MassCancelScope::Expiration(expiry)
+            | MassCancelScope::Strike {
+                expiration: expiry, ..
+            } => match format_expiration_yyyymmdd(expiry) {
+                Ok(yyyymmdd) => Some(yyyymmdd),
+                Err(error) => {
+                    return VenueOutcome::Rejected {
+                        reason: format!("mass-cancel scope expiry is unresolvable: {error}"),
+                    };
+                }
+            },
+            MassCancelScope::Underlying | MassCancelScope::Book(_) => None,
+        };
+
+        // Collect the matching resting orders (id + identity) from the venue
+        // registry. Collected into a Vec and sorted below, so the HashMap iteration
+        // order never reaches the sweep / event order.
+        let mut targets: Vec<(OrderId, Symbol, VenueOrderId, Hash32)> = self
+            .resting
+            .iter()
+            .filter(|(_, record)| {
+                mass_cancel_matches(record, scope, scope_expiry.as_deref(), cancel_type)
+            })
+            .map(|(engine_id, record)| {
+                (
+                    *engine_id,
+                    record.symbol.clone(),
+                    record.venue_order_id.clone(),
+                    record.owner,
+                )
+            })
+            .collect();
+        targets.sort_by(|a, b| a.2.as_str().cmp(b.2.as_str()));
+
+        let mut affected: Vec<CancelledLeg> = Vec::with_capacity(targets.len());
+        for (engine_id, symbol, venue_order_id, owner) in targets {
+            let Some(leaf) = self.resolve_leaf_read(&symbol) else {
+                continue;
+            };
+            if let Ok(true) = leaf.cancel_order(engine_id) {
+                self.remove_resting(engine_id);
+                affected.push(CancelledLeg {
+                    order_id: venue_order_id,
+                    owner,
+                    reason: CancelReason::MassCancel,
+                });
+            }
+        }
+
+        VenueOutcome::MassCancelled { affected }
+    }
+
+    /// Executes a [`VenueCommand::EvictExpiredOrders`] across this underlying:
+    /// drives the **upstream** expiry sweep ([`OptionOrderBook::evict_expired_orders`],
+    /// which compares the caller-supplied `now_ms` against each order's `Day`/`Gtd`
+    /// deadline and never reads a clock of its own) on every leaf that holds a
+    /// resting order, then maps the evicted engine ids back to their venue ids.
+    ///
+    /// Because the sweep is driven by the **journaled** `now_ms` and the resting set
+    /// is rebuilt by re-executing the prior `AddOrder`s (with byte-identical explicit
+    /// `Gtd` deadlines), a replay evicts the identical set. The evicted list is
+    /// sorted by venue order id for a deterministic sweep order.
+    ///
+    /// **Named upstream limitation.** `Day` orders (and the *admission* of a
+    /// `Gtd`/`Day` order) still resolve their deadline against the leaf's default
+    /// wall clock — `option-chain-orderbook` 0.7.0 does not thread the venue clock
+    /// into lazy leaf construction — so `Day`-TIF eviction is not replay-stable
+    /// across arbitrary wall times. Explicit-deadline `Gtd` eviction (the value in
+    /// the command) is deterministic; the residual admission gap is pinned by
+    /// `tests/determinism.rs::test_day_gtd_admission_determinism_blocked_by_leaf_clock_gap`
+    /// ([02 §5.5b](../../../docs/02-matching-architecture.md#5-determinism)).
+    fn execute_evict_expired(&mut self, now_ms: EventTimestamp) -> VenueOutcome {
+        // The distinct leaves that currently hold a resting order. Collected via a
+        // set: per-leaf eviction is independent, so visitation order does not change
+        // *which* orders are evicted, and the emitted list is sorted below.
+        let mut leaves: Vec<Symbol> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for record in self.resting.values() {
+            if seen.insert(record.symbol.as_str()) {
+                leaves.push(record.symbol.clone());
+            }
+        }
+
+        let cutoff = TimestampMs::new(now_ms.get());
+        let mut evicted_ids: Vec<OrderId> = Vec::new();
+        for symbol in &leaves {
+            if let Some(leaf) = self.resolve_leaf_read(symbol) {
+                evicted_ids.extend(leaf.evict_expired_orders(cutoff));
+            }
+        }
+
+        let mut evicted: Vec<VenueOrderId> = Vec::with_capacity(evicted_ids.len());
+        for engine_id in evicted_ids {
+            let Some(venue_order_id) = self
+                .resting
+                .get(&engine_id)
+                .map(|record| record.venue_order_id.clone())
+            else {
+                continue;
+            };
+            evicted.push(venue_order_id);
+            self.remove_resting(engine_id);
+        }
+        evicted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+
+        VenueOutcome::Evicted { evicted }
     }
 
     // ---- fill + STP capture ---------------------------------------------
@@ -1339,6 +1594,7 @@ impl MatchingExecutor {
                 order.order_id,
                 order.account,
                 order.owner,
+                order.side,
             );
         }
         Ok(())
@@ -1445,18 +1701,40 @@ impl CommandExecutor for MatchingExecutor {
                 *quantity,
                 *time_in_force,
             ),
-            // Control-plane commands have no leaf effect on this path; their
+            // A market-maker control change (#47): apply the knobs onto the market
+            // maker through the sequenced apply seam (a live-only side effect — the
+            // requotes it induces are journaled as their own `AddOrder` commands),
+            // then capture the lossless `ControlApplied`. The replay/recovery path
+            // installs no sink, so re-execution derives the identical event.
+            VenueCommand::MarketMakerControl {
+                spread_multiplier,
+                size_scalar,
+                directional_skew,
+                enabled,
+            } => {
+                if let Some(sink) = &self.mm_control {
+                    sink.apply_control(MarketMakerControlKnobs {
+                        spread_multiplier: *spread_multiplier,
+                        size_scalar: *size_scalar,
+                        directional_skew: *directional_skew,
+                        enabled: *enabled,
+                    });
+                }
+                VenueOutcome::ControlApplied
+            }
+            // Clock / sim-step advances have no leaf effect on this path; their
             // derived effects are journaled as their own sequenced commands.
-            VenueCommand::MarketMakerControl { .. }
-            | VenueCommand::Clock { .. }
-            | VenueCommand::SimStep { .. } => VenueOutcome::ControlApplied,
-            // Hierarchy-sweep / lifecycle commands are routed by later issues; the
-            // #007 order path does not execute them.
-            VenueCommand::MassCancel { .. }
-            | VenueCommand::SetInstrumentStatus { .. }
-            | VenueCommand::EvictExpiredOrders { .. } => VenueOutcome::Rejected {
-                reason: "command not routed by the order path".to_string(),
-            },
+            VenueCommand::Clock { .. } | VenueCommand::SimStep { .. } => {
+                VenueOutcome::ControlApplied
+            }
+            // Lifecycle + hierarchy-sweep commands (#47): all sequenced + journaled.
+            VenueCommand::SetInstrumentStatus { symbol, status } => {
+                self.execute_set_instrument_status(symbol, *status)
+            }
+            VenueCommand::MassCancel {
+                scope, cancel_type, ..
+            } => self.execute_mass_cancel(scope, cancel_type),
+            VenueCommand::EvictExpiredOrders { now_ms } => self.execute_evict_expired(*now_ms),
         }
     }
 }
@@ -1480,6 +1758,53 @@ const NOT_ORDER_OWNER_REASON: &str = "requesting account does not own the order"
 #[inline]
 fn engine_order_id(sequence: SequenceNumber) -> OrderId {
     OrderId::sequential(sequence.get())
+}
+
+/// The **deterministic** reject reason for an order into a non-`Active`
+/// instrument — a pure function of the symbol and its upstream status
+/// [`Display`](std::fmt::Display), so a replay reproduces the exact reject text.
+#[inline]
+fn instrument_not_active_reason(symbol: &Symbol, status: InstrumentStatus) -> String {
+    format!("instrument {symbol} is {status} and is not accepting orders")
+}
+
+/// Whether a resting order matches a mass-cancel `scope` + `cancel_type`.
+///
+/// `scope_expiry` is the scope expiration pre-formatted to canonical `YYYYMMDD`
+/// (present for an `Expiration` / `Strike` scope), so the per-order predicate does
+/// no fallible formatting. A resting order whose own symbol fails to parse is
+/// excluded (it can never match a hierarchy scope) — defensive under the
+/// single-writer invariant, where every registered symbol was already parsed.
+fn mass_cancel_matches(
+    record: &RestingRecord,
+    scope: &MassCancelScope,
+    scope_expiry: Option<&str>,
+    cancel_type: &MassCancelType,
+) -> bool {
+    let type_matches = match cancel_type {
+        MassCancelType::All => true,
+        MassCancelType::BySide(side) => record.side == *side,
+        MassCancelType::ByUser(owner) => record.owner == *owner,
+    };
+    if !type_matches {
+        return false;
+    }
+    match scope {
+        MassCancelScope::Underlying => true,
+        MassCancelScope::Book(symbol) => record.symbol == *symbol,
+        MassCancelScope::Expiration(_) => {
+            let Ok(parsed) = SymbolParser::parse(record.symbol.as_str()) else {
+                return false;
+            };
+            Some(parsed.expiration_str()) == scope_expiry
+        }
+        MassCancelScope::Strike { strike, .. } => {
+            let Ok(parsed) = SymbolParser::parse(record.symbol.as_str()) else {
+                return false;
+            };
+            Some(parsed.expiration_str()) == scope_expiry && parsed.strike() == *strike
+        }
+    }
 }
 
 /// Whether a time-in-force rests its unfilled remainder (`Gtc` / `Gtd` / `Day`)
@@ -1621,10 +1946,16 @@ where
 /// Returns the bounded [`ActorHandle`] plus the task's [`JoinHandle`] for graceful
 /// shutdown.
 ///
+/// `mm_control` is the optional market-maker control apply seam (#47): `Some` on the
+/// live path (the persona layer's engine-backed [`MarketMakerControlSink`], phase 2)
+/// so a `MarketMakerControl` command takes effect on the sequenced path, and `None`
+/// where no live engine is driven.
+///
 /// # Errors
 ///
 /// [`MicrostructureConfigError`] if the resolved contract specs are rejected by the
 /// upstream `ContractSpecsBuilder` (unreachable for a resolver-validated config).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_matching_actor_with_registry_and_index<J, F, C>(
     config: ActorConfig,
     journal: J,
@@ -1633,6 +1964,7 @@ pub fn spawn_matching_actor_with_registry_and_index<J, F, C>(
     registry: Arc<InstrumentRegistry>,
     symbol_index: Arc<SymbolIndex>,
     microstructure: &MicrostructureConfig,
+    mm_control: Option<Arc<dyn MarketMakerControlSink>>,
 ) -> Result<(ActorHandle, JoinHandle<()>), MicrostructureConfigError>
 where
     J: VenueJournal + Send + 'static,
@@ -1645,6 +1977,10 @@ where
         symbol_index,
         microstructure,
     )?;
+    let executor = match mm_control {
+        Some(sink) => executor.with_mm_control_sink(sink),
+        None => executor,
+    };
     Ok(spawn_underlying_actor(
         config, journal, executor, fan_out, clock,
     ))

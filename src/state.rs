@@ -78,9 +78,9 @@ use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
     ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, InMemoryExecutionsStore,
-    InMemoryPositionsStore, InMemoryVenueJournal, JournalHeader, JournalSnapshot, LineageId,
-    MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, TeeFanOut, VenueCommand,
-    check_price_band, spawn_matching_actor_with_registry_and_index,
+    InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus, JournalHeader, JournalSnapshot,
+    LineageId, MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, Symbol, TeeFanOut,
+    VenueCommand, check_price_band, spawn_matching_actor_with_registry_and_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
 use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
@@ -571,6 +571,21 @@ impl ClockAdvance {
     }
 }
 
+/// Whether `command` is **venue-global** — it names no single routable underlying
+/// and so fans out to every hosted underlying's actor (#47): a `MarketMakerControl`,
+/// an `EvictExpiredOrders`, or a hierarchy-wide (non-`Book`) `MassCancel`. A `Book`
+/// mass cancel names one instrument and routes per-underlying; a `Clock` advance
+/// enters through the clock coordinator, not this raw submit path, so neither is
+/// venue-global here.
+#[must_use]
+fn is_venue_global(command: &VenueCommand) -> bool {
+    match command {
+        VenueCommand::MarketMakerControl { .. } | VenueCommand::EvictExpiredOrders { .. } => true,
+        VenueCommand::MassCancel { scope, .. } => !matches!(scope, MassCancelScope::Book(_)),
+        _ => false,
+    }
+}
+
 impl AppState {
     /// Assembles an [`AppState`] behind an `Arc`, spawning **one single-writer
     /// actor per configured underlying** and wiring the real order path
@@ -740,6 +755,10 @@ impl AppState {
                         Arc::clone(&registry),
                         Arc::clone(&symbol_index),
                         &microstructure,
+                        // The market-maker control apply seam (#47) is wired by the
+                        // persona layer (phase 2); the order path routes + journals
+                        // a `MarketMakerControl` today with no live sink installed.
+                        None,
                     )?
                 }
                 None => {
@@ -752,6 +771,7 @@ impl AppState {
                         Arc::clone(&registry),
                         Arc::clone(&symbol_index),
                         &microstructure,
+                        None,
                     )?
                 }
             };
@@ -825,17 +845,25 @@ impl AppState {
     /// Routing extracts the underlying from the command (the target symbol, via
     /// the upstream [`SymbolParser`], for order-path and instrument commands; the
     /// `underlying` ticker for a `SimStep`; the `Book` symbol for a scoped mass
-    /// cancel). Venue-global commands that carry no single underlying (`Clock`,
-    /// `MarketMakerControl`, `EvictExpiredOrders`, and hierarchy-wide mass
-    /// cancels) are not routable on this per-underlying submit path — their
-    /// broadcast/lifecycle routing lands with the control-plane issues.
+    /// cancel). **Venue-global** commands that carry no single underlying — a
+    /// `MarketMakerControl`, an `EvictExpiredOrders`, and a hierarchy-wide (non-`Book`)
+    /// `MassCancel` — **fan out** to every hosted underlying's actor, each journaled
+    /// in its own stream (mirroring the [`advance_clock_step`](Self::advance_clock_step)
+    /// coordinator); a `Clock` still enters through that clock coordinator, not this
+    /// raw submit path.
+    ///
+    /// A fan-out returns a **representative** [`Receipt`] (the last committed
+    /// underlying's); a **partial** fan-out (committed on some underlyings, not
+    /// others) is logged (`WARN`) rather than hidden — the venue does not promise
+    /// atomic venue-wide fan-out.
     ///
     /// # Errors
     ///
     /// - [`VenueError::InvalidOrder`] if the command's symbol does not parse, the
     ///   command carries no routable underlying, or the order price falls outside the
     ///   venue-owned price band (#044);
-    /// - [`VenueError::NotFound`] if the underlying is not hosted by this venue;
+    /// - [`VenueError::NotFound`] if the underlying is not hosted by this venue (or a
+    ///   venue-global command is submitted to a venue hosting no underlyings);
     /// - the actor's own typed rejection ([`VenueError::RateLimited`] on a full
     ///   mailbox, [`VenueError::JournalUnavailable`] if the actor has stopped, or
     ///   a sequencing seal) otherwise.
@@ -845,8 +873,82 @@ impl AppState {
         // gateway and never journaled — replay never re-executes a price the live
         // venue refused.
         self.admit_command_price(&command)?;
+        if is_venue_global(&command) {
+            return self.submit_venue_global(command).await;
+        }
         let handle = self.route(&command)?;
         handle.submit(command).await
+    }
+
+    /// Submits a [`VenueCommand::SetInstrumentStatus`] transition onto the
+    /// sequenced order path (#47) — the typed entry point the admin instrument-status
+    /// route builds on. It routes by the target **symbol** to that instrument's
+    /// underlying actor (a status change targets one instrument, not the whole venue),
+    /// so it returns that actor's [`Receipt`].
+    ///
+    /// # Errors
+    ///
+    /// The same typed rejections as [`submit`](Self::submit): an unparseable /
+    /// cross-underlying symbol ([`VenueError::InvalidOrder`]), an unhosted underlying
+    /// ([`VenueError::NotFound`]), or the actor's own sequencing rejection.
+    pub async fn submit_set_instrument_status(
+        &self,
+        symbol: Symbol,
+        status: InstrumentStatus,
+    ) -> Result<Receipt, VenueError> {
+        self.submit(VenueCommand::SetInstrumentStatus { symbol, status })
+            .await
+    }
+
+    /// Fans a **venue-global** command (a `MarketMakerControl`, an
+    /// `EvictExpiredOrders`, or a hierarchy-wide non-`Book` `MassCancel`) to every
+    /// hosted underlying's actor, in the deterministic **sorted** order, each
+    /// journaled in its own stream. Returns the last committed [`Receipt`]; a partial
+    /// fan-out is logged under a shared [`CorrelationId`], never hidden. No borrow of
+    /// `self` is held across an `.await` — each handle is cloned out first.
+    async fn submit_venue_global(&self, command: VenueCommand) -> Result<Receipt, VenueError> {
+        let correlation_id = self.next_correlation_id();
+        let tickers: Vec<String> = self.underlyings().into_iter().map(str::to_string).collect();
+        if tickers.is_empty() {
+            return Err(VenueError::NotFound(
+                "no hosted underlyings for a venue-global command".to_string(),
+            ));
+        }
+        let mut committed: Option<Receipt> = None;
+        let mut first_error: Option<VenueError> = None;
+        let mut ok_count = 0usize;
+        for ticker in &tickers {
+            let result = match self.handle_for(ticker) {
+                Ok(handle) => handle.submit(command.clone()).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(receipt) => {
+                    ok_count += 1;
+                    committed = Some(receipt);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if ok_count != 0 && ok_count != tickers.len() {
+            tracing::warn!(
+                correlation_id = %correlation_id,
+                committed = ok_count,
+                total = tickers.len(),
+                "venue-global command fan-out was partial across underlyings"
+            );
+        }
+        match (committed, first_error) {
+            (Some(receipt), _) => Ok(receipt),
+            (None, Some(error)) => Err(error),
+            // Non-empty `tickers` with no Ok and no Err is unreachable; return a
+            // typed rejection rather than fabricate a receipt.
+            (None, None) => Err(VenueError::JournalUnavailable),
+        }
     }
 
     /// Admits a price-bearing order command against the venue-owned price band
@@ -1524,7 +1626,7 @@ impl std::fmt::Debug for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::{Cents, Hash32, STPMode, Side, Symbol, TimeInForce};
+    use crate::exchange::{Cents, Hash32, MassCancelType, STPMode, Side, Symbol, TimeInForce};
     use crate::models::{AccountId, OrderType, VenueOrderId};
 
     fn config(underlyings: &[&str]) -> AppStateConfig {
@@ -1662,7 +1764,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_venue_global_command_is_not_routable() {
+    async fn test_submit_clock_command_is_not_routable_by_raw_submit() {
+        // A raw `Clock` submit is still refused (a stepped advance enters through the
+        // clock coordinator, not this path) — the venue-global fan-out (#47) does not
+        // capture `Clock`.
         let state = new_state(config(&["BTC"]));
         match state
             .submit(VenueCommand::Clock {
@@ -1672,6 +1777,119 @@ mod tests {
         {
             Err(VenueError::InvalidOrder(detail)) => assert!(detail.contains("routable")),
             other => panic!("expected an unroutable InvalidOrder, got {other:?}"),
+        }
+    }
+
+    // ---- venue-global fan-out routing (#47) ------------------------------
+
+    #[tokio::test]
+    async fn test_market_maker_control_fans_out_and_is_journaled_by_every_underlying() {
+        let state = new_state(config(&["BTC", "ETH"]));
+        // A venue-global MarketMakerControl fans to every actor and journals in each
+        // stream (there is no live sink wired in phase 1 — the seam is dispatched but
+        // no persona knob is applied).
+        let receipt = match state
+            .submit(VenueCommand::MarketMakerControl {
+                spread_multiplier: Some(1.5),
+                size_scalar: None,
+                directional_skew: None,
+                enabled: Some(false),
+            })
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => panic!("MarketMakerControl fan-out failed: {e}"),
+        };
+        assert_eq!(receipt.underlying_sequence.get(), 0);
+        for ticker in ["BTC", "ETH"] {
+            let snap = match state.journal_snapshot(ticker).await {
+                Ok(s) => s,
+                Err(e) => panic!("{ticker} snapshot failed: {e}"),
+            };
+            assert_eq!(
+                snap.last_sequence.map(|s| s.get()),
+                Some(0),
+                "{ticker} journaled the control command"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hierarchy_mass_cancel_fans_out_to_every_underlying() {
+        let state = new_state(config(&["BTC", "ETH"]));
+        match state
+            .submit(VenueCommand::MassCancel {
+                scope: MassCancelScope::Underlying,
+                cancel_type: MassCancelType::All,
+                account: AccountId::new("admin"),
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => panic!("hierarchy MassCancel fan-out failed: {e}"),
+        }
+        for ticker in ["BTC", "ETH"] {
+            let snap = match state.journal_snapshot(ticker).await {
+                Ok(s) => s,
+                Err(e) => panic!("{ticker} snapshot failed: {e}"),
+            };
+            assert_eq!(snap.last_sequence.map(|s| s.get()), Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_book_scoped_mass_cancel_routes_to_one_underlying() {
+        // A `Book`-scoped mass cancel names one instrument and routes per-underlying:
+        // only the owning actor journals it.
+        let state = new_state(config(&["BTC", "ETH"]));
+        match state
+            .submit(VenueCommand::MassCancel {
+                scope: MassCancelScope::Book(sym("BTC-20240329-50000-C")),
+                cancel_type: MassCancelType::All,
+                account: AccountId::new("admin"),
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => panic!("book-scoped MassCancel failed: {e}"),
+        }
+        let btc = state.journal_snapshot("BTC").await.expect("BTC snapshot");
+        let eth = state.journal_snapshot("ETH").await.expect("ETH snapshot");
+        assert_eq!(
+            btc.last_sequence.map(|s| s.get()),
+            Some(0),
+            "BTC journaled it"
+        );
+        assert_eq!(eth.last_sequence, None, "ETH was not touched");
+    }
+
+    #[tokio::test]
+    async fn test_submit_set_instrument_status_routes_by_symbol() {
+        let state = new_state(config(&["BTC"]));
+        let receipt = match state
+            .submit_set_instrument_status(sym("BTC-20240329-50000-C"), InstrumentStatus::Halted)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => panic!("submit_set_instrument_status failed: {e}"),
+        };
+        assert_eq!(receipt.underlying_sequence.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_venue_global_command_on_empty_venue_is_not_found() {
+        let state = new_state(config(&[]));
+        match state
+            .submit(VenueCommand::MarketMakerControl {
+                spread_multiplier: Some(1.0),
+                size_scalar: None,
+                directional_skew: None,
+                enabled: None,
+            })
+            .await
+        {
+            Err(VenueError::NotFound(detail)) => assert!(detail.contains("no hosted underlyings")),
+            other => panic!("expected NotFound on an empty venue, got {other:?}"),
         }
     }
 

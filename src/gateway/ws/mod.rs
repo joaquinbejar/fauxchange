@@ -763,9 +763,9 @@ impl Connection {
             enabled: knobs.enabled,
         };
         match state.submit(command).await {
-            // `MarketMakerControl` is venue-global and not routable on the
-            // per-underlying submit path yet (#010 deviation); the error is
-            // surfaced honestly rather than fabricating a success.
+            // `MarketMakerControl` is venue-global: [`AppState::submit`] fans it out
+            // to every underlying's actor, each journaling it (#47). The live persona
+            // apply seam is wired by phase 2; the control is sequenced today.
             Ok(_receipt) => WsMessage::Config {
                 enabled: knobs.enabled.unwrap_or(true),
                 spread_multiplier: knobs.spread_multiplier.unwrap_or(1.0),
@@ -1075,10 +1075,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_admin_control_surfaces_not_routable_error_non_terminal() {
-        // An Admin caller: the control is permission-admitted but
-        // `MarketMakerControl` is not routable on the per-underlying path yet, so
-        // the honest not-routable error surfaces (never a fabricated success).
+    async fn test_admin_control_is_routed_and_sequenced() {
+        // An Admin caller: the control is permission-admitted and now **routed** —
+        // `MarketMakerControl` is venue-global and fans out to every underlying's
+        // actor (#47), so the handler reports the applied config (never an error).
         let state = crate::state::AppState::new(crate::state::AppStateConfig::new(["BTC"]))
             .expect("state builds");
         let connection = Connection::new(claims("admin", vec![Permission::Admin]));
@@ -1093,11 +1093,10 @@ mod tests {
             )
             .await;
         match message {
-            WsMessage::Error(error) => {
-                assert_eq!(error.code, crate::error::WsErrorCode::InvalidOrder);
-                assert!(!error.terminal);
+            WsMessage::Config { enabled, .. } => {
+                assert!(!enabled, "the kill control is sequenced and echoed back");
             }
-            other => panic!("expected a not-routable error, got {other:?}"),
+            other => panic!("expected a sequenced Config response, got {other:?}"),
         }
     }
 

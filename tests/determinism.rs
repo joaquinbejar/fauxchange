@@ -50,7 +50,10 @@
 //! | Out-of-sequencer state — an admin snapshot restore starts a NEW lineage, **not** a replay input; a restore-boundary journal fail-stops (single-epoch scope, #030) | [`test_out_of_sequencer_state_is_not_a_replay_input`] |
 //! | OHLC bars — an exclusion **by derivation** (same fills ⇒ same bars, not separately asserted) | derivation basis (documented in [04 §7](../docs/04-market-data-and-replay.md#7-ohlc-aggregation)); the fills they derive from are asserted above |
 //! | The synthetic price **walk** — journal-driven, **not** seed-regenerated (`optionstratlib` sampler unseedable) | asserted throughout replay (the recorded `SimStep`s replay identically); [`test_stepped_session_synthesis_is_deterministic_for_the_same_config`] separates the deterministic synthesis from the journal-driven path |
-//! | `Day`/`GTD` TIF admission determinism — **deferred** to the upstream leaf-clock seam | [`test_evict_expired_orders_is_a_documented_leaf_clock_limitation`] (pinned as a journaled no-op); [`test_day_gtd_admission_determinism_blocked_by_leaf_clock_gap`] (`#[ignore]`d, ready-to-enable) |
+//! | Sequenced expiry sweep (`EvictExpiredOrders`) evicts explicit-deadline `Gtd` orders and replays identically | [`test_evict_expired_gtd_orders_replays_identically`], [`test_evict_expired_orders_empty_sweep_replays`] |
+//! | `Day`-TIF eviction + `Day`/`Gtd` TIF *admission* determinism — still **deferred** to the upstream leaf-clock seam | [`test_day_gtd_admission_determinism_blocked_by_leaf_clock_gap`] (`#[ignore]`d, ready-to-enable) |
+//! | Sequenced instrument-status gate (`SetInstrumentStatus` halts; `AddOrder` into a non-`Active` book is rejected) replays identically | [`test_order_into_halted_instrument_is_rejected_and_replays`], [`test_instrument_status_lifecycle_replays_identically`] |
+//! | Sequenced hierarchy `MassCancel` (per-order affected list) replays identically | [`test_mass_cancel_replays_identically`] |
 //! | The two annotated `Days` carve-outs at the clock-free kernel seams (walk x-axis, MM pricer) | [`test_no_days_relative_expiry_survives_anywhere_in_the_venue`] enumerates them as the ONLY `Days` sites (#032) |
 //! | Boot-time resume of a non-empty durable journal — the reducer exists (#029/#030), the boot wiring is **not yet built** (tracked in #85) | out of this suite's runtime scope (the offline driver replays into a fresh registry, never the live venue) |
 //!
@@ -74,14 +77,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use fauxchange::exchange::{
-    ActorConfig, AddOutcome, Cents, CommandExecutor, EventTimestamp, ExecutionContext,
-    ExecutionFilter, ExecutionsStore, ExpirationDate, FanOut, FixedClock, Hash32,
-    InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, JournalCommand,
-    JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook, MatchingExecutor,
-    NoopFanOut, PositionsStore, RecordKind, STPMode, SequenceNumber, Side, SignedCents,
-    StoreFanOut, Symbol, SymbolError, SymbolParser, TimeInForce, TopOfBook, UnderlyingActor,
-    VenueClock, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, recover,
-    validate_venue_expiry,
+    ActorConfig, AddOutcome, CancelReason, Cents, CommandExecutor, EventTimestamp,
+    ExecutionContext, ExecutionFilter, ExecutionsStore, ExpirationDate, FanOut, FixedClock, Hash32,
+    InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
+    JournalCommand, JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook,
+    MassCancelScope, MassCancelType, MatchingExecutor, NoopFanOut, PositionsStore, RecordKind,
+    STPMode, SequenceNumber, Side, SignedCents, StoreFanOut, Symbol, SymbolError, SymbolParser,
+    TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal,
+    VenueOutcome, recover, validate_venue_expiry,
 };
 use fauxchange::gateway::fix::enums::{OrdType as FixOrdType, OrderSide, TimeInForce as FixTif};
 use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
@@ -1305,49 +1308,101 @@ fn test_clock_advance_is_reproducible_across_two_runs() {
     );
 }
 
-/// **Named upstream limitation (#028).** Deterministic `Day` / `GTD` time-in-force
-/// *admission* requires an injected venue clock **at the leaf**, so TIF is decided
-/// against venue time rather than wall time. `orderbook-rs` 0.10.5 provides the API
-/// (`OrderBook::with_clock` / `Arc<dyn Clock>` / `MonotonicClock` / `StubClock`),
-/// but the pinned `option-chain-orderbook` 0.7.0 does **not** thread it through its
-/// lazy `get_or_create_*` leaf construction, exposes no `OptionOrderBook::with_clock`,
-/// and `OrderBook::set_clock` needs `&mut self` while the venue holds vivified leaves
-/// as `Arc<OptionOrderBook>` (shared). Until that named upstream work lands, the
-/// injectable-leaf-clock guarantee covers **no** hierarchy leaf, and the intraday
-/// expiry sweep (`EvictExpiredOrders`) is a journaled no-op the executor `Rejected`s.
-/// This test pins that current, documented reality — and that it *still* replays
-/// deterministically from the journaled `now_ms` — so the gap is **named, not
-/// silent** ([02 §5.5b](../docs/02-matching-architecture.md#5-determinism)).
+/// The sequenced expiry sweep (#47) over an **empty** venue evicts nothing — a real
+/// `Evicted { evicted: [] }`, no longer a journaled `Rejected` no-op — and replays
+/// deterministically from the journaled `now_ms`.
 #[test]
-fn test_evict_expired_orders_is_a_documented_leaf_clock_limitation() {
-    let lineage = LineageId::new("run-evict");
+fn test_evict_expired_orders_empty_sweep_replays() {
+    let lineage = LineageId::new("run-evict-empty");
     let commands = vec![VenueCommand::EvictExpiredOrders {
         now_ms: EventTimestamp::new(1_900_000_000_000),
     }];
     let recording = record(&commands, &lineage, &[]);
     match &recording.events[0].outcome {
-        // Pending the upstream leaf clock, the intraday sweep is a journaled no-op.
-        VenueOutcome::Rejected { .. } => {}
-        other => panic!(
-            "EvictExpiredOrders outcome changed; revisit the named leaf-clock limitation: {other:?}"
+        VenueOutcome::Evicted { evicted } => assert!(
+            evicted.is_empty(),
+            "an empty venue evicts nothing, got {evicted:?}"
         ),
+        other => panic!("expected an empty Evicted sweep, got {other:?}"),
     }
-    // It still replays deterministically from the journaled now_ms.
     let replayed = replay(&recording);
     assert_eq!(replayed.events, recording.events);
 }
 
-/// **Blocked, not passing — the honest form of the `Day`/`GTD`-admission
+/// The sequenced expiry sweep (#47) evicts a resting **explicit-deadline `Gtd`**
+/// order past the journaled `now_ms`, leaves the `Gtc` control resting, and replays
+/// to the identical `VenueEvent` stream + top-of-book witness. The `Gtd` deadline is
+/// journaled in the `AddOrder`, the sweep cutoff in the `EvictExpiredOrders`, so the
+/// eviction is a pure function of the journal.
+///
+/// The `Gtd` deadline is chosen **far in the future** so the leaf's default
+/// wall-clock *admission* check always admits it (the documented leaf-clock gap only
+/// bites when a deadline straddles wall-clock time across runs); the sweep cutoff is
+/// past the deadline so the sweep fires.
+#[test]
+fn test_evict_expired_gtd_orders_replays_identically() {
+    let lineage = LineageId::new("run-evict-gtd");
+    // Far-future deadline (ms): always > the leaf wall clock, so always admitted.
+    let gtd_deadline = 9_000_000_000_000_u64;
+    let commands = vec![
+        // A GTC control order that is never evicted.
+        add(
+            &lineage,
+            0,
+            CALL,
+            "mm",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+        // A GTD order whose deadline is past the sweep cutoff below.
+        add(
+            &lineage,
+            1,
+            CALL,
+            "mm",
+            0x11,
+            Side::Sell,
+            50_100,
+            2,
+            TimeInForce::Gtd(gtd_deadline),
+        ),
+        // Sweep cutoff past the GTD deadline: the GTD order is evicted, the GTC is not.
+        VenueCommand::EvictExpiredOrders {
+            now_ms: EventTimestamp::new(gtd_deadline + 1_000),
+        },
+    ];
+    let recording = record(&commands, &lineage, &[sym(CALL)]);
+
+    // The GTD order's venue id (grammar id for its sequence) is the sole eviction.
+    let gtd_id = lineage.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0);
+    match &recording.events[2].outcome {
+        VenueOutcome::Evicted { evicted } => {
+            assert_eq!(evicted, &vec![gtd_id], "only the GTD order is evicted");
+        }
+        other => panic!("expected an Evicted sweep, got {other:?}"),
+    }
+
+    // Same journal ⇒ same events + top-of-book witness on replay.
+    let replayed = replay(&recording);
+    assert_replay_equals(&recording, &replayed);
+}
+
+/// **Blocked, not passing — the honest form of the `Day`/`Gtd`-admission
 /// determinism criterion.** `#[ignore]`d on purpose: with the pinned
 /// `option-chain-orderbook` 0.7.0 the venue **cannot** construct any hierarchy
 /// leaf with an injected venue clock (no `OptionOrderBook::with_clock`;
 /// `get_or_create_*` installs the default `MonotonicClock`; `OrderBook::set_clock`
-/// needs `&mut self` while leaves are `Arc`-shared), so `Day`/`GTD` *admission*
-/// still reads the leaf's wall clock and is **not** deterministic across runs.
-/// Asserting it identical would be a false green, so this test is not run. It is
-/// the ready-to-enable check for when the named upstream work lands (threading
-/// `Arc<dyn Clock>` through the managers); at that point drop the `#[ignore]` and
-/// it should pass unchanged ([02 §5.5b](../docs/02-matching-architecture.md#5-determinism)).
+/// needs `&mut self` while leaves are `Arc`-shared), so `Day`/`Gtd` *admission*
+/// still reads the leaf's wall clock and is **not** deterministic across runs
+/// (nor is `Day`-TIF eviction, whose deadline is a wall-clock-derived market close).
+/// The **explicit-deadline `Gtd` eviction** path IS deterministic and is covered by
+/// `test_evict_expired_gtd_orders_replays_identically`; this residual admission gap
+/// is the ready-to-enable check for when the named upstream work lands (threading
+/// `Arc<dyn Clock>` through the managers); at that point drop the `#[ignore]` and it
+/// should pass unchanged ([02 §5.5b](../docs/02-matching-architecture.md#5-determinism)).
 #[test]
 #[ignore = "blocked: option-chain-orderbook 0.7.0 does not thread Arc<dyn Clock> to leaf construction, \
             so Day/GTD TIF admission reads the leaf wall clock and is not deterministic across runs"]
@@ -1378,6 +1433,312 @@ fn test_day_gtd_admission_determinism_blocked_by_leaf_clock_gap() {
         first.events, second.events,
         "Day/GTD admission is identical across runs under an injected leaf clock"
     );
+}
+
+// ============================================================================
+// #47: the sequenced lifecycle + hierarchy control plane
+// ============================================================================
+
+/// A `SetInstrumentStatus` transition command.
+fn set_status(symbol: &str, status: InstrumentStatus) -> VenueCommand {
+    VenueCommand::SetInstrumentStatus {
+        symbol: sym(symbol),
+        status,
+    }
+}
+
+/// An order into a **halted** instrument is rejected on the sequenced path, and the
+/// same rejection replays identically — the halt is journaled state (a prior
+/// `SetInstrumentStatus`), so the gate is a deterministic function of the journal
+/// (#47).
+#[test]
+fn test_order_into_halted_instrument_is_rejected_and_replays() {
+    let lineage = LineageId::new("run-halt");
+    let commands = vec![
+        // Halt the call, then try to rest an order on it (rejected), then rest one on
+        // the (still Active) put to prove the gate is per-instrument.
+        set_status(CALL, InstrumentStatus::Halted),
+        add(
+            &lineage,
+            1,
+            CALL,
+            "mm",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            2,
+            PUT,
+            "mm",
+            0x11,
+            Side::Buy,
+            30_000,
+            2,
+            TimeInForce::Gtc,
+        ),
+    ];
+    let recording = record(&commands, &lineage, &[sym(CALL), sym(PUT)]);
+
+    // The halted-call add is a no-op Rejected; the put add rests.
+    match &recording.events[1].outcome {
+        VenueOutcome::Rejected { reason } => {
+            assert!(
+                reason.contains("Halted"),
+                "reason names the status: {reason}"
+            );
+        }
+        other => panic!("an order into a halted instrument must be Rejected, got {other:?}"),
+    }
+    assert!(matches!(
+        &recording.events[2].outcome,
+        VenueOutcome::Added {
+            resting_quantity: 2,
+            ..
+        }
+    ));
+    // The halted call never accepted an order — no bid/ask depth on it.
+    assert_eq!(
+        recording.tops.last().map(|row| row[0]),
+        Some(TopOfBook::default())
+    );
+
+    let replayed = replay(&recording);
+    assert_replay_equals(&recording, &replayed);
+}
+
+/// A Settling and an Expired instrument also refuse new orders — the whole
+/// non-`Active` set gates, replaying identically (#47).
+#[test]
+fn test_order_into_settling_or_expired_instrument_is_rejected_and_replays() {
+    let lineage = LineageId::new("run-settle-expire");
+    let commands = vec![
+        set_status(CALL, InstrumentStatus::Settling),
+        add(
+            &lineage,
+            1,
+            CALL,
+            "mm",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+        set_status(PUT, InstrumentStatus::Expired),
+        add(
+            &lineage,
+            3,
+            PUT,
+            "mm",
+            0x11,
+            Side::Buy,
+            30_000,
+            2,
+            TimeInForce::Gtc,
+        ),
+    ];
+    let recording = record(&commands, &lineage, &[sym(CALL), sym(PUT)]);
+    assert!(matches!(
+        &recording.events[1].outcome,
+        VenueOutcome::Rejected { .. }
+    ));
+    assert!(matches!(
+        &recording.events[3].outcome,
+        VenueOutcome::Rejected { .. }
+    ));
+    let replayed = replay(&recording);
+    assert_replay_equals(&recording, &replayed);
+}
+
+/// The full lifecycle `Active → Halted → Active → Settling → Expired` plus an
+/// illegal `Expired → Active` (rejected) replays to the identical event stream —
+/// the transition legality is delegated to the upstream state machine, and the
+/// venue registry is folded deterministically by re-execution (#47).
+#[test]
+fn test_instrument_status_lifecycle_replays_identically() {
+    let lineage = LineageId::new("run-lifecycle");
+    let commands = vec![
+        set_status(CALL, InstrumentStatus::Halted),
+        set_status(CALL, InstrumentStatus::Active), // resume (legal)
+        set_status(CALL, InstrumentStatus::Settling),
+        set_status(CALL, InstrumentStatus::Expired),
+        set_status(CALL, InstrumentStatus::Active), // Expired is terminal (illegal)
+    ];
+    let recording = record(&commands, &lineage, &[]);
+
+    // The four legal transitions applied; the terminal-escape is rejected.
+    for (index, expected) in [
+        InstrumentStatus::Halted,
+        InstrumentStatus::Active,
+        InstrumentStatus::Settling,
+        InstrumentStatus::Expired,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        match &recording.events[index].outcome {
+            VenueOutcome::InstrumentStatusChanged { status, .. } => assert_eq!(*status, expected),
+            other => panic!("event {index} must be a status change, got {other:?}"),
+        }
+    }
+    assert!(matches!(
+        &recording.events[4].outcome,
+        VenueOutcome::Rejected { .. }
+    ));
+
+    let replayed = replay(&recording);
+    assert_replay_equals(&recording, &replayed);
+}
+
+/// A hierarchy `MassCancel` sweeps the resting orders matching its scope + type,
+/// emits the ordered per-order affected list, and replays to the identical event
+/// stream + top-of-book witness — the affected list is sorted by venue order id,
+/// so it is a deterministic function of the journal (#47).
+#[test]
+fn test_mass_cancel_replays_identically() {
+    let lineage = LineageId::new("run-mass-cancel");
+    let commands = vec![
+        // Two resting sells + one resting buy on the call, and one on the put.
+        add(
+            &lineage,
+            0,
+            CALL,
+            "a",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            1,
+            CALL,
+            "b",
+            0x12,
+            Side::Sell,
+            50_100,
+            2,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            2,
+            CALL,
+            "c",
+            0x13,
+            Side::Buy,
+            49_900,
+            4,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            3,
+            PUT,
+            "d",
+            0x14,
+            Side::Buy,
+            30_000,
+            5,
+            TimeInForce::Gtc,
+        ),
+        // Cancel every SELL across the whole underlying (both call sells, not the buys).
+        VenueCommand::MassCancel {
+            scope: MassCancelScope::Underlying,
+            cancel_type: MassCancelType::BySide(Side::Sell),
+            account: AccountId::new("admin"),
+        },
+    ];
+    let recording = record(&commands, &lineage, &witnesses());
+
+    // Exactly the two call sells are swept, in venue-order-id sorted order.
+    let sell_0 = lineage.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0);
+    let sell_1 = lineage.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0);
+    match &recording.events[4].outcome {
+        VenueOutcome::MassCancelled { affected } => {
+            let ids: Vec<_> = affected.iter().map(|leg| leg.order_id.clone()).collect();
+            let mut expected = vec![sell_0, sell_1];
+            expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            assert_eq!(ids, expected, "only the two sells, sorted by venue id");
+            assert!(
+                affected
+                    .iter()
+                    .all(|leg| leg.reason == CancelReason::MassCancel)
+            );
+        }
+        other => panic!("expected a MassCancelled outcome, got {other:?}"),
+    }
+    // The call ask side is now empty; the buys survive.
+    let call_top = recording.tops.last().map(|row| row[0]).unwrap_or_default();
+    assert_eq!(call_top.best_ask, None, "both call sells were cancelled");
+    assert_eq!(
+        call_top.best_bid,
+        Some(Cents::new(49_900)),
+        "the call buy survives"
+    );
+
+    let replayed = replay(&recording);
+    assert_replay_equals(&recording, &replayed);
+}
+
+/// A per-`Book` `MassCancel` (`MassCancelType::All`) sweeps only the named leaf, and
+/// replays identically — proving the scope filter is journal-deterministic (#47).
+#[test]
+fn test_mass_cancel_book_scope_replays_identically() {
+    let lineage = LineageId::new("run-mass-cancel-book");
+    let commands = vec![
+        add(
+            &lineage,
+            0,
+            CALL,
+            "a",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            1,
+            PUT,
+            "b",
+            0x12,
+            Side::Buy,
+            30_000,
+            5,
+            TimeInForce::Gtc,
+        ),
+        VenueCommand::MassCancel {
+            scope: MassCancelScope::Book(sym(CALL)),
+            cancel_type: MassCancelType::All,
+            account: AccountId::new("admin"),
+        },
+    ];
+    let recording = record(&commands, &lineage, &witnesses());
+    let call_id = lineage.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0);
+    match &recording.events[2].outcome {
+        VenueOutcome::MassCancelled { affected } => {
+            assert_eq!(affected.len(), 1, "only the call leaf is swept");
+            assert_eq!(affected[0].order_id, call_id);
+        }
+        other => panic!("expected a MassCancelled outcome, got {other:?}"),
+    }
+    // The put (a different book) is untouched.
+    let put_top = recording.tops.last().map(|row| row[1]).unwrap_or_default();
+    assert_eq!(
+        put_top.best_bid,
+        Some(Cents::new(30_000)),
+        "the put is untouched"
+    );
+
+    let replayed = replay(&recording);
+    assert_replay_equals(&recording, &replayed);
 }
 
 /// Lint / grep GUARD (#028 acceptance): **no wall-clock read appears on the

@@ -2,7 +2,7 @@
 //! with three renderings of one failure.
 //!
 //! - **HTTP (REST/WS)** — [`VenueError::http_status`] maps each variant to
-//!   exactly one status (`404`/`400`/`401`/`403`/`429`/`500`), and
+//!   exactly one status (`404`/`400`/`401`/`403`/`409`/`429`/`500`), and
 //!   [`IntoResponse`] emits a typed [`ErrorEnvelope`] JSON body (never a
 //!   `serde_json::Value`) plus `X-RateLimit-*` context on `429`.
 //! - **FIX** — [`VenueError::fix_reject`] resolves, **by the inbound message
@@ -91,6 +91,18 @@ pub enum VenueError {
     /// HTTP `403`. Carries the **missing** [`Permission`].
     #[error("forbidden: missing permission {0:?}")]
     Forbidden(Permission),
+    /// An order targeted an instrument that is not `Active` (halted, settling, or
+    /// expired) and so is not accepting orders — the venue's sequenced
+    /// instrument-status gate (#47). HTTP `409` (the request conflicts with the
+    /// instrument's current lifecycle state). The carried string names the client's
+    /// own symbol + the refusing status and is safe to echo. This is the boundary
+    /// rendering of the sequenced [`crate::exchange::VenueOutcome::Rejected`] a
+    /// halted-instrument order is captured as on the order path; a gateway maps a
+    /// halt-reject outcome onto it once the `Receipt`→`VenueOutcome` surfacing seam
+    /// lands (until then the sequenced rejection is journaled and replays, and the
+    /// order-mutating route reports accepted-and-sequenced).
+    #[error("instrument not accepting orders: {0}")]
+    InstrumentHalted(String),
     /// The caller exceeded its rate-limit budget. HTTP `429` with
     /// `X-RateLimit-*` / `Retry-After` context.
     #[error("rate limited")]
@@ -199,6 +211,7 @@ impl VenueError {
             VenueError::InvalidOrder(_) => StatusCode::BAD_REQUEST,
             VenueError::Unauthorized => StatusCode::UNAUTHORIZED,
             VenueError::Forbidden(_) => StatusCode::FORBIDDEN,
+            VenueError::InstrumentHalted(_) => StatusCode::CONFLICT,
             VenueError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             VenueError::Overflow => StatusCode::INTERNAL_SERVER_ERROR,
             VenueError::SequenceExhausted => StatusCode::INTERNAL_SERVER_ERROR,
@@ -217,6 +230,7 @@ impl VenueError {
             VenueError::InvalidOrder(_) => "invalid_order",
             VenueError::Unauthorized => "unauthorized",
             VenueError::Forbidden(_) => "forbidden",
+            VenueError::InstrumentHalted(_) => "instrument_halted",
             VenueError::RateLimited => "throttled",
             VenueError::Overflow => "internal",
             VenueError::SequenceExhausted => "internal",
@@ -237,6 +251,9 @@ impl VenueError {
             VenueError::InvalidOrder(detail) => format!("invalid order: {detail}"),
             VenueError::Unauthorized => "unauthorized".to_string(),
             VenueError::Forbidden(permission) => format!("missing permission {permission:?}"),
+            VenueError::InstrumentHalted(detail) => {
+                format!("instrument not accepting orders: {detail}")
+            }
             VenueError::RateLimited => "rate limited".to_string(),
             VenueError::Overflow => REDACTED_INTERNAL_MESSAGE.to_string(),
             VenueError::SequenceExhausted => REDACTED_INTERNAL_MESSAGE.to_string(),
@@ -295,6 +312,7 @@ impl VenueError {
             VenueError::InvalidOrder(_) => FixRejectReason::Invalid,
             VenueError::Unauthorized => FixRejectReason::Authorization,
             VenueError::Forbidden(_) => FixRejectReason::Authorization,
+            VenueError::InstrumentHalted(_) => FixRejectReason::Invalid,
             VenueError::RateLimited => FixRejectReason::Throttle,
             VenueError::Overflow => FixRejectReason::Internal,
             VenueError::SequenceExhausted => FixRejectReason::Internal,
@@ -327,6 +345,7 @@ impl VenueError {
             VenueError::NotFound(_)
             | VenueError::InvalidOrder(_)
             | VenueError::Forbidden(_)
+            | VenueError::InstrumentHalted(_)
             | VenueError::Overflow
             | VenueError::SequenceExhausted
             | VenueError::JournalUnavailable
@@ -353,6 +372,9 @@ impl VenueError {
             VenueError::InvalidOrder(_) => (WsErrorCode::InvalidOrder, WsErrorCategory::Validation),
             VenueError::Unauthorized => (WsErrorCode::Unauthorized, WsErrorCategory::Authorization),
             VenueError::Forbidden(_) => (WsErrorCode::Forbidden, WsErrorCategory::Authorization),
+            VenueError::InstrumentHalted(_) => {
+                (WsErrorCode::InstrumentHalted, WsErrorCategory::Validation)
+            }
             VenueError::RateLimited => (WsErrorCode::Throttled, WsErrorCategory::Throttle),
             VenueError::Overflow => (WsErrorCode::Internal, WsErrorCategory::Internal),
             VenueError::SequenceExhausted => (WsErrorCode::Internal, WsErrorCategory::Internal),
@@ -386,6 +408,7 @@ impl IntoResponse for VenueError {
             | VenueError::InvalidOrder(_)
             | VenueError::Unauthorized
             | VenueError::Forbidden(_)
+            | VenueError::InstrumentHalted(_)
             | VenueError::Overflow
             | VenueError::SequenceExhausted
             | VenueError::JournalUnavailable
@@ -557,6 +580,9 @@ pub enum WsErrorCode {
     Unauthorized,
     /// The session lacks the required permission ([`VenueError::Forbidden`]).
     Forbidden,
+    /// An order targeted an instrument not accepting orders
+    /// ([`VenueError::InstrumentHalted`]).
+    InstrumentHalted,
     /// The caller is rate-limited ([`VenueError::RateLimited`]).
     Throttled,
     /// A referenced resource does not exist ([`VenueError::NotFound`]).
@@ -637,6 +663,7 @@ mod tests {
             VenueError::InvalidOrder("quantity must be positive".to_string()),
             VenueError::Unauthorized,
             VenueError::Forbidden(Permission::Trade),
+            VenueError::InstrumentHalted("BTC-20240329-50000-C is Halted".to_string()),
             VenueError::RateLimited,
             VenueError::Overflow,
             VenueError::SequenceExhausted,
@@ -713,6 +740,31 @@ mod tests {
         assert_eq!(err.redacted_message(), REDACTED_INTERNAL_MESSAGE);
         // Display carries the distinct cause for server-side logs.
         assert_eq!(err.to_string(), "sequence exhausted");
+    }
+
+    #[test]
+    fn test_venue_error_instrument_halted_maps_to_409_and_echoes_symbol() {
+        // The sequenced instrument-status gate's boundary rendering (#47): a halt
+        // reject is a 409 (a conflict with the instrument's lifecycle state), with a
+        // stable machine code and a client-safe message that echoes the symbol/status.
+        let err = VenueError::InstrumentHalted("BTC-20240329-50000-C is Halted".to_string());
+        assert_eq!(err.http_status(), StatusCode::CONFLICT);
+        assert_eq!(err.machine_code(), "instrument_halted");
+        assert_eq!(
+            err.redacted_message(),
+            "instrument not accepting orders: BTC-20240329-50000-C is Halted"
+        );
+        // FIX: a business-validation reject on whichever context is processing it.
+        assert_eq!(
+            err.fix_reject(FixRejectContext::NewOrder).reason,
+            FixRejectReason::Invalid
+        );
+        // WS: a non-terminal, non-retryable validation error.
+        let env = err.ws_error(None);
+        assert_eq!(env.code, WsErrorCode::InstrumentHalted);
+        assert_eq!(env.category, WsErrorCategory::Validation);
+        assert!(!env.terminal);
+        assert!(!env.retryable);
     }
 
     #[test]
