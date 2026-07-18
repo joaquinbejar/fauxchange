@@ -51,7 +51,7 @@ use serde::Deserialize;
 use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tokio::time::MissedTickBehavior;
 
-use crate::auth::{Admission, Claims, PeerAddr, RateLimitKey};
+use crate::auth::{Admission, Claims, PeerAddr, RateLimitKey, RateLimitTier};
 use crate::error::{VenueError, WsError};
 use crate::exchange::{EventTimestamp, Symbol, VenueCommand};
 use crate::models::{
@@ -559,6 +559,7 @@ impl Connection {
         let key = RateLimitKey::Account {
             account: self.claims.account().clone(),
             revocation_epoch: self.claims.revocation_epoch,
+            tier: RateLimitTier::from_permissions(&self.claims.permissions),
         };
         let decision = state.auth().rate_limiter().check_and_record_status(&key);
         if !decision.allowed {
@@ -746,6 +747,7 @@ impl Connection {
         let key = RateLimitKey::Account {
             account: self.claims.account().clone(),
             revocation_epoch: self.claims.revocation_epoch,
+            tier: RateLimitTier::from_permissions(&self.claims.permissions),
         };
         let decision = state.auth().rate_limiter().check_and_record_status(&key);
         if !decision.allowed {

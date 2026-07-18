@@ -650,6 +650,146 @@ impl RateLimitClock for FixedClock {
 }
 
 // ============================================================================
+// RateLimitTier + RateLimitBudgets — the per-tier venue rate-limit config (#046)
+// ============================================================================
+
+/// The rate-limit **tier** — an authenticated principal's effective permission
+/// level (or [`RateLimitTier::Read`] for an unauthenticated peer), selecting which
+/// per-window budget from [`RateLimitBudgets`] applies
+/// ([05 §5](../docs/05-microstructure-config.md#5-rate-limits)).
+///
+/// The tier is a **stable** property of the account — its highest held permission
+/// under the `Read ⊂ Trade ⊂ Admin` order (the same total order
+/// [`Permission::grants`] enforces) — so one account keeps **one** budget across
+/// every surface (REST/WS/FIX): the "one `AccountId`, one budget" contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum RateLimitTier {
+    /// Read-only access — also the unauthenticated peer-IP fallback tier (the most
+    /// restrictive budget for a caller with no resolved permissions).
+    Read,
+    /// Trade access (implies `Read`).
+    Trade,
+    /// Admin access (implies `Trade` + `Read`).
+    Admin,
+}
+
+impl RateLimitTier {
+    /// The tier a single [`Permission`] maps to.
+    #[must_use]
+    #[inline]
+    const fn of(permission: Permission) -> Self {
+        match permission {
+            Permission::Admin => RateLimitTier::Admin,
+            Permission::Trade => RateLimitTier::Trade,
+            Permission::Read => RateLimitTier::Read,
+        }
+    }
+
+    /// The tier for a permission set — the **highest** permission held under
+    /// `Read ⊂ Trade ⊂ Admin`, or [`RateLimitTier::Read`] when the set is empty
+    /// (every principal at least reads).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fauxchange::auth::RateLimitTier;
+    /// use fauxchange::models::Permission;
+    /// assert_eq!(
+    ///     RateLimitTier::from_permissions(&[Permission::Read, Permission::Admin]),
+    ///     RateLimitTier::Admin
+    /// );
+    /// assert_eq!(RateLimitTier::from_permissions(&[]), RateLimitTier::Read);
+    /// ```
+    #[must_use]
+    pub fn from_permissions(permissions: &[Permission]) -> Self {
+        permissions
+            .iter()
+            .map(|held| RateLimitTier::of(*held))
+            .max()
+            .unwrap_or(RateLimitTier::Read)
+    }
+}
+
+/// The per-tier request budgets and the sliding window the [`RateLimiter`]
+/// enforces — the resolved shape of the `[rate_limits]` venue config
+/// ([05 §5](../docs/05-microstructure-config.md#5-rate-limits)). Each budget is a
+/// **count** of admissions per `window_ms`, never money.
+///
+/// Built by [`crate::config::RateLimitConfig::to_budgets`] at boot; the
+/// [`RateLimitBudgets::uniform`] shape (all tiers equal) is the pre-#046 default
+/// until `[rate_limits]` is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitBudgets {
+    window_ms: u64,
+    read: u32,
+    trade: u32,
+    admin: u32,
+}
+
+impl RateLimitBudgets {
+    /// Explicit per-tier budgets over `window_ms` (**milliseconds**).
+    #[must_use]
+    #[inline]
+    pub const fn new(window_ms: u64, read: u32, trade: u32, admin: u32) -> Self {
+        Self {
+            window_ms,
+            read,
+            trade,
+            admin,
+        }
+    }
+
+    /// A **uniform** budget across every tier over the venue's 60 s window
+    /// ([`RATE_LIMIT_WINDOW_MS`]) — the pre-#046 single-limit shape, and the
+    /// default until `[rate_limits]` is configured.
+    #[must_use]
+    #[inline]
+    pub const fn uniform(limit: u32) -> Self {
+        Self::new(RATE_LIMIT_WINDOW_MS, limit, limit, limit)
+    }
+
+    /// The sliding window, in **milliseconds**.
+    #[must_use]
+    #[inline]
+    pub const fn window_ms(&self) -> u64 {
+        self.window_ms
+    }
+
+    /// The per-window budget for `tier`.
+    #[must_use]
+    #[inline]
+    pub const fn limit_for(&self, tier: RateLimitTier) -> u32 {
+        match tier {
+            RateLimitTier::Read => self.read,
+            RateLimitTier::Trade => self.trade,
+            RateLimitTier::Admin => self.admin,
+        }
+    }
+
+    /// The `Read`-tier per-window budget.
+    #[must_use]
+    #[inline]
+    pub const fn read(&self) -> u32 {
+        self.read
+    }
+
+    /// The `Trade`-tier per-window budget.
+    #[must_use]
+    #[inline]
+    pub const fn trade(&self) -> u32 {
+        self.trade
+    }
+
+    /// The `Admin`-tier per-window budget.
+    #[must_use]
+    #[inline]
+    pub const fn admin(&self) -> u32 {
+        self.admin
+    }
+}
+
+// ============================================================================
 // RateLimiter
 // ============================================================================
 
@@ -662,16 +802,39 @@ impl RateLimitClock for FixedClock {
 /// buckets **separately** from a freshly re-authenticated session, so a
 /// post-compromise holder of a stale token cannot drain the budget the owner's
 /// current session needs ([01 §8](../docs/01-domain-model.md#8-accounts-and-sessions)).
+///
+/// The [`RateLimitTier`] rides on the authenticated key so the applicable
+/// per-window budget is a function of the principal's identity (its highest held
+/// permission). Because the tier is **stable** for an account, it never splits an
+/// account's budget — it selects which [`RateLimitBudgets`] tier applies. A peer
+/// (unauthenticated) key always resolves to the restrictive [`RateLimitTier::Read`]
+/// budget.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RateLimitKey {
-    /// Keyed on the authenticated account **and** its token's revocation epoch.
+    /// Keyed on the authenticated account **and** its token's revocation epoch,
+    /// carrying the account's rate-limit tier.
     Account {
         /// The authenticated account.
         account: AccountId,
         /// The token's revocation epoch (stale-epoch tokens bucket apart).
         revocation_epoch: u64,
+        /// The account's rate-limit tier (its highest held permission) — selects
+        /// the applicable per-window budget, stable for the account.
+        ///
+        /// INVARIANT (one `AccountId`, one budget): the tier rides in the key's
+        /// `Hash`/`Eq`, so this does **not** split an account's budget only
+        /// because the tier is a function of `(account, revocation_epoch)` — every
+        /// token/logon derives its permissions from the account registry's
+        /// canonical, immutable set (`AccountRegistry::mint_for_account` / the FIX
+        /// logon path), never from caller-supplied claims. A future feature that
+        /// mutates an account's permissions **within** an epoch, or issues
+        /// subset-scoped tokens, MUST bump `revocation_epoch` (or derive the tier
+        /// from the registry at check time) or the same account would key into two
+        /// buckets and defeat this contract silently.
+        tier: RateLimitTier,
     },
-    /// Keyed on the peer IP (unauthenticated fallback, never `/health`).
+    /// Keyed on the peer IP (unauthenticated fallback, never `/health`) — always
+    /// the [`RateLimitTier::Read`] budget.
     Peer(IpAddr),
 }
 
@@ -726,8 +889,7 @@ impl RateLimitDecision {
 /// [`sweep_expired`]: RateLimiter::sweep_expired
 pub struct RateLimiter<C> {
     clock: C,
-    limit: u32,
-    window_ms: u64,
+    budgets: RateLimitBudgets,
     max_keys: usize,
     windows: DashMap<RateLimitKey, Vec<u64>>,
 }
@@ -735,8 +897,7 @@ pub struct RateLimiter<C> {
 impl<C> std::fmt::Debug for RateLimiter<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RateLimiter")
-            .field("limit", &self.limit)
-            .field("window_ms", &self.window_ms)
+            .field("budgets", &self.budgets)
             .field("max_keys", &self.max_keys)
             .field("tracked_keys", &self.windows.len())
             .finish_non_exhaustive()
@@ -744,39 +905,72 @@ impl<C> std::fmt::Debug for RateLimiter<C> {
 }
 
 impl<C: RateLimitClock> RateLimiter<C> {
-    /// Builds a limiter with the venue's 60 s window ([`RATE_LIMIT_WINDOW_MS`]),
-    /// the given per-window budget, and the default key-space ceiling
-    /// ([`DEFAULT_MAX_RATE_LIMIT_KEYS`]).
+    /// Builds a limiter with the venue's 60 s window ([`RATE_LIMIT_WINDOW_MS`]), a
+    /// **uniform** per-tier budget, and the default key-space ceiling
+    /// ([`DEFAULT_MAX_RATE_LIMIT_KEYS`]). The per-tier venue config is applied via
+    /// [`with_budgets`](Self::with_budgets) (#046).
     #[must_use]
     pub fn new(clock: C, limit: u32) -> Self {
         Self::with_window(clock, limit, RATE_LIMIT_WINDOW_MS)
     }
 
-    /// Builds a limiter with an explicit window and the default key-space ceiling
-    /// (used by tests; production uses [`RATE_LIMIT_WINDOW_MS`]).
+    /// Builds a limiter with an explicit window, a **uniform** per-tier budget, and
+    /// the default key-space ceiling (used by tests; production uses
+    /// [`with_budgets`](Self::with_budgets)).
     #[must_use]
     pub fn with_window(clock: C, limit: u32, window_ms: u64) -> Self {
         Self::with_capacity(clock, limit, window_ms, DEFAULT_MAX_RATE_LIMIT_KEYS)
     }
 
-    /// Builds a limiter with an explicit window **and** key-space ceiling. The
-    /// ceiling is clamped to at least `1`.
+    /// Builds a limiter with an explicit window and key-space ceiling and a
+    /// **uniform** per-tier budget. The ceiling is clamped to at least `1`.
     #[must_use]
     pub fn with_capacity(clock: C, limit: u32, window_ms: u64, max_keys: usize) -> Self {
+        Self::with_budgets_and_capacity(
+            clock,
+            RateLimitBudgets::new(window_ms, limit, limit, limit),
+            max_keys,
+        )
+    }
+
+    /// Builds a limiter with explicit **per-tier** [`RateLimitBudgets`] and the
+    /// default key-space ceiling — the #046 venue-config path.
+    #[must_use]
+    pub fn with_budgets(clock: C, budgets: RateLimitBudgets) -> Self {
+        Self::with_budgets_and_capacity(clock, budgets, DEFAULT_MAX_RATE_LIMIT_KEYS)
+    }
+
+    /// Builds a limiter with explicit per-tier [`RateLimitBudgets`] **and** a
+    /// key-space ceiling (clamped to at least `1`) — the fully-explicit constructor
+    /// every other constructor funnels through.
+    #[must_use]
+    pub fn with_budgets_and_capacity(clock: C, budgets: RateLimitBudgets, max_keys: usize) -> Self {
         Self {
             clock,
-            limit,
-            window_ms,
+            budgets,
             max_keys: max_keys.max(1),
             windows: DashMap::new(),
         }
     }
 
-    /// The per-window budget.
+    /// The resolved per-tier budgets (window + Read/Trade/Admin limits).
     #[must_use]
     #[inline]
-    pub fn limit(&self) -> u32 {
-        self.limit
+    pub fn budgets(&self) -> RateLimitBudgets {
+        self.budgets
+    }
+
+    /// The applicable per-window budget for `key` — the tier's limit for an
+    /// authenticated account, or the [`RateLimitTier::Read`] budget for an
+    /// unauthenticated peer.
+    #[must_use]
+    #[inline]
+    fn limit_for_key(&self, key: &RateLimitKey) -> u32 {
+        let tier = match key {
+            RateLimitKey::Account { tier, .. } => *tier,
+            RateLimitKey::Peer(_) => RateLimitTier::Read,
+        };
+        self.budgets.limit_for(tier)
     }
 
     /// The key-space ceiling (the DoS bound on the number of tracked buckets).
@@ -800,12 +994,16 @@ impl<C: RateLimitClock> RateLimiter<C> {
     #[must_use]
     pub fn check_and_record_status(&self, key: &RateLimitKey) -> RateLimitDecision {
         let now = self.clock.now_ms();
+        // The per-window budget is a function of the key's tier (#046): an account
+        // gets its tier's budget, a peer the restrictive Read budget.
+        let limit = self.limit_for_key(key);
+        let window_ms = self.budgets.window_ms;
 
         // Fast path: an existing key always proceeds (no capacity concern). The
         // shard guard is held only across the pure `decide` computation — no map
         // access inside it, so no lock is held across another map operation.
         if let Some(mut timestamps) = self.windows.get_mut(key) {
-            return self.decide(&mut timestamps, now);
+            return Self::decide(&mut timestamps, now, limit, window_ms);
         }
 
         // Would-be NEW key: enforce the key-space ceiling (DoS control). No shard
@@ -813,12 +1011,12 @@ impl<C: RateLimitClock> RateLimiter<C> {
         if self.windows.len() >= self.max_keys {
             self.sweep_expired();
             if self.windows.len() >= self.max_keys {
-                return self.denied_capacity(now);
+                return Self::denied_capacity(now, limit, window_ms);
             }
         }
 
         let mut timestamps = self.windows.entry(key.clone()).or_default();
-        self.decide(&mut timestamps, now)
+        Self::decide(&mut timestamps, now, limit, window_ms)
     }
 
     /// Prunes the expired timestamps for one bucket, then admits (recording the
@@ -830,9 +1028,13 @@ impl<C: RateLimitClock> RateLimiter<C> {
     /// overflow), so clippy's `manual_saturating_arithmetic` suggestion — which
     /// would reintroduce them — is allowed here.
     #[allow(clippy::manual_saturating_arithmetic)]
-    fn decide(&self, timestamps: &mut Vec<u64>, now: u64) -> RateLimitDecision {
-        let window_ms = self.window_ms;
-        let limit = u64::from(self.limit);
+    fn decide(
+        timestamps: &mut Vec<u64>,
+        now: u64,
+        limit_u32: u32,
+        window_ms: u64,
+    ) -> RateLimitDecision {
+        let limit = u64::from(limit_u32);
 
         // Drop timestamps older than the window (age >= window_ms). A timestamp in
         // the future (clock skew) is kept — it is trivially within the window.
@@ -854,7 +1056,7 @@ impl<C: RateLimitClock> RateLimiter<C> {
             let remaining = limit.checked_sub(used + 1).unwrap_or(0);
             RateLimitDecision {
                 allowed: true,
-                limit: self.limit,
+                limit: limit_u32,
                 remaining: u32::try_from(remaining).unwrap_or(u32::MAX),
                 reset_ms,
                 retry_after_ms: None,
@@ -865,7 +1067,7 @@ impl<C: RateLimitClock> RateLimiter<C> {
             let retry_after_ms = reset_ms.checked_sub(now).unwrap_or(0);
             RateLimitDecision {
                 allowed: false,
-                limit: self.limit,
+                limit: limit_u32,
                 remaining: 0,
                 reset_ms,
                 retry_after_ms: Some(retry_after_ms),
@@ -876,14 +1078,14 @@ impl<C: RateLimitClock> RateLimiter<C> {
     /// The fail-closed throttle for a new key refused at the `max_keys` ceiling —
     /// the request is denied without being tracked (the key-space cannot grow).
     #[allow(clippy::manual_saturating_arithmetic)]
-    fn denied_capacity(&self, now: u64) -> RateLimitDecision {
-        let reset_ms = now.checked_add(self.window_ms).unwrap_or(u64::MAX);
+    fn denied_capacity(now: u64, limit: u32, window_ms: u64) -> RateLimitDecision {
+        let reset_ms = now.checked_add(window_ms).unwrap_or(u64::MAX);
         RateLimitDecision {
             allowed: false,
-            limit: self.limit,
+            limit,
             remaining: 0,
             reset_ms,
-            retry_after_ms: Some(self.window_ms),
+            retry_after_ms: Some(window_ms),
         }
     }
 
@@ -891,7 +1093,7 @@ impl<C: RateLimitClock> RateLimiter<C> {
     /// gateway (#012/#013), never on the request path.
     pub fn sweep_expired(&self) {
         let now = self.clock.now_ms();
-        let window_ms = self.window_ms;
+        let window_ms = self.budgets.window_ms;
         self.windows.retain(|_key, timestamps| {
             timestamps.retain(
                 |&recorded| matches!(now.checked_sub(recorded), Some(age) if age < window_ms),
@@ -1785,6 +1987,10 @@ impl<C: RateLimitClock> AuthService<C> {
             Some(claims) => RateLimitKey::Account {
                 account: claims.sub.clone(),
                 revocation_epoch: claims.revocation_epoch,
+                // The account's tier (its highest held permission) selects the
+                // per-window budget (#046) — stable for the account, so it never
+                // splits its one budget across surfaces.
+                tier: RateLimitTier::from_permissions(&claims.permissions),
             },
             None => RateLimitKey::Peer(peer),
         };
@@ -2471,11 +2677,22 @@ mod tests {
 
     // ---- rate limiter units ----------------------------------------------
 
-    /// An authenticated bucket key for `account` at revocation epoch `0`.
+    /// An authenticated bucket key for `account` at revocation epoch `0`, at the
+    /// `Read` tier (the uniform-budget test limiters treat every tier alike).
     fn acct_key(account: &str) -> RateLimitKey {
         RateLimitKey::Account {
             account: AccountId::new(account),
             revocation_epoch: 0,
+            tier: RateLimitTier::Read,
+        }
+    }
+
+    /// An authenticated bucket key for `account` at `tier`.
+    fn acct_key_tier(account: &str, tier: RateLimitTier) -> RateLimitKey {
+        RateLimitKey::Account {
+            account: AccountId::new(account),
+            revocation_epoch: 0,
+            tier,
         }
     }
 
@@ -2497,6 +2714,83 @@ mod tests {
         let denied = limiter.check_and_record_status(&key);
         assert!(!denied.allowed);
         assert_eq!(denied.remaining, 0);
+    }
+
+    #[test]
+    fn test_rate_limiter_blocks_after_window_exceeded() {
+        // The mandated #046 unit: a burst up to the per-window budget is admitted,
+        // the next request in the same window is blocked (429-eligible), and the
+        // budget frees once the venue clock advances past the window.
+        let clock = TestClock::new(0);
+        let limiter = RateLimiter::new(clock.clone(), 2);
+        let key = acct_key("flooder");
+
+        assert!(limiter.check_and_record_status(&key).allowed);
+        assert!(limiter.check_and_record_status(&key).allowed);
+        let blocked = limiter.check_and_record_status(&key);
+        assert!(
+            !blocked.allowed,
+            "the request past the window budget is blocked"
+        );
+        assert_eq!(blocked.remaining, 0);
+        assert_eq!(blocked.limit, 2);
+        assert!(blocked.retry_after_ms.is_some());
+
+        // Advance strictly past the window: the two admissions age out, budget frees.
+        clock.set(RATE_LIMIT_WINDOW_MS);
+        assert!(limiter.check_and_record_status(&key).allowed);
+    }
+
+    #[test]
+    fn test_rate_limit_tier_from_permissions_picks_highest() {
+        assert_eq!(RateLimitTier::from_permissions(&[]), RateLimitTier::Read);
+        assert_eq!(
+            RateLimitTier::from_permissions(&[Permission::Read]),
+            RateLimitTier::Read
+        );
+        assert_eq!(
+            RateLimitTier::from_permissions(&[Permission::Read, Permission::Trade]),
+            RateLimitTier::Trade
+        );
+        assert_eq!(
+            RateLimitTier::from_permissions(&[Permission::Read, Permission::Admin]),
+            RateLimitTier::Admin
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_enforces_per_tier_budgets() {
+        // Per-tier budgets: Read=1, Trade=2, Admin=3 over the venue window. The
+        // SAME account keyed at each tier gets exactly that tier's budget — a
+        // separate account per tier so buckets do not interfere.
+        let clock = TestClock::new(0);
+        let budgets = RateLimitBudgets::new(RATE_LIMIT_WINDOW_MS, 1, 2, 3);
+        let limiter = RateLimiter::with_budgets(clock, budgets);
+
+        // Read tier: exactly one admission.
+        let read = acct_key_tier("reader", RateLimitTier::Read);
+        assert!(limiter.check_and_record_status(&read).allowed);
+        assert!(!limiter.check_and_record_status(&read).allowed);
+
+        // Trade tier: two admissions.
+        let trade = acct_key_tier("trader", RateLimitTier::Trade);
+        assert!(limiter.check_and_record_status(&trade).allowed);
+        assert!(limiter.check_and_record_status(&trade).allowed);
+        assert!(!limiter.check_and_record_status(&trade).allowed);
+
+        // Admin tier: three admissions, and the header limit reflects the tier.
+        let admin = acct_key_tier("admin", RateLimitTier::Admin);
+        for _ in 0..3 {
+            let decision = limiter.check_and_record_status(&admin);
+            assert!(decision.allowed);
+            assert_eq!(decision.limit, 3);
+        }
+        assert!(!limiter.check_and_record_status(&admin).allowed);
+
+        // An unauthenticated peer resolves to the restrictive Read budget (1).
+        let peer = peer_key(9);
+        assert!(limiter.check_and_record_status(&peer).allowed);
+        assert!(!limiter.check_and_record_status(&peer).allowed);
     }
 
     #[test]

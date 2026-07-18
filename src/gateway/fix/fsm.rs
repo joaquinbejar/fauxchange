@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 
 use ironfix_core::types::{CompId, SeqNum};
 
-use crate::auth::{AccountStore, RateLimitKey, RevocationOracle};
+use crate::auth::{AccountStore, RateLimitKey, RateLimitTier, RevocationOracle};
 use crate::error::{FixReject, FixRejectContext, VenueError};
 use crate::exchange::{Cents, Symbol, SymbolParser, TimeInForce as SeamTif};
 use crate::gateway::rest::support::{
@@ -1954,6 +1954,10 @@ impl VenueFixSession {
             .check_and_record_status(&RateLimitKey::Account {
                 account,
                 revocation_epoch: self.fsm.session_epoch,
+                // The bound account's tier (#046) — the same per-window budget the
+                // REST/WS surfaces resolve for this account, so throttling is
+                // identical across surfaces.
+                tier: RateLimitTier::from_permissions(&self.fsm.permissions),
             })
             .allowed
     }

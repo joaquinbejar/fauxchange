@@ -22,7 +22,7 @@ mod specs;
 mod stp;
 
 pub use apply::apply_to_underlying;
-pub use config::{FileMicrostructure, MicrostructureConfig};
+pub use config::{FileMicrostructure, MicrostructureConfig, MicrostructureProfile};
 pub use error::{LatencyConfigError, MicrostructureConfigError, PriceBoundError};
 pub use fees::FeeConfig;
 pub use latency::{FileLatency, LatencyConfig, LatencyModel, LatencyOffset};

@@ -71,7 +71,8 @@ use tokio::time::MissedTickBehavior;
 
 use crate::auth::{
     AccountProvision, AccountRegistry, AccountStore, Argon2Hasher, AuthError, AuthService,
-    BootstrapGate, DEFAULT_RATE_LIMIT_PER_WINDOW, JwtAuth, RateLimiter, RevocationOracle,
+    BootstrapGate, DEFAULT_RATE_LIMIT_PER_WINDOW, JwtAuth, RateLimitBudgets, RateLimiter,
+    RevocationOracle,
 };
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
@@ -176,8 +177,10 @@ pub struct AuthConfig {
     pub pepper: Option<Vec<u8>>,
     /// The accounts to provision into the registry at construction.
     pub accounts: Vec<AccountProvision>,
-    /// The per-window rate-limit budget.
-    pub rate_limit_per_window: u32,
+    /// The per-tier rate-limit budgets and window (#046). Defaults to a uniform
+    /// [`DEFAULT_RATE_LIMIT_PER_WINDOW`] budget across every tier; the venue config
+    /// (`[rate_limits]`) overrides it via [`AuthConfig::with_rate_limit_budgets`].
+    pub rate_limit: RateLimitBudgets,
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -192,7 +195,7 @@ impl std::fmt::Debug for AuthConfig {
             )
             .field("pepper", &self.pepper.as_ref().map(|_| "<redacted>"))
             .field("accounts", &self.accounts.len())
-            .field("rate_limit_per_window", &self.rate_limit_per_window)
+            .field("rate_limit", &self.rate_limit)
             .finish()
     }
 }
@@ -207,7 +210,7 @@ impl AuthConfig {
             bootstrap_secret: None,
             pepper: None,
             accounts: Vec::new(),
-            rate_limit_per_window: DEFAULT_RATE_LIMIT_PER_WINDOW,
+            rate_limit: RateLimitBudgets::uniform(DEFAULT_RATE_LIMIT_PER_WINDOW),
         }
     }
 
@@ -243,10 +246,19 @@ impl AuthConfig {
         self
     }
 
-    /// Overrides the per-window rate-limit budget.
+    /// Overrides the rate-limit budget with a **uniform** per-window limit across
+    /// every tier (the pre-#046 single-limit shape).
     #[must_use]
     pub fn with_rate_limit(mut self, per_window: u32) -> Self {
-        self.rate_limit_per_window = per_window;
+        self.rate_limit = RateLimitBudgets::uniform(per_window);
+        self
+    }
+
+    /// Overrides the rate-limit budget with explicit **per-tier**
+    /// [`RateLimitBudgets`] — the #046 venue-config path (`[rate_limits]`).
+    #[must_use]
+    pub fn with_rate_limit_budgets(mut self, budgets: RateLimitBudgets) -> Self {
+        self.rate_limit = budgets;
         self
     }
 }
@@ -638,7 +650,7 @@ impl AppState {
             bootstrap_secret,
             pepper,
             accounts,
-            rate_limit_per_window,
+            rate_limit,
         } = match auth {
             Some(auth) => auth,
             None => AuthConfig::dev()?,
@@ -650,7 +662,9 @@ impl AppState {
         let revocation: Arc<dyn RevocationOracle> = account_registry.clone();
         let auth_service = AuthService::new(
             jwt,
-            RateLimiter::new(clock.clone(), rate_limit_per_window),
+            // The per-tier venue rate-limit budgets (#046) on the shared venue
+            // clock, so throttling replays deterministically.
+            RateLimiter::with_budgets(clock.clone(), rate_limit),
             revocation,
         );
         let bootstrap_gate = BootstrapGate::new(bootstrap_secret);

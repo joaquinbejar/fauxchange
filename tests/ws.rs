@@ -149,6 +149,78 @@ fn raw_handshake(addr: SocketAddr, path: &str, bearer: Option<&str>) -> u16 {
         .unwrap_or(0)
 }
 
+/// Sends one raw HTTP `GET` with an optional bearer and returns the HTTP status
+/// code — the REST sibling of [`raw_handshake`], driven over the **same** bound
+/// server so a REST call and a WS handshake share one venue (and one rate-limit
+/// budget). Runs on a blocking thread (a plain `std::net::TcpStream`).
+fn raw_get(addr: SocketAddr, path: &str, bearer: Option<&str>) -> u16 {
+    let mut stream = match std::net::TcpStream::connect(addr) {
+        Ok(stream) => stream,
+        Err(e) => panic!("connect must succeed: {e}"),
+    };
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Connection: close\r\n"
+    );
+    if let Some(token) = bearer {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    if let Err(e) = stream.write_all(request.as_bytes()) {
+        panic!("write must succeed: {e}");
+    }
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buffer = [0u8; 512];
+    let read = stream.read(&mut buffer).unwrap_or(0);
+    let response = String::from_utf8_lossy(&buffer[..read]);
+    response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn test_throttling_parity_one_budget_across_rest_and_ws() {
+    // Control/observation parity of throttling (#046): an authenticated account has
+    // ONE budget across surfaces. Budget = 2 on the fixed venue clock → two REST
+    // reads consume it, then the WS handshake for the SAME account is throttled
+    // (`429`) from the same shared budget. Both hit one bound server.
+    let state = venue(2);
+    let bearer = token(&state, "reader-1");
+    let addr = spawn_server(Arc::clone(&state)).await;
+
+    // Two REST reads exhaust the reader's whole per-window budget.
+    for i in 0..2u8 {
+        let bearer = bearer.clone();
+        let status = match tokio::task::spawn_blocking(move || {
+            raw_get(addr, "/api/v1/stats", Some(&bearer))
+        })
+        .await
+        {
+            Ok(status) => status,
+            Err(e) => panic!("client task panicked: {e}"),
+        };
+        assert_eq!(status, 200, "REST read {i} is within the shared budget");
+    }
+
+    // The WS handshake for the SAME account draws the SAME (now-exhausted) budget.
+    let status = match tokio::task::spawn_blocking(move || {
+        raw_handshake(addr, "/ws", Some(&bearer))
+    })
+    .await
+    {
+        Ok(status) => status,
+        Err(e) => panic!("client task panicked: {e}"),
+    };
+    assert_eq!(
+        status, 429,
+        "the WS handshake shares the account's one REST/WS budget (throttling parity)"
+    );
+}
+
 #[tokio::test]
 async fn test_ws_handshake_without_token_refuses_upgrade_401() {
     let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
