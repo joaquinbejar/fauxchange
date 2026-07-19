@@ -271,6 +271,22 @@ impl MatchingExecutor {
         }
     }
 
+    /// Whether `account` owns the resting order with engine id `engine_id` — the
+    /// ownership gate every cancel and replace passes **before** mutating the book
+    /// (Copilot PR #62 SECURITY). Grounded in the journaled resting-owner registry
+    /// ([`RestingRecord::account`], folded from the add commands), so the check is
+    /// deterministic and replay-stable — no wall-clock, no RNG, a point lookup.
+    ///
+    /// Fails **closed**: a missing registry entry (the two maps are kept in
+    /// lockstep, so this is an invariant violation) returns `false` rather than
+    /// grant a mutation the caller cannot be proven to own.
+    #[must_use]
+    fn account_owns(&self, engine_id: OrderId, account: &AccountId) -> bool {
+        self.resting
+            .get(&engine_id)
+            .is_some_and(|record| &record.account == account)
+    }
+
     // ---- command handlers -----------------------------------------------
 
     /// Routes an `AddOrder` onto the limit or market leaf path.
@@ -587,8 +603,21 @@ impl MatchingExecutor {
         }
     }
 
-    /// Cancels a resting order by its venue order id.
-    fn execute_cancel(&mut self, symbol: &Symbol, venue_order_id: &VenueOrderId) -> VenueOutcome {
+    /// Cancels a resting order by its venue order id, **only** when the requesting
+    /// `account` owns it.
+    ///
+    /// Account ownership is enforced on the shared sequenced path — **before** any
+    /// book mutation — so REST/WS/FIX all inherit it: a cancel from an account that
+    /// is not the resting order's owner is rejected without touching the book, so
+    /// no authenticated account can cancel another account's order (Copilot PR #62
+    /// SECURITY). The rejection is a captured [`VenueOutcome::Rejected`], which the
+    /// single-writer actor journals as this sequence's event.
+    fn execute_cancel(
+        &mut self,
+        symbol: &Symbol,
+        venue_order_id: &VenueOrderId,
+        account: &AccountId,
+    ) -> VenueOutcome {
         let leaf = match self.resolve_leaf_read(symbol) {
             Some(leaf) => leaf,
             None => {
@@ -597,30 +626,58 @@ impl MatchingExecutor {
                 };
             }
         };
-        match self.venue_to_engine.get(venue_order_id).copied() {
-            Some(engine_id) => match leaf.cancel_order(engine_id) {
-                Ok(true) => {
-                    self.remove_resting(engine_id);
-                    VenueOutcome::Cancelled {
-                        order_id: venue_order_id.clone(),
-                    }
+        let engine_id = match self.venue_to_engine.get(venue_order_id).copied() {
+            Some(engine_id) => engine_id,
+            None => {
+                return VenueOutcome::Rejected {
+                    reason: "order not found".to_string(),
+                };
+            }
+        };
+        // Ownership gate, BEFORE any mutation: the requesting account must own the
+        // resting order, or the cancel is refused with the book untouched.
+        if !self.account_owns(engine_id, account) {
+            return VenueOutcome::Rejected {
+                reason: NOT_ORDER_OWNER_REASON.to_string(),
+            };
+        }
+        match leaf.cancel_order(engine_id) {
+            Ok(true) => {
+                self.remove_resting(engine_id);
+                VenueOutcome::Cancelled {
+                    order_id: venue_order_id.clone(),
                 }
-                Ok(false) => VenueOutcome::Rejected {
-                    reason: "order is not resting".to_string(),
-                },
-                Err(error) => VenueOutcome::Rejected {
-                    reason: error.to_string(),
-                },
+            }
+            Ok(false) => VenueOutcome::Rejected {
+                reason: "order is not resting".to_string(),
             },
-            None => VenueOutcome::Rejected {
-                reason: "order not found".to_string(),
+            Err(error) => VenueOutcome::Rejected {
+                reason: error.to_string(),
             },
         }
     }
 
     /// Executes a **non-atomic** replace as cancel-then-add in one turn, recorded
-    /// as one [`VenueOutcome::Replace`] at one sequence — no rollback if the add
-    /// leg is rejected after the cancel succeeded.
+    /// as one [`VenueOutcome`] at one sequence.
+    ///
+    /// The cancel leg is a **precondition** the add leg is gated on, enforced on
+    /// the shared sequenced path so REST/WS/FIX all inherit it:
+    ///
+    /// - **Ownership** — the requesting `account` must own the target resting
+    ///   order, checked **before** any mutation. A mismatch rejects the whole
+    ///   command ([`VenueOutcome::Rejected`]) without cancelling or adding, so no
+    ///   authenticated account can replace another account's order (Copilot PR #62
+    ///   SECURITY).
+    /// - **Atomic cancel leg** — if the target is unknown or the cancel does not
+    ///   remove it, the whole command is rejected and the add leg does **not**
+    ///   run, so a replace never creates a naked new order when nothing was
+    ///   replaced (Copilot PR #62).
+    ///
+    /// Once the cancel leg succeeds, the add leg runs and is **not** rolled back if
+    /// it is itself rejected (e.g. a killed `Fok`, or a missing limit price): that
+    /// defined partial state is recorded losslessly as
+    /// [`VenueOutcome::Replace`] `{ cancelled: true, add: Rejected }`. Every
+    /// rejection is a captured outcome the single-writer actor journals.
     #[allow(clippy::too_many_arguments)]
     fn execute_replace(
         &mut self,
@@ -639,25 +696,46 @@ impl MatchingExecutor {
             Err(reason) => return VenueOutcome::Rejected { reason },
         };
 
-        // Cancel leg. The replacement inherits the cancelled order's STP owner
-        // (the `Replace` command carries no owner of its own).
-        let (cancelled, owner) = match self.venue_to_engine.get(order_id).copied() {
-            Some(engine_id) => {
-                let owner = self
-                    .resting
-                    .get(&engine_id)
-                    .map(|record| record.owner)
-                    .unwrap_or(Hash32([0u8; 32]));
-                let cancelled = matches!(leaf.cancel_order(engine_id), Ok(true));
-                if cancelled {
-                    self.remove_resting(engine_id);
-                }
-                (cancelled, owner)
+        // Resolve the target resting order. An unknown target rejects the WHOLE
+        // command — a replace must never add a naked new order when nothing was
+        // replaced.
+        let engine_id = match self.venue_to_engine.get(order_id).copied() {
+            Some(engine_id) => engine_id,
+            None => {
+                return VenueOutcome::Rejected {
+                    reason: "order not found".to_string(),
+                };
             }
-            None => (false, Hash32([0u8; 32])),
         };
 
-        // Add leg (never rolled back if it is rejected).
+        // Ownership gate, BEFORE any mutation: the requesting account must own the
+        // target order, exactly as on the cancel path.
+        if !self.account_owns(engine_id, account) {
+            return VenueOutcome::Rejected {
+                reason: NOT_ORDER_OWNER_REASON.to_string(),
+            };
+        }
+
+        // The replacement inherits the cancelled order's STP owner (the `Replace`
+        // command carries no owner of its own). Ownership just proved the record is
+        // present, so the fallback is unreachable.
+        let owner = self
+            .resting
+            .get(&engine_id)
+            .map(|record| record.owner)
+            .unwrap_or(Hash32([0u8; 32]));
+
+        // Cancel leg. If it does not remove the target order, reject the WHOLE
+        // replace and do NOT run the add leg.
+        if !matches!(leaf.cancel_order(engine_id), Ok(true)) {
+            return VenueOutcome::Rejected {
+                reason: "order is not resting".to_string(),
+            };
+        }
+        self.remove_resting(engine_id);
+
+        // Add leg — reached ONLY because the cancel leg succeeded; not rolled back
+        // if it is itself rejected.
         let add = match limit_price {
             Some(price) => {
                 let result = self.run_add(
@@ -678,7 +756,10 @@ impl MatchingExecutor {
             },
         };
 
-        VenueOutcome::Replace { cancelled, add }
+        VenueOutcome::Replace {
+            cancelled: true,
+            add,
+        }
     }
 
     // ---- fill + STP capture ---------------------------------------------
@@ -840,8 +921,10 @@ impl CommandExecutor for MatchingExecutor {
                 *time_in_force,
             ),
             VenueCommand::CancelOrder {
-                symbol, order_id, ..
-            } => self.execute_cancel(symbol, order_id),
+                symbol,
+                order_id,
+                account,
+            } => self.execute_cancel(symbol, order_id, account),
             VenueCommand::Replace {
                 symbol,
                 order_id,
@@ -882,6 +965,15 @@ impl CommandExecutor for MatchingExecutor {
 // ============================================================================
 // Free helpers
 // ============================================================================
+
+/// The client-safe reject reason for a cancel/replace whose requesting account is
+/// not the resting order's owner — an authorization failure on the shared
+/// sequenced path (Copilot PR #62 SECURITY).
+///
+/// Carried on the captured [`VenueOutcome::Rejected`]; the gateway boundary maps
+/// it to an authorization rejection (HTTP `403` on REST/WS, an `OrderCancelReject`
+/// with an authorization reason on FIX). It echoes no order or account detail.
+const NOT_ORDER_OWNER_REASON: &str = "requesting account does not own the order";
 
 /// The deterministic engine order id for a command: a sequential id keyed on the
 /// per-underlying sequence, so the engine never RNG-mints a `Uuid` and the id is
@@ -1018,7 +1110,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::identity::LineageId;
+    use crate::exchange::actor::{FixedClock, NoopFanOut, UnderlyingActor};
+    use crate::exchange::identity::{JournalHeader, LineageId};
+    use crate::exchange::journal::{InMemoryVenueJournal, JournalRecord};
     use crate::models::ClientOrderId;
 
     const UNDERLYING: &str = "BTC";
@@ -1056,6 +1150,29 @@ mod tests {
             venue_ts: TS,
             command,
         })
+    }
+
+    /// The captured outcome journaled at `sequence` (its paired event) — a
+    /// fully-committed turn always journals one, so a missing event is a bug.
+    fn outcome_at(records: &[JournalRecord], sequence: u64) -> VenueOutcome {
+        let target = SequenceNumber::new(sequence);
+        for record in records {
+            if let JournalRecord::Event(event) = record
+                && event.underlying_sequence == target
+            {
+                return event.outcome.clone();
+            }
+        }
+        panic!("no event journaled at sequence {sequence}");
+    }
+
+    /// A cancel command for `venue_order_id` submitted by `account`.
+    fn cancel_by(venue_order_id: &VenueOrderId, account: &str) -> VenueCommand {
+        VenueCommand::CancelOrder {
+            symbol: sym(),
+            order_id: venue_order_id.clone(),
+            account: AccountId::new(account),
+        }
     }
 
     /// A limit add whose venue order id is the grammar id for `sequence`.
@@ -1325,6 +1442,64 @@ mod tests {
         assert!(matches!(outcome, VenueOutcome::Rejected { .. }));
     }
 
+    #[test]
+    fn test_cross_account_cancel_is_rejected_and_journaled() {
+        // The security property on the shared sequenced path: an authenticated
+        // account may NOT cancel another account's order. Driven end-to-end through
+        // the single-writer actor so the rejection is proven to reach the journal,
+        // and the victim's order is proven to survive (Copilot PR #62 SECURITY).
+        let lin = lineage();
+        let mut actor = UnderlyingActor::new(
+            ActorConfig::new(UNDERLYING, lin.clone(), 16),
+            InMemoryVenueJournal::new(JournalHeader::new(lin.clone())),
+            MatchingExecutor::new(UNDERLYING),
+            NoopFanOut,
+            FixedClock::new(TS),
+        );
+        let order_id = lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0);
+
+        // seq 0: "owner" rests a sell.
+        if let Err(e) = actor.handle(add(
+            &lin,
+            0,
+            "owner",
+            0x11,
+            Side::Sell,
+            50_000,
+            2,
+            TimeInForce::Gtc,
+        )) {
+            panic!("the owner's add must commit: {e}");
+        }
+        // seq 1: a DIFFERENT account tries to cancel the owner's order.
+        if let Err(e) = actor.handle(cancel_by(&order_id, "attacker")) {
+            panic!("the cancel turn must commit its (rejected) outcome: {e}");
+        }
+        // seq 2: the TRUE owner cancels — this must succeed, proving the attacker's
+        // attempt never removed the order.
+        if let Err(e) = actor.handle(cancel_by(&order_id, "owner")) {
+            panic!("the owner's cancel must commit: {e}");
+        }
+
+        let records = match actor.journal().read_from(SequenceNumber::START) {
+            Ok(records) => records,
+            Err(e) => panic!("in-memory read is infallible: {e}"),
+        };
+        // The attacker's cancel (seq 1) journaled a Rejected outcome...
+        match outcome_at(&records, 1) {
+            VenueOutcome::Rejected { reason } => {
+                assert_eq!(reason, NOT_ORDER_OWNER_REASON.to_string());
+            }
+            other => panic!("expected the attacker's cancel to be Rejected, got {other:?}"),
+        }
+        // ...and the owner's later cancel (seq 2) succeeded — the order was still
+        // resting after the cross-account attempt, so nothing was cancelled by it.
+        assert!(
+            matches!(outcome_at(&records, 2), VenueOutcome::Cancelled { .. }),
+            "the owner's cancel must succeed, proving the order survived the attacker"
+        );
+    }
+
     // ---- market ----------------------------------------------------------
 
     #[test]
@@ -1574,6 +1749,113 @@ mod tests {
         }
         // The old order is gone and no new order rested — a defined state.
         assert_eq!(ex.top_of_book(&sym()), TopOfBook::default());
+    }
+
+    #[test]
+    fn test_replace_with_missing_cancel_leg_does_not_add() {
+        // A replace whose cancel leg finds nothing must reject the WHOLE command
+        // and NOT run the add leg — otherwise it would create a naked new order
+        // that replaced nothing (Copilot PR #62).
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        // Seed an unrelated resting sell so the leaf exists, but the replace
+        // targets an order id that was never added.
+        run(
+            &mut ex,
+            &lin,
+            0,
+            &add(
+                &lin,
+                0,
+                "acct",
+                0x11,
+                Side::Sell,
+                50_000,
+                1,
+                TimeInForce::Gtc,
+            ),
+        );
+        let outcome = run(
+            &mut ex,
+            &lin,
+            1,
+            &VenueCommand::Replace {
+                symbol: sym(),
+                order_id: VenueOrderId::new("never-existed"),
+                new_order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0),
+                account: AccountId::new("acct"),
+                side: Side::Buy,
+                limit_price: Some(Cents::new(49_000)),
+                quantity: 4,
+                time_in_force: TimeInForce::Gtc,
+                stp_mode: STPMode::None,
+            },
+        );
+        // The whole replace is rejected (not a `Replace` outcome) — nothing added.
+        assert!(
+            matches!(outcome, VenueOutcome::Rejected { .. }),
+            "a missing cancel leg must reject the whole replace, got {outcome:?}"
+        );
+        // The book is exactly the seed: the replacement buy at 49_000 never rested,
+        // and the unrelated sell is untouched.
+        let top = ex.top_of_book(&sym());
+        assert_eq!(top.best_ask, Some(Cents::new(50_000)));
+        assert_eq!(top.ask_depth, 1);
+        assert_eq!(
+            top.best_bid, None,
+            "the replacement add leg must not have rested a bid"
+        );
+    }
+
+    #[test]
+    fn test_cross_account_replace_is_rejected_and_does_not_mutate() {
+        // Ownership is enforced on the replace path exactly as on cancel: a
+        // different account may not replace another account's resting order, and
+        // the reject happens BEFORE any mutation (Copilot PR #62 SECURITY).
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        run(
+            &mut ex,
+            &lin,
+            0,
+            &add(
+                &lin,
+                0,
+                "owner",
+                0x11,
+                Side::Sell,
+                50_000,
+                2,
+                TimeInForce::Gtc,
+            ),
+        );
+        let outcome = run(
+            &mut ex,
+            &lin,
+            1,
+            &VenueCommand::Replace {
+                symbol: sym(),
+                order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0),
+                new_order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0),
+                account: AccountId::new("attacker"),
+                side: Side::Sell,
+                limit_price: Some(Cents::new(50_100)),
+                quantity: 4,
+                time_in_force: TimeInForce::Gtc,
+                stp_mode: STPMode::None,
+            },
+        );
+        match outcome {
+            VenueOutcome::Rejected { reason } => {
+                assert_eq!(reason, NOT_ORDER_OWNER_REASON.to_string());
+            }
+            other => panic!("expected a not-owner Rejected, got {other:?}"),
+        }
+        // The owner's original order still rests, untouched at its old price/depth —
+        // neither cancelled nor replaced.
+        let top = ex.top_of_book(&sym());
+        assert_eq!(top.best_ask, Some(Cents::new(50_000)));
+        assert_eq!(top.ask_depth, 2);
     }
 
     // ---- STP affected-id recording ---------------------------------------
