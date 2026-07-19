@@ -7,3 +7,6 @@
 /milestones
 # Local environment secrets (never commit; use .env.example as the template)
 .env
+
+# JetBrains IDE metadata (local; must not ship)
+/.idea/
