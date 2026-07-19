@@ -75,17 +75,20 @@ fix: ## cargo fix (auto-apply compiler-suggested fixes)
 doc: ## Missing-docs gate on every `pub` item
 	$(CARGO) clippy --all-features -- -W missing-docs
 
-check-spanish: ## Fail if Spanish-only diacritics appear in src/ or tests/ (basic heuristic; rules/global_rules.md)
-	@if grep -rn \
+check-spanish: ## Fail if Spanish-only diacritics appear in src/ or tests/ (basic heuristic; rules/global_rules.md); excludes a quoted single accented char fed to .repeat(...) — a deliberate multi-byte-vs-byte-length test literal (src/gateway/fix/limits.rs, src/conformance/report.rs), never Spanish prose
+	@matches="$$(grep -rn \
 		-e 'ñ' -e 'Ñ' -e '¿' -e '¡' \
 		-e 'á' -e 'é' -e 'í' -e 'ó' -e 'ú' \
 		-e 'Á' -e 'É' -e 'Í' -e 'Ó' -e 'Ú' \
-		--include='*.rs' src tests 2>/dev/null; then \
+		--include='*.rs' src tests 2>/dev/null \
+		| grep -vE '"[^"]*"[[:space:]]*\.repeat\(' || true)"; \
+	if [ -n "$$matches" ]; then \
+		echo "$$matches"; \
 		echo "check-spanish: Spanish characters found above — rules/global_rules.md" >&2; \
 		echo "  requires English-only code/comments. Fix and re-run." >&2; \
 		exit 1; \
 	else \
-		echo "check-spanish: OK — no Spanish diacritics found in src/ tests/."; \
+		echo "check-spanish: OK — no Spanish diacritics found in src/ tests/ (excluding deliberate multi-byte test literals piped through .repeat())."; \
 	fi
 
 # --- Test ------------------------------------------------------------------
