@@ -2164,7 +2164,10 @@ mod tests {
             !state.symbol_index().register(raw, sym_ref),
             "seed the unhosted leaf into the shared index as a new entry"
         );
-        assert!(state.symbol_index().contains(raw), "the leaf is now indexed");
+        assert!(
+            state.symbol_index().contains(raw),
+            "the leaf is now indexed"
+        );
 
         let schedule = ExpirySchedule::default();
         let expiration = *parsed.expiration();
