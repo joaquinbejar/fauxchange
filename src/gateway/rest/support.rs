@@ -181,10 +181,16 @@ pub(crate) fn immediate_fills(
 }
 
 /// The volume-weighted average price over a set of `(price, quantity)` fill
-/// legs, in **cents** as a derived analytic float (a display average, never a
-/// settled amount), or `None` when there were no fills.
+/// legs, in **integer cents**, or `None` when there were no fills. Realized
+/// money — kept as `Cents` on the wire, never a float (the review-fixed contract).
+///
+/// The volume-weighted average `Σ(pᵢ·qᵢ) / Σqᵢ` is computed in `u128`
+/// (`Notional`) space and **truncated toward zero** to whole cents — the
+/// documented wire rounding rule, consistent with `Position.avg_price`. The
+/// quotient is bounded by the largest leg price (a `u64` cents value), so the
+/// `try_from` never actually rejects for real fills.
 #[must_use]
-pub(crate) fn vwap_cents(fills: &[(Cents, u64)]) -> Option<f64> {
+pub(crate) fn vwap_cents(fills: &[(Cents, u64)]) -> Option<Cents> {
     let total_qty: u128 = fills.iter().map(|(_, q)| u128::from(*q)).sum();
     if total_qty == 0 {
         return None;
@@ -193,8 +199,7 @@ pub(crate) fn vwap_cents(fills: &[(Cents, u64)]) -> Option<f64> {
         .iter()
         .map(|(p, q)| u128::from(p.get()) * u128::from(*q))
         .sum();
-    // Cast is a display average; the settled per-leg prices stay integer cents.
-    Some((notional as f64) / (total_qty as f64))
+    u64::try_from(notional / total_qty).ok().map(Cents::new)
 }
 
 /// Formats a Unix-epoch **seconds** instant as an RFC3339 / ISO-8601 UTC
@@ -287,8 +292,16 @@ mod tests {
 
     #[test]
     fn test_vwap_cents_weights_by_quantity() {
-        // (100c × 1) + (200c × 3) = 700 over 4 = 175.
+        // (100c × 1) + (200c × 3) = 700 over 4 = 175, exact — integer cents.
         let vwap = vwap_cents(&[(Cents::new(100), 1), (Cents::new(200), 3)]);
-        assert_eq!(vwap, Some(175.0));
+        assert_eq!(vwap, Some(Cents::new(175)));
+    }
+
+    #[test]
+    fn test_vwap_cents_truncates_toward_zero() {
+        // (100c × 1) + (101c × 1) = 201 over 2 = 100.5 → truncated to 100 cents
+        // (the documented wire rounding rule; never a fractional-cent float).
+        let vwap = vwap_cents(&[(Cents::new(100), 1), (Cents::new(101), 1)]);
+        assert_eq!(vwap, Some(Cents::new(100)));
     }
 }
