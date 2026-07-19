@@ -2190,6 +2190,45 @@ The full versioning and release-process policy lives in the design docs
   behavior yet — every module is an empty stub so later issues add code
   into a tree that already compiles.
 
+### Security
+
+- **REST/WS JSON decoder fuzz targets, the journal/bundle deserialiser fuzz
+  target, and the final `SECURITY.md` — the v1.0 security gate** (#52). Three
+  `cargo fuzz` targets extend the FIX-primary fuzz set (#42) with the
+  secondary REST/WS/journal decoders named in
+  [08 §6](docs/08-threat-model.md#6-fuzzing-and-adversarial-testing): drives
+  arbitrary bytes through the REAL production decode paths — no new
+  validation logic, this only proves the existing ceilings/typed errors.
+  - `fuzz/fuzz_targets/rest_json_decode.rs` — `axum::Json::<T>::from_bytes`
+    (the exact function axum's own extractor calls) plus each DTO's real
+    `.validate()`, under the router's `MAX_REQUEST_BODY_BYTES` ceiling, for
+    `PlaceLimitOrderRequest` / `PlaceMarketOrderRequest` / `BulkOrderRequest`
+    (the `Symbol` round-trip validator on every item) / `InsertPriceRequest`.
+  - `fuzz/fuzz_targets/ws_frame_decode.rs` — `fauxchange::gateway::ws::parse_frame`
+    (the exact function the socket loop calls on every inbound text frame),
+    under `MAX_WS_FRAME_BYTES` and the real transport's UTF-8 guarantee.
+  - `fuzz/fuzz_targets/journal_bundle_decode.rs` — folds the #34 adversarial
+    corpus into the coverage-guided fuzz set: `decode_journal_record` and
+    `ScenarioBundle::from_json` (both self-bounding on
+    `MAX_JOURNAL_RECORD_BYTES` / `MAX_BUNDLE_BYTES` before the `serde_json`
+    parse), so `cargo fuzz` now covers FIX + REST + WS + journal.
+  - Each target's committed seed corpus (`fuzz/corpus/<target>/`) exercises
+    oversized/truncated/malformed-JSON/unknown-field/duplicate-field/
+    out-of-range-economic-field/malformed-symbol/deeply-nested-type-mismatch
+    shapes (the journal/bundle corpus reuses #34's committed adversarial
+    fixtures verbatim); every seed decodes without a panic or an unbounded
+    allocation across a full local `cargo +nightly fuzz run` pass with no
+    crash found.
+  - The CI `fuzz` job (`.github/workflows/ci.yml`) now builds and runs all
+    four targets — the existing FIX budget is unchanged; each new target gets
+    its own short, bounded `-max_total_time=60 -max_len=<target-ceiling>`
+    pass, seeded by its committed corpus.
+  - `SECURITY.md`'s placeholder `0.0.x`/`0.x` supported-versions table is
+    replaced with the `v1.0` policy (security fixes on the latest published
+    `1.x` minor once `v1.0.0` ships; `0.x` carries no security-fix
+    guarantee); the private disclosure channel (GitHub Security Advisories +
+    email) and coordinated-disclosure expectations are confirmed unchanged.
+
 ## [0.0.1] - 2026-07-12
 
 ### Added

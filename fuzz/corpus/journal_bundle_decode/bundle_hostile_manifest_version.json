@@ -1,0 +1,148 @@
+{
+  "schema": "scenario-bundle.v1",
+  "manifest": {
+    "seed": 0,
+    "clock_mode": "realtime",
+    "instrument_seed": 0,
+    "microstructure_fingerprint": "microstructure.default.v1",
+    "versions": {
+      "fauxchange": "0.0.0-attacker",
+      "optionstratlib": "0.17.3",
+      "envelope_schema": "venue.v1"
+    }
+  },
+  "streams": [
+    {
+      "underlying": "BTC",
+      "header": {
+        "schema_version": "venue.v1",
+        "lineage_id": "run-1"
+      },
+      "records": [
+        {
+          "Command": {
+            "sequence": 0,
+            "venue_ts": 1700000000000,
+            "command": {
+              "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "run-1:BTC:0:0",
+                "account": "maker",
+                "owner": "0000000000000000000000000000000000000000000000000000000000000000",
+                "client_order_id": null,
+                "side": "SELL",
+                "order_type": "limit",
+                "limit_price": 50000,
+                "quantity": 3,
+                "time_in_force": "GTC",
+                "stp_mode": "None"
+              }
+            }
+          }
+        },
+        {
+          "Event": {
+            "schema": "venue.v1",
+            "underlying_sequence": 0,
+            "venue_ts": 1700000000000,
+            "command": {
+              "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "run-1:BTC:0:0",
+                "account": "maker",
+                "owner": "0000000000000000000000000000000000000000000000000000000000000000",
+                "client_order_id": null,
+                "side": "SELL",
+                "order_type": "limit",
+                "limit_price": 50000,
+                "quantity": 3,
+                "time_in_force": "GTC",
+                "stp_mode": "None"
+              }
+            },
+            "outcome": {
+              "Added": {
+                "fills": [],
+                "resting_quantity": 3,
+                "stp_cancelled": []
+              }
+            }
+          }
+        },
+        {
+          "Command": {
+            "sequence": 1,
+            "venue_ts": 1700000000000,
+            "command": {
+              "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "run-1:BTC:1:0",
+                "account": "taker",
+                "owner": "0101010101010101010101010101010101010101010101010101010101010101",
+                "client_order_id": null,
+                "side": "BUY",
+                "order_type": "limit",
+                "limit_price": 50000,
+                "quantity": 2,
+                "time_in_force": "GTC",
+                "stp_mode": "None"
+              }
+            }
+          }
+        },
+        {
+          "Event": {
+            "schema": "venue.v1",
+            "underlying_sequence": 1,
+            "venue_ts": 1700000000000,
+            "command": {
+              "AddOrder": {
+                "symbol": "BTC-20240329-50000-C",
+                "order_id": "run-1:BTC:1:0",
+                "account": "taker",
+                "owner": "0101010101010101010101010101010101010101010101010101010101010101",
+                "client_order_id": null,
+                "side": "BUY",
+                "order_type": "limit",
+                "limit_price": 50000,
+                "quantity": 2,
+                "time_in_force": "GTC",
+                "stp_mode": "None"
+              }
+            },
+            "outcome": {
+              "Added": {
+                "fills": [
+                  {
+                    "execution_id": "run-1:BTC:1:0",
+                    "order_id": "run-1:BTC:0:0",
+                    "account": "maker",
+                    "owner": "0000000000000000000000000000000000000000000000000000000000000000",
+                    "side": "SELL",
+                    "liquidity": "maker",
+                    "price": 50000,
+                    "quantity": 2,
+                    "fee": 0
+                  },
+                  {
+                    "execution_id": "run-1:BTC:1:0",
+                    "order_id": "run-1:BTC:1:0",
+                    "account": "taker",
+                    "owner": "0101010101010101010101010101010101010101010101010101010101010101",
+                    "side": "BUY",
+                    "liquidity": "taker",
+                    "price": 50000,
+                    "quantity": 2,
+                    "fee": 0
+                  }
+                ],
+                "resting_quantity": 0,
+                "stp_cancelled": []
+              }
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
