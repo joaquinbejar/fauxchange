@@ -234,6 +234,11 @@ async fn run(
     let mut delta_hist = new_histogram();
     let mut command_append_hist = new_histogram();
     let mut event_append_hist = new_histogram();
+    // Turns whose full-turn timing came in below the match-only timing (an
+    // inconsistent pair from scheduler noise / clock skew). Counted + disclosed
+    // rather than clamped to a fabricated 1 ns delta that would contaminate the
+    // venue-overhead histogram.
+    let mut delta_anomalies = 0u64;
 
     for command in workload {
         let t0 = Instant::now();
@@ -253,8 +258,14 @@ async fn run(
         let full_ns = u64::try_from(full_elapsed.as_nanos()).unwrap_or(u64::MAX);
         if let Some(ns) = match_ns {
             record_duration(&mut match_hist, Duration::from_nanos(ns));
-            let delta_ns = full_ns.saturating_sub(ns).max(1);
-            record_duration(&mut delta_hist, Duration::from_nanos(delta_ns));
+            match full_ns.checked_sub(ns) {
+                Some(delta_ns) => {
+                    record_duration(&mut delta_hist, Duration::from_nanos(delta_ns));
+                }
+                // full < match: an inconsistent timing pair. Skip it (do not
+                // clamp to 1 ns) so the venue-overhead histogram stays honest.
+                None => delta_anomalies += 1,
+            }
         }
         if let Some(ns) = command_ns {
             record_duration(&mut command_append_hist, Duration::from_nanos(ns));
@@ -277,6 +288,11 @@ async fn run(
 
     println!("\n[HP-5] venue-added delta (full - match, paired per turn, durable mode):");
     report("hp5_venue_delta", &delta_hist);
+    if delta_anomalies > 0 {
+        println!(
+            "  NOTE: {delta_anomalies} inconsistent full<match timing pair(s) were excluded from the delta histogram (not clamped)."
+        );
+    }
 
     println!(
         "\n[HP-5] durable write-ahead command append (ADR-0006 step 1, real Postgres round-trip):"
@@ -301,8 +317,13 @@ async fn run(
     println!("postgres ready; running the open-loop HP-5 workload");
 
     let open_loop_lineage = LineageId::new("bench-hp5-open-loop");
-    let open_loop_workload =
-        build_workload(open_loop_ops, seed.wrapping_add(1), &open_loop_lineage);
+    // The open-loop workload derives its seed as `seed + 1`; reject a `HP5_SEED`
+    // of u64::MAX rather than wrapping it silently to 0 (which would select an
+    // unexpected workload) — checked, per the arithmetic rule.
+    let open_loop_seed = seed.checked_add(1).unwrap_or_else(|| {
+        panic!("HP5_SEED must be < u64::MAX so the open-loop derived seed (seed + 1) does not wrap")
+    });
+    let open_loop_workload = build_workload(open_loop_ops, open_loop_seed, &open_loop_lineage);
     let open_loop_slot = TurnTimings::new();
     let open_loop_handle = spawn_bench_actor_durable(
         &open_loop_db,
