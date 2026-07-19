@@ -11,9 +11,16 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
-- Nothing yet. `fauxchange v0.0.1` is a crates.io name-reservation placeholder;
-  no implementation code exists. The design docs are maintained locally during
-  the design phase and order the work starting at v0.1.0.
+- Crate skeleton (#1): the canonical module tree from
+  `docs/00-design-bootstrap.md` §6 as empty, `//!`-documented stubs —
+  `config`, `error`, `models`, `state`, `gateway/{rest,ws,fix}`,
+  `exchange`, `market_maker`, `simulation`, `microstructure`, `ohlc`,
+  `db`, `auth` — plus `#![forbid(unsafe_code)]`, crate-level docs in
+  `src/lib.rs` (`error`/`models` re-exported at the crate root), a
+  commented bootstrap outline in `src/main.rs`, and the empty
+  `tests/`, `benches/`, `migrations/`, `docker/` directories. No venue
+  behavior yet — every module is an empty stub so later issues add code
+  into a tree that already compiles.
 
 ## [0.0.1] - 2026-07-12
 
