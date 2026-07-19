@@ -281,8 +281,8 @@ async fn test_journal_replay_reproduces_price_path_and_requotes() {
 
     // The requotes reproduce the same fills — the shared executions match.
     assert_eq!(
-        state_b.executions().capture().len(),
-        state_a.executions().capture().len(),
+        state_b.executions().len(),
+        state_a.executions().len(),
         "replay reproduces the same fills without cascading duplicate orders"
     );
     assert!(
