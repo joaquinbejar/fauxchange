@@ -1063,19 +1063,34 @@ impl MatchingExecutor {
         }
     }
 
-    /// **Prepares** a restore of the leaf books + idempotency map — the fallible,
-    /// **non-mutating** phase that validates every captured order's symbol
-    /// resolves within this underlying and orders the re-adds by `engine_seq`.
+    /// **Prepares** a restore of the leaf books + idempotency map by building a
+    /// **complete detached executor** off to the side — the fallible,
+    /// **live-non-mutating** phase where every re-add actually happens.
     ///
-    /// This is the seam that keeps a restore all-or-nothing: every fallible
-    /// check happens here, **before** [`commit_restore`](Self::commit_restore)
-    /// touches a book, so a malformed cut fails the restore with the four stores
-    /// untouched ([02 §9](../../../docs/02-matching-architecture.md)).
+    /// This is what makes a restore all-or-nothing. It validates every captured
+    /// order's symbol resolves within this underlying, orders the re-adds by
+    /// `engine_seq` (reproducing price-time priority; a consistent cut never
+    /// crosses, so no re-add matches), then re-adds **all** of them into a fresh
+    /// detached [`MatchingExecutor`] and installs the idempotency map on it. A
+    /// single failing re-add aborts here with a typed error, and because nothing
+    /// on this path touches `self`, the running executor's book and the other
+    /// three stores are left **exactly** as they were
+    /// ([02 §9](../../../docs/02-matching-architecture.md)). Only after every add
+    /// has succeeded does [`commit_restore`](Self::commit_restore) swap the fully
+    /// built executor into live state.
+    ///
+    /// Reusing each order's original `engine_seq` for `OrderId::sequential` keeps
+    /// the venue↔engine id mapping stable and cannot collide, because the
+    /// continued `underlying_sequence` is already past every captured `engine_seq`.
+    /// Rebuilding into a fresh underlying book (rather than clearing the live one)
+    /// also means every re-add lands on a freshly vivified, order-accepting leaf.
     ///
     /// # Errors
     ///
     /// Returns [`SnapshotError::RebuildFailed`] if a captured order's symbol does
-    /// not parse or belongs to a different underlying.
+    /// not parse, belongs to a different underlying, or cannot be re-added to the
+    /// detached book (a malformed cut — e.g. a duplicated `engine_seq`). In every
+    /// case the live executor is untouched.
     pub fn prepare_restore(
         &self,
         resting: &[RestingOrderCapture],
@@ -1109,84 +1124,89 @@ impl MatchingExecutor {
             });
         }
         orders.sort_by_key(|order| order.engine_seq);
-        Ok(PreparedRestore {
-            orders,
-            idempotency: IdempotencyMap::from_records(idempotency),
-        })
+
+        // Build the whole restored book on a detached executor. A re-add failure
+        // here propagates before any live state is touched — `self` is `&self`.
+        let mut detached = MatchingExecutor::new(expected);
+        detached.rebuild_from(orders)?;
+        detached.idempotency = IdempotencyMap::from_records(idempotency);
+        Ok(PreparedRestore { detached })
     }
 
-    /// **Commits** a prepared restore — the infallible mutation phase: clear
-    /// every currently-resting order, then re-add the cut's orders in ascending
-    /// `engine_seq` order (reproducing price-time priority; a consistent cut
-    /// never crosses, so no re-add matches) and install the idempotency map.
+    /// Re-adds every prepared order (already ordered by `engine_seq`) into this
+    /// executor's fresh hierarchy — the detached-build step of a restore.
     ///
-    /// Reusing each order's original `engine_seq` keeps the venue↔engine id
-    /// mapping stable and cannot collide, because the continued
-    /// `underlying_sequence` is already past every captured `engine_seq`.
-    pub fn commit_restore(&mut self, prepared: PreparedRestore) {
-        // Clear the current book wholesale: cancel every resting order on its
-        // leaf (collected first so `self.resting` is not borrowed while mutating).
-        let engine_ids: Vec<(OrderId, Symbol)> = self
-            .resting
-            .iter()
-            .map(|(id, record)| (*id, record.symbol.clone()))
-            .collect();
-        for (engine_id, symbol) in engine_ids {
-            if let Some(leaf) = self.resolve_leaf_read(&symbol)
-                && let Err(error) = leaf.cancel_order(engine_id)
-            {
-                tracing::warn!(
-                    error = %error,
-                    "clearing a resting order during restore failed; continuing"
-                );
-            }
-        }
-        self.resting.clear();
-        self.venue_to_engine.clear();
-
-        for order in prepared.orders {
-            let leaf = match self.resolve_leaf_vivify(&order.symbol) {
-                Ok(leaf) => leaf,
-                Err(reason) => {
-                    tracing::error!(reason, "restore could not vivify a leaf; dropping order");
-                    continue;
-                }
-            };
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::RebuildFailed`] on the first order whose leaf
+    /// cannot be vivified or whose re-add is rejected by the engine. The caller
+    /// discards the partially built detached executor, so no live state is
+    /// affected.
+    fn rebuild_from(&mut self, orders: Vec<PreparedRestingOrder>) -> Result<(), SnapshotError> {
+        for order in orders {
+            let leaf = self.resolve_leaf_vivify(&order.symbol).map_err(|reason| {
+                SnapshotError::RebuildFailed(format!(
+                    "could not vivify leaf for '{}': {reason}",
+                    order.symbol
+                ))
+            })?;
             let engine_id = OrderId::sequential(order.engine_seq);
-            match leaf.add_limit_order_with_tif_and_user_full(
+            leaf.add_limit_order_with_tif_and_user_full(
                 engine_id,
                 order.side,
                 order.price.as_u128(),
                 order.quantity,
                 order.time_in_force,
                 order.owner,
-            ) {
-                Ok(_) => self.register_resting(
-                    engine_id,
-                    order.symbol,
-                    order.order_id,
-                    order.account,
-                    order.owner,
-                ),
-                Err(error) => {
-                    tracing::error!(error = %error, "restore re-add failed; dropping order");
-                }
-            }
+            )
+            .map_err(|error| {
+                SnapshotError::RebuildFailed(format!(
+                    "re-adding restored order '{}' failed: {error}",
+                    order.order_id.as_str()
+                ))
+            })?;
+            self.register_resting(
+                engine_id,
+                order.symbol,
+                order.order_id,
+                order.account,
+                order.owner,
+            );
         }
+        Ok(())
+    }
 
-        self.idempotency = prepared.idempotency;
+    /// **Commits** a prepared restore — the truly infallible mutation phase: an
+    /// atomic swap of the fully built detached executor into live state.
+    ///
+    /// All fallible work (validation and every re-add) already ran in
+    /// [`prepare_restore`](Self::prepare_restore) against a detached executor, so
+    /// installing it here cannot fail and cannot leave a half-restored book: the
+    /// old book, registry, and idempotency map are replaced wholesale by the
+    /// detached ones in a single move.
+    pub fn commit_restore(&mut self, prepared: PreparedRestore) {
+        *self = prepared.detached;
     }
 }
 
-/// A validated, non-mutating plan to restore the leaf books + idempotency map —
+/// A fully built, detached executor image ready to be swapped into live state —
 /// the output of [`MatchingExecutor::prepare_restore`] applied by
 /// [`MatchingExecutor::commit_restore`] (#009). The prepare/commit split is what
-/// makes a restore **all-or-nothing**: the fallible validation runs before any
-/// book is touched.
-#[derive(Debug)]
+/// makes a restore **all-or-nothing**: every fallible re-add already happened on
+/// this detached executor, so the commit is an infallible swap that never leaves
+/// a half-restored live book.
 pub struct PreparedRestore {
-    orders: Vec<PreparedRestingOrder>,
-    idempotency: IdempotencyMap,
+    detached: MatchingExecutor,
+}
+
+impl std::fmt::Debug for PreparedRestore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedRestore")
+            .field("underlying", &self.detached.underlying())
+            .field("resting_orders", &self.detached.resting.len())
+            .field("idempotency", &self.detached.idempotency.len())
+            .finish()
+    }
 }
 
 /// One validated resting order in a [`PreparedRestore`].
@@ -2441,6 +2461,96 @@ mod tests {
             Err(SnapshotError::RebuildFailed(_)) => {}
             other => panic!("expected RebuildFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_failed_restore_leaves_live_books_untouched_and_is_all_or_nothing() {
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        // A defined, non-empty live book: two non-crossing resting orders.
+        run(
+            &mut ex,
+            &lin,
+            0,
+            &add(&lin, 0, "m1", 0x11, Side::Sell, 50_100, 3, TimeInForce::Gtc),
+        );
+        run(
+            &mut ex,
+            &lin,
+            1,
+            &add(&lin, 1, "b1", 0x22, Side::Buy, 49_900, 2, TimeInForce::Gtc),
+        );
+        let live_top_before = ex.top_of_book(&sym());
+        let live_state_before = ex.capture_state();
+
+        // A malformed cut that PASSES symbol validation (both are BTC contracts)
+        // but whose second order re-uses the first's `engine_seq`. The detached
+        // rebuild rests the first, then collides on `OrderId::sequential(seq)`
+        // when it re-adds the second — the engine returns `DuplicateOrderId`, so
+        // the restore fails mid-way. This is exactly the case the old commit path
+        // would have half-applied after already clearing the live book.
+        let dup_seq = 7;
+        let malformed = vec![
+            RestingOrderCapture {
+                symbol: sym(),
+                order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(dup_seq), 0),
+                account: AccountId::new("x"),
+                owner: owner(0x33),
+                engine_seq: dup_seq,
+                side: Side::Sell,
+                price: Cents::new(50_500),
+                quantity: 1,
+                time_in_force: TimeInForce::Gtc,
+            },
+            RestingOrderCapture {
+                symbol: sym(),
+                order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(dup_seq), 1),
+                account: AccountId::new("y"),
+                owner: owner(0x44),
+                // Duplicated `engine_seq` → the second re-add collides.
+                engine_seq: dup_seq,
+                side: Side::Sell,
+                price: Cents::new(50_600),
+                quantity: 1,
+                time_in_force: TimeInForce::Gtc,
+            },
+        ];
+
+        // Determinism-stable: the malformed restore fails identically on repeat,
+        // and each failed prepare leaves EVERY live store byte-for-byte the cut.
+        for _ in 0..2 {
+            match ex.prepare_restore(&malformed, &[]) {
+                Err(SnapshotError::RebuildFailed(_)) => {}
+                other => panic!("expected RebuildFailed, got {other:?}"),
+            }
+            assert_eq!(
+                ex.top_of_book(&sym()),
+                live_top_before,
+                "a failed restore must not mutate the live book (all-or-nothing)"
+            );
+            assert_eq!(
+                ex.capture_state(),
+                live_state_before,
+                "a failed restore leaves every live store untouched"
+            );
+        }
+
+        // A well-formed restore of the live book's own cut still round-trips
+        // exactly through the detached-then-swap path.
+        let prepared = match ex.prepare_restore(
+            &live_state_before.resting_orders,
+            &live_state_before.idempotency,
+        ) {
+            Ok(p) => p,
+            Err(e) => panic!("prepare of a well-formed cut failed: {e}"),
+        };
+        ex.commit_restore(prepared);
+        assert_eq!(
+            ex.top_of_book(&sym()),
+            live_top_before,
+            "the successful restore round-trips to the cut"
+        );
+        assert_eq!(ex.capture_state(), live_state_before);
     }
 
     #[test]
