@@ -12,8 +12,12 @@
 //!
 //! - **Money is integer cents** — every monetary field is a [`Cents`] /
 //!   [`SignedCents`] newtype from #002 (`#[serde(transparent)]`, bare integer on
-//!   the wire), never `f64`. The only floats are derived analytics (Greeks, IV,
-//!   VWAP, impact, basis points), each documented at its field.
+//!   the wire), never `f64`. The only floats are genuinely derived analytics —
+//!   Greeks, IV, mid/micro-price estimators, basis points (spread / slippage),
+//!   imbalance, and market-maker scalars — each documented at its field. A
+//!   realized or volume-weighted **average price** (market-order VWAP,
+//!   book-side VWAP, market-impact average price) is money and stays integer
+//!   cents, truncated toward zero to the nearest cent.
 //! - **Timestamps** are venue-clock milliseconds ([`EventTimestamp`]) or
 //!   ISO-8601 strings.
 //! - **Casing is pinned per enum family** and preserves the inherited Backend
@@ -601,14 +605,19 @@ pub struct PlaceMarketOrderResponse {
     pub filled_quantity: u64,
     /// Quantity that could not be filled, in **contracts**.
     pub remaining_quantity: u64,
-    /// Volume-weighted average execution price, in **cents** (`None` when no
-    /// fills).
+    /// Volume-weighted average execution price, in **integer cents** (`None`
+    /// when there are no fills).
     ///
-    /// A **derived analytic float**, exempt from the integer-cents rule: a
-    /// display average, not a settled amount. The settled per-fill prices in
-    /// [`FillPrint`] stay integer cents.
+    /// A realized average of actual fill prices is a monetary value crossing
+    /// the wire, so it obeys the integer-cents contract like every other
+    /// price — it is **not** a float-exempt analytic. It is computed as
+    /// `Σ(priceᵢ × qtyᵢ) / Σ(qtyᵢ)` in `u128` notional space with checked
+    /// arithmetic and **truncated toward zero** to the nearest whole cent — the
+    /// venue's single rounding rule for every volume-weighted average price.
+    /// The exact per-fill prices in [`FillPrint`] are the settled amounts.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub average_price: Option<f64>,
+    #[schema(value_type = Option<u64>)]
+    pub average_price: Option<Cents>,
     /// The `underlying_sequence` of the resulting event.
     #[schema(value_type = u64)]
     pub sequence: SequenceNumber,
@@ -1381,7 +1390,9 @@ pub struct GreeksResponse {
     pub greeks: GreeksData,
     /// Implied volatility used in the calculation.
     pub iv: f64,
-    /// Theoretical option value (analytic float).
+    /// Theoretical (Black-Scholes) option value — a pricing-model output, the
+    /// documented Greeks/IV-family **derived analytic float** exception to the
+    /// integer-cents rule, not a settled or executable price.
     pub theoretical_value: f64,
     /// Calculation time on the venue clock, in **milliseconds**.
     #[schema(value_type = u64)]
@@ -1389,7 +1400,8 @@ pub struct GreeksResponse {
 }
 
 // ============================================================================
-// Orderbook metrics (all derived analytic floats)
+// Orderbook metrics — mostly derived analytic floats, but any monetary average
+// (book-side VWAP, market-impact average price) stays integer cents
 // ============================================================================
 
 /// Spread metrics — derived analytics.
@@ -1415,30 +1427,48 @@ pub struct DepthMetrics {
     pub imbalance: f64,
 }
 
-/// Price metrics — **all derived analytic floats** (mid/micro/VWAP).
+/// Price metrics for one book. `mid_price` / `micro_price` are **derived
+/// analytic floats** (synthetic estimators, sub-cent by nature — the documented
+/// Greeks/IV-family exception); `vwap_bid` / `vwap_ask` are volume-weighted
+/// averages of the real, integer-cent book prices, so they are money and stay
+/// **integer cents**.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct PriceMetrics {
-    /// Mid price (analytic float).
+    /// Mid price `(bid + ask) / 2` — a synthetic midpoint, **derived analytic
+    /// float** (not a settled amount; genuinely sub-cent on a one-tick market).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mid_price: Option<f64>,
-    /// Micro price (analytic float).
+    /// Micro price (size-weighted mid) — a synthetic estimator, **derived
+    /// analytic float**.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub micro_price: Option<f64>,
-    /// Bid-side VWAP (analytic float).
+    /// Bid-side VWAP in **integer cents** — the volume-weighted average of the
+    /// real bid prices, truncated toward zero to the nearest cent (checked
+    /// `u128` arithmetic). A monetary average, not a float-exempt analytic.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vwap_bid: Option<f64>,
-    /// Ask-side VWAP (analytic float).
+    #[schema(value_type = Option<u64>)]
+    pub vwap_bid: Option<Cents>,
+    /// Ask-side VWAP in **integer cents** — the volume-weighted average of the
+    /// real ask prices, truncated toward zero to the nearest cent (checked
+    /// `u128` arithmetic).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub vwap_ask: Option<f64>,
+    #[schema(value_type = Option<u64>)]
+    pub vwap_ask: Option<Cents>,
 }
 
-/// Market-impact metrics for one side — **derived analytic floats**.
+/// Market-impact metrics for one side. `avg_price` is the average execution
+/// price of sweeping a fixed clip — a monetary value, so **integer cents**;
+/// `slippage_bps` is a dimensionless basis-point ratio, a **derived analytic
+/// float**.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct ImpactMetrics {
-    /// Average execution price (analytic float).
+    /// Average execution price of the swept clip, in **integer cents** — the
+    /// volume-weighted average of the real levels consumed, truncated toward
+    /// zero to the nearest cent (checked `u128` arithmetic).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_price: Option<f64>,
-    /// Slippage from mid, in basis points (analytic float).
+    #[schema(value_type = Option<u64>)]
+    pub avg_price: Option<Cents>,
+    /// Slippage from mid, in basis points — a **derived analytic float**.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slippage_bps: Option<f64>,
 }

@@ -169,7 +169,10 @@ fn test_golden_rest_place_market_order_response() {
         status: MarketOrderStatus::Filled,
         filled_quantity: 10,
         remaining_quantity: 0,
-        average_price: Some(50_012.5),
+        // Volume-weighted average of the two fills, in integer cents:
+        // (50_000·6 + 50_025·4) / 10 = 500_100 / 10 = 50_010 (exact; the
+        // truncate-toward-zero rounding rule leaves it unchanged here).
+        average_price: Some(Cents::new(50_010)),
         sequence: SequenceNumber::new(8),
         fills: vec![
             FillPrint {
@@ -183,6 +186,10 @@ fn test_golden_rest_place_market_order_response() {
         ],
     };
     assert_golden("rest/place_market_order_response.json", &resp);
+    assert_no_float_money(
+        &load_golden("rest/place_market_order_response.json"),
+        &["average_price"],
+    );
 }
 
 #[test]
