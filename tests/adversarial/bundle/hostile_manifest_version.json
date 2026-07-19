@@ -6,7 +6,7 @@
     "instrument_seed": 0,
     "microstructure_fingerprint": "microstructure.default.v1",
     "versions": {
-      "fauxchange": "0.0.0-attacker",
+      "fauxchange": "0.1.0-attacker",
       "optionstratlib": "0.17.3",
       "envelope_schema": "venue.v1"
     }

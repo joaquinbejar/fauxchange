@@ -538,8 +538,15 @@ edited here.
 This PR prepares release **readiness**; it does **not** bump the version,
 lock the changelog, publish, tag, or merge anything. In order, still to do:
 
-0. **Land `matching-expert`'s §0 fix** — the schema-tag (+ same-major)
-   replay gate — as the next commit on `stack/55-v1-release`.
+0. **Done — `matching-expert`'s §0 fix landed** (commit `3c3fa83`, architect
+   PASS): the replay load-gate now keys on the envelope schema tag + a
+   SemVer-major rule (major ≥ 1 → same MAJOR; `0.x` → same `MAJOR.MINOR`),
+   aligning the code with `docs/SEMVER.md`'s "a journal recorded by v1.x
+   replays on any later v1.y" promise and with the durable-recovery path
+   (which was already schema-tag-only). The exact crate/dep-version match is
+   retained ONLY as the determinism-oracle bit-repro predicate + a
+   non-blocking WARN — it no longer blocks a compatible cross-version load. A
+   positive cross-version replay test now proves the mechanism.
 1. **Review and merge the stack bottom-up:** #124 (issue #51) → #125 (#52) →
    #127 (#53) → #128 (#54) → this readiness PR (#55, once §0's fix lands)
    → `main`. Every PR is individually CI-green (confirmed for all four,
@@ -553,6 +560,15 @@ lock the changelog, publish, tag, or merge anything. In order, still to do:
    at that time. **`fauxchange v0.0.1` is already published on crates.io**
    — `cargo publish` is irreversible per version, so whatever version is
    chosen must be a version that has never been published before.
+   **If you promote across the `0.x → 1.0.0` major boundary, regenerate the
+   two crate-version-pinning corpus fixtures in the SAME commit:**
+   `tests/adversarial/bundle/{newer_journal_schema,tampered_event}.json`
+   hardcode `fauxchange: "0.0.1"`, and the new major-aware replay gate (step
+   0) would refuse them (`major 0 ≠ 1`) *before* they reach their intended
+   `SchemaRefused` / `JournalCorruption` scenario — failing
+   `tests/adversarial.rs`. Run `UPDATE_CORPUS=1 cargo test --test adversarial`
+   after the version bump to regenerate them at the promoted version
+   (architect flagged this on the §0 fix).
 3. **Provision `CARGO_REGISTRY_TOKEN`** as a repository secret before the
    first tag push — `gh secret list --repo joaquinbejar/fauxchange`
    currently returns **no secrets configured**, so `release.yml`'s

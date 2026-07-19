@@ -682,7 +682,21 @@ pub fn replay_bundle(bundle: &ScenarioBundle) -> Result<ReplayReport, ReplayErro
 }
 
 /// Verifies a bundle's wire-contract schema and its manifest's pinned versions
-/// against the running binary — the oracle-scoping gate before any re-execution.
+/// against the running binary — the **load-admission** gate before any re-execution.
+///
+/// Per [SEMVER.md](../../docs/SEMVER.md) the **journal schema tag is the primary
+/// version pin, the crate version secondary**, so admission keys on the schema tags
+/// (`scenario-bundle.v1` container + the manifest `envelope_schema` = `venue.v1`) plus
+/// a **SemVer-major-aware** `fauxchange` rule ([`DependencyVersions::first_incompatibility`]),
+/// **not** an exact crate-version match: a `v1.x` journal replays on any later `v1.y`.
+/// Only a genuine incompatibility (a differing envelope schema, or a crate major /
+/// pre-1.0-minor boundary) is refused as [`ReplayError::VersionMismatch`].
+///
+/// A bundle that is load-compatible but whose dependency set is not **bit-identical**
+/// to the running binary (a benign patch bump, or a differing secondary
+/// `optionstratlib`) is admitted with a non-blocking `tracing::warn!` honestly stating
+/// bit-for-bit reproducibility is not asserted — the integrity oracle (`recover`'s
+/// stored-vs-derived halt) remains the backstop for any actual divergence.
 fn verify_bundle_versions(bundle: &ScenarioBundle) -> Result<(), ReplayError> {
     if !bundle.is_current_schema() {
         return Err(ReplayError::VersionMismatch {
@@ -691,12 +705,23 @@ fn verify_bundle_versions(bundle: &ScenarioBundle) -> Result<(), ReplayError> {
             found: bundle.schema.clone(),
         });
     }
-    if let Some((field, expected, found)) = bundle.manifest.versions.first_mismatch() {
+    if let Some((field, expected, found)) = bundle.manifest.versions.first_incompatibility() {
         return Err(ReplayError::VersionMismatch {
             kind: field,
             expected,
             found,
         });
+    }
+    // Load-compatible but not bit-identical: surface it honestly, never refuse.
+    if let Some((field, expected, found)) = bundle.manifest.versions.first_mismatch() {
+        tracing::warn!(
+            field,
+            expected,
+            found,
+            "replaying a bundle recorded under a compatible but differing dependency \
+             version; bit-for-bit reproducibility is not asserted (the integrity oracle \
+             remains the backstop)"
+        );
     }
     Ok(())
 }
@@ -899,10 +924,11 @@ mod tests {
     fn test_replay_refuses_version_mismatch() {
         let lineage = LineageId::new("run-1");
         let stream = record_stream(&crossing_session(&lineage), &lineage);
-        // A bundle whose manifest pins a WRONG fauxchange version — the oracle holds
-        // only across a matching version set, so replay refuses it (typed reject).
+        // A bundle whose manifest pins an INCOMPATIBLE fauxchange version (a differing
+        // MINOR at the current 0.x base is a breaking boundary) — refused (typed
+        // reject). A benign patch bump would instead LOAD (see the positive test).
         let mut manifest = RunManifest::new(0, ClockMode::Realtime);
-        manifest.versions.fauxchange = "0.0.0-mismatch".to_string();
+        manifest.versions.fauxchange = "0.1.0-mismatch".to_string();
         let bundle = ScenarioBundle::new(manifest, vec![stream]);
         match replay_bundle(&bundle) {
             Err(ReplayError::VersionMismatch {
@@ -912,9 +938,52 @@ mod tests {
             }) => {
                 assert_eq!(kind, "fauxchange");
                 assert_eq!(expected, env!("CARGO_PKG_VERSION"));
-                assert_eq!(found, "0.0.0-mismatch");
+                assert_eq!(found, "0.1.0-mismatch");
             }
             other => panic!("expected a VersionMismatch reject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_replay_admits_a_compatible_differing_patch_version() {
+        use crate::simulation::manifest::parse_major_minor;
+        // The v1.x -> v1.y forward-compat MECHANISM, proven at the current 0.x base: a
+        // bundle recorded under a same-(major,minor), differing-PATCH crate version
+        // LOADS and replays to the oracle (no VersionMismatch). The schema tag is the
+        // primary pin, the crate version secondary — the same rule yields v1.x <-> v1.y
+        // once the crate is promoted past 1.0.
+        let lineage = LineageId::new("run-1");
+        let stream = record_stream(&crossing_session(&lineage), &lineage);
+        let mut manifest = RunManifest::new(0, ClockMode::Realtime);
+        let (major, minor) =
+            parse_major_minor(&manifest.versions.fauxchange).expect("current version parses");
+        manifest.versions.fauxchange = format!("{major}.{minor}.99");
+        assert!(
+            !manifest.versions.matches_current(),
+            "the patch genuinely differs (bit-repro not asserted; a WARN fires)"
+        );
+        let bundle = ScenarioBundle::new(manifest, vec![stream]);
+        let report =
+            replay_bundle(&bundle).expect("a compatible differing-patch bundle loads and replays");
+        assert_eq!(report.total_events(), 2);
+        assert_eq!(report.executions.len(), 2);
+    }
+
+    #[test]
+    fn test_replay_refuses_an_incompatible_major_version() {
+        use crate::simulation::manifest::parse_major_minor;
+        // A different MAJOR is a genuine incompatibility at any base — refused,
+        // distinct from a benign patch bump.
+        let lineage = LineageId::new("run-1");
+        let stream = record_stream(&crossing_session(&lineage), &lineage);
+        let mut manifest = RunManifest::new(0, ClockMode::Realtime);
+        let (major, _) =
+            parse_major_minor(&manifest.versions.fauxchange).expect("current version parses");
+        manifest.versions.fauxchange = format!("{}.0.0", major + 1);
+        let bundle = ScenarioBundle::new(manifest, vec![stream]);
+        match replay_bundle(&bundle) {
+            Err(ReplayError::VersionMismatch { kind, .. }) => assert_eq!(kind, "fauxchange"),
+            other => panic!("a different major must refuse, got {other:?}"),
         }
     }
 
