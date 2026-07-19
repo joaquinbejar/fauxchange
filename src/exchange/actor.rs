@@ -479,7 +479,7 @@ where
         self.epoch
     }
 
-    /// Captures a **consistent cut** of the four derived stores plus
+    /// Captures a **consistent cut** of this underlying's four derived stores plus
     /// config/version metadata, keyed by `snapshot_id`
     /// ([02 §9](../../../docs/02-matching-architecture.md)).
     ///
@@ -487,6 +487,13 @@ where
     /// log, the positions fold, and the idempotency map — non-journaled analytics
     /// (mark price, unrealised P&L, Greeks, registry ids) are **excluded** and
     /// recompute live after a restore.
+    ///
+    /// The executions/positions stores are shared venue-wide across every
+    /// per-underlying actor, so the cut is scoped to **this actor's underlying**
+    /// (`capture_for`): the leaf books and idempotency map are already this
+    /// underlying's, and slicing the shared stores by underlying keeps the cut a
+    /// consistent, single-writer read of only this underlying's data — it never
+    /// captures another underlying's concurrently-written legs.
     #[must_use]
     pub fn capture(
         &self,
@@ -502,8 +509,14 @@ where
         VenueSnapshot {
             metadata,
             executor: self.executor.capture_state(),
-            executions: self.fan_out.executions().capture(),
-            positions: self.fan_out.positions().capture(),
+            executions: self
+                .fan_out
+                .executions()
+                .capture_for(self.underlying.as_ref()),
+            positions: self
+                .fan_out
+                .positions()
+                .capture_for(self.underlying.as_ref()),
         }
     }
 
@@ -597,15 +610,21 @@ where
             return Err(SnapshotError::JournalUnavailable);
         }
 
-        // Step 3: commit — swap all four stores infallibly under quiescence, then
-        // continue the `underlying_sequence` past the marker. The capacity was
-        // proven above (`next_sequence`), so this advance cannot exhaust and the
-        // commit cannot leave a half-restored, un-advanceable book.
+        // Step 3: commit — swap this underlying's four stores infallibly under
+        // quiescence, then continue the `underlying_sequence` past the marker. The
+        // executions/positions stores are shared venue-wide, so the swap is scoped to
+        // **this actor's underlying** (`restore_for`): it replaces only this
+        // underlying's slice and leaves every other underlying's (possibly newer)
+        // legs/folds untouched — a `BTC` restore never erases `ETH`. The sequence
+        // capacity was proven above (`next_sequence`), so this advance cannot exhaust
+        // and the commit cannot leave a half-restored, un-advanceable book.
         self.executor.commit_restore(prepared);
         self.fan_out
             .executions()
-            .restore(snapshot.executions.clone());
-        self.fan_out.positions().restore(snapshot.positions.clone());
+            .restore_for(self.underlying.as_ref(), snapshot.executions.clone());
+        self.fan_out
+            .positions()
+            .restore_for(self.underlying.as_ref(), snapshot.positions.clone());
         self.epoch = new_epoch;
         self.next_sequence = next_sequence;
 
