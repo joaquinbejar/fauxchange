@@ -587,8 +587,59 @@ pub struct ExpiryRollReport {
     pub settling: usize,
     /// Expirations advanced to `Expired` on this roll.
     pub expired: usize,
-    /// Sequenced commands (`MassCancel` / `SetInstrumentStatus`) accepted this roll.
+    /// Sequenced commands (`MassCancel` / `SetInstrumentStatus`) **committed** this
+    /// roll (a rejected command is not counted and does not advance a phase).
     pub commands_issued: usize,
+}
+
+/// One expiration the scheduled roll could **not** advance because a required
+/// sequenced command — the scoped [`MassCancel`](crate::exchange::VenueCommand::MassCancel)
+/// (incl. `GTC`) or a
+/// [`SetInstrumentStatus`](crate::exchange::VenueCommand::SetInstrumentStatus) — was
+/// rejected on the sequenced order path (#47). The expiration is **left at its prior
+/// operational phase** so a later roll retries it; it is never recorded `Settling` /
+/// `Expired` while resting orders may remain live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiryRollFailure {
+    /// The underlying whose expiration could not advance.
+    pub underlying: String,
+    /// The expiration's UTC-day identity instant in **ms** (the group key), a pure
+    /// function of the expiration's `ExpirationDate::DateTime` — never a wall clock.
+    pub expiration_ms: i64,
+    /// The operational phase the roll was attempting to reach and did **not**.
+    pub attempted_phase: ExpiryPhase,
+    /// The **redacted**, client-safe rejection message from the sequenced submit —
+    /// the reason the required command did not commit. Never a secret or a cause chain.
+    pub reason: String,
+}
+
+/// A **partial** scheduled-expiry roll (#47): at least one expiration's required
+/// sequenced command was rejected, so that expiration was **not** advanced.
+///
+/// The operational phase (`Settling` / `Expired`) advances **only after every
+/// required sequenced command for that expiration commits**; a rejected `MassCancel`
+/// or `SetInstrumentStatus` leaves the expiration at its prior phase, never marking
+/// it `Expired` while resting orders remain live
+/// ([05 §10](../docs/05-microstructure-config.md#10-halt-scenarios)). The error carries
+/// the summary of the expirations that *did* fully commit ([`ExpiryRollReport`])
+/// alongside the typed list of the expirations that did **not**, so the caller retries
+/// the roll rather than treating a falsely-advanced instrument as settled.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExpiryRollError {
+    /// One or more expirations could not advance because a required sequenced command
+    /// was rejected. Carries the committed summary and the per-expiration failures, in
+    /// the roll's deterministic sorted order.
+    #[error(
+        "scheduled expiry roll partially applied: {} expiration(s) not advanced",
+        .failures.len()
+    )]
+    Partial {
+        /// The expirations that fully committed and advanced on this roll.
+        report: ExpiryRollReport,
+        /// The expirations left un-advanced (a required command was rejected), in the
+        /// roll's deterministic sorted order.
+        failures: Vec<ExpiryRollFailure>,
+    },
 }
 
 /// Whether `command` is **venue-global** — it names no single routable underlying
@@ -954,12 +1005,30 @@ impl AppState {
     /// iterated in sorted order, so the emitted command stream is deterministic. No
     /// lock is held across the `submit` `.await`.
     ///
+    /// The operational phase for an expiration advances (its `expiry_phases` entry is
+    /// written) **only after every required sequenced command for that expiration has
+    /// committed** — the scoped `MassCancel` (incl. `GTC`) then the per-symbol
+    /// `SetInstrumentStatus`. On the **first** rejected command the driver stops issuing
+    /// that expiration's remaining commands and leaves its phase unchanged, so a later
+    /// roll retries it; an instrument is **never** recorded `Settling` / `Expired` while
+    /// a `MassCancel` or status transition did not commit and resting orders may remain
+    /// live. Each expiration is independent — one expiration's rejection never blocks
+    /// another's advance.
+    ///
     /// `now_ms` is the **venue clock** instant (a venue service, never `SystemTime`).
+    ///
+    /// # Errors
+    ///
+    /// [`ExpiryRollError::Partial`] when at least one expiration's required sequenced
+    /// command was rejected: the error carries the [`ExpiryRollReport`] of the
+    /// expirations that *did* fully commit and the typed [`ExpiryRollFailure`] list
+    /// naming each expiration left un-advanced (with the phase it failed to reach), so
+    /// the caller retries rather than treating a falsely-advanced instrument as settled.
     pub async fn run_expiry_roll(
         &self,
         schedule: &ExpirySchedule,
         now_ms: i64,
-    ) -> ExpiryRollReport {
+    ) -> Result<ExpiryRollReport, ExpiryRollError> {
         // Group vivified contracts by (underlying, expiration-identity-ms) in sorted
         // order for a deterministic issue sequence.
         let mut groups: BTreeMap<(String, i64), (ExpirationDate, Vec<Symbol>)> = BTreeMap::new();
@@ -984,6 +1053,7 @@ impl AppState {
         }
 
         let mut report = ExpiryRollReport::default();
+        let mut failures: Vec<ExpiryRollFailure> = Vec::new();
         for ((underlying, key_ms), (expiration, mut symbols)) in groups {
             let Some(target) = schedule.phase_at(&expiration, now_ms) else {
                 continue;
@@ -1002,25 +1072,63 @@ impl AppState {
                 continue;
             }
             let commands = schedule.transition_commands(&expiration, &symbols, last, target);
+            // Issue every required command; the operational phase advances ONLY once
+            // all of them commit. On the FIRST rejection we stop issuing this
+            // expiration's remaining commands and leave its phase at `last`, so a later
+            // roll retries it — never marking it `Settling` / `Expired` while a
+            // `MassCancel` or a `SetInstrumentStatus` did not commit (rule 2 / #47).
+            let mut committed = 0usize;
+            let mut rejection: Option<VenueError> = None;
             for command in commands {
                 match self.submit(command).await {
-                    Ok(_) => report.commands_issued += 1,
+                    Ok(_) => committed = committed.checked_add(1).unwrap_or(committed),
                     Err(error) => {
-                        tracing::warn!(underlying = %underlying, error = %error, "expiry-roll command rejected");
+                        tracing::warn!(
+                            underlying = %underlying,
+                            attempted_phase = ?target,
+                            error = %error,
+                            "expiry-roll command rejected — phase not advanced, will retry"
+                        );
+                        rejection = Some(error);
+                        break;
                     }
                 }
             }
+            report.commands_issued = report
+                .commands_issued
+                .checked_add(committed)
+                .unwrap_or(report.commands_issued);
+            if let Some(error) = rejection {
+                // A required command did not commit: DO NOT advance the phase. The
+                // expiration stays at `last` and this roll is reported partial.
+                failures.push(ExpiryRollFailure {
+                    underlying,
+                    expiration_ms: key_ms,
+                    attempted_phase: target,
+                    reason: error.redacted_message(),
+                });
+                continue;
+            }
+            // Every required command committed — it is now safe to advance the phase.
             self.expiry_phases
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert((underlying, key_ms), target);
             match target {
-                ExpiryPhase::Settling => report.settling += 1,
-                ExpiryPhase::Expired => report.expired += 1,
+                ExpiryPhase::Settling => {
+                    report.settling = report.settling.checked_add(1).unwrap_or(report.settling);
+                }
+                ExpiryPhase::Expired => {
+                    report.expired = report.expired.checked_add(1).unwrap_or(report.expired);
+                }
                 ExpiryPhase::PreExpiry => {}
             }
         }
-        report
+        if failures.is_empty() {
+            Ok(report)
+        } else {
+            Err(ExpiryRollError::Partial { report, failures })
+        }
     }
 
     /// Evicts every resting order whose intraday `Day` / `Gtd` time-in-force has
@@ -2029,6 +2137,88 @@ mod tests {
             Err(VenueError::NotFound(detail)) => assert!(detail.contains("no hosted underlyings")),
             other => panic!("expected NotFound on an empty venue, got {other:?}"),
         }
+    }
+
+    // ---- scheduled expiry roll gates the phase advance on every commit (#47) ----
+
+    #[tokio::test]
+    async fn test_expiry_roll_does_not_advance_phase_when_a_required_command_is_rejected() {
+        use option_chain_orderbook::SymbolRef;
+
+        // The venue hosts BTC, but the shared symbol index is seeded with a leaf under
+        // an UNHOSTED underlying ("ZZZ"). Its per-symbol `SetInstrumentStatus` routes to
+        // a non-existent actor and is rejected (`NotFound`), so the required sequenced
+        // command set for that expiration never fully commits.
+        let state = new_state(config(&["BTC"]));
+        let raw = "ZZZ-20250102-50000-C";
+        let parsed = SymbolParser::parse(raw).expect("valid unhosted-underlying symbol");
+        let sym_ref = SymbolRef::new(
+            parsed.underlying(),
+            *parsed.expiration(),
+            parsed.strike(),
+            parsed.option_style(),
+        );
+        // `register` returns `true` only on a duplicate overwrite; this is a fresh
+        // insert, so it returns `false`.
+        assert!(
+            !state.symbol_index().register(raw, sym_ref),
+            "seed the unhosted leaf into the shared index as a new entry"
+        );
+        assert!(state.symbol_index().contains(raw), "the leaf is now indexed");
+
+        let schedule = ExpirySchedule::default();
+        let expiration = *parsed.expiration();
+        let (_expiry, settle) = schedule
+            .operational_instants(&expiration)
+            .expect("DateTime expiry");
+        let key_ms = match &expiration {
+            ExpirationDate::DateTime(dt) => dt.timestamp_millis(),
+            // days-expiry-allow: defensive read-arm; the fixture symbol is a DateTime expiry.
+            ExpirationDate::Days(_) => panic!("fixture is a DateTime expiry"),
+        };
+
+        // Drive the roll past settlement: the target phase is `Expired`, but the
+        // per-symbol status transition is rejected, so the phase MUST NOT advance —
+        // the driver returns a typed partial result instead.
+        let failures = match state.run_expiry_roll(&schedule, settle).await {
+            Err(ExpiryRollError::Partial { failures, .. }) => failures,
+            Ok(report) => panic!(
+                "a rejected required command must yield a typed partial result, got Ok({report:?})"
+            ),
+        };
+        let failure = failures
+            .iter()
+            .find(|f| f.underlying == "ZZZ")
+            .expect("the partial result names the un-advanced ZZZ expiration");
+        assert_eq!(failure.expiration_ms, key_ms);
+        assert_eq!(
+            failure.attempted_phase,
+            ExpiryPhase::Expired,
+            "it names the phase it failed to reach"
+        );
+
+        // The phase was NOT recorded — the instrument is not falsely marked Expired
+        // while its resting orders may remain live; it stays at the implicit PreExpiry.
+        {
+            let map = state
+                .expiry_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                map.get(&("ZZZ".to_string(), key_ms)).is_none(),
+                "a rejected roll must leave the expiry phase un-advanced so it is retried"
+            );
+        }
+
+        // Re-running the roll at the same instant RETRIES it (still partial), rather
+        // than silently treating the expiration as settled.
+        assert!(
+            matches!(
+                state.run_expiry_roll(&schedule, settle).await,
+                Err(ExpiryRollError::Partial { .. })
+            ),
+            "the un-advanced expiration is retried on the next roll, not skipped as done"
+        );
     }
 
     // ---- fan-out writes the store AppState exposes -----------------------

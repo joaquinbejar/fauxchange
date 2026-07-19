@@ -701,7 +701,10 @@ async fn test_scheduled_expiry_roll_issues_sequenced_transitions() {
         Some(ExpiryPhase::Expired),
         "at settlement the expiration is Expired"
     );
-    let report = state.run_expiry_roll(&schedule, settle).await;
+    let report = state
+        .run_expiry_roll(&schedule, settle)
+        .await
+        .expect("every required lifecycle command commits for the hosted underlying");
     assert!(
         report.commands_issued >= 1,
         "the roll issued sequenced lifecycle commands ({})",
@@ -720,7 +723,10 @@ async fn test_scheduled_expiry_roll_issues_sequenced_transitions() {
     let _ = receipt;
 
     // A second roll at the same instant is idempotent (no forward transition).
-    let again = state.run_expiry_roll(&schedule, settle).await;
+    let again = state
+        .run_expiry_roll(&schedule, settle)
+        .await
+        .expect("a repeat roll at the same instant advances nothing and cannot be partial");
     assert_eq!(again.commands_issued, 0, "a repeat roll issues nothing new");
 }
 
