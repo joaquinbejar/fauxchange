@@ -1,0 +1,247 @@
+# fauxchange — the `bench-regression` CI performance gate (#053).
+#
+# Arms docs/07-performance-budgets.md §6 / docs/TESTING.md §11's promised
+# regression gate: a budget-breaching p99/p99.9 on any hot-path (HP-1..HP-5)
+# `bench-hdr` bench, a steady-state allocation regression on the common actor
+# turn, or an HP-1-p99-grows-with-N fan-out regression now FAILS THE BUILD,
+# not just reviewer vigilance.
+#
+# ---------------------------------------------------------------------------
+# THE HONESTY PROBLEM AND THE CHOSEN APPROACH (read before touching a ceiling)
+# ---------------------------------------------------------------------------
+# `BENCH.md`'s committed HP-1..HP-5 baselines were measured on one developer's
+# Apple M4 Max laptop (disclosed, un-pinned, BENCH.md §1). This repo has NO
+# self-hosted runner (every job across this repo's workflows runs on
+# `ubuntu-24.04`, GitHub-hosted, shared, no CPU-governor control, no
+# guarantee of the same physical host between runs) — so option (a),
+# "pin a self-hosted/fixed runner class and compare measured-to-measured on
+# THAT class," is INFEASIBLE here; this is disclosed, not silently skipped.
+# Option (c), "compare each run against a CI-runner-established baseline,"
+# was rejected too: a first CI-runner baseline would itself be measured on
+# noisy, non-reproducible shared hardware (the same class of problem this
+# gate exists to avoid), and #053 is explicitly NOT the place to establish a
+# new baseline (that is #035/#043/#050's job, already done).
+#
+# This gate uses option (b): every gated series is compared against a
+# GENEROUS, DOCUMENTED ABSOLUTE CEILING derived from the WORST disclosed
+# measured p99/p99.9 across every `BENCH.md` run for that series (plus this
+# gate's own #053 re-verification run, `BENCH.md` §13), multiplied by a
+# stated margin (10x once a series is already at/above ~100 us of measured
+# latency; a 1 ms floor for series still at low-microsecond scale). This is
+# NEVER a same-machine p99 delta against the laptop-recorded baseline — it
+# is measured-to-a-documented-ceiling, explicitly labelled DESIGN TARGET
+# where the ceiling itself is not yet a tuned SLO. See
+# `scripts/bench_regression_gate.py`'s module doc and `BENCH.md` §13 for the
+# full derivation, per-series numbers, and the noise-margin / baseline-update
+# procedure (a legitimate budget change is a reviewed `BENCH.md` commit with
+# an interpretation block, never a silent ceiling edit in this file or the
+# gate script).
+#
+# The allocation gate: docs/07 §4 asks for "zero steady-state allocation on
+# the common actor turn." The measured reality (BENCH.md §6, re-verified in
+# §13.3 / #126) is NON-ZERO. Precision matters (architect review, #053): the
+# two `tokio`-driven sections are a COARSE MULTI-X ALLOC-REGRESSION CATCHER
+# over a baseline that is ITSELF currently unstable (#126: a disclosed
+# ~2.3-2.6x divergence between the previously committed BENCH.md §6 figure
+# and this gate's own #053 re-verification, same machine/code/Cargo.lock) —
+# the ceiling sits ~2.2-2.5x above the freshly re-verified numbers, so it
+# catches an order-of-magnitude blowup but would NOT catch a modest 1.5-2x
+# regression. The market-maker-requote section is different in kind: it is
+# exactly reproducible (343.000 allocs/op, zero disclosed variance across
+# every run), so ITS ceiling genuinely is a tight no-regression bound. See
+# `scripts/bench_regression_gate.py`'s `ALLOC_CEILINGS_PER_OP` comment and
+# BENCH.md §13.3 for the precise numbers.
+#
+# ---------------------------------------------------------------------------
+# WHEN THIS RUNS, AND WHAT IS GATED AT EACH SCALE
+# ---------------------------------------------------------------------------
+# `bench-regression` (job id preserved for `make workflow-bench-regression`):
+#   push (all branches) + PR to main/release/** — the SAME trigger set every
+#   other job in this repo uses (an intentional, accepted CI-minutes cost:
+#   this job runs the full 6-bench suite plus a Postgres testcontainer on
+#   every branch push, the same tradeoff `ci.yml`'s `migrations` /
+#   `image-build` / `docker-smoke` jobs already accept for their own
+#   Docker-backed work — kept consistent with that existing precedent rather
+#   than narrowed to `main`-only, per `devops`'s "push on all branches"
+#   trigger-set rule). REDUCED ("smoke") sample counts, via the
+#   *_WARMUP_OPS/*_MEASURED_OPS env-var overrides every #020-era bench
+#   already exposes (BENCH.md §2) — no bench code changes needed to run at a
+#   smaller scale. Because every LATENCY ceiling is an ABSOLUTE ns bound (not
+#   a percentage-of-baseline), a reduced-sample run is still a REAL,
+#   meaningful gate for those — just a LESS discriminating one than the
+#   nightly full run for HP-1's own journal-depth-dependent tail (BENCH.md
+#   §3.4): at low journal depth HP-1's OWN measured p99 sits far below the
+#   15 ms ceiling, so this job mainly catches catastrophic
+#   (order-of-magnitude) regressions cheaply on every push.
+#
+#   HP-2 FAN-OUT FLATNESS IS **NOT** GATED AT THIS SCALE (`BENCH_REGRESSION_-
+#   GATE_FLATNESS` unset, defaults to report-only) — BENCH.md §13.2 measured
+#   worst |Δp99| = 13.3% at 10,000 ops, only 1.7 percentage points under the
+#   15% tolerance; at this job's smaller 3,000-op sample (fewer tail
+#   samples), gating flatness risked a spurious >15% on an unrelated PR (a
+#   gate that cries wolf gets overridden — worse than not gating it at this
+#   scale). The flatness percentage is still computed and printed every run
+#   (never silently dropped), just not build-failing here. See BENCH.md
+#   §13.6.
+#
+# `bench-regression-nightly`: `schedule` (03:17 UTC nightly) + manual
+# `workflow_dispatch`. FULL default sample counts — identical op counts to
+# `BENCH.md`'s own committed methodology (100 000 measured ops for HP-1/HP-3,
+# 30 000 for HP-2, 2 000 for HP5, 5 000 for HP-4, 50 000 for alloc_profile) —
+# the authoritative, high-fidelity run, and the ONE THAT GENUINELY GATES
+# HP-2 FLATNESS (`BENCH_REGRESSION_GATE_FLATNESS=1`), at the same sample
+# scale BENCH.md §4's own flatness finding was measured at. Uploads a
+# longer-retention artifact.
+#
+# Both jobs run the SAME gate script (`scripts/bench_regression_gate.py`)
+# against the SAME documented latency/allocation ceiling tables, so "smoke"
+# and "nightly" can never silently diverge on what counts as a regression —
+# only the flatness-gating toggle and the sample scale differ, both
+# explicit env vars, both documented here and in BENCH.md §13.6.
+
+name: bench-regression
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "main"
+      - "release/**"
+  workflow_dispatch: {}
+  schedule:
+    # 03:17 UTC nightly — an off-peak, non-round-number time (avoids the
+    # top-of-hour thundering herd GitHub Actions' own docs warn scheduled
+    # workflows pile onto).
+    - cron: "17 3 * * *"
+
+# Cancel a superseded run on the same ref (mirrors ci.yml) — this workflow
+# has no deploy job, so any in-progress run is safe to cancel.
+concurrency:
+  group: bench-regression-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Build the compile-time `sqlx::query!` macros from the committed `.sqlx/`
+  # offline data — no database is contacted at BUILD time; HP-5 still opens a
+  # REAL ephemeral `postgres:18-alpine` at bench RUNTIME via `testcontainers`
+  # (the same pattern the `migrations` job in ci.yml uses).
+  SQLX_OFFLINE: "true"
+  # The pinned stable toolchain (matches rust-toolchain.toml / ci.yml).
+  RUST_TOOLCHAIN: "1.97.0"
+
+jobs:
+  # --- The armed, per-push/PR gate — REDUCED ("smoke") sample counts -------
+  bench-regression:
+    name: bench-regression
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      # Report-only for HP-2 flatness at this reduced sample scale — see the
+      # top-of-file "WHEN THIS RUNS" note and BENCH.md §13.6. Explicit "0"
+      # (not merely unset) so a reader never has to guess the default.
+      BENCH_REGRESSION_GATE_FLATNESS: "0"
+      # Reduced-sample overrides — see the top-of-file "WHEN THIS RUNS" note.
+      HP1_WARMUP_OPS: "1000"
+      HP1_MEASURED_OPS: "5000"
+      HP1_OPEN_LOOP_OPS: "200"
+      HP2_WARMUP_OPS: "500"
+      HP2_MEASURED_OPS: "3000"
+      HP3_WARMUP_OPS: "1000"
+      HP3_MEASURED_OPS: "10000"
+      HP3_OPEN_LOOP_OPS: "200"
+      HP4_WARMUP_OPS: "500"
+      HP4_MEASURED_OPS: "2000"
+      HP4_OPEN_LOOP_OPS: "200"
+      HP5_WARMUP_OPS: "30"
+      HP5_MEASURED_OPS: "150"
+      HP5_OPEN_LOOP_OPS: "20"
+      ALLOC_WARMUP_OPS: "2000"
+      ALLOC_MEASURED_OPS: "10000"
+      ALLOC_MM_WARMUP_OPS: "500"
+      ALLOC_MM_MEASURED_OPS: "2000"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: bench-regression
+      - run: mkdir -p bench-out
+      - name: Record run conditions (docs/07 §5)
+        run: scripts/record_bench_run_conditions.sh smoke | tee bench-out/run-conditions.txt
+      - name: HP-1 — sequenced order path, in-memory journal
+        run: cargo bench --bench hp1_order_path | tee bench-out/hp1.log
+      - name: HP-2 — WS fan-out isolation (N = 1/10/100/1000 sweep)
+        run: cargo bench --bench hp2_ws_fanout | tee bench-out/hp2.log
+      - name: HP-3 — FIX parse/encode
+        run: cargo bench --bench hp3_fix_parse | tee bench-out/hp3.log
+      - name: HP-4 — market-maker requote
+        run: cargo bench --bench mm_requote_hdr | tee bench-out/hp4.log
+      - name: HP-5 — durable PostgreSQL journal append (testcontainers; needs
+          local Docker, preinstalled on ubuntu-24.04 — same pattern as
+          ci.yml's `migrations` job)
+        run: cargo bench --bench hp5_durable_append | tee bench-out/hp5.log
+      - name: Allocation profile — steady-state actor turn (docs/07 §4)
+        run: cargo bench --bench alloc_profile | tee bench-out/alloc.log
+      - name: Gate — compare measured quantiles/allocs against the documented
+          ceilings (BENCH.md §13, scripts/bench_regression_gate.py)
+        run: python3 scripts/bench_regression_gate.py bench-out/*.log
+      - name: Upload bench-regression artifact (always, for triage on either
+          a pass or a fail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-regression-smoke-${{ github.run_id }}
+          path: bench-out/
+          retention-days: 14
+
+  # --- The full-fidelity run — nightly + on-demand ---------------------------
+  bench-regression-nightly:
+    name: bench-regression-nightly
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    env:
+      # The ONE job that genuinely gates HP-2 fan-out flatness — full
+      # default sample scale, matching BENCH.md §4's own methodology. See
+      # the top-of-file "WHEN THIS RUNS" note and BENCH.md §13.6.
+      BENCH_REGRESSION_GATE_FLATNESS: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: bench-regression-nightly
+      - run: mkdir -p bench-out
+      - name: Record run conditions (docs/07 §5)
+        run: scripts/record_bench_run_conditions.sh full | tee bench-out/run-conditions.txt
+      - name: HP-1 — sequenced order path, in-memory journal (full default sample)
+        run: cargo bench --bench hp1_order_path | tee bench-out/hp1.log
+      - name: HP-2 — WS fan-out isolation (full default sample)
+        run: cargo bench --bench hp2_ws_fanout | tee bench-out/hp2.log
+      - name: HP-3 — FIX parse/encode (full default sample)
+        run: cargo bench --bench hp3_fix_parse | tee bench-out/hp3.log
+      - name: HP-4 — market-maker requote (full default sample)
+        run: cargo bench --bench mm_requote_hdr | tee bench-out/hp4.log
+      - name: HP-5 — durable PostgreSQL journal append (full default sample, testcontainers)
+        run: cargo bench --bench hp5_durable_append | tee bench-out/hp5.log
+      - name: Allocation profile (full default sample)
+        run: cargo bench --bench alloc_profile | tee bench-out/alloc.log
+      - name: Gate — compare measured quantiles/allocs against the documented
+          ceilings (BENCH.md §13, scripts/bench_regression_gate.py)
+        run: python3 scripts/bench_regression_gate.py bench-out/*.log
+      - name: Upload bench-regression-nightly artifact (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-regression-nightly-${{ github.run_id }}
+          path: bench-out/
+          retention-days: 90

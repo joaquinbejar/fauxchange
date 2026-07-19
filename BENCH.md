@@ -2,9 +2,9 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), and the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only); 2026-07-18 (§12, `#050`), on routinely-rebased working trees at those dates |
-| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
+| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), and the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`), on routinely-rebased working trees at those dates |
+| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
 > **Every number in this document is a DESIGN TARGET comparison, never an
@@ -1119,3 +1119,279 @@ genuinely sensitive to load rather than trivially always green.
   `bench-hdr` quantiles arms before v1.0 (#053,
   [07 §6](docs/07-performance-budgets.md#6-ci-regression-gate)), same as
   every other hot path in this document.
+
+## 13. CI regression-gate ceilings, re-verification, and the dry-run (`#053`)
+
+`#053` arms `.github/workflows/bench-regression.yml`: a `bench-regression`
+job (every push, every PR to `main`/`release/**`) plus a
+`bench-regression-nightly` job (`schedule` + `workflow_dispatch`, full
+default sample counts). Both run the SAME gate,
+[`scripts/bench_regression_gate.py`](scripts/bench_regression_gate.py),
+against the SAME documented ceiling table — see that script's module doc for
+the full per-series numbers; this section records the derivation, the
+re-verification runs the ceilings are grounded in, an honestly-disclosed
+divergence this re-verification surfaced, and the synthetic-regression
+dry-run proving the gate actually fails a real regression.
+
+### 13.1 Why a ceiling, not a same-machine p99 delta
+
+Every number in §§1-12 above was measured on ONE developer's Apple M4 Max
+laptop (§1: "not a tuned bench rig," un-pinned). `fauxchange` has **no
+self-hosted CI runner** — every job in every workflow in this repo
+(`.github/workflows/ci.yml`, and this one) runs on GitHub-hosted
+`ubuntu-24.04`: shared, no CPU-governor control, no guarantee of the same
+physical host between runs. Comparing a CI run's measured p99 directly to
+this laptop's measured p99 with a tight tolerance would be apples-to-oranges
+— either spuriously failing on ordinary cross-machine noise, or (loosened
+enough to avoid that) becoming meaningless. Two of the three approaches the
+`#053` task considered were therefore rejected, explicitly, rather than
+silently:
+
+- **(a) Pin a self-hosted/fixed runner class.** Infeasible — this repo has no
+  self-hosted runner today, and adding one is a paid-infrastructure decision
+  outside `#053`'s scope (and `devops`'s "confirm first" list for paid CI-minute
+  expansions applies equally to standing up new infrastructure).
+- **(c) A first CI-runner-established baseline artifact.** Rejected: a first
+  CI-runner baseline would itself be measured on the same noisy, shared,
+  non-reproducible hardware this gate exists to be honest about — it does not
+  solve the problem, it relocates it. `#053` is also explicitly not the place
+  to *establish* a new baseline (that was `#035`/`#043`/`#050`'s job).
+- **(b) A generous, documented absolute ceiling — CHOSEN.** Every gated
+  series is compared against a ceiling derived from the **worst disclosed
+  measured p99/p99.9** for that series across every `BENCH.md` run (§§3-12)
+  *and* this section's own re-verification runs (§13.2), multiplied by a
+  stated margin: **10x** once a series' measured latency is already at or
+  above ~100 µs, or a **1 ms floor** for series still at low-microsecond
+  scale (HP-3's decode/encode, whose measured p99 sits 400-2000x inside that
+  floor — genuinely "an order of magnitude inside," not a tight bound dressed
+  up as generous). This is measured-to-a-documented-ceiling, explicitly
+  labelled a provisional DESIGN TARGET where no formal numeric budget exists
+  yet in [docs/07-performance-budgets.md](docs/07-performance-budgets.md)
+  (HP-3, HP-4) — **never** a same-machine p99 comparison presented as such.
+
+**HP-1's own ceiling is deliberately wide for a second, disclosed reason.**
+[Issue #91](https://github.com/joaquinbejar/fauxchange/issues/91) (the
+in-memory journal's O(journal-depth) append-tail cost, §3's own diagnosed
+driver of "just inside the ceiling, then past it") was named in §3.6 as
+"scheduled to land before #53 arms the CI bench-regression gate over HP-1" —
+**it has not landed as of this gate's arming.** A tight ceiling at the
+sub-millisecond DESIGN TARGET would therefore be **born red**: BENCH.md's own
+committed baseline already shows p99.9/p99.99 past 1 ms at full journal depth
+(§3.1, §3.6) on the REFERENCE laptop, before any CI-runner slowdown is even
+considered. The chosen ceiling (15 ms p99 / 25 ms p99.9) is generous enough
+to stay green against that already-disclosed, tracked, unresolved issue while
+still failing on a genuine multi-x regression — see §13.4 for proof it does.
+
+### 13.2 Re-verification runs (2026-07-19, immediately before arming the gate)
+
+Same machine, same toolchain, same OS, same `Cargo.lock` as §1 (`rustc
+1.97.0`, macOS 26.5.2, Darwin 25.5.0, Apple M4 Max — re-confirmed via `uname
+-a` / `sw_vers` / `rustc --version` before this run) — no dependency or
+`src/`/`benches/` code changed since the `#050` baseline (`git diff
+71df09f..HEAD -- src/ benches/` is empty for every file these benches
+exercise; confirmed before drawing any conclusion below).
+
+| Bench | Config | Flagship p99 | Flagship p99.9 |
+|---|---|---|---|
+| HP-1 (`hp1_full_turn_closed_loop`) | `HP1_WARMUP_OPS=2000 HP1_MEASURED_OPS=20000` (reduced — journal depth ~22k, not the full-scale ~105k §3.1 uses) | 220,031 ns | 303,615 ns |
+| HP-2 (flatness verdict) | `HP2_WARMUP_OPS=1000 HP2_MEASURED_OPS=10000` | worst \|Δp99\| vs N=1: **13.3%** | PASS (tolerance 15%) |
+| HP-3 (`hp3_decode_d_closed_loop` / `hp3_encode_8_closed_loop`) | full default (`5000`/`100000`) | 1,125 ns / 584 ns | 1,250 ns / 1,375 ns |
+| HP-4 (`hp4_requote_engine_only_closed_loop` / `hp4_requote_mailbox_closed_loop`) | full default (`1000`/`5000`) | 160,767 ns / 156,671 ns | 216,447 ns / 195,583 ns |
+| HP-5 (`hp5_persistent_full_turn_closed_loop`) | `HP5_WARMUP_OPS=50 HP5_MEASURED_OPS=300` (reduced; real ephemeral `postgres:18-alpine` via `testcontainers`) | 800,767 ns | 977,407 ns |
+
+**Interpretation.** HP-2/HP-3/HP-4/HP-5 all land within the same order of
+magnitude as their §4/§11/§12/§5 committed figures — no unexplained
+divergence, the mechanism and magnitude both still hold. HP-1's reduced-scale
+number (p99 220 µs at ~22k records) is consistent with §3.4's small-N
+reference (p99 33 µs at ~2.2k records) and far below the full-scale §3.1
+figure (p99 932 µs-1.5 ms at ~105k records) — exactly the journal-depth
+dependence §3 already diagnosed, reconfirmed, not contradicted.
+
+### 13.3 A disclosed, unresolved divergence: the allocation profile does NOT reproduce §6's committed numbers today
+
+This is the one re-verification result that did **not** land where §6's
+committed baseline says it should, and it is reported honestly rather than
+quietly reconciled or overwritten.
+
+Five independent `cargo bench --bench alloc_profile` runs today (default
+`5000`/`50000` ops except where noted), same machine/toolchain/`Cargo.lock`
+as §13.2:
+
+| Run | `UnderlyingActor::handle` direct (allocs/op) | `ActorHandle::submit` (allocs/op) | `MarketMakerEngine::update_price` (allocs/op) |
+|---|---|---|---|
+| 1 (default) | 180.355 | 193.426 | 343.000 |
+| 2 (default) | 197.098 | — | — |
+| 3 (default) | 197.877 | — | — |
+| 4 (default) | 202.160 | — | — |
+| 5 (`ALLOC_WARMUP_OPS=100000`, larger warmup) | 189.745 | — | — |
+| 6 (default) | 197.487 | 199.656 | 343.000 |
+| 7 (smoke-scale, `2000`/`10000`) | 181.489 | 193.775 | 343.000 |
+
+**§6's committed baseline (recorded 2026-07-18, three runs): direct
+62.577/79.710/77.374, submit 61.630/79.153/82.657.** Today's seven runs
+(direct: 180.355-202.160, tightly clustered around ~190; submit:
+193.426-199.656) sit **roughly 2.3-2.6x above §6's own highest disclosed
+figure**, with NO code, dependency, or `Cargo.lock` change between the two
+measurement sessions (`git diff 71df09f..HEAD -- benches/alloc_profile.rs
+benches/support/workload.rs` shows only `#050`'s purely-additive section-3
+insertion, verified in §13.2). A larger warmup (run 5) did not converge the
+number down toward §6's figure, ruling out "insufficient warmup / still
+mid-growth" as the explanation. The `MarketMakerEngine::update_price` section
+is, by contrast, **exactly reproducible**: `343.000` allocs/op on every one
+of these seven runs, matching §6's own three historical runs exactly — ten
+total measurements, zero variance, on the SAME machine as the two sections
+above that show a real, unexplained ~2.3-2.6x shift.
+
+**This is named, not investigated further — the same limitation §6 already
+discloses (no call-stack profiler available in this environment) applies
+here too.** Plausible, **unattributed** candidate causes: `DashMap`'s
+randomized per-instance hasher shifting shard-resize timing more than §6's
+own disclosed run-to-run spread anticipated (§6's hypothesis, but that
+hypothesis was framed around a ~25% spread, not a ~150% one); a change in
+this host's memory-pressure state between the two measurement sessions
+interacting with macOS `libmalloc`'s allocation-vs-realloc decision in a way
+that changes allocator CALL COUNT, not just latency (speculative — allocation
+*count* should, in principle, be a pure function of program logic plus hasher
+seed, not of system memory pressure, but this was not ruled out); or a
+subtlety in how the two measurement sessions differ that this investigation
+did not find. **Filed as [issue #126](https://github.com/joaquinbejar/fauxchange/issues/126)**
+for `matching-expert`/`architect` — with a real call-stack profiler
+(`dhat`/`heaptrack`/Instruments) — mirroring #91's own "measured, disclosed,
+tracked, not root-caused here" precedent; `architect`'s #053 review confirmed
+this is a ship-with-follow-up finding, not a blocker for arming the gate
+itself.
+
+**Why the gate's ceiling uses the freshly-observed numbers, not §6's stale
+figure.** A "no regression over the committed §6 baseline" gate taken
+literally would be **born red today**, on this exact machine, with zero code
+change — the same "born red" problem §13.1 names for HP-1 and #91. The
+allocation ceilings in `scripts/bench_regression_gate.py`
+(`ALLOC_CEILINGS_PER_OP`) are therefore set from THIS section's freshly
+re-verified numbers with real margin (450 allocs/op for the direct section,
+~2.2x the highest of the seven fresh runs and ~5.8x §6's own historical
+maximum; 500 for the submit section, similarly), so the gate is honest about
+current, reproducible reality rather than gating against a number that does
+not reproduce on this exact host today. §6's own committed table above is
+left UNCHANGED (this is a disclosed divergence, not a "correction" — a
+future investigation may find §6's number was itself measured under
+unusually favourable conditions, or that today's session has an identifiable
+cause; neither is known yet). The `MarketMakerEngine::update_price` ceiling
+(350) stays tight, matching that section's genuine, ten-run,
+zero-variance reproducibility.
+
+### 13.4 The synthetic-regression dry-run
+
+Proving the gate actually fails, per the milestone's acceptance criterion —
+never asserted without evidence:
+
+1. **A real, injected latency regression.** A single `std::thread::sleep(Duration::from_millis(20))`
+   was added, temporarily, inside `benches/hp1_order_path.rs`'s closed-loop
+   measurement loop (never `src/` — the venue code itself was never touched),
+   clearly commented as a `#053` dry-run injection. A real
+   `cargo bench --bench hp1_order_path` run (`HP1_WARMUP_OPS=50
+   HP1_MEASURED_OPS=200`) against the modified binary measured
+   `hp1_full_turn_closed_loop` p99 = **25,706,495 ns (25.7 ms)**, p99.9 =
+   **26,214,399 ns (26.2 ms)** — both comfortably past the 15 ms / 25 ms
+   ceiling. `python3 scripts/bench_regression_gate.py` against this REAL
+   (not fabricated) output printed:
+   ```
+   FAIL — 2 violation(s):
+     - 'hp1_full_turn_closed_loop' p99 25,706,495 ns exceeds the documented ceiling 15,000,000 ns
+     - 'hp1_full_turn_closed_loop' p99.9 26,214,399 ns exceeds the documented ceiling 25,000,000 ns
+   ```
+   exit status **1**. The injection was then reverted (`git diff --stat --
+   benches/hp1_order_path.rs` is empty after the revert — confirmed, never
+   committed).
+2. **Synthetic latency/allocation/flatness breaches (parser + comparator
+   coverage).** A hand-built, clearly-synthetic log (never presented as a
+   real bench run) with an inflated `hp1_full_turn_closed_loop` p99/p99.9, an
+   inflated `UnderlyingActor::handle` allocs/op, a non-flat `hp2_fanout_n1000`
+   p99, and several gated series simply OMITTED (simulating a bench crash)
+   was fed to the same script, producing 11 distinct violations covering
+   every branch of the gate logic (latency ceiling, alloc ceiling, missing
+   -gated-series, and fan-out flatness) — exit status **1**.
+3. **A clean baseline passes.** The REAL, un-injected §13.2 logs (HP-1
+   through HP-5 plus `alloc_profile`) were run through the same script:
+   `PASS — every gated series is within its documented ceiling.`, exit status
+   **0**.
+
+### 13.5 Noise margin and the baseline-update procedure
+
+- **The noise margin is the ceiling's own multiplier**, not a separate knob:
+  10x the worst disclosed measured p99/p99.9 for series already above ~100 µs,
+  or a 1 ms floor for series still at low-microsecond scale (§13.1). This is
+  wide enough to absorb (a) the M4-Max-laptop-vs-GitHub-hosted-runner
+  hardware gap, (b) #91's own disclosed, unresolved HP-1 tail regression, and
+  (c) §13.3's disclosed, unresolved allocation-count divergence — while still
+  failing a genuine multi-x regression (§13.4 proves this against a REAL 20ms
+  injection, not merely a fabricated one).
+- **A legitimate budget change is a reviewed `BENCH.md` commit, never a
+  silent gate edit.** If a future PR intentionally changes a hot path's
+  performance characteristics (a deliberate trade-off, a new dependency, an
+  accepted regression with a documented reason), the correct procedure is:
+  1. Re-run the affected `bench-hdr` bench(es) for real, paste the output
+     into a new dated `BENCH.md` entry (never edit the historical §§3-13
+     tables in place — add, disclose, interpret, per this repo's existing
+     convention throughout §§3-12).
+  2. Write an interpretation block: what moved, why (grounded in code
+     actually read, not "probably jitter"), and whether the new ceiling
+     still holds or needs a reviewed change.
+  3. If the ceiling itself needs to move, edit
+     `scripts/bench_regression_gate.py`'s `LATENCY_CEILINGS_NS` /
+     `ALLOC_CEILINGS_PER_OP` tables in the SAME PR as the `BENCH.md` entry,
+     with the module doc comment updated to point at the new dated section —
+     never a bare number change with no `BENCH.md` paper trail. A reviewer
+     rejects a ceiling-only diff with no accompanying `BENCH.md` commit.
+- **What this gate does NOT prove**: a production SLA on GitHub-hosted
+  runners (the ceilings are deliberately generous, not tuned); that #91 or
+  §13.3's divergence (#126) is resolved (both remain open, named follow-ups);
+  or that the smoke-scale per-push job reaches the same journal depth /
+  sample count the ceilings' margin was sized against (§13.2's reduced-scale
+  HP-1 number is far below its own ceiling for a different reason than
+  "healthy" — see the nightly-job rationale in
+  `.github/workflows/bench-regression.yml`'s header comment).
+
+### 13.6 HP-2 fan-out flatness is gated at nightly full sample, report-only at per-PR smoke sample
+
+Architect review (#053) flagged this as the one gate-design point that
+mattered most to fix before landing: §13.2's own re-verification measured
+worst |Δp99| across the N sweep = **13.3% at 10,000 measured ops** — only
+**1.7 percentage points** under the 15% `FANOUT_FLATNESS_TOLERANCE_PCT`
+tolerance (`benches/hp2_ws_fanout.rs`, reused unchanged by
+`scripts/bench_regression_gate.py`). The per-PR `bench-regression` job runs
+HP-2 at a smaller, faster `HP2_MEASURED_OPS=3000` — fewer tail samples per N,
+so the SAME underlying noise that produced 13.3% at 10,000 ops could plausibly
+cross 15% at 3,000 ops on a PR that changed nothing about fan-out at all. A
+gate that fails an unrelated PR on ordinary sampling noise gets overridden or
+disabled by frustrated reviewers — which defeats the gate more thoroughly
+than not gating that one check at that one sample scale.
+
+**The fix, chosen from the options architect named:** gate flatness ONLY in
+the `bench-regression-nightly` job (full default `HP2_MEASURED_OPS=30000`,
+the SAME sample scale §4's own flatness finding was measured at — 3.7%
+worst |Δp99|, well inside tolerance). The per-PR `bench-regression` job still
+PARSES and PRINTS the flatness percentage every run (never silently dropped —
+visible in both the job log and the uploaded artifact, under "reported, NOT
+gated"), it just does not fail the build on a breach at that sample scale.
+Mechanism: `scripts/bench_regression_gate.py` reads the
+`BENCH_REGRESSION_GATE_FLATNESS` environment variable (`"1"` = gate, anything
+else = report-only, default report-only) — `bench-regression.yml` sets it
+explicitly to `"0"` in the smoke job and `"1"` in the nightly job, so the
+distinction is a visible, reviewable, one-line diff in the workflow file, not
+a silent loosening buried in the script.
+
+The two OTHER options architect offered (raise the smoke job's
+`HP2_MEASURED_OPS` until flatness is stable at PR scale; or widen the
+smoke-scale tolerance specifically) were considered and set aside: raising
+`HP2_MEASURED_OPS` enough to reliably clear the 1.7-point margin would erode
+most of the per-PR job's speed advantage over the nightly job for exactly the
+one series least likely to need per-PR granularity (a fan-out regression is
+architecturally a whole-class-of-change issue — `WsFanOut`/
+`OrderbookSubscriptionManager` — not a narrow one-line diff a fast per-PR
+signal is uniquely suited to catch minutes sooner); a SEPARATE, WIDER
+smoke-scale tolerance constant would work but adds a second tolerance number
+to keep synchronized with the bench's own `FLATNESS_TOLERANCE_PCT` and BENCH.md
+§4's interpretation, for a check that is, by construction, only ever
+authoritative at full sample anyway. Gating once, at the sample scale the
+15% tolerance was actually calibrated against, is the more honest of the
+three.
