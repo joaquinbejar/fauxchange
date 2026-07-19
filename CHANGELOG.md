@@ -11,6 +11,34 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Added the v1.0 stability soak** (#54, `tests/load.rs`,
+  [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
+  `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;
+  `SOAK=1 cargo test --test load -- --ignored`, or `make soak`), it drives a
+  bounded, sustained order-flow window through the real REST router
+  (`tests/conformance/`) and asserts the four v1.0 acceptance properties:
+  flat RSS over the window (`ps -o rss=`, a disclosed POSIX-only mechanism —
+  never `getrusage`'s monotonic-peak `ru_maxrss`), no sequence gaps in either
+  `underlying_sequence` (the live journal) or `instrument_sequence` (the live
+  WS broadcast), a clean shutdown that GENUINELY drains a concurrent burst
+  against a deliberately small bounded mailbox with zero orders lost — a
+  dedicated actor built directly on `spawn_matching_actor` (the one place an
+  awaitable completion `JoinHandle` exists; `AppState` itself detaches and
+  discards it) drops every handle, then actually AWAITS the actor's own task
+  to completion before reading a surviving `Arc<Mutex<...>>`-backed journal
+  clone back, rather than inferring the drain from the submitters' own
+  results — and restart-from-journal determinism — reusing the real
+  `fauxchange::simulation::replay_bundle` recovery-as-re-execution oracle
+  (never a reimplementation), including the negative case: a corrupted
+  stored event halts recovery with the typed `JournalCorruption` naming the
+  exact `(underlying, sequence)`. Also records real REST round-trip
+  throughput/latency and a seeded-latency-draw fidelity check via the
+  `bench-hdr` `hdrhistogram` harness, disclosing that the live gateway-edge
+  application of injected latency is itself deferred to #111. New `Makefile`
+  `soak` target. A real `SOAK=1 cargo test --test load -- --ignored` run
+  (the documented default invocation) passed clean in 61.10 s with all four
+  properties holding — see `BENCH.md` §14 for the measured numbers.
+
 - **Armed the CI performance regression gate — the v1.0 performance gate**
   (#53, [07 §6](docs/07-performance-budgets.md#6-ci-regression-gate),
   [BENCH.md §13](BENCH.md#13-ci-regression-gate-ceilings-re-verification-and-the-dry-run-053)).

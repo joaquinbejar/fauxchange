@@ -18,7 +18,7 @@ LOGLEVEL ?= WARN
 .DEFAULT_GOAL := help
 
 .PHONY: all help build release run run-seeded check test test-conformance \
-	docker-smoke fmt fmt-check lint lint-fix fix clean doc readme coverage \
+	docker-smoke soak fmt fmt-check lint lint-fix fix clean doc readme coverage \
 	coverage-html audit deny check-spanish pre-push publish \
 	bench-regression bench-regression-full
 
@@ -99,6 +99,9 @@ test-conformance: ## The tests/ protocol conformance + e2e suite (golden/determi
 docker-smoke: ## Docker e2e smoke (DOCKER=1): compose up -> health -> order -> WS fill -> clean shutdown, < 30s cold budget (builds the image first)
 	docker compose -f docker/docker-compose.yml build
 	DOCKER=1 $(CARGO) test --test docker_smoke --all-features -- --nocapture
+
+soak: ## Stability soak (SOAK=1, a few minutes): flat memory, no sequence gaps, clean shutdown, restart-from-journal (#54) — operator-run before a release cut, never on the fast CI gate
+	SOAK=1 $(CARGO) test --release --test load -- --ignored --nocapture
 
 # --- Supply-chain gate (docs/08-threat-model.md §8) -------------------------
 

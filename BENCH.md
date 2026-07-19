@@ -2,9 +2,9 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), and the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`), on routinely-rebased working trees at those dates |
-| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
+| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), and the v1.0 stability soak (`#054`, §14, v1.0); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`), on routinely-rebased working trees at those dates |
+| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
 > **Every number in this document is a DESIGN TARGET comparison, never an
@@ -760,6 +760,12 @@ superseded by §5's real measurements, `#035`), not duplicated here.
   (`InMemoryVenueJournal`, `check_record_size`) — the two journal
   implementations §3.6 and §5 measure; neither changed in `#035` (a pure
   measurement issue, no `src/` change).
+- `tests/load.rs` (`#054`, §14) — the v1.0 stability soak: flat memory, no
+  sequence gaps, clean shutdown drains in-flight orders, restart-from-journal
+  determinism, `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate).
+  Reuses `tests/conformance/` for the REST driver and `benches/support/hdr.rs`
+  for the throughput/latency and latency-draw-fidelity quantile reports —
+  neither reimplemented. `Makefile`'s `soak` target runs it (`--release`).
 
 ## 11. HP-3 — FIX parse/encode, pure venue overhead (`#043`)
 
@@ -1395,3 +1401,167 @@ to keep synchronized with the bench's own `FLATNESS_TOLERANCE_PCT` and BENCH.md
 authoritative at full sample anyway. Gating once, at the sample scale the
 15% tolerance was actually calibrated against, is the more honest of the
 three.
+
+## 14. Stability soak — flat memory, no sequence gaps, clean shutdown, restart-from-journal (`#054`, v1.0)
+
+`tests/load.rs` (`#[ignore]` + `SOAK=1` — never on the fast CI gate,
+[docs/TESTING.md §8](docs/TESTING.md#8-load--soak)) drives a bounded,
+sustained order-flow window through the real REST router (`tests/conformance/`
+— the module `src/conformance/harness.rs`'s own doc comment names as its
+"library-side, production-grade sibling"; the milestone's named
+`src/conformance/harness.rs`/`VenueServer` is `mod harness;`, private to
+`fauxchange::conformance`, unreachable from an external `tests/*.rs` crate —
+see the test file's own module docs for the full disclosure) and asserts the
+four v1.0 stability properties. This is a stability/duration check, not a
+throughput ceiling measurement — peak matching throughput stays HP-1's job
+(§3).
+
+### 14.1 Run conditions
+
+| Item | Value |
+|---|---|
+| Machine | Apple M4 Max developer laptop (macOS, Darwin 25.5.0, `arm64`) — same class as §1, not a tuned bench rig |
+| Build | `cargo test` (debug/`unoptimized + debuginfo`) — the EXACT documented acceptance-criterion invocation, `SOAK=1 cargo test --test load -- --ignored` (no `--release`) |
+| Invocation | `SOAK=1 cargo test --test load --all-features -- --ignored --nocapture` (`make soak` runs the `--release` variant for a faster operator loop; both pass) |
+| Window (`SOAK_SECS`) | `60` s (default) |
+| Target rate (`SOAK_RATE`) | `40.0` rounds/sec (80 orders/sec) — deliberately modest, see rationale below and the test file's own module docs |
+| Fixture | `BTC-20240329-50000-C`, `trader-1` (maker, GTC sell) / `trader-2` (taker, market buy), `tests/conformance/mod.rs::venue(AMPLE_RATE_LIMIT)` |
+| RSS read mechanism | `ps -o rss= -p <pid>` (POSIX; verified on this Darwin host) — see §14.2's disclosure |
+
+### 14.2 The four properties — real measured results
+
+A real `SOAK=1 cargo test --test load --all-features -- --ignored --nocapture`
+run, the exact documented default invocation, passed clean in `61.10s`
+(re-verification run, after the §14.6 Property-3 fix):
+
+| Property | Result |
+|---|---|
+| 1. Flat RSS | Early-window median **28 480 KB**, late-window median **36 752 KB** (Δ = 8 272 KB), documented margin **20 480 KB** (`max(20% relative, 20 MB absolute)`) — **within margin, PASSED**. Journal footprint lower bound at window end: 8 680 records × 280 B (`size_of::<JournalRecord>`) ≈ 2 373 KB — the disclosed, EXPECTED, volume-proportional component (`InMemoryVenueJournal` retains every record for the process lifetime by design; not a leak), a small fraction of both the observed Δ and the margin. |
+| 2. No sequence gaps | `underlying_sequence`: **4 340** distinct values, `0..=4339` contiguous, **zero gaps** (read from the live `AppState::journal_snapshot`). `instrument_sequence` (WS `orderbook_delta`, `BTC-20240329-50000-C`): **4 340** messages observed, strictly consecutive, **zero duplicates, zero gaps, zero broadcast-lag skips**. |
+| 3. Clean shutdown drains in-flight orders | A dedicated actor (`spawn_matching_actor`, bypassing `AppState` — see §14.6 for why) took a 60-submission concurrent burst against a deliberately small 4-slot bounded mailbox: **5/60 accepted, 55 rate-limited (fail-fast, not lost), 0 orphaned**. Every `ActorHandle` clone was dropped, the actor's own `JoinHandle` was GENUINELY AWAITED to completion (real proof the `run()` loop drained and exited, not an inference), and only then was the SURVIVING `SharedJournal` (an `Arc<Mutex<...>>` clone held independently of the actor's lifetime) read back to confirm every accepted receipt's `underlying_sequence` has a committed `VenueEvent`. (`SOAK_SECS=15`/`60` re-runs both landed 5/60 accepted, 0 lost — the accept/reject SPLIT is a scheduling artifact of the deliberately tiny 4-slot mailbox racing 60 concurrent submitters, not something this property asserts a fixed ratio on.) |
+| 4. Restart-from-journal determinism | **4 340** exported events re-executed through `fauxchange::simulation::replay_bundle` (recovery-as-re-execution, ADR-0006) to values EQUAL to the stored oracle (positive case) — with the live venue already dropped before the replay call. A corrupted stored event at `underlying_sequence 0` correctly HALTED recovery with the typed `ReplayError::JournalCorruption { underlying: "BTC", sequence: 0 }` (negative case) — never a silent divergent resume. |
+
+### 14.3 Throughput + latency (real measurements, `bench-hdr`/`hdrhistogram`)
+
+REST round-trip latency (maker sell + taker market-buy, `benches/support/hdr.rs`
+reused verbatim), over 4 340 samples across the 60 s window:
+
+| Quantile | Value |
+|---|---|
+| p50 | 3 993 599 ns |
+| p99 | 9 502 719 ns |
+| p99.9 | 12 140 543 ns |
+| p99.99 | 20 922 367 ns |
+| min / max | 1 833 984 ns / 20 922 367 ns |
+
+2 170 rounds completed (4 340 commands) — **36.2 rounds/sec achieved** against
+a 40.0/sec target (an `axum::Router` `tower::ServiceExt::oneshot` dispatch
+through the real auth/handler/actor stack per call, debug build — NOT HP-1's
+dedicated hot-path measurement; the gap to target is expected debug-build +
+`oneshot`-dispatch overhead, not a regression signal this soak asserts
+against, and the run-to-run tail variance vs the first recorded run — e.g.
+p99.99 20.9ms here vs 33.3ms originally — is this shared, un-pinned
+developer laptop's own ordinary scheduler noise, §1's own disclosed
+characteristic, not a regression). A `--release` re-run at the same 60 s
+window/40 rounds-per-sec target showed the same four properties holding (all
+four PASSED), confirming the result is not a debug-build artifact.
+
+### 14.4 Injected-latency fidelity — honest disclosure
+
+`src/microstructure/latency.rs`'s own module docs are explicit: the **live
+gateway-edge application** of a drawn `LatencyOffset` onto real request
+arrival order is deferred to
+[#111](https://github.com/joaquinbejar/fauxchange/issues/111) — today
+`LatencyConfig` is a config + seeded-draw surface only, not yet wired onto
+live traffic. So §14.3's REST latency above carries **zero** injected delay.
+What this soak measures instead is the seeded draw's OWN fidelity against its
+configured distribution — the only latency mechanism that exists today —
+2 000 samples per model:
+
+| Model | Configured | Observed (p50 / min / max) | Result |
+|---|---|---|---|
+| `Fixed{us:2000}` | exact 2 000 µs every draw | 2 000 895 / 1 999 872 / 2 000 895 ns | Exact at the source; the reported spread is `hdrhistogram`'s own 3-sig-fig bucket resolution (≤ 0.06%), not draw jitter — PASSED within a disclosed 0.5% tolerance |
+| `Uniform{min:1000,max:5000}` | band `[1 000, 5 000]` µs | p50 2 973 695 / min 999 936 / max 5 001 215 ns | Within the configured band (± the same bucket-resolution artifact at the edges); p50 near the analytic midpoint — PASSED |
+| `Lognormal{median:1500,sigma:0.5}` | median 1 500 µs | p50 1 494 015 ns | Within a disclosed 50% tolerance of the configured median (heavy-tailed, 2 000 samples) — PASSED |
+
+### 14.5 Interpretation
+
+All four v1.0 stability properties held over the default documented window,
+measured both at debug build (the literal acceptance-criterion invocation)
+and `--release` (`make soak`), and at several window sizes (10 s / 15 s / 20 s
+/ 60 s) during iteration. The soak is genuinely exercising sustained flow, not
+a single request: 2 170-2 916 rounds (4 340-8 696 commands) depending on the
+window, through the real REST gateway, auth middleware, and the sequenced
+actor path, with concurrent RSS sampling and live WS broadcast observation
+running the whole time.
+
+**Platform limitation, disclosed as designed:** the RSS read shells out to
+the POSIX `ps -o rss= -p <pid>` utility rather than `/proc/self/status`
+(Linux-only) or `getrusage`'s `ru_maxrss` (a monotonic peak, structurally
+unusable for a flatness trend) via a new `libc` dependency this crate does
+not otherwise need. `ps` is present on both macOS and Linux CI runners; a
+host with neither (a `scratch`/`distroless` container, Windows) degrades to
+zero RSS samples and the test prints a `WARNING:` line rather than failing
+the whole soak on a missing tool — this did not occur on this run (120 real
+samples collected over the 60 s window).
+
+**DESIGN TARGETs, not achieved SLOs:** the `max(20% relative, 20 MB
+absolute)` RSS flatness margin and the soak's own throughput/latency numbers
+are this soak's own measured evidence for [docs/07-performance-budgets.md
+§4](docs/07-performance-budgets.md#4-throughput-scaling-and-isolation-budgets)'s
+"flat memory under sustained order flow" DESIGN TARGET — met on this run, on
+this host, at this volume; re-measure (never re-estimate) if the sustained
+volume, the journal's retention policy, or the mailbox capacity change
+materially. Peak matching throughput remains HP-1's (§3) DESIGN TARGET, not
+this soak's.
+
+### 14.6 Architect review fix — Property 3 now genuinely exercises the drain
+
+Architect review flagged that the first cut of Property 3 overstated what it
+tested: it kept a second `Arc<AppState>` clone (`verifier`) alive across the
+whole burst + assertion sequence purely to read the journal back afterward —
+which meant the actor's mailbox never actually reached zero senders during
+the test, so the "clean shutdown drains in-flight orders" title, and a
+comment claiming "the mailbox only closes once every one of them has
+resolved," were not literally exercised (`verifier` kept it open past that
+point).
+
+**Investigated first, per the review's own instruction, before picking a
+fix.** `AppState` itself has **no awaitable drain hook**:
+`AppState::new` spawns each per-underlying actor via
+`spawn_matching_actor_with_registry_and_index` and immediately `drop(join)`s
+the returned `JoinHandle` (`src/state.rs`) — the task is detached by
+construction, and nothing in `AppState`'s public surface can await its
+completion. But the lower-level primitive `AppState` itself calls,
+`spawn_matching_actor` (`fauxchange::exchange`, already `pub`, already used
+directly by several other tests — `tests/order_path.rs`,
+`tests/simulation.rs`), DOES return `(ActorHandle, JoinHandle<()>)` — a real,
+awaitable completion signal exists one layer below `AppState`.
+
+**Fix taken: the PREFERRED path — genuinely exercise the drain**, not a
+retitle. `run_shutdown_drain_check` now builds its own actor directly on
+`spawn_matching_actor`, over a test-local `SharedJournal`
+(`tests/load.rs`) — a `VenueJournal` implementation whose storage is an
+`Arc<Mutex<Vec<JournalRecord>>>`, so a clone taken BEFORE the journal is
+moved into the actor **survives** the actor/handle/task, unlike the
+actor-owned `InMemoryVenueJournal`. The check fires the 60-submission burst
+through cloned `ActorHandle`s, drops every handle (including its own),
+awaits every submission to a definitive `Ok(Receipt)` / `Err(RateLimited)`,
+THEN genuinely **awaits the actor's own `JoinHandle`** — proof the `run()`
+receive loop actually drained its backlog and returned — and only after that
+real completion signal reads the surviving `SharedJournal` to confirm every
+accepted receipt's event is durably present. The title is now literally
+true. §14.2's Property 3 row and this document's §14 numbers were
+re-measured (not carried over) against the fixed code.
+
+Two cosmetic nits from the same review were also applied:
+`collect_orderbook_deltas`'s `Instant::saturating_duration_since` now carries
+a one-line note distinguishing it from the overflow-hiding integer/`Decimal`
+arithmetic `rules/global_rules.md` and this file's own `bounded` helper are
+about (a monotonic-clock timeout-budget clamp, the same idiom
+`src/conformance/harness.rs` already uses, is a different thing); and
+`capture_mid_run_bundle`'s doc comment now clarifies "mid-run" means "the
+venue was never stopped/drained before this capture," not "while the load
+loop was still actively looping" (that loop has already returned by the time
+this function runs — the venue's own continuous serving state, proven by the
+post-export `CancelOrder` liveness probe, is what "mid-run" refers to).
