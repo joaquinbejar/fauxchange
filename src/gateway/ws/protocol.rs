@@ -130,6 +130,18 @@ pub fn parse_frame(text: &str) -> FrameOutcome {
         .get("request_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+
+    // `serde_json::Value` silently keeps the last value for a repeated key, so a
+    // duplicate top-level field (e.g. two `action`s) would slip through the parse
+    // above. A duplicate key is a malformed frame — detect it on the raw text and
+    // reject with the same non-terminal decode error shape as malformed JSON.
+    if value.is_object() && has_duplicate_top_level_key(text) {
+        return FrameOutcome::Reject(Box::new(decode_error(
+            request_id,
+            "duplicate top-level field",
+        )));
+    }
+
     let action = value
         .get("action")
         .and_then(serde_json::Value::as_str)
@@ -163,6 +175,57 @@ pub fn is_order_entry_action(action: &str) -> bool {
 /// `price` or `quantity`).
 fn looks_like_order_entry(value: &serde_json::Value) -> bool {
     value.get("side").is_some() && (value.get("price").is_some() || value.get("quantity").is_some())
+}
+
+/// Whether `text` — already known to parse as a JSON object — carries a
+/// duplicate top-level key, which [`serde_json::Value`] would silently collapse
+/// to the last value. Only the top-level object keys are inspected.
+#[must_use]
+fn has_duplicate_top_level_key(text: &str) -> bool {
+    // Given a valid JSON object, [`UniqueTopLevelKeys`] only ever errors on the
+    // first repeated key (nested values are ignored), so `is_err()` means the
+    // frame has a duplicate top-level field.
+    serde_json::from_str::<UniqueTopLevelKeys>(text).is_err()
+}
+
+/// A structural guard whose [`Deserialize`] visits a JSON object's top-level
+/// keys and fails on the first repeat. Values are ignored via
+/// [`serde::de::IgnoredAny`] — nested objects are not inspected — so the check
+/// stays pure (no wall-clock, no RNG) and touches only top-level keys.
+struct UniqueTopLevelKeys;
+
+impl<'de> Deserialize<'de> for UniqueTopLevelKeys {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct KeyVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for KeyVisitor {
+            type Value = UniqueTopLevelKeys;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object with unique top-level keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut seen: Vec<String> = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if seen.contains(&key) {
+                        return Err(serde::de::Error::custom("duplicate top-level key"));
+                    }
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                    seen.push(key);
+                }
+                Ok(UniqueTopLevelKeys)
+            }
+        }
+
+        deserializer.deserialize_map(KeyVisitor)
+    }
 }
 
 /// A non-terminal decode/validation WS error for a malformed frame.
@@ -298,6 +361,44 @@ mod tests {
             FrameOutcome::Reject(err) => assert_eq!(err.code, WsErrorCode::BadRequest),
             other => panic!("expected a decode error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_parse_frame_rejects_duplicate_action_field() {
+        // Two `action` keys: `serde_json::Value` would keep only the last; the
+        // frame is malformed and must be rejected as a decode error.
+        let frame = r#"{"action":"subscribe","action":"set_spread","channel":"orderbook","symbol":"BTC-20240329-50000-C","value":1.5}"#;
+        match parse_frame(frame) {
+            FrameOutcome::Reject(err) => {
+                assert_eq!(err.code, WsErrorCode::BadRequest);
+                assert_eq!(err.category, WsErrorCategory::Decode);
+                assert!(!err.terminal, "a duplicate-key rejection is non-terminal");
+            }
+            other => panic!("a duplicate `action` frame must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_frame_rejects_duplicate_request_id_field() {
+        let frame = r#"{"action":"list_subscriptions","request_id":"a","request_id":"b"}"#;
+        match parse_frame(frame) {
+            FrameOutcome::Reject(err) => {
+                assert_eq!(err.code, WsErrorCode::BadRequest);
+                assert_eq!(err.category, WsErrorCategory::Decode);
+                assert!(!err.terminal);
+            }
+            other => panic!("a duplicate `request_id` frame must be rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_frame_accepts_unique_keys() {
+        // A well-formed frame with all-unique top-level keys still decodes.
+        let frame = r#"{"action":"subscribe","channel":"orderbook","symbol":"BTC-20240329-50000-C","depth":5}"#;
+        assert!(matches!(
+            parse_frame(frame),
+            FrameOutcome::Action(ClientAction::Subscribe(_), _)
+        ));
     }
 
     #[test]
