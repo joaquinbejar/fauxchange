@@ -852,5 +852,4 @@ mod tests {
             "a dropped override must not publish a PriceUpdate"
         );
     }
-
 }
