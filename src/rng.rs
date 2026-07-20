@@ -26,7 +26,22 @@
 //! draw into integer cents / microseconds still guards its own `f64 → integer`
 //! boundary (this module only guarantees finite `f64` draws).
 //!
+//! ## Modular arithmetic — the one audited `wrapping_*` exception
+//!
+//! `rules/global_rules.md` forbids `wrapping_*` because it silently hides overflow.
+//! FNV-1a and `SplitMix64` are the documented exception: both are **defined over
+//! `mod 2^64` arithmetic** — the `wrapping_mul` in [`fnv1a_64`] / [`mix64`] and the
+//! `wrapping_add` in [`SplitMix64::next_u64`] are the algorithms' *specified*
+//! behaviour, not an accidental overflow. Using `checked_*` here would either reject
+//! the normal, correct wrap (breaking the hash/PRNG) or force a meaningless error on
+//! a value that is pure PRNG/hash state — **never money (`Cents`), a sequence number,
+//! a timestamp, or a leg/row count**, the values the arithmetic rule actually guards.
+//! Each site is annotated inline; this is the single place the crate wraps on purpose.
+//!
 //! [`next_open_unit`]: SplitMix64::next_open_unit
+//! [`fnv1a_64`]: fnv1a_64
+//! [`mix64`]: mix64
+//! [`SplitMix64::next_u64`]: SplitMix64::next_u64
 
 /// The FNV-1a 64-bit offset basis — folds a byte string into a stream key with a
 /// fixed, portable hash (never `std::hash::RandomState`).
@@ -50,6 +65,8 @@ pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash = FNV_OFFSET_BASIS;
     for &byte in bytes {
         hash ^= u64::from(byte);
+        // Audited `wrapping_*` exception (see module docs): FNV-1a is defined over
+        // `mod 2^64`; the wrap is the spec, and `hash` is hash state, not money/seq.
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
@@ -60,6 +77,8 @@ pub(crate) fn fnv1a_64(bytes: &[u8]) -> u64 {
 #[inline]
 #[must_use]
 pub(crate) fn mix64(z: u64) -> u64 {
+    // Audited `wrapping_*` exception (see module docs): the SplitMix64 finaliser is
+    // defined over `mod 2^64`; the wrap is the spec, and `z` is PRNG state.
     let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -105,6 +124,8 @@ impl SplitMix64 {
     /// The next 64-bit output.
     #[inline]
     pub(crate) fn next_u64(&mut self) -> u64 {
+        // Audited `wrapping_*` exception (see module docs): SplitMix64's state advance
+        // is defined over `mod 2^64`; the wrap is the spec, `state` is PRNG state.
         self.state = self.state.wrapping_add(SPLITMIX_GAMMA);
         mix64(self.state)
     }
