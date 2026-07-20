@@ -533,7 +533,9 @@ where
     /// - [`SnapshotError::JournalUnavailable`] if the epoch marker cannot be
     ///   journaled (rolls back), or the underlying is sealed on the journal;
     /// - [`SnapshotError::SequenceExhausted`] if the underlying is sealed on
-    ///   exhaustion or the sequence cannot advance past the marker.
+    ///   exhaustion, the epoch counter cannot advance, or the
+    ///   `underlying_sequence` cannot continue past the epoch marker — the last
+    ///   is refused **before** any live state is mutated (nothing swapped).
     pub fn restore(
         &mut self,
         snapshot: &VenueSnapshot,
@@ -558,10 +560,24 @@ where
             .checked_add(1)
             .ok_or(SnapshotError::SequenceExhausted)?;
 
+        // Pre-mutation sequence-capacity gate (#009 all-or-nothing): the epoch
+        // marker consumes `sequence`, and the fresh epoch must be able to continue
+        // PAST it. Prove that capacity now — while everything is still on the
+        // detached/prepared side — so a restore that would exhaust the
+        // `underlying_sequence` is refused BEFORE any live state (books, stores,
+        // epoch, journal) is touched, leaving the live books exactly as they were.
+        // This mirrors the re-add path's all-or-nothing contract; the genuinely
+        // at-the-limit LIVE command path still seals post-commit (`handle`), but a
+        // RESTORE fails closed rather than sealing after replacing the books.
+        let next_sequence = sequence
+            .checked_next()
+            .ok_or(SnapshotError::SequenceExhausted)?;
+
         // Step 2a: prepare the detached book image (fallible, non-mutating).
         let prepared = self.executor.prepare_restore(
             &snapshot.executor.resting_orders,
             &snapshot.executor.idempotency,
+            &snapshot.executor.instrument_statuses,
         )?;
 
         // Step 2b: append the epoch marker as the first record of the fresh
@@ -581,25 +597,17 @@ where
             return Err(SnapshotError::JournalUnavailable);
         }
 
-        // Step 3: commit — swap all four stores infallibly under quiescence.
+        // Step 3: commit — swap all four stores infallibly under quiescence, then
+        // continue the `underlying_sequence` past the marker. The capacity was
+        // proven above (`next_sequence`), so this advance cannot exhaust and the
+        // commit cannot leave a half-restored, un-advanceable book.
         self.executor.commit_restore(prepared);
         self.fan_out
             .executions()
             .restore(snapshot.executions.clone());
         self.fan_out.positions().restore(snapshot.positions.clone());
         self.epoch = new_epoch;
-
-        // Continue the underlying_sequence past the marker (checked, never wraps).
-        match sequence.checked_next() {
-            Some(next) => self.next_sequence = next,
-            None => {
-                self.sealed = Some(SealReason::SequenceExhausted);
-                tracing::error!(
-                    underlying = %self.underlying,
-                    "underlying_sequence exhausted opening the restore epoch; sealing"
-                );
-            }
-        }
+        self.next_sequence = next_sequence;
 
         tracing::info!(
             underlying = %self.underlying,
@@ -778,10 +786,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::boundary::{Hash32, STPMode, Side, TimeInForce};
     use crate::exchange::identity::JournalHeader;
     use crate::exchange::journal::InMemoryVenueJournal;
+    use crate::exchange::money::Cents;
+    use crate::exchange::stores::MarkPriceBook;
     use crate::exchange::symbol::Symbol;
-    use crate::models::{AccountId, VenueOrderId};
+    use crate::models::{AccountId, ClientOrderId, OrderType, VenueOrderId};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // ---- fixtures --------------------------------------------------------
@@ -1008,6 +1019,97 @@ mod tests {
             Err(VenueError::SequenceExhausted) => {}
             other => panic!("expected SequenceExhausted, got {other:?}"),
         }
+    }
+
+    // ---- restore refuses pre-mutation on sequence exhaustion (#009) -------
+
+    /// A default-wired actor (real [`MatchingExecutor`] over the in-memory
+    /// [`StoreFanOut`]) seeded at `start_sequence`, so a restore can be driven
+    /// synchronously under the single writer.
+    fn real_actor(
+        start_sequence: SequenceNumber,
+    ) -> UnderlyingActor<
+        InMemoryVenueJournal,
+        MatchingExecutor,
+        StoreFanOut<InMemoryExecutionsStore, InMemoryPositionsStore>,
+        FixedClock,
+    > {
+        let fan = StoreFanOut::new(
+            Arc::new(InMemoryExecutionsStore::new()),
+            Arc::new(InMemoryPositionsStore::new()),
+            Arc::new(MarkPriceBook::new()),
+        );
+        UnderlyingActor::new(
+            config_from(start_sequence),
+            journal(),
+            MatchingExecutor::new("BTC"),
+            fan,
+            CLOCK,
+        )
+    }
+
+    /// A resting limit add on the shared fixture leaf.
+    fn add_order(tag: &str, sequence: u64, side: Side, price: u64, quantity: u64) -> VenueCommand {
+        VenueCommand::AddOrder {
+            symbol: sym("BTC-20240329-50000-C"),
+            order_id: LineageId::new("run-1").venue_order_id(
+                "BTC",
+                SequenceNumber::new(sequence),
+                0,
+            ),
+            account: AccountId::new(tag),
+            owner: Hash32([0xAB; 32]),
+            client_order_id: Some(ClientOrderId::new(format!("cloid-{tag}"))),
+            side,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(price)),
+            quantity,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        }
+    }
+
+    #[test]
+    fn test_restore_that_would_exhaust_sequence_refuses_before_mutating() {
+        // Source venue: a healthy actor with one resting order → the snapshot cut.
+        let mut source = real_actor(SequenceNumber::START);
+        if let Err(e) = source.handle(add_order("m1", 0, Side::Sell, 50_100, 3)) {
+            panic!("source add failed: {e}");
+        }
+        let snapshot = source.capture("snap-1", "fp-1");
+
+        // Target venue: a DISTINCT actor seeded one below the ceiling, given its
+        // OWN resting order in one committed turn — which advances the counter to
+        // exactly u64::MAX WITHOUT sealing (the genuinely-at-the-limit live case).
+        let mut target = real_actor(SequenceNumber::new(u64::MAX - 1));
+        if let Err(e) = target.handle(add_order("b1", u64::MAX - 1, Side::Buy, 49_900, 2)) {
+            panic!("target add failed: {e}");
+        }
+
+        // The target's cut BEFORE the attempted restore. FixedClock ⇒ two captures
+        // are byte-identical iff every store is unchanged.
+        let before = target.capture("probe", "fp-1");
+
+        // A restore whose epoch marker would consume the last assignable sequence
+        // and then be unable to advance MUST be refused BEFORE any live state is
+        // mutated (the all-or-nothing contract) — not sealed after a swap.
+        match target.restore(&snapshot, "fp-1") {
+            Err(SnapshotError::SequenceExhausted) => {}
+            other => panic!("expected SequenceExhausted, got {other:?}"),
+        }
+
+        // Live books untouched: the target still carries its OWN order, not the
+        // source's — the pre-fix post-mutation check would have swapped them first.
+        let after = target.capture("probe", "fp-1");
+        assert_eq!(
+            before, after,
+            "a refused restore must leave top_of_book / capture_state byte-identical"
+        );
+        assert_eq!(
+            target.epoch(),
+            0,
+            "a refused restore must not open a new epoch"
+        );
     }
 
     // ---- pre-execution append failure: reuse N, book untouched -----------

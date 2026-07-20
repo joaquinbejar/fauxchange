@@ -53,7 +53,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::exchange::boundary::{Hash32, Side, TimeInForce};
+use crate::exchange::boundary::{Hash32, InstrumentStatus, Side, TimeInForce};
 use crate::exchange::envelope::VenueOutcome;
 use crate::exchange::event::EventTimestamp;
 use crate::exchange::identity::{LineageId, VENUE_ENVELOPE_SCHEMA};
@@ -383,6 +383,26 @@ pub struct RestingOrderCapture {
     pub time_in_force: TimeInForce,
 }
 
+/// One leaf's **lifecycle status** in the book cut — captured so a restore keeps
+/// a non-accepting instrument non-accepting ([02 §9](../../../docs/02-matching-architecture.md)).
+///
+/// A freshly-rebuilt leaf comes up [`InstrumentStatus::Active`] (the upstream
+/// default), so a restore that only re-added resting orders would silently
+/// reactivate a `Halted` / `Settling` / `Expired` instrument — turning a halted
+/// contract tradable again. Only **non-`Active`** leaves are captured (the vivify
+/// default already reproduces `Active`), and a restore re-applies each one with
+/// the upstream `OptionOrderBook::set_status`, whose lifecycle state machine
+/// admits every reachable target from a fresh `Active` leaf. Captured in a stable
+/// order (by symbol) so the cut is deterministic — no wall-clock, no RNG.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstrumentStatusCapture {
+    /// The contract symbol whose leaf carries this status.
+    pub symbol: Symbol,
+    /// The captured (non-`Active`) lifecycle status.
+    pub status: InstrumentStatus,
+}
+
 /// One executions-log leg in the cut — the authoritative [`ExecutionRecord`]
 /// plus its insertion-order surrogate, so restore preserves list ordering.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -429,6 +449,12 @@ pub struct ExecutorState {
     pub resting_orders: Vec<RestingOrderCapture>,
     /// The idempotency map records.
     pub idempotency: Vec<IdempotencyRecord>,
+    /// The non-`Active` leaf lifecycle statuses to re-apply on restore, in a
+    /// stable order (by symbol). `#[serde(default)]` so a snapshot serialised
+    /// before this field existed still deserialises (an empty list — every leaf
+    /// rebuilds `Active`, the prior behaviour).
+    #[serde(default)]
+    pub instrument_statuses: Vec<InstrumentStatusCapture>,
 }
 
 /// A complete venue snapshot — the atomic consistent cut of the four derived
@@ -610,6 +636,10 @@ mod tests {
                 idempotency: vec![IdempotencyRecord {
                     key: IdempotencyKey::new(AccountId::new("maker"), ClientOrderId::new("c-0")),
                     entry: entry(0),
+                }],
+                instrument_statuses: vec![InstrumentStatusCapture {
+                    symbol: sym(),
+                    status: InstrumentStatus::Halted,
                 }],
             },
             executions: vec![],

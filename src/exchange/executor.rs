@@ -76,7 +76,9 @@ use crate::exchange::actor::{
     ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, VenueClock,
     spawn_underlying_actor,
 };
-use crate::exchange::boundary::{Hash32, OptionStyle, OrderId, STPMode, Side, TimeInForce};
+use crate::exchange::boundary::{
+    Hash32, InstrumentStatus, OptionStyle, OrderId, STPMode, Side, TimeInForce,
+};
 use crate::exchange::envelope::{
     AddOutcome, CancelReason, CancelledLeg, Fill, VenueCommand, VenueOutcome,
 };
@@ -85,7 +87,7 @@ use crate::exchange::journal::VenueJournal;
 use crate::exchange::money::{Cents, MoneyError, SignedCents};
 use crate::exchange::snapshot::{
     ExecutorState, IdempotencyEntry, IdempotencyFingerprint, IdempotencyKey, IdempotencyMap,
-    IdempotencyRecord, RestingOrderCapture, SnapshotError,
+    IdempotencyRecord, InstrumentStatusCapture, RestingOrderCapture, SnapshotError,
 };
 use crate::exchange::symbol::Symbol;
 use crate::models::{AccountId, ClientOrderId, LiquidityFlag, OrderType, VenueOrderId};
@@ -1060,7 +1062,46 @@ impl MatchingExecutor {
         ExecutorState {
             resting_orders,
             idempotency: self.idempotency.capture(),
+            instrument_statuses: self.capture_instrument_statuses(),
         }
+    }
+
+    /// Captures every leaf's **non-`Active`** lifecycle status so a restore keeps
+    /// a `Halted` / `Settling` / `Expired` instrument non-accepting instead of
+    /// silently reactivating it (a fresh rebuilt leaf comes up `Active`).
+    ///
+    /// A pure read: it walks the hierarchy through non-creating iterators and
+    /// never mutates structure. `Active` leaves are skipped — the vivify default
+    /// already reproduces `Active` on restore. The result is sorted by symbol so
+    /// the cut is deterministic (no wall-clock, no RNG, no map-iteration order).
+    #[must_use]
+    fn capture_instrument_statuses(&self) -> Vec<InstrumentStatusCapture> {
+        let mut statuses: Vec<InstrumentStatusCapture> = Vec::new();
+        for (_expiration, expiration_book) in self.underlying_book.expirations().iter() {
+            let mut strikes = expiration_book.strike_prices();
+            strikes.sort_unstable();
+            for strike in strikes {
+                let Ok(strike_book) = expiration_book.get_strike(strike) else {
+                    continue;
+                };
+                for leaf in [strike_book.call_arc(), strike_book.put_arc()] {
+                    let status = leaf.status();
+                    if status == InstrumentStatus::Active {
+                        continue;
+                    }
+                    let Ok(symbol) = Symbol::parse(leaf.symbol()) else {
+                        tracing::error!(
+                            symbol = leaf.symbol(),
+                            "leaf symbol failed to parse during status capture; skipping"
+                        );
+                        continue;
+                    };
+                    statuses.push(InstrumentStatusCapture { symbol, status });
+                }
+            }
+        }
+        statuses.sort_by(|a, b| a.symbol.as_str().cmp(b.symbol.as_str()));
+        statuses
     }
 
     /// **Prepares** a restore of the leaf books + idempotency map by building a
@@ -1071,9 +1112,11 @@ impl MatchingExecutor {
     /// order's symbol resolves within this underlying, orders the re-adds by
     /// `engine_seq` (reproducing price-time priority; a consistent cut never
     /// crosses, so no re-add matches), then re-adds **all** of them into a fresh
-    /// detached [`MatchingExecutor`] and installs the idempotency map on it. A
-    /// single failing re-add aborts here with a typed error, and because nothing
-    /// on this path touches `self`, the running executor's book and the other
+    /// detached [`MatchingExecutor`], installs the idempotency map, and re-applies
+    /// each captured non-`Active` leaf lifecycle status (after the re-adds, so an
+    /// order lands while its leaf is still `Active`). A single failing re-add or
+    /// status transition aborts here with a typed error, and because nothing on
+    /// this path touches `self`, the running executor's book and the other
     /// three stores are left **exactly** as they were
     /// ([02 §9](../../../docs/02-matching-architecture.md)). Only after every add
     /// has succeeded does [`commit_restore`](Self::commit_restore) swap the fully
@@ -1088,13 +1131,15 @@ impl MatchingExecutor {
     /// # Errors
     ///
     /// Returns [`SnapshotError::RebuildFailed`] if a captured order's symbol does
-    /// not parse, belongs to a different underlying, or cannot be re-added to the
-    /// detached book (a malformed cut — e.g. a duplicated `engine_seq`). In every
-    /// case the live executor is untouched.
+    /// not parse, belongs to a different underlying, cannot be re-added to the
+    /// detached book (a malformed cut — e.g. a duplicated `engine_seq`), or a
+    /// captured leaf status transition is refused by the upstream lifecycle state
+    /// machine. In every case the live executor is untouched.
     pub fn prepare_restore(
         &self,
         resting: &[RestingOrderCapture],
         idempotency: &[IdempotencyRecord],
+        instrument_statuses: &[InstrumentStatusCapture],
     ) -> Result<PreparedRestore, SnapshotError> {
         let expected = self.underlying_book.underlying();
         let mut orders: Vec<PreparedRestingOrder> = Vec::with_capacity(resting.len());
@@ -1130,7 +1175,50 @@ impl MatchingExecutor {
         let mut detached = MatchingExecutor::new(expected);
         detached.rebuild_from(orders)?;
         detached.idempotency = IdempotencyMap::from_records(idempotency);
+        // Re-apply lifecycle statuses AFTER every re-add: the upstream add path
+        // rejects a non-`Active` leaf, so orders must land while the fresh leaf is
+        // still `Active`, then the captured non-`Active` status is set.
+        detached.apply_instrument_statuses(instrument_statuses)?;
         Ok(PreparedRestore { detached })
+    }
+
+    /// Re-applies each captured leaf lifecycle status onto this (detached)
+    /// executor's rebuilt hierarchy — the status step of a restore.
+    ///
+    /// Each freshly-vivified leaf comes up [`InstrumentStatus::Active`], so this
+    /// drives it to the captured non-`Active` target through the upstream
+    /// `OptionOrderBook::set_status`, whose lifecycle state machine admits every
+    /// reachable target (`Halted` / `Settling` / `Expired`) from `Active`. The
+    /// captures are already ordered by symbol, so application is deterministic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::RebuildFailed`] if a captured leaf's symbol does
+    /// not resolve within this underlying or the upstream state machine refuses
+    /// the transition (a malformed cut — e.g. an unreachable `Pending`). Because
+    /// this runs on the detached executor, no live state is affected.
+    fn apply_instrument_statuses(
+        &self,
+        instrument_statuses: &[InstrumentStatusCapture],
+    ) -> Result<(), SnapshotError> {
+        for capture in instrument_statuses {
+            let leaf = self
+                .resolve_leaf_vivify(&capture.symbol)
+                .map_err(|reason| {
+                    SnapshotError::RebuildFailed(format!(
+                        "could not vivify leaf for status restore '{}': {reason}",
+                        capture.symbol.as_str()
+                    ))
+                })?;
+            leaf.set_status(capture.status).map_err(|error| {
+                SnapshotError::RebuildFailed(format!(
+                    "restoring instrument status {} for '{}' failed: {error}",
+                    capture.status,
+                    capture.symbol.as_str()
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Re-adds every prepared order (already ordered by `engine_seq`) into this
@@ -2383,7 +2471,11 @@ mod tests {
         );
 
         // Restore the cut: prepare then commit returns the book exactly.
-        let prepared = match ex.prepare_restore(&state.resting_orders, &state.idempotency) {
+        let prepared = match ex.prepare_restore(
+            &state.resting_orders,
+            &state.idempotency,
+            &state.instrument_statuses,
+        ) {
             Ok(p) => p,
             Err(e) => panic!("prepare failed: {e}"),
         };
@@ -2393,6 +2485,66 @@ mod tests {
             top_before,
             "restore returns the books to the snapshot state"
         );
+    }
+
+    #[test]
+    fn test_restore_round_trips_instrument_lifecycle_status() {
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        // Rest an order, then halt the instrument (a legal `Active -> Halted`
+        // edge). A halted leaf stops accepting NEW orders but keeps its resting
+        // book — exactly the "silently tradable again" regression this guards.
+        run(
+            &mut ex,
+            &lin,
+            0,
+            &add(&lin, 0, "m1", 0x11, Side::Sell, 50_100, 3, TimeInForce::Gtc),
+        );
+        let leaf = match ex.resolve_leaf_vivify(&sym()) {
+            Ok(l) => l,
+            Err(e) => panic!("resolve failed: {e}"),
+        };
+        if let Err(e) = leaf.set_status(InstrumentStatus::Halted) {
+            panic!("set_status failed: {e}");
+        }
+        assert!(!leaf.status().is_accepting_orders());
+
+        // The cut captures the non-`Active` status (keyed by symbol).
+        let state = ex.capture_state();
+        assert!(
+            state
+                .instrument_statuses
+                .iter()
+                .any(|c| c.symbol == sym() && c.status == InstrumentStatus::Halted),
+            "capture records the halted instrument status"
+        );
+
+        // Restore into a FRESH executor whose leaves would otherwise vivify
+        // `Active` (the upstream default) — the bug being fixed.
+        let mut restored = MatchingExecutor::new(UNDERLYING);
+        let prepared = match restored.prepare_restore(
+            &state.resting_orders,
+            &state.idempotency,
+            &state.instrument_statuses,
+        ) {
+            Ok(p) => p,
+            Err(e) => panic!("prepare failed: {e}"),
+        };
+        restored.commit_restore(prepared);
+
+        // The restored instrument keeps its status — NOT silently `Active` again.
+        let restored_leaf = match restored.resolve_leaf_read(&sym()) {
+            Some(l) => l,
+            None => panic!("restored leaf missing"),
+        };
+        assert_eq!(
+            restored_leaf.status(),
+            InstrumentStatus::Halted,
+            "a restored halted instrument must not silently become tradable"
+        );
+        assert!(!restored_leaf.status().is_accepting_orders());
+        // The whole executor cut round-trips (resting book + status together).
+        assert_eq!(restored.capture_state(), state);
     }
 
     #[test]
@@ -2457,7 +2609,7 @@ mod tests {
             quantity: 1,
             time_in_force: TimeInForce::Gtc,
         };
-        match ex.prepare_restore(&[bad], &[]) {
+        match ex.prepare_restore(&[bad], &[], &[]) {
             Err(SnapshotError::RebuildFailed(_)) => {}
             other => panic!("expected RebuildFailed, got {other:?}"),
         }
@@ -2519,7 +2671,7 @@ mod tests {
         // Determinism-stable: the malformed restore fails identically on repeat,
         // and each failed prepare leaves EVERY live store byte-for-byte the cut.
         for _ in 0..2 {
-            match ex.prepare_restore(&malformed, &[]) {
+            match ex.prepare_restore(&malformed, &[], &[]) {
                 Err(SnapshotError::RebuildFailed(_)) => {}
                 other => panic!("expected RebuildFailed, got {other:?}"),
             }
@@ -2540,6 +2692,7 @@ mod tests {
         let prepared = match ex.prepare_restore(
             &live_state_before.resting_orders,
             &live_state_before.idempotency,
+            &live_state_before.instrument_statuses,
         ) {
             Ok(p) => p,
             Err(e) => panic!("prepare of a well-formed cut failed: {e}"),
@@ -2621,7 +2774,11 @@ mod tests {
 
         // A fresh executor rehydrated from the cut serves the same retry.
         let mut restored = MatchingExecutor::new(UNDERLYING);
-        let prepared = match restored.prepare_restore(&state.resting_orders, &state.idempotency) {
+        let prepared = match restored.prepare_restore(
+            &state.resting_orders,
+            &state.idempotency,
+            &state.instrument_statuses,
+        ) {
             Ok(p) => p,
             Err(e) => panic!("prepare failed: {e}"),
         };
