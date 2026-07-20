@@ -53,26 +53,20 @@ Environment:
         percentage. Defaults to `FANOUT_FLATNESS_TOLERANCE_PCT_FULL` (15.0,
         matching `FLATNESS_TOLERANCE_PCT` in `benches/hp2_ws_fanout.rs` and
         BENCH.md §4's own full-sample methodology) when unset. The per-PR
-        `bench-regression` job sets this to `40` (wider) because its smaller
-        HP2_MEASURED_OPS=3000 sample is noisier than the nightly job's full
-        30,000-op sample — BENCH.md §13.2 measured worst |delta p99| = 13.3%
-        at 10,000 ops, only 1.7 percentage points under the 15% tolerance, so
-        gating the SAME 15% bound at an even smaller, noisier sample risked a
-        spurious fail on an unrelated PR. 40% is NOT a fresh measurement at
-        3,000 ops (none was taken) — it is a disclosed extrapolation from
-        BENCH.md's two real data points (3.7% at 30,000 ops, 13.3% at 10,000
-        ops): a naive 1/sqrt(N) scaling from the 10,000-op point predicts
-        ~24% at 3,000 ops, but the empirical ratio between the two disclosed
-        points (13.3/3.7 ~ 3.6x noise for a 3x drop in N) is already steeper
-        than 1/sqrt(N) predicts (1.7x), so a purely theoretical extrapolation
-        would likely UNDERSTATE the true smoke-scale noise; applying that
-        same empirical ratio again for the further ~3.3x drop from 10,000 to
-        3,000 ops gives ~48%. 40% sits inside that disclosed [24%, 48%]
-        bracket, still a small fraction of the many-times-the-baseline
-        signature a genuine O(N) fan-out regression produces (BENCH.md §4),
-        so it remains a real, meaningful gate on the PR path, not a
-        rubber stamp. See BENCH.md §13.6 for the original per-PR design this
-        refines.
+        `bench-regression` job sets this to `100` because its smaller
+        HP2_MEASURED_OPS=3000 sample on the shared, virtualised GitHub-hosted
+        runner is far noisier than the nightly job's full 30,000-op sample on
+        a quiet host. The first cut was `40`, extrapolated from BENCH.md's
+        DEV-LAPTOP data (3.7% at 30,000 ops, 13.3% at 10,000 ops); a live PR
+        run on the CI runner then measured worst |delta p99| = 64.9% at 3,000
+        ops — the contended CI runner's noise floor is well above the laptop
+        extrapolation, so 40% spuriously failed. `100` (a p99 that DOUBLES
+        across N) sits above that observed runner noise, yet is still a tiny
+        fraction of the many-times-the-baseline signature a genuine O(N)
+        fan-out regression produces at N=1000 (BENCH.md §4) — so the PR gate
+        still hard-fails a real blowup without flaking on runner noise. The
+        subtle-trend gate is the nightly job (15%, full sample); this PR gate
+        catches the catastrophe. See BENCH.md §13.6 for the per-PR design.
 
 Exit status: 0 if every gated series (latency ceilings, allocation ceilings,
 and — unless `BENCH_REGRESSION_GATE_FLATNESS=0` is set explicitly — HP-2
