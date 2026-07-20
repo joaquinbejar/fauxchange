@@ -398,13 +398,24 @@ fn rest_error_summary(reply: &RestReply) -> String {
     format!("status {} code {code} message {message}", reply.status)
 }
 
-/// Parses `HTTP/1.1 <status> …\r\n…\r\n\r\n<body>` into a [`RestReply`].
+/// Parses `HTTP/1.1 <status> …\r\n…\r\n\r\n<body>` into a [`RestReply`], validating
+/// the framing before accepting it.
+///
+/// A header-terminated reply is NOT accepted on the strength of its status line
+/// alone: a `Content-Length` header, when present, must be fully received (a
+/// connection reset after only the `401`/`403` headers leaves a short body — that
+/// is a truncated reply, not a valid status-only pass), and a reply that carries a
+/// body must parse as JSON (the venue answers every API route with a JSON
+/// envelope). A truncated or unframed reply is the harness's typed `Err`, never a
+/// silently-accepted `Value::Null`.
 fn parse_http_reply(raw: &[u8]) -> Result<RestReply, String> {
     let split = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| "malformed REST reply: no header terminator".to_string())?;
     let header = &raw[..split];
+    // The header terminator is 4 bytes (`\r\n\r\n`); `split` is a valid `windows(4)`
+    // offset, so `split + 4 <= raw.len()`.
     let body = &raw[split + 4..];
 
     let header_text = String::from_utf8_lossy(header);
@@ -418,10 +429,29 @@ fn parse_http_reply(raw: &[u8]) -> Result<RestReply, String> {
         .and_then(|code| code.parse().ok())
         .ok_or_else(|| format!("malformed REST status line: {status_line}"))?;
 
-    let value = if body.is_empty() {
-        Value::Null
+    // A declared `Content-Length` (case-insensitive header name) must be fully
+    // received — a short body is a truncated, reset-mid-reply frame.
+    let content_length: Option<usize> = header_text
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok());
+    if let Some(declared) = content_length
+        && body.len() < declared
+    {
+        return Err(format!(
+            "truncated REST reply: body {} bytes, Content-Length {declared}",
+            body.len()
+        ));
+    }
+
+    // A reply that carries a body must parse as JSON — a garbled / partial body is
+    // rejected, never accepted as `Value::Null`.
+    let expects_body = content_length.is_some_and(|len| len > 0) || !body.is_empty();
+    let value = if expects_body {
+        serde_json::from_slice(body).map_err(|e| format!("malformed REST reply body: {e}"))?
     } else {
-        serde_json::from_slice(body).unwrap_or(Value::Null)
+        Value::Null
     };
     Ok(RestReply {
         status,

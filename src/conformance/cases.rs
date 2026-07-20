@@ -127,6 +127,46 @@ fn rest_fix() -> Vec<Surface> {
     vec![Surface::Rest, Surface::Fix]
 }
 
+/// Requires a FIX reject frame to carry a `Text (58)` and asserts the value is
+/// safe by the **report boundary's own** redaction — issue #51's rule that every
+/// §8 reject row carry a redacted `Text (58)`
+/// ([03 §8](../../docs/03-protocol-surfaces.md#8-error-mapping-across-surfaces)).
+/// Used for the application-level reject rows (`8` / `9` / `j` / `Y`) the venue
+/// populates with a reason string.
+fn require_redacted_text(frame: &[u8]) -> CaseOutcome {
+    let text =
+        field(frame, "58").ok_or_else(|| "a §8 reject row must carry a Text(58)".to_string())?;
+    assert_text_redaction_safe(&text)
+}
+
+/// Runs the same redaction check on a reject frame's `Text (58)` **when present**.
+/// A session `Reject (3)` deliberately omits `Text` — it never echoes untrusted
+/// inbound bytes into a reject (`src/gateway/fix/fsm.rs`, 03 §8) — so presence is
+/// not required here; the check is the regression guard that no session reject
+/// ever grows a leaking `Text`.
+fn check_optional_redacted_text(frame: &[u8]) -> CaseOutcome {
+    match field(frame, "58") {
+        Some(text) => assert_text_redaction_safe(&text),
+        None => Ok(()),
+    }
+}
+
+/// Asserts a reject `Text (58)` is safe by the report boundary: the venue's own
+/// redaction (`super::report::redact`, the exact function the report serializes
+/// through) masks nothing (no secret-shaped value is present), and the value
+/// neither echoes a panic / source path nor is unbounded.
+fn assert_text_redaction_safe(text: &str) -> CaseOutcome {
+    let redacted = super::report::redact(text);
+    require(
+        !redacted.contains("<redacted>"),
+        "a reject Text(58) must carry no secret-shaped value (the report redaction masked it)",
+    )?;
+    require(
+        !text.contains("panic") && !text.contains("src/") && text.len() < 200,
+        "a reject Text(58) must be a safe, bounded reason",
+    )
+}
+
 // ============================================================================
 // 1. Order-entry parity (REST ≡ FIX)
 // ============================================================================
@@ -1041,7 +1081,10 @@ async fn case_fix_reject_3() -> CaseOutcome {
     require(
         field(r3, "371").as_deref() == Some("54"),
         "RefTagID(371) must point at the missing Side(54)",
-    )
+    )?;
+    // A session Reject(3) carries no Text(58) by design; if one is ever present it
+    // must still be redaction-clean.
+    check_optional_redacted_text(r3)
 }
 
 async fn case_fix_reject_8() -> CaseOutcome {
@@ -1062,7 +1105,8 @@ async fn case_fix_reject_8() -> CaseOutcome {
     require(
         field(rejected, "103").as_deref() == Some("6"),
         "OrdRejReason must be Duplicate Order",
-    )
+    )?;
+    require_redacted_text(rejected)
 }
 
 async fn case_fix_reject_9() -> CaseOutcome {
@@ -1089,7 +1133,8 @@ async fn case_fix_reject_9() -> CaseOutcome {
     require(
         field(r9, "41").as_deref() == Some("never-placed"),
         "the OrigClOrdID must be echoed",
-    )
+    )?;
+    require_redacted_text(r9)
 }
 
 async fn case_fix_reject_y() -> CaseOutcome {
@@ -1106,13 +1151,7 @@ async fn case_fix_reject_y() -> CaseOutcome {
         field(y, "281").as_deref() == Some("8"),
         "MDReqRejReason must be Unsupported MDEntryType",
     )?;
-    if let Some(text) = field(y, "58") {
-        require(
-            !text.contains("panic") && !text.contains("src/") && text.len() < 200,
-            "the Text(58) must be a safe, redacted reason",
-        )?;
-    }
-    Ok(())
+    require_redacted_text(y)
 }
 
 async fn case_fix_reject_j() -> CaseOutcome {
@@ -1129,7 +1168,8 @@ async fn case_fix_reject_j() -> CaseOutcome {
     require(
         field(j, "372").as_deref() == Some("R"),
         "RefMsgType must be echoed",
-    )
+    )?;
+    require_redacted_text(j)
 }
 
 async fn case_fix_logout_5() -> CaseOutcome {

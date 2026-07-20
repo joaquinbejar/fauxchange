@@ -282,11 +282,20 @@ impl SuiteRecorder {
 ///
 /// 1. **control-strip** — every control byte (NUL / SOH from a raw FIX frame, …)
 ///    becomes a space, so a report line never carries wire control noise;
-/// 2. **secret-scrub** — a `Bearer <token>` value, a value following a
-///    `token` / `password` / `secret` / `authorization` keyword, or a standalone
-///    JWT/base64url-shaped run (20+ chars of `[A-Za-z0-9_-./+=]` containing a
-///    `.`) is replaced with [`REDACTED`], so a JWT / API key / password can never
-///    reach the report;
+/// 2. **secret-scrub** — the following are replaced with [`REDACTED`], so a JWT /
+///    API key / password / connection-string credential can never reach the
+///    report:
+///    - a known secret **env var** assignment ([`SECRET_ENV_KEYS`]:
+///      `DATABASE_URL`, `AUTH_BOOTSTRAP_SECRET`, `CARGO_REGISTRY_TOKEN`, key
+///      material, …) — the WHOLE value is masked whatever its charset, so a
+///      credentialed URI's `://` / `@` punctuation cannot slip it past the
+///      charset-gated keyword scrub;
+///    - a **credentialed URI** (`scheme://user:password@host…`) — its
+///      `user:password@` userinfo is masked wherever it appears;
+///    - a `Bearer <token>` value, a value following a
+///      `token` / `password` / `secret` / `authorization` keyword, or a standalone
+///      JWT/base64url-shaped run (20+ chars of `[A-Za-z0-9_-./+=]` containing a
+///      `.`);
 /// 3. **byte-bound** — the result is truncated at a UTF-8 char boundary so it
 ///    never exceeds [`MAX_DETAIL_LEN`] **bytes** plus the truncation marker.
 #[must_use]
@@ -304,6 +313,23 @@ pub fn redact(detail: &str) -> String {
         head.to_string()
     }
 }
+
+/// The known secret **environment variable** names whose assigned value
+/// (`KEY=value` / `KEY:value`) is masked in full — whatever its charset. A
+/// credentialed connection string (`DATABASE_URL=postgres://user:pw@host/db`)
+/// carries `://` / `@` punctuation outside [`is_secret_charset`], so the
+/// charset-gated keyword scrub alone would let it through; matching the env key
+/// name redacts the whole value regardless. Lower-cased for a case-insensitive
+/// compare.
+const SECRET_ENV_KEYS: &[&str] = &[
+    "database_url",
+    "auth_bootstrap_secret",
+    "auth_password_pepper",
+    "cargo_registry_token",
+    "jwt_private_key",
+    "private_key",
+    "signing_key",
+];
 
 /// The keywords whose following token (or inline `key=value` / `key:value`) is a
 /// credential to mask.
@@ -338,12 +364,54 @@ fn is_jwt_shaped(token: &str) -> bool {
     token.len() >= SECRET_RUN_MIN_LEN && token.contains('.') && is_secret_charset(token)
 }
 
+/// Masks the `user:password@` userinfo of a credentialed URI token
+/// (`scheme://user:password@host…`) to [`REDACTED`], returning `None` when the
+/// token carries no credentialed authority. This catches a connection string
+/// whose URI punctuation (`:` `@` `/`) falls outside [`is_secret_charset`] and so
+/// would otherwise bypass the keyword/JWT scrub. Pure: all slicing is bounds- and
+/// char-boundary-checked via [`str::get`], so it never panics on inbound bytes.
+fn mask_credential_uri(token: &str) -> Option<String> {
+    let scheme_end = token.find("://")?;
+    let after = scheme_end.checked_add(3)?;
+    let rest = token.get(after..)?;
+    // The authority ends at the first path / query / fragment delimiter, so an
+    // `@` in a later path/query (e.g. `?email=user@host`) is never mistaken for
+    // userinfo.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = rest.get(..authority_end)?;
+    let at = authority.find('@')?;
+    let host_and_rest = rest.get(at.checked_add(1)?..)?;
+    let scheme = token.get(..scheme_end)?;
+    Some(format!("{scheme}://{REDACTED}@{host_and_rest}"))
+}
+
 /// Masks credential-shaped substrings. Tokenised on whitespace (control bytes are
 /// already spaces), so it is allocation-light and needs no regex dependency.
 fn scrub_secrets(input: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut prev_is_keyword = false;
     for token in input.split_whitespace() {
+        // A known secret env-var assignment (`DATABASE_URL=…`, `AUTH_BOOTSTRAP_SECRET=…`,
+        // `CARGO_REGISTRY_TOKEN=…`, key material): mask the WHOLE value regardless of
+        // charset, so a credentialed connection string cannot slip past the
+        // charset-gated keyword scrub below.
+        if let Some((key, value)) = token.split_once(['=', ':'])
+            && SECRET_ENV_KEYS.contains(&key.trim().to_ascii_lowercase().as_str())
+            && !value.is_empty()
+        {
+            out.push(format!("{key}={REDACTED}"));
+            prev_is_keyword = false;
+            continue;
+        }
+
+        // A credentialed URI (`scheme://user:password@host…`) anywhere in the token:
+        // mask the `user:password@` userinfo so no credential reaches the report.
+        if let Some(masked) = mask_credential_uri(token) {
+            out.push(masked);
+            prev_is_keyword = false;
+            continue;
+        }
+
         // Inline `key=value` / `key:value` (e.g. `password=…`, `Authorization:…`).
         if let Some((key, value)) = token.split_once(['=', ':'])
             && SECRET_KEYWORDS.contains(&key.trim().to_ascii_lowercase().as_str())
@@ -522,5 +590,44 @@ mod tests {
         assert!(redacted.contains("password=<redacted>"));
         // A route path (secret-charset but not dotted, not keyword-following) survives.
         assert!(redacted.contains("/api/v1/controls/enable"));
+    }
+
+    #[test]
+    fn test_redact_masks_credentialed_uri_and_secret_env_keys() {
+        // The sentinel regression: a credentialed connection string — whose `://`,
+        // `@`, `:` punctuation falls outside the base64url charset — must NEVER
+        // serialize its password into the report, neither standalone nor behind a
+        // `DATABASE_URL=` assignment (the bare `…=` base64-padded form included).
+        const PASSWORD: &str = "s3cr3tP4ssw0rd";
+        let cases = [
+            // A standalone credentialed URI in prose (userinfo masked).
+            format!("connect failed to postgres://user:{PASSWORD}@db-host:5432/orders"),
+            // A DATABASE_URL assignment carrying the URI (whole value masked).
+            format!("boot DATABASE_URL=postgres://user:{PASSWORD}@db-host/orders?sslmode=require"),
+            // A bare DATABASE_URL=…= assignment with base64 padding (whole value masked).
+            format!("bad DATABASE_URL=aGFyZGNvZGVk{PASSWORD}base64=="),
+            // Other known secret env keys.
+            format!("AUTH_BOOTSTRAP_SECRET={PASSWORD}-op-gate"),
+            format!("CARGO_REGISTRY_TOKEN=cio{PASSWORD}xyztoken"),
+        ];
+        for input in cases {
+            let redacted = redact(&input);
+            assert!(
+                !redacted.contains(PASSWORD),
+                "the credential must never reach the report: input={input:?} redacted={redacted:?}"
+            );
+            assert!(
+                redacted.contains(REDACTED),
+                "the masked value must be marked redacted: redacted={redacted:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_leaves_a_credential_free_uri_intact() {
+        // A URI with NO userinfo is diagnostic and must survive verbatim.
+        let detail = "GET https://api.example.com/v1/health returned 503";
+        let redacted = redact(detail);
+        assert_eq!(redacted, detail);
     }
 }
