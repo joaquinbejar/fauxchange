@@ -59,8 +59,16 @@ use crate::market_maker::MarketMakerEngine;
 /// liquidity are journaled.
 pub trait StepSink: Send + Sync {
     /// Applies one price step for `underlying` at the caller-supplied venue-clock
-    /// `now_ms` (never `SystemTime`). Non-blocking, fire-and-forget; ordering of
-    /// the `SimStep`s handed to a single sink is preserved.
+    /// `now_ms` (never `SystemTime`). Non-blocking; ordering of the `SimStep`s
+    /// handed to a single sink is preserved.
+    ///
+    /// Returns whether the step was **admitted** onto the sequenced path. The
+    /// caller MUST journal-before-publish: a step reported dropped (`false` —
+    /// backpressure or a closed forwarder) has **no** journal record, so the
+    /// caller must NOT publish a price for it, or a subscriber would observe a
+    /// price replay cannot reproduce (rule 3). `true` means the `SimStep` was
+    /// accepted onto the ordered forwarder that sequences it.
+    #[must_use = "a dropped step (false) has no journal record; the caller must not publish its price"]
     fn apply_step(
         &self,
         now_ms: EventTimestamp,
@@ -68,7 +76,7 @@ pub trait StepSink: Send + Sync {
         price: Cents,
         bid: Option<Cents>,
         ask: Option<Cents>,
-    );
+    ) -> bool;
 }
 
 /// The default bounded capacity of the [`VenueStepSink`] forwarding channel — a
@@ -136,14 +144,15 @@ impl StepSink for VenueStepSink {
         price: Cents,
         bid: Option<Cents>,
         ask: Option<Cents>,
-    ) {
+    ) -> bool {
         // Hand the price move to the ordered forwarder as a `SimStep`. The
         // market-maker drive is NOT done here: it happens on the forwarder task
         // only after this step is confirmed sequenced, so a requote can never be
         // journaled before its causing step and a dropped step drives no requote
         // (rule 3). A full or closed channel drops the step with a WARN; the next
         // tick supersedes it (rule 8) and, because the step is never sequenced, no
-        // requote fires for it.
+        // requote fires for it — and, reported as `false`, the caller publishes no
+        // price for it either.
         let command = VenueCommand::SimStep {
             now_ms,
             underlying: underlying.to_string(),
@@ -152,18 +161,20 @@ impl StepSink for VenueStepSink {
             ask,
         };
         match self.tx.try_send(command) {
-            Ok(()) => {}
+            Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::warn!(
                     underlying,
                     "simulation step sink is full; dropping a SimStep (backpressure)"
                 );
+                false
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 tracing::warn!(
                     underlying,
                     "simulation step sink is closed; dropping a SimStep"
                 );
+                false
             }
         }
     }
@@ -283,12 +294,20 @@ mod tests {
         // before any `submit`, so the market-maker drive is unreachable.
         let step_sink = VenueStepSink::new(HashMap::new(), Arc::clone(&mm));
 
-        step_sink.apply_step(
+        // `apply_step` admits the step onto the forwarder (the channel is open);
+        // the forwarder then drops it because no handle hosts "BTC", so the maker
+        // is never advanced. (Admission to the forwarder is not the same as the
+        // actor accepting it.)
+        let admitted = step_sink.apply_step(
             EventTimestamp::new(1_735_689_600_000),
             "BTC",
             Cents::new(5_000_000),
             None,
             None,
+        );
+        assert!(
+            admitted,
+            "the open forwarder admits the step before it drops it"
         );
 
         // Let the forwarder drain the step (and prove it dropped it): the maker is

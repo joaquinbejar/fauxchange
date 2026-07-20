@@ -289,10 +289,20 @@ impl PriceSimulator {
     ///
     /// # Errors
     ///
-    /// [`SimError::UnknownUnderlying`] if `underlying` is not a configured asset
-    /// (the transport-level `POST /api/v1/prices` override goes through the actor
-    /// on its own path and is not scoped to configured assets).
+    /// - [`SimError::UnknownUnderlying`] if `underlying` is not a configured asset
+    ///   (the transport-level `POST /api/v1/prices` override goes through the actor
+    ///   on its own path and is not scoped to configured assets).
+    /// - [`SimError::TimelineExhausted`] if the virtual clock has reached the `u64`
+    ///   ceiling (unreachable in practice): the override is not applied and the
+    ///   simulator halts rather than stamp a clamped, non-monotonic instant.
     pub fn set_price(&self, underlying: &str, price: Cents) -> Result<(), SimError> {
+        // Stamp with the current virtual-clock instant FIRST (checked): if the
+        // clock is exhausted, halt without mutating or publishing rather than emit
+        // a clamped, non-monotonic instant (rule 3).
+        let Some(now_ms) = self.now_ms_at(self.step_index.load(Ordering::Relaxed)) else {
+            self.seal_exhausted("virtual clock");
+            return Err(SimError::TimelineExhausted);
+        };
         {
             let mut assets = self.write_assets();
             let state = assets
@@ -301,7 +311,6 @@ impl PriceSimulator {
             state.current = price;
             state.dormant = false;
         }
-        let now_ms = self.now_ms_at(self.step_index.load(Ordering::Relaxed));
         self.emit(now_ms, underlying, price);
         Ok(())
     }
@@ -318,8 +327,28 @@ impl PriceSimulator {
         if self.stopped.load(Ordering::Relaxed) {
             return;
         }
-        let step = self.step_index.fetch_add(1, Ordering::Relaxed);
-        let now_ms = self.now_ms_at(step);
+        // Reserve this step's index with a CHECKED advance: at the `u64` ceiling
+        // the counter would wrap to a repeated index, so we fail closed (halt)
+        // instead. `fetch_update` keeps the reserve-and-advance atomic.
+        let step =
+            match self
+                .step_index
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    current.checked_add(1)
+                }) {
+                Ok(previous) => previous,
+                Err(_) => {
+                    self.seal_exhausted("step counter");
+                    return;
+                }
+            };
+        // Stamp the step with a CHECKED virtual-clock instant: an overflowing clock
+        // would clamp to a repeated/regressed `now_ms`, so we fail closed (halt)
+        // and emit no instant rather than corrupt the deterministic timeline.
+        let Some(now_ms) = self.now_ms_at(step) else {
+            self.seal_exhausted("virtual clock");
+            return;
+        };
         for underlying in self.underlyings() {
             if let Some(price) = self.next_price(&underlying) {
                 self.emit(now_ms, &underlying, price);
@@ -361,31 +390,58 @@ impl PriceSimulator {
 
     // ---- internals -------------------------------------------------------
 
-    /// Publishes a [`PriceUpdate`] and routes the journaled `SimStep` through the
-    /// sink. No lock is held across the broadcast send or the sink call (rule 8).
+    /// Journals the `SimStep` through the sink **first**, then publishes the
+    /// [`PriceUpdate`] only if the step was admitted (rule 3). A dropped/rejected
+    /// step has no journal record, so a subscriber must never observe its price —
+    /// replay could not reproduce it. No lock is held across the sink call or the
+    /// broadcast send (rule 8).
     fn emit(&self, now_ms: EventTimestamp, underlying: &str, price: Cents) {
-        // Send-and-continue on the bounded broadcast: a laggard drops (rule 7).
+        // Journal-before-publish: route the step onto the sequenced path and bail
+        // if the bounded sink dropped it — no price is published for a step that
+        // was never journaled.
+        if !self.sink.apply_step(now_ms, underlying, price, None, None) {
+            return;
+        }
+        // Admitted: send-and-continue on the bounded broadcast (a laggard drops,
+        // rule 7).
         let _ = self.price_tx.send(PriceUpdate {
             underlying: underlying.to_string(),
             price,
             now_ms,
         });
-        self.sink.apply_step(now_ms, underlying, price, None, None);
+    }
+
+    /// Halts the simulator on virtual-timeline exhaustion — the step counter or the
+    /// virtual clock reached the `u64` ceiling. Sets the stop flag so no further
+    /// step runs (and no wrapped index or clamped, non-monotonic instant is ever
+    /// emitted) and logs the cause once. Unreachable in practice (a `2^64`-step /
+    /// `2^64`-ms horizon); the simulator fails **closed** (rule 3).
+    #[cold]
+    fn seal_exhausted(&self, cause: &str) {
+        if !self.stopped.swap(true, Ordering::Relaxed) {
+            tracing::error!(
+                cause,
+                "virtual timeline exhausted; halting the price simulator"
+            );
+        }
     }
 
     /// The venue-clock instant for step `step`, in **milliseconds** — a
     /// deterministic virtual clock (`start_ms + step × step_ms`), never
     /// `SystemTime`.
     ///
-    /// `checked(..).unwrap_or(u64::MAX)` is the explicit clamp the repo rules
-    /// prefer over `saturating_*` (never a silent wrap): a `2^64`-millisecond
-    /// virtual timeline is unreachable, so the clamp never fires in practice.
-    #[allow(clippy::manual_saturating_arithmetic)]
+    /// Returns `None` when the instant would overflow `u64` milliseconds. A
+    /// `2^64`-millisecond virtual timeline is unreachable in practice, but the
+    /// arithmetic is **checked** and surfaces exhaustion instead of clamping to
+    /// `u64::MAX`: a clamped clock would repeat or regress `now_ms`, corrupting
+    /// the deterministic timeline. The caller halts the simulator on `None` rather
+    /// than emitting a non-monotonic instant (rule 3 / global `checked_*`).
+    #[must_use]
     #[inline]
-    fn now_ms_at(&self, step: u64) -> EventTimestamp {
-        let offset = step.checked_mul(self.config.step_ms).unwrap_or(u64::MAX);
-        let millis = self.config.start_ms.checked_add(offset).unwrap_or(u64::MAX);
-        EventTimestamp::new(millis)
+    fn now_ms_at(&self, step: u64) -> Option<EventTimestamp> {
+        let offset = step.checked_mul(self.config.step_ms)?;
+        let millis = self.config.start_ms.checked_add(offset)?;
+        Some(EventTimestamp::new(millis))
     }
 
     /// Serves `underlying`'s next price, regenerating its path **off-lock** when
@@ -400,11 +456,19 @@ impl PriceSimulator {
                     return None;
                 }
                 match state.path.get(state.cursor).copied() {
-                    Some(price) => {
-                        state.cursor += 1;
-                        state.current = price;
-                        Some(price)
-                    }
+                    // Advance the cursor with CHECKED arithmetic; a cursor that
+                    // cannot advance is treated as exhausted (regenerate off-lock)
+                    // rather than wrapping to a repeated index. Unreachable in
+                    // practice: the path length is far below `usize::MAX`, so `get`
+                    // returns `None` long before the cursor could overflow.
+                    Some(price) => match state.cursor.checked_add(1) {
+                        Some(next) => {
+                            state.cursor = next;
+                            state.current = price;
+                            Some(price)
+                        }
+                        None => None,
+                    },
                     None => None,
                 }
             };
@@ -519,7 +583,7 @@ mod tests {
             price: Cents,
             bid: Option<Cents>,
             ask: Option<Cents>,
-        ) {
+        ) -> bool {
             self.steps
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -530,6 +594,26 @@ mod tests {
                     bid,
                     ask,
                 });
+            // A synchronous collector always admits the step.
+            true
+        }
+    }
+
+    /// A [`StepSink`] that reports every step **dropped** (never admitted) — models
+    /// a full or closed bounded forwarder, so a journal-before-publish caller must
+    /// publish no price for the step.
+    struct DroppingStepSink;
+
+    impl StepSink for DroppingStepSink {
+        fn apply_step(
+            &self,
+            _now_ms: EventTimestamp,
+            _underlying: &str,
+            _price: Cents,
+            _bid: Option<Cents>,
+            _ask: Option<Cents>,
+        ) -> bool {
+            false
         }
     }
 
@@ -747,5 +831,98 @@ mod tests {
             }
         }
         assert!(saw_lagged, "a slow consumer lags on the bounded broadcast");
+    }
+
+    #[test]
+    fn test_emit_does_not_publish_when_the_step_is_dropped() {
+        // The sink reports every step DROPPED (no journal record). `emit` must
+        // journal-before-publish, so a dropped step publishes NO `PriceUpdate` —
+        // a subscriber never observes a price replay cannot reproduce (rule 3).
+        let sim = PriceSimulator::new(
+            vec![gbm_asset("BTC", 5_000_000)],
+            config(),
+            Arc::new(DroppingStepSink),
+        );
+        let mut rx = sim.subscribe();
+        sim.step_once();
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "a dropped step must not publish a PriceUpdate"
+        );
+
+        // A programmatic override is guarded the same way: the drop suppresses its
+        // broadcast too.
+        sim.set_price("BTC", Cents::new(4_200_000))
+            .expect("BTC is a configured asset");
+        assert!(
+            matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
+            "a dropped override must not publish a PriceUpdate"
+        );
+    }
+
+    #[test]
+    fn test_step_clock_is_strictly_monotonic_and_halts_on_exhaustion() {
+        let (sim, sink) = simulator(vec![gbm_asset("BTC", 5_000_000)]);
+        let step_ms = sim.config.step_ms;
+        let start_ms = sim.config.start_ms;
+        // The largest step index whose instant still fits in `u64` ms.
+        let last_ok = (u64::MAX - start_ms) / step_ms;
+
+        // Park the counter two below the ceiling so two representable steps run.
+        sim.step_index.store(last_ok - 1, Ordering::Relaxed);
+        sim.step_once();
+        sim.step_once();
+        assert!(
+            !sim.is_stopped(),
+            "the last two representable steps do not halt the simulator"
+        );
+        let stamps: Vec<u64> = sink
+            .drain()
+            .into_iter()
+            .filter_map(|command| match command {
+                VenueCommand::SimStep { now_ms, .. } => Some(now_ms.get()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stamps,
+            vec![
+                start_ms + (last_ok - 1) * step_ms,
+                start_ms + last_ok * step_ms
+            ],
+            "each representable step stamps its exact deterministic instant"
+        );
+        assert!(
+            stamps[1] > stamps[0],
+            "the virtual clock is strictly monotonic (never repeated or regressed)"
+        );
+
+        // The next step would overflow the virtual clock. The simulator fails
+        // CLOSED: it halts and emits no further (repeated/regressed) instant rather
+        // than clamping to `u64::MAX`.
+        sim.step_once();
+        assert!(
+            sim.is_stopped(),
+            "an overflowing virtual clock halts the simulator"
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "a halted step emits no instant (no clamp, no regression)"
+        );
+    }
+
+    #[test]
+    fn test_step_counter_halts_at_the_ceiling_rather_than_wrapping() {
+        // Park the counter at `u64::MAX`: the checked advance cannot produce a
+        // fresh index, so the simulator halts instead of wrapping to a repeated
+        // step index.
+        let (sim, sink) = simulator(vec![gbm_asset("BTC", 5_000_000)]);
+        sim.step_index.store(u64::MAX, Ordering::Relaxed);
+        sim.step_once();
+        assert!(
+            sim.is_stopped(),
+            "a step counter at the ceiling halts rather than wrapping"
+        );
+        assert!(sink.drain().is_empty(), "the wrapped step emits nothing");
     }
 }
