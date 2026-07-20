@@ -45,11 +45,15 @@
 //!    repo's own Darwin dev host) to sample the CURRENT resident set — not
 //!    `getrusage`'s `ru_maxrss`, which is a MONOTONIC PEAK since process start
 //!    and therefore structurally unusable for a flatness trend (it can only
-//!    ever climb). This needs no new dependency and no `unsafe`. Platform
-//!    disclosure: a host with no `ps` (a `scratch`/`distroless` container,
-//!    Windows) degrades to zero samples, and [`assess_rss_flatness`] reports
-//!    that gap honestly (`WARNING:` line) rather than failing the whole soak
-//!    on a missing tool. [`assess_rss_flatness`] compares the **median** RSS
+//!    ever climb). This needs no new dependency and no `unsafe`. Platform gate:
+//!    on a supported POSIX host (Linux CI / macOS dev, where `ps -o rss=`
+//!    exists) the gated soak MUST measure memory — if RSS cannot be assessed it
+//!    FAILS rather than passing blind, so the stability gate can never go green
+//!    without a real memory measurement ([`rss_sampling_supported`]). Only a
+//!    non-POSIX host (Windows) — with no `ps` — is granted a warn-and-skip
+//!    escape hatch; a POSIX image stripped of `ps` (a `scratch`/`distroless`
+//!    container) is not excused and will fail the gated soak.
+//!    [`assess_rss_flatness`] compares the **median** RSS
 //!    of an early post-warmup window against a **late** window at the same
 //!    size, asserting the late reading stays within a documented margin
 //!    (`max(20 % relative, 20 MB absolute)`) of the early one — a NO-LEAK
@@ -73,22 +77,40 @@
 //!    via `spawn_matching_actor_with_registry_and_index` and immediately
 //!    `drop(join)`s the returned `JoinHandle` (`src/state.rs`), so the task is
 //!    detached and its completion can never be awaited through `AppState`'s
-//!    public surface. This check instead builds its OWN actor directly on the
-//!    SAME public [`spawn_matching_actor`] primitive `AppState` uses
-//!    internally — the one place a genuine, awaitable completion signal
-//!    exists — over a test-local `SharedJournal` (an `Arc<Mutex<...>>`-backed
-//!    [`VenueJournal`] whose storage outlives the actor, unlike the
-//!    actor-owned `InMemoryVenueJournal`). It fires a concurrent burst of
-//!    `AddOrder` submissions through cloned `ActorHandle`s against a
-//!    deliberately small bounded mailbox, drops every handle (including its
-//!    own), awaits every submitting task to a definitive `Ok(Receipt)` /
-//!    `Err(RateLimited)`, THEN **genuinely awaits the actor's own
-//!    `JoinHandle`** — proof the `run()` receive loop actually drained its
-//!    backlog and returned, not an inferred "probably done." Only after that
-//!    real completion signal does it read the SURVIVING `SharedJournal` clone
-//!    (held independently of the actor/handle lifetime from construction) and
-//!    confirm every accepted receipt's `underlying_sequence` has a committed
-//!    `VenueEvent` — nothing silently lost.
+//!    public surface. Nor does the venue expose any EXPLICIT shutdown signal
+//!    (no `shutdown()` / `CancellationToken` / close channel): the actor's ONLY
+//!    shutdown is last-sender-drop — its `run()` loop ends when every
+//!    `ActorHandle` clone drops and the bounded mailbox closes
+//!    (`src/exchange/actor.rs`). This check drives that real drop-based path. It
+//!    builds its OWN actor on the SAME public [`spawn_matching_actor`] primitive
+//!    `AppState` uses internally — the one place a genuine, awaitable completion
+//!    signal exists — over a test-local `SharedJournal` (an
+//!    `Arc<Mutex<...>>`-backed [`VenueJournal`] whose storage outlives the
+//!    actor, unlike the actor-owned `InMemoryVenueJournal`), then uses a
+//!    `tokio::sync::Barrier` to release a concurrent burst of `AddOrder`
+//!    submissions through cloned `ActorHandle`s against a deliberately small
+//!    bounded mailbox and drop this function's own top-level handle AT the same
+//!    rendezvous — so the shutdown trigger (top-level sender drop) fires WHILE
+//!    the mailbox is being flooded with in-flight work, before the drain
+//!    completes, rather than after the burst has already resolved. Because
+//!    `ActorHandle::submit` COUPLES enqueue and reply-await (a submitter holds
+//!    its own clone across the `.await`), a submitter's sender releases exactly
+//!    when its reply resolves, so under this graceful drop-based path every
+//!    accepted submission drains to a committed `Ok(Receipt)` and every
+//!    rejected-at-the-door one to `Err(RateLimited)`; a genuine "closed" error
+//!    is reachable only on abnormal actor termination, never graceful drain. It
+//!    asserts every submission resolves to exactly one of those two definitive
+//!    outcomes (no panic, nothing lost without an error), THEN **genuinely
+//!    awaits the actor's own `JoinHandle`** — proof the `run()` receive loop
+//!    actually drained its backlog and returned, not an inferred "probably
+//!    done." Only after that real completion signal does it read the SURVIVING
+//!    `SharedJournal` clone (held independently of the actor/handle lifetime
+//!    from construction) and confirm every accepted receipt's
+//!    `underlying_sequence` has a committed `VenueEvent` — nothing silently
+//!    lost. Follow-up: an explicit mid-flight shutdown signal (a
+//!    `CancellationToken` on the actor) would let this additionally assert a
+//!    typed shutdown error for genuinely-queued-but-unprocessed work; no such
+//!    signal exists to test today.
 //! 4. **Restart-from-journal determinism.** [`capture_mid_run_bundle`] exports
 //!    the live venue's journal MID-RUN (`AppState::export_bundle`) and submits
 //!    one more order afterward to prove the venue was still live (not
@@ -335,6 +357,23 @@ fn assess_rss_flatness(
     })
 }
 
+/// Whether this platform is expected to support the `ps -o rss=` sampler
+/// [`read_rss_kb`] relies on.
+///
+/// Every POSIX host the soak runs on — Linux CI and the macOS dev host — ships
+/// `ps -o rss=`; a non-POSIX host (Windows) does not. This is the ONLY platform
+/// granted the warn-and-skip escape hatch in the flat-RSS assertion: on a
+/// supported POSIX host the gated soak MUST measure memory — it FAILS rather
+/// than passing blind if RSS cannot be assessed — so the stability gate can
+/// never go green without a real memory measurement. A POSIX image that has
+/// been stripped of `ps` (a `scratch`/`distroless` container) is intentionally
+/// NOT excused: it will fail the gated soak. Install `procps` (standard in CI
+/// images) to run the soak there.
+#[must_use]
+const fn rss_sampling_supported() -> bool {
+    cfg!(unix)
+}
+
 // ============================================================================
 // Property 2 — no sequence gaps (underlying_sequence, instrument_sequence)
 // ============================================================================
@@ -364,34 +403,46 @@ fn assert_underlying_sequence_gap_free(records: &[JournalRecord]) -> usize {
     distinct.len()
 }
 
-/// Asserts a collected `instrument_sequence` stream (WS `orderbook_delta`) has
-/// no duplicates and advances by exactly `+1` between consecutive values,
+/// Asserts a collected `instrument_sequence` stream (WS `orderbook_delta`),
+/// **in the order it was received off the wire**, is strictly monotonically
+/// increasing by exactly `+1` — no duplicate, no backward step, no gap —
 /// returning the count.
-fn assert_instrument_sequence_gap_free(mut sequences: Vec<u64>) -> usize {
+///
+/// The stream is validated AS RECEIVED and is **never sorted**. The WS
+/// per-instrument sequence is a strictly monotonic `+1` counter, and a single
+/// broadcast receiver observes one instrument's deltas in send order, so the
+/// wire stream must already be strictly consecutive. Sorting first would
+/// launder a genuine out-of-order / backward-on-the-wire delivery (e.g. `2`
+/// then `1`) into a passing "consecutive" run — the exact defect this guards
+/// against — so the check runs on the received order directly. A strictly
+/// increasing `+1` sequence is inherently duplicate-free, so uniqueness falls
+/// out of the same pass rather than needing a separate sorted-set comparison.
+fn assert_instrument_sequence_gap_free(sequences: Vec<u64>) -> usize {
     assert!(
         !sequences.is_empty(),
         "[soak] no orderbook_delta messages observed on the WS broadcast for the fixture instrument"
     );
     let observed = sequences.len();
-    sequences.sort_unstable();
-    let unique: BTreeSet<u64> = sequences.iter().copied().collect();
-    assert_eq!(
-        unique.len(),
-        observed,
-        "[soak] duplicate instrument_sequence values observed on the WS broadcast"
-    );
     for pair in sequences.windows(2) {
         let (a, b) = (pair[0], pair[1]);
         let expected = match a.checked_add(1) {
             Some(next) => next,
             None => panic!("[soak] instrument_sequence counter exhausted u64::MAX (unreachable)"),
         };
+        assert!(
+            b > a,
+            "[soak] instrument_sequence went backward or repeated on the WS wire: {a} then {b} \
+             — the per-instrument sequence must be strictly monotonically increasing in the \
+             order received (a duplicate or backward delivery here would have been hidden by \
+             sorting the stream first)"
+        );
         assert_eq!(
             b, expected,
-            "[soak] instrument_sequence gap: {a} then {b} (expected {expected})"
+            "[soak] instrument_sequence gap on the WS wire: {a} then {b} (expected strictly \
+             consecutive {expected})"
         );
     }
-    sequences.len()
+    observed
 }
 
 /// What [`collect_orderbook_deltas`] observed over its window.
@@ -638,10 +689,22 @@ async fn run_shutdown_drain_check() -> DrainReport {
         spawn_matching_actor(config, journal, NoopFanOut, CLOCK);
     let symbol = sym(CALL);
 
+    // A rendezvous for the whole burst PLUS this coordinator. Every submitter
+    // parks at the barrier already holding its cloned `ActorHandle`, and this
+    // function parks too; when the barrier releases, all BURST submitters flood
+    // the tiny bounded mailbox TOGETHER and this coordinator drops its own
+    // top-level handle at the same instant — so the venue's shutdown trigger
+    // fires WHILE the mailbox is being flooded with in-flight, not-yet-drained
+    // work, not after the burst has already resolved.
+    let barrier = Arc::new(tokio::sync::Barrier::new(match BURST.checked_add(1) {
+        Some(count) => count,
+        None => panic!("[soak] drain check: barrier party count overflow (unreachable)"),
+    }));
     let mut handles = Vec::with_capacity(BURST);
     for index in 0..BURST {
         let submitter = handle.clone();
         let order_symbol = symbol.clone();
+        let gate = Arc::clone(&barrier);
         handles.push(tokio::spawn(async move {
             let price = match 60_000_u64.checked_add(u64::try_from(index).unwrap_or(0)) {
                 Some(price) => price,
@@ -662,15 +725,34 @@ async fn run_shutdown_drain_check() -> DrainReport {
                 time_in_force: TimeInForce::Gtc,
                 stp_mode: STPMode::None,
             };
+            // Release together with every other submitter and the coordinator's
+            // handle drop, so this submit contends for the bounded mailbox at
+            // the exact moment shutdown is triggered.
+            gate.wait().await;
             submitter.submit(command).await
         }));
     }
 
-    // "Stop the venue": drop THIS function's own top-level `ActorHandle` now,
-    // while some of the BURST submissions above may still be sitting in the
-    // 4-slot bounded mailbox. Each spawned task above still holds its OWN
-    // `ActorHandle` clone until it completes, so the mailbox's sender count
-    // only reaches zero once every one of them has resolved.
+    // "Stop the venue" the ONLY way it can be stopped: the actor has no
+    // explicit shutdown signal (no `shutdown()` / `CancellationToken` / close
+    // channel) — its `run()` loop ends solely when every `ActorHandle` clone
+    // drops and the bounded mailbox closes (`src/exchange/actor.rs`). Rendezvous
+    // with the burst, then IMMEDIATELY drop this coordinator's own top-level
+    // handle while the flood is in flight and the mailbox still holds queued,
+    // not-yet-drained work — the shutdown trigger firing before the drain
+    // completes, rather than the earlier no-op ordering where it fired only
+    // after the burst had resolved. Because `ActorHandle::submit` COUPLES
+    // enqueue and reply-await (each spawned submitter holds its own clone across
+    // its `submit().await`), the mailbox's sender count — and thus the actor's
+    // `run()` loop — only reaches zero once the last in-flight submission has
+    // been drained to its receipt; that is the real drop-based drain-then-stop
+    // this asserts, and the honest reason a graceful "closed" error is NOT among
+    // the expected outcomes below (it is reachable only on abnormal actor
+    // termination). Follow-up: an explicit mid-flight shutdown signal (a
+    // `CancellationToken` on the actor) would let this additionally assert a
+    // typed shutdown error for genuinely-queued-but-unprocessed work; no such
+    // signal exists to test today.
+    barrier.wait().await;
     drop(handle);
 
     let mut accepted_sequences = Vec::new();
@@ -1099,10 +1181,25 @@ async fn test_soak_stability_flat_memory_no_gaps_clean_shutdown_restart_from_jou
             );
         }
         None => {
+            // On a supported POSIX host (Linux CI / macOS dev) the gated soak
+            // MUST measure memory: if RSS could not be assessed we FAIL rather
+            // than pass blind, so the stability gate can never go green without
+            // a real memory measurement. Only a non-POSIX host (Windows) — with
+            // no `ps -o rss=` — takes the warn-and-skip escape hatch.
+            if rss_sampling_supported() {
+                panic!(
+                    "[soak] RSS flatness could not be assessed on a POSIX host where the `ps -o \
+                     rss=` sampler is expected (Linux CI / macOS dev) — the gated soak MUST measure \
+                     memory, not pass blind. Either `ps` is missing (install `procps`) or the window \
+                     is too short for an early/late median split (raise SOAK_SECS). Refusing to green \
+                     the stability gate without a memory measurement."
+                );
+            }
             println!(
-                "[soak] WARNING: RSS flatness could not be assessed on this host (`ps` unavailable, or \
-                 too few samples for the configured window) — a disclosed platform limitation, not a \
-                 stability failure."
+                "[soak] WARNING: RSS flatness not assessed — this is a non-POSIX host (Windows) with \
+                 no `ps -o rss=`, a disclosed and narrow platform limitation, not a stability \
+                 failure. On the supported POSIX CI path this branch FAILS instead of warning, so \
+                 the stability gate cannot pass without measuring memory."
             );
         }
     }
