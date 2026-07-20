@@ -541,8 +541,9 @@ where
     ///
     /// - [`SnapshotError::MetadataMismatch`] if the snapshot does not match the
     ///   running venue;
-    /// - [`SnapshotError::RebuildFailed`] if the captured book cannot be rebuilt
-    ///   (rolls back — nothing swapped);
+    /// - [`SnapshotError::RebuildFailed`] if the captured book cannot be rebuilt,
+    ///   or an executions/positions cut carries a leg/fold for another underlying
+    ///   (both raised in the preparation phase — rolls back, nothing swapped);
     /// - [`SnapshotError::JournalUnavailable`] if the epoch marker cannot be
     ///   journaled (rolls back), or the underlying is sealed on the journal;
     /// - [`SnapshotError::SequenceExhausted`] if the underlying is sealed on
@@ -592,6 +593,19 @@ where
             &snapshot.executor.idempotency,
             &snapshot.executor.instrument_statuses,
         )?;
+
+        // Step 2a (cont.): validate the shared-store cuts belong to THIS underlying
+        // before any mutation or marker append. The executions/positions stores are
+        // shared venue-wide and only this actor is quiesced, so a cut carrying
+        // another underlying's legs/folds is a corrupt snapshot that could inject or
+        // overwrite a live underlying's rows. It is refused wholesale (all-or-nothing)
+        // here, so the marker is never journaled and no store is swapped.
+        self.fan_out
+            .executions()
+            .validate_restore(self.underlying.as_ref(), &snapshot.executions)?;
+        self.fan_out
+            .positions()
+            .validate_restore(self.underlying.as_ref(), &snapshot.positions)?;
 
         // Step 2b: append the epoch marker as the first record of the fresh
         // epoch (fallible). Done before any swap so a failure rolls back cleanly.
