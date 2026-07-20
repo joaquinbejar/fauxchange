@@ -11,6 +11,12 @@
 > the `CHANGELOG.md` preamble), so this file is the **committed** mirror of
 > the readiness evidence; the fuller design-doc narrative lives in
 > `docs/RELEASE-PROCESS.md` / `docs/SEMVER.md` / `docs/ROADMAP.md` locally.
+>
+> **This PR references #55 but does NOT close it.** Because the promotion is
+> held, merging this readiness record must leave issue #55 (the release cut)
+> **open** — its acceptance criteria (version bump to `1.0.0`, tag, publish,
+> the stability-soak period) are not yet met. The PR body uses `Refs #55`,
+> not `Closes #55`; #55 closes only when 1.0 is actually cut.
 
 - **Crate version:** unchanged at `0.0.1` (still the name-reservation
   placeholder — deliberately NOT bumped by this pass).

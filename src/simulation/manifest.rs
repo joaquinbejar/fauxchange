@@ -129,12 +129,13 @@ impl DependencyVersions {
     ///   a major SemVer event and a forward-incompatible journal is refused, mirroring
     ///   the per-stream recovery schema gate
     ///   ([`JournalError::SchemaTooNew`](crate::exchange::JournalError)).
-    /// - [`fauxchange`](Self::fauxchange) must be **SemVer-compatible**: for a
-    ///   `>= 1.0.0` binary, the **same MAJOR** (a `v1.x` journal replays on any later
-    ///   `v1.y`, the SEMVER promise); for a `0.x` binary, the same `(MAJOR, MINOR)`
-    ///   (SemVer treats a `0.MINOR` bump as breaking, so only a differing `0.MINOR.PATCH`
-    ///   is compatible). A version string that does not parse is treated as
-    ///   incompatible — refused, never a panic.
+    /// - [`fauxchange`](Self::fauxchange) must be **SemVer-compatible, directionally**:
+    ///   for a `>= 1.0.0` binary, the **same MAJOR** and `recorded_minor <= running_minor`
+    ///   (a `v1.x` journal replays on any *later-or-equal* `v1.y`, the SEMVER promise —
+    ///   but a *future*-minor bundle is refused, not admitted); for a `0.x` binary, the
+    ///   same `(MAJOR, MINOR)` exactly (SemVer treats a `0.MINOR` bump as breaking). A
+    ///   version that does not parse as a full `MAJOR.MINOR.PATCH` (`1.2`, `1.2.3.4`) is
+    ///   treated as incompatible — refused, never a panic.
     /// - [`optionstratlib`](Self::optionstratlib) is a **secondary** dependency and is
     ///   **not** a load gate — a difference does not refuse the load (the integrity
     ///   oracle is the backstop). [`first_mismatch`] still reports it for the WARN.
@@ -157,23 +158,46 @@ impl DependencyVersions {
     }
 }
 
-/// Parses the leading `MAJOR.MINOR` of a SemVer string into `(major, minor)`,
-/// returning `None` if either component is absent or non-numeric. A pre-release /
-/// build suffix attaches to the **patch** (the third component), so it never affects
-/// `MAJOR` / `MINOR` parsing. Never panics (a malformed version yields `None`, which
-/// the caller treats as incompatible).
+/// Parses and **validates a full `MAJOR.MINOR.PATCH` SemVer** string, returning the
+/// `(major, minor)` the load-admission gate keys on. A pre-release (`-…`) and/or build
+/// (`+…`) suffix attaches to the **patch** (the third component) and is stripped before
+/// parsing, so it never affects `MAJOR` / `MINOR`.
+///
+/// The core must be **exactly three** numeric dot-separated components — a version with
+/// a missing or extra component (`1.2`, `1.2.3.4`) is malformed and yields `None`, which
+/// the caller treats as incompatible (refused). This is full-structure validation, not a
+/// lenient "read the first two numbers" scan: a `1.2.3.4` bundle can no longer slip
+/// through as `(1, 2)`. Never panics.
 #[must_use]
 pub(crate) fn parse_major_minor(version: &str) -> Option<(u64, u64)> {
-    let mut parts = version.split('.');
+    // Build metadata (`+…`) then pre-release (`-…`) both hang off the patch; strip them
+    // so the remaining core is bare `MAJOR.MINOR.PATCH`.
+    let core = version.split('+').next()?.split('-').next()?;
+    let mut parts = core.split('.');
     let major = parts.next()?.parse::<u64>().ok()?;
     let minor = parts.next()?.parse::<u64>().ok()?;
+    // A numeric PATCH must be present (rejects `1.2`) …
+    let _patch = parts.next()?.parse::<u64>().ok()?;
+    // … and nothing may follow it (rejects `1.2.3.4`).
+    if parts.next().is_some() {
+        return None;
+    }
     Some((major, minor))
 }
 
-/// Whether a `recorded` `fauxchange` version is SemVer-compatible with the `running`
-/// binary for **load admission**: same `MAJOR` at `>= 1.0.0`, same `(MAJOR, MINOR)` at
-/// `0.x`. An unparseable version on either side is incompatible (refused, never a
-/// panic). This is admission only — it does not assert bit-reproducibility.
+/// Whether a `recorded` `fauxchange` version is load-compatible with the `running`
+/// binary, **directionally from recorded to running**. An unparseable / malformed
+/// version on either side is incompatible (refused, never a panic). This is admission
+/// only — it does not assert bit-reproducibility.
+///
+/// - Same `MAJOR` is always required (a cross-major journal is refused).
+/// - `>= 1.x`: a recorded journal replays on any **later-or-equal** running minor
+///   (`recorded_minor <= running_minor`) — the SEMVER.md "a `v1.x` journal replays on
+///   any later `v1.y`" promise, read **directionally**. A bundle recorded by a *future*
+///   minor (e.g. a `1.99` bundle on a `1.0` runtime) is **refused**, not admitted — the
+///   older runtime cannot prove it understands a newer minor's records.
+/// - `0.x`: every `0.MINOR` bump is a breaking boundary (SemVer 0.x), so the
+///   `(MAJOR, MINOR)` must match **exactly** (direction is moot under equality).
 #[must_use]
 fn fauxchange_versions_compatible(running: &str, recorded: &str) -> bool {
     let (Some((run_major, run_minor)), Some((rec_major, rec_minor))) =
@@ -184,12 +208,10 @@ fn fauxchange_versions_compatible(running: &str, recorded: &str) -> bool {
     if run_major != rec_major {
         return false;
     }
-    // At `0.x` every `0.MINOR` bump is a breaking boundary (SemVer 0.x); at `>= 1.x`
-    // the whole major line is the compatibility unit.
     if run_major == 0 {
         run_minor == rec_minor
     } else {
-        true
+        rec_minor <= run_minor
     }
 }
 
@@ -342,6 +364,31 @@ mod tests {
         assert_eq!(parse_major_minor("garbage"), None);
         assert_eq!(parse_major_minor(""), None);
         assert_eq!(parse_major_minor("1"), None);
+        // A missing PATCH or an EXTRA component is malformed — full-structure
+        // validation, so `1.2.3.4` can no longer slip through as `(1, 2)`.
+        assert_eq!(parse_major_minor("1.2"), None);
+        assert_eq!(parse_major_minor("1.2.3.4"), None);
+        assert_eq!(parse_major_minor("1.2.x"), None);
+    }
+
+    #[test]
+    fn test_fauxchange_versions_compatible_is_directional_at_v1() {
+        // `>= 1.x` admits an older-or-equal recorded minor on a newer running binary…
+        assert!(fauxchange_versions_compatible("1.5.0", "1.2.0"));
+        assert!(fauxchange_versions_compatible("1.5.0", "1.5.9"));
+        // …but REFUSES a future-minor bundle on an older runtime (the finding's case:
+        // a `1.99` bundle must not load on a `1.0` binary).
+        assert!(!fauxchange_versions_compatible("1.0.0", "1.99.0"));
+        // A different major is always refused, either direction.
+        assert!(!fauxchange_versions_compatible("2.0.0", "1.0.0"));
+        assert!(!fauxchange_versions_compatible("1.0.0", "2.0.0"));
+        // A malformed version on either side is refused, never a panic.
+        assert!(!fauxchange_versions_compatible("1.2.3.4", "1.2.0"));
+        assert!(!fauxchange_versions_compatible("1.2.0", "1.2.3.4"));
+        // `0.x` stays exact-minor in both directions.
+        assert!(fauxchange_versions_compatible("0.7.3", "0.7.0"));
+        assert!(!fauxchange_versions_compatible("0.7.0", "0.8.0"));
+        assert!(!fauxchange_versions_compatible("0.8.0", "0.7.0"));
     }
 
     #[test]

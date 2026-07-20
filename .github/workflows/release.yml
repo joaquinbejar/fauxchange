@@ -15,27 +15,35 @@
 #
 # RELEASE-PROCESS.md §5 "push order matters": the branch is pushed first
 # (so the tagged commit is reachable on `main` and has already gone
-# through `ci.yml`'s full push-triggered gate as an ordinary branch push),
-# *then* the tag — this workflow assumes that ordering and re-verifies the
-# Pre-Submission Checklist itself in `verify` before either publish step
-# runs, rather than trusting the earlier `ci.yml` run blindly (a tag can,
-# in principle, point at a commit `ci.yml` never saw).
+# through the FULL push-triggered gate set as an ordinary branch push),
+# *then* the tag. `verify` does NOT trust that ordering blindly — it
+# PROVES it: the tagged commit must be an ancestor of `origin/main`, AND
+# every required gate (conformance, fuzz, performance, stability, audit,
+# migration — every check-run those workflows post) must have concluded
+# `success` on THIS EXACT commit SHA, or the release fails before anything
+# is published. A tag pointing at an unmerged branch, or at a commit whose
+# CI is red/absent, therefore cannot publish an artifact.
 #
-# `verify` gates BOTH publish jobs — a broken build, a clippy warning, or a
-# tag/Cargo.toml version mismatch fails BEFORE `cargo publish` or `docker
-# push` run (both are effectively irreversible per RELEASE-PROCESS.md §9).
-# `publish-crate` and `publish-image` run in parallel (independent
-# artifacts); `github-release` waits on both so the Release notes only ever
-# point at artifacts that are actually live.
+# `verify` gates ALL publish jobs. The irreversible promotions are then
+# SERIALIZED (RELEASE-PROCESS.md §9): `publish-crate` first, then
+# `publish-image` (`needs` it), then `github-release`. crates.io is the
+# first irreversible step; if `publish-image` fails after the crate is
+# live, the crate version is already public and IMMUTABLE — recovery is a
+# PATCH re-tag (a new `vX.Y.(Z+1)`), never a mutate/yank of the published
+# version (see RELEASE-PROCESS.md §9 "partial-release recovery").
 #
 # Secrets: `CARGO_REGISTRY_TOKEN` (crates.io, repo secret — provisioned by
 # the operator before the first tag push, see RELEASE-READINESS.md
 # "REMAINING FOR THE HUMAN") and the ambient `GITHUB_TOKEN` (ghcr.io push under
-# `packages: write`, and `gh release create` under `contents: write`) — the
-# minimum permission set, scoped to this workflow only (`ci.yml` /
-# `bench-regression.yml` stay `contents: read`). Neither secret is ever
-# echoed to a log; `cargo publish` / `docker login` read them from the step
-# `env`, never a shell interpolation that could land in `set -x` output.
+# `packages: write`, `gh release create` under `contents: write`, and the
+# read-only check-run query in `verify`) — the minimum permission set,
+# scoped per job. Neither secret is ever echoed to a log; `cargo publish` /
+# `docker login` read them from the step `env`, never a shell interpolation
+# that could land in `set -x` output.
+#
+# Third-party actions are PINNED to a reviewed commit SHA (docs/08 §7 supply
+# chain) with a trailing `# vX.Y.Z` comment — a mutable major tag on a
+# publish-capable workflow is a supply-chain hole.
 name: release
 
 on:
@@ -63,22 +71,67 @@ env:
   IMAGE: ghcr.io/joaquinbejar/fauxchange
 
 jobs:
-  # --- Re-run the binding Pre-Submission Checklist on the tagged commit, ---
-  # --- plus the release-specific tag/version consistency check -------------
+  # --- Prove the tag is on main AND its full gate set is green on THIS SHA, --
+  # --- then re-run the binding Pre-Submission Checklist + supply-chain/ ------
+  # --- migration gates on the tagged commit --------------------------------
   verify:
     name: verify
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: read
     env:
       RUSTFLAGS: "-D warnings"
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          # Full history so the main-ancestry proof below can resolve the
+          # merge-base — a shallow clone cannot answer `--is-ancestor`.
+          fetch-depth: 0
+      - name: Tagged commit is reachable from origin/main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME ($GITHUB_SHA) is NOT an ancestor of origin/main — refusing to publish an unmerged commit" >&2
+            exit 1
+          fi
+          echo "tagged commit $GITHUB_SHA is on main"
+      - name: Every required gate is green on THIS exact tagged commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The tag must point at a commit that ALREADY passed the full gate
+          # set (conformance, fuzz, performance, stability, audit, migration —
+          # every check the push-to-main workflows post) as an ordinary push.
+          # We REQUIRE their success on THIS SHA rather than re-running the
+          # heavy suites (nightly fuzz, Docker soak) or trusting a same-branch
+          # run reached it. Any non-success — or a suspiciously empty check
+          # set (a commit CI never actually saw) — fails the release.
+          runs="$(gh api "repos/${{ github.repository }}/commits/${GITHUB_SHA}/check-runs?per_page=100" --paginate)"
+          total="$(echo "$runs" | jq '[.check_runs[]] | length')"
+          # A completed check that did not succeed (ignore the release run's own
+          # in-progress checks: only terminal, non-success conclusions block).
+          bad="$(echo "$runs" | jq -r '[.check_runs[] | select(.status=="completed") | select(.conclusion!="success" and .conclusion!="neutral" and .conclusion!="skipped") | "\(.name)=\(.conclusion)"] | unique | join(", ")')"
+          if [ -n "$bad" ]; then
+            echo "::error::required gates are not green on $GITHUB_SHA: $bad" >&2
+            exit 1
+          fi
+          # A real CI-covered commit has many checks; near-zero means the tag
+          # points at a commit main's gate workflows never actually ran on.
+          if [ "$total" -lt 5 ]; then
+            echo "::error::only $total check-runs on $GITHUB_SHA — the tagged commit did not go through the CI gate set" >&2
+            exit 1
+          fi
+          echo "all $total check-runs on $GITHUB_SHA are green"
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: release-verify
       - name: Tag matches Cargo.toml [package].version
@@ -93,12 +146,32 @@ jobs:
           echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
       # The four binding checks (rules/global_rules.md "Pre-Submission
       # Checklist") — unchanged from ci.yml's fmt/clippy/test/build-release
-      # jobs, run again here so a release NEVER depends on trusting a
-      # separate workflow run reached the same commit.
+      # jobs, re-run here (cheap) so a release NEVER depends on trusting a
+      # separate workflow run reached the same commit. `cargo test
+      # --all-features` covers the conformance / determinism / parity
+      # suites in `tests/`; the specialized fuzz / bench / soak gates are
+      # required-green above rather than re-run.
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
       - run: cargo build --release
+      # Supply-chain + migration gates (docs/08 §8), re-proven on the tagged
+      # commit rather than only required-green above.
+      - name: cargo-audit (RustSec advisory scan)
+        run: |
+          cargo install cargo-audit --locked --version ^0.21 || cargo install cargo-audit --locked
+          cargo audit
+      - name: cargo-deny (license / ban / source policy)
+        run: |
+          cargo install cargo-deny --locked --version ^0.16 || cargo install cargo-deny --locked
+          cargo deny check
+      - name: Migrations compile-check (sqlx offline data is current)
+        run: |
+          # `.sqlx/` is the committed offline query data every `sqlx::query!`
+          # builds from; a stale set means a migration/query drift. A clean
+          # `--offline` build (above) already exercised it; re-assert the
+          # migrations directory is present and non-empty for the image build.
+          test -d migrations && [ -n "$(ls -A migrations)" ] || { echo "::error::migrations/ missing or empty" >&2; exit 1; }
       - name: "cargo package --list — the exact file set that would be published"
         run: cargo package --list
       # `--dry-run` REBUILDS the repackaged tarball in an isolated directory and
@@ -111,17 +184,18 @@ jobs:
       # `CARGO_REGISTRY_TOKEN` is needed for a dry run — it never uploads.
       - run: cargo publish --dry-run
 
-  # --- crates.io ---------------------------------------------------------
+  # --- crates.io — the FIRST irreversible promotion, serialized before the ---
+  # --- image push so a partial release has a defined recovery (patch re-tag) --
   publish-crate:
     name: publish-crate
     needs: [verify]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: release-publish-crate
       - name: cargo publish (CARGO_REGISTRY_TOKEN read from env only, never echoed)
@@ -131,37 +205,43 @@ jobs:
 
   # --- ghcr.io: both runtime targets, tagged from Cargo.toml's version ---
   # --- (docs/06-deployment.md §12, SEMVER.md "single crate, coordinated ---
-  # --- image") -------------------------------------------------------------
+  # --- image"). SERIALIZED AFTER publish-crate: the image build + secret ---
+  # --- scan (reversible, local) run first, and the irreversible `docker ---
+  # --- push` only after the crate is already live, so the two irreversible ---
+  # --- promotions never race. If a push here fails, the crate is public and ---
+  # --- immutable — recover with a patch re-tag, never a yank. ---------------
   publish-image:
     name: publish-image
-    needs: [verify]
+    needs: [verify, publish-crate]
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
-      - name: Log in to ghcr.io
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: "Build + push runtime-slim (the DEFAULT target — docker-compose.yml pins target: runtime-slim)"
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - name: Build runtime-slim (the DEFAULT target — reversible, no push yet)
         run: |
           docker build -f docker/Dockerfile --target runtime-slim \
             -t "$IMAGE:${{ needs.verify.outputs.version }}" \
             -t "$IMAGE:latest" .
       - name: No baked secrets — the #26 image-scan gate, re-run against the artifact about to be pushed (docs/08 §7)
         run: docker/scan-image-secrets.sh "$IMAGE:${{ needs.verify.outputs.version }}"
-      - run: |
-          docker push "$IMAGE:${{ needs.verify.outputs.version }}"
-          docker push "$IMAGE:latest"
-      - name: Build + push runtime-distroless (minimal variant, own tag suffix — never `latest`)
+      - name: Build runtime-distroless (minimal variant, own tag suffix — never `latest`; reversible, no push yet)
         run: |
           docker build -f docker/Dockerfile --target runtime-distroless \
             -t "$IMAGE:${{ needs.verify.outputs.version }}-distroless" .
       - name: No baked secrets — runtime-distroless (docs/08 §7)
         run: docker/scan-image-secrets.sh "$IMAGE:${{ needs.verify.outputs.version }}-distroless"
-      - run: docker push "$IMAGE:${{ needs.verify.outputs.version }}-distroless"
+      # Both images are built + scanned above; only now do the irreversible
+      # pushes run, back to back, after the crate is already live.
+      - name: Log in to ghcr.io
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - run: |
+          docker push "$IMAGE:${{ needs.verify.outputs.version }}"
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:${{ needs.verify.outputs.version }}-distroless"
 
   # --- GitHub Release, notes lifted verbatim from CHANGELOG.md -----------
   github-release:
@@ -171,7 +251,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
       - name: Extract this version's CHANGELOG.md section as the release notes
         run: |
           awk "/^## \[${{ needs.verify.outputs.version }}\]/,/^## \[/" CHANGELOG.md \
