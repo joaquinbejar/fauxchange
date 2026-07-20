@@ -181,25 +181,37 @@ pub(crate) fn immediate_fills(
 }
 
 /// The volume-weighted average price over a set of `(price, quantity)` fill
-/// legs, in **integer cents**, or `None` when there were no fills. Realized
+/// legs, in **integer cents** — `Ok(None)` when there were no fills. Realized
 /// money — kept as `Cents` on the wire, never a float (the review-fixed contract).
 ///
 /// The volume-weighted average `Σ(pᵢ·qᵢ) / Σqᵢ` is computed in `u128`
 /// (`Notional`) space and **truncated toward zero** to whole cents — the
-/// documented wire rounding rule, consistent with `Position.avg_price`. The
-/// quotient is bounded by the largest leg price (a `u64` cents value), so the
-/// `try_from` never actually rejects for real fills.
-#[must_use]
-pub(crate) fn vwap_cents(fills: &[(Cents, u64)]) -> Option<Cents> {
-    let total_qty: u128 = fills.iter().map(|(_, q)| u128::from(*q)).sum();
-    if total_qty == 0 {
-        return None;
+/// documented wire rounding rule, consistent with `Position.avg_price`.
+///
+/// # Errors
+///
+/// Every step is **checked** (`rules/global_rules.md` — no `saturating_*`/
+/// `wrapping_*`, and `Iterator::sum` panics-in-debug / wraps-in-release on
+/// overflow). Each `pᵢ·qᵢ` is a `u64 × u64` product that always fits `u128`; the
+/// running sums could only overflow past ~2^64 legs (unreachable for a real
+/// order). Any such overflow returns [`VenueError::Overflow`] (a redacted `500`)
+/// rather than panicking or wrapping to a wrong wire price.
+pub(crate) fn vwap_cents(fills: &[(Cents, u64)]) -> Result<Option<Cents>, VenueError> {
+    let mut total_qty: u128 = 0;
+    let mut notional: u128 = 0;
+    for (price, qty) in fills {
+        let q = u128::from(*qty);
+        let leg = u128::from(price.get())
+            .checked_mul(q)
+            .ok_or(VenueError::Overflow)?;
+        total_qty = total_qty.checked_add(q).ok_or(VenueError::Overflow)?;
+        notional = notional.checked_add(leg).ok_or(VenueError::Overflow)?;
     }
-    let notional: u128 = fills
-        .iter()
-        .map(|(p, q)| u128::from(p.get()) * u128::from(*q))
-        .sum();
-    u64::try_from(notional / total_qty).ok().map(Cents::new)
+    if total_qty == 0 {
+        return Ok(None);
+    }
+    let vwap = u64::try_from(notional / total_qty).map_err(|_| VenueError::Overflow)?;
+    Ok(Some(Cents::new(vwap)))
 }
 
 /// Formats a Unix-epoch **seconds** instant as an RFC3339 / ISO-8601 UTC
@@ -287,13 +299,13 @@ mod tests {
 
     #[test]
     fn test_vwap_cents_is_none_without_fills() {
-        assert_eq!(vwap_cents(&[]), None);
+        assert_eq!(vwap_cents(&[]).expect("no overflow"), None);
     }
 
     #[test]
     fn test_vwap_cents_weights_by_quantity() {
         // (100c × 1) + (200c × 3) = 700 over 4 = 175, exact — integer cents.
-        let vwap = vwap_cents(&[(Cents::new(100), 1), (Cents::new(200), 3)]);
+        let vwap = vwap_cents(&[(Cents::new(100), 1), (Cents::new(200), 3)]).expect("no overflow");
         assert_eq!(vwap, Some(Cents::new(175)));
     }
 
@@ -301,7 +313,7 @@ mod tests {
     fn test_vwap_cents_truncates_toward_zero() {
         // (100c × 1) + (101c × 1) = 201 over 2 = 100.5 → truncated to 100 cents
         // (the documented wire rounding rule; never a fractional-cent float).
-        let vwap = vwap_cents(&[(Cents::new(100), 1), (Cents::new(101), 1)]);
+        let vwap = vwap_cents(&[(Cents::new(100), 1), (Cents::new(101), 1)]).expect("no overflow");
         assert_eq!(vwap, Some(Cents::new(100)));
     }
 }

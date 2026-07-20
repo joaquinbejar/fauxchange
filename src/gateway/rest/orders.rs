@@ -234,7 +234,13 @@ pub async fn place_market_order(
         .await?;
 
     let fills = immediate_fills(&state, &account, &order_id, receipt.underlying_sequence);
-    let filled: u64 = fills.iter().map(|(_, q)| q).sum();
+    // Checked fold (never `Iterator::sum`, which panics-in-debug / wraps-in-release):
+    // the filled quantity is bounded by the order quantity, so overflow is
+    // unreachable, but the arithmetic stays checked per rules/global_rules.md.
+    let filled: u64 = fills
+        .iter()
+        .try_fold(0u64, |acc, (_, q)| acc.checked_add(*q))
+        .ok_or(VenueError::Overflow)?;
     let status = if filled == 0 {
         MarketOrderStatus::Rejected
     } else if filled >= request.quantity {
@@ -242,7 +248,7 @@ pub async fn place_market_order(
     } else {
         MarketOrderStatus::Partial
     };
-    let average_price = vwap_cents(&fills);
+    let average_price = vwap_cents(&fills)?;
     let fill_prints = fills
         .into_iter()
         .map(|(price, quantity)| FillPrint { price, quantity })
