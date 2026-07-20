@@ -2,9 +2,9 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note) |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-18 (§5 only)                       |
-| Commit      | `de07a26dfba97f598d43818048e74fa43822ceb8` + this branch's uncommitted `#020` changes (`stack/20-bench-hdr`) |
+| Status      | First baseline (`#020`); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-18 (§5 only), on the `stack/20-bench-hdr` working tree at those dates |
+| Commit      | **Not pinned to a single SHA.** This baseline was measured on an actively developed, routinely-rebased branch (`stack/20-bench-hdr`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
 > **Every number in this document is a DESIGN TARGET comparison, never an
@@ -16,6 +16,13 @@
 > number being invented. `HP-1`'s own DESIGN TARGET (docs/07 §3: "sub-millisecond
 > (< 1 ms) at p99") is **not yet reliably met at sustained scale** — see the
 > HP-1 interpretation below, and the follow-up this baseline surfaces.
+> **Provenance:** these numbers were measured on a working tree during
+> active, routinely-rebased development, not an immutable released commit —
+> see the "Commit" row above. Do not read any date in this document as
+> "re-measured on \<date\> at \<some SHA\>"; the SHA that produced a given
+> number stops identifying the tree as soon as the branch moves. The
+> authoritative, commit-pinned re-measurement happens on the release-pinned
+> tree (#138).
 
 ## 1. Run conditions
 
@@ -282,6 +289,18 @@ warmup ops, same seeded workload as HP-1) in two sections.
 | `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **77.374** | 10 881.6 |
 | `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **82.657** | 11 102.3 |
 
+**Target status: NOT MET — disclosed gap, not partial credit.** docs/07 §4's
+criterion is *zero* steady-state allocation on the common path; the measured
+common actor turn allocates roughly 60–80 times per submitted command. This
+is failed-target evidence, reported honestly rather than framed as "close
+enough": the zero-steady-state-allocation DESIGN TARGET is open, and the
+measured numbers below are the disclosed size of that gap, not a partial
+pass. The run-to-run instability of this measurement is itself tracked as an
+open item (#126); a dedicated re-measure once #126 is resolved — ideally
+paired with a call-stack profiler so these ~60–80 allocs/op can be
+attributed to a concrete call site instead of process-wide — is tracked as
+the #138 follow-up.
+
 **Run-to-run variance, disclosed.** Three consecutive runs at the identical
 default configuration (`ALLOC_WARMUP_OPS=5000 ALLOC_MEASURED_OPS=50000`) on
 this host produced allocs/op of 62.577 / 79.710 / 77.374 (direct) and
@@ -302,9 +321,10 @@ thread during the window), not a call-stack-scoped instrumentation of
 `heaptrack`, Instruments) this environment does not have available, and no
 such tool was used; **this bench does not attribute allocations to a
 specific call site**, and no claim below should be read as one. What it
-proves: **the steady-state turn is measurably far from the zero-allocation
-DESIGN TARGET** — roughly 60–80 allocations per submitted command in both
-sections, not the `0` the target names. (The earlier baseline read the
+proves is the failed-target finding stated above: the steady-state turn is
+measurably far from the zero-allocation DESIGN TARGET, at roughly 60–80
+allocations per submitted command in both sections, not the `0` the target
+names. (The earlier baseline read the
 async-submit section as allocating *fewer* than the direct section and called
 that "notable"; across these three repeat runs the two sections are close
 enough, and swap ordering run to run, that no reliable direction — async

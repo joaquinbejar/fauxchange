@@ -20,6 +20,21 @@
 //!
 //! `harness = false`; run: `cargo bench --bench hp2_ws_fanout`. Reduced
 //! sample: `HP2_MEASURED_OPS=5000 cargo bench --bench hp2_ws_fanout`.
+//!
+//! **Self-check flatness assertion.** This bench prints the p99 delta of
+//! every swept N vs the N=1 baseline unconditionally. Set
+//! `HP2_FLATNESS_ASSERT=1` to turn that into a hard `panic!` (failing this
+//! `cargo bench` run) when `|delta%|` exceeds `HP2_FLATNESS_TOLERANCE_PCT`
+//! (default `40.0`, mirroring the tolerance the `bench-regression` CI job's
+//! reduced-sample PR path uses for the same reason: at a small local sample
+//! count the tail is noisier, so a tight bound would be spuriously red on an
+//! unrelated run). Left unset (the default), this is report-only — so a
+//! developer running a tiny local `HP2_MEASURED_OPS` is never spuriously
+//! failed by sampling noise alone. This in-bench check is this bench's own
+//! self-check, not the definitive regression gate: the authoritative,
+//! cross-run gate is the `bench-regression` CI job (introduced at #53),
+//! which compares against a documented ceiling table rather than a
+//! same-process N=1 baseline.
 
 #[path = "support/mod.rs"]
 mod support;
@@ -45,6 +60,17 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_flag(key: &str) -> bool {
+    std::env::var(key).ok().as_deref() == Some("1")
+}
+
 fn main() {
     support::print_run_conditions("hp2_ws_fanout");
 
@@ -53,7 +79,18 @@ fn main() {
     let seed = 0xA5A5_A5A5_A5A5_A5A5_u64;
     let ns_to_sweep: [usize; 4] = [1, 10, 100, 1_000];
 
-    println!("config: warmup_ops={warmup_ops} measured_ops={measured_ops} N={ns_to_sweep:?}");
+    // See the module doc's "Self-check flatness assertion" section: unset
+    // (default) is report-only so a reduced local sample is never
+    // spuriously red; `HP2_FLATNESS_ASSERT=1` (CI) turns a breach into a
+    // failing `panic!`. The definitive cross-run gate is the
+    // `bench-regression` CI job (#53), not this same-process self-check.
+    let flatness_assert = env_flag("HP2_FLATNESS_ASSERT");
+    let flatness_tolerance_pct = env_f64("HP2_FLATNESS_TOLERANCE_PCT", 40.0);
+
+    println!(
+        "config: warmup_ops={warmup_ops} measured_ops={measured_ops} N={ns_to_sweep:?} \
+         flatness_assert={flatness_assert} flatness_tolerance_pct={flatness_tolerance_pct}"
+    );
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -80,6 +117,20 @@ fn main() {
                 #[allow(clippy::cast_precision_loss)]
                 let pct = if base == 0 { 0.0 } else { 100.0 * delta as f64 / base as f64 };
                 println!("  p99 delta vs N=1 baseline: {delta:+} ns ({pct:+.1}%)");
+                // Self-check only (see module doc) — the definitive cross-run
+                // regression gate is the `bench-regression` CI job (#53).
+                if flatness_assert {
+                    assert!(
+                        pct.abs() <= flatness_tolerance_pct,
+                        "HP-2 flatness self-check failed: N={n} p99={p99_ns} ns vs N=1 \
+                         baseline={base} ns, delta {pct:+.2}% exceeds the configured \
+                         ±{flatness_tolerance_pct:.1}% tolerance \
+                         (HP2_FLATNESS_TOLERANCE_PCT). This is this bench's own \
+                         same-process self-check, gated by HP2_FLATNESS_ASSERT=1; the \
+                         definitive cross-run gate is the bench-regression CI job (#53).",
+                        p99_ns = q.p99_ns,
+                    );
+                }
             }
         }
     });
