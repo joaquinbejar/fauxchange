@@ -3,25 +3,21 @@
 //! `fuzz/fuzz_targets/ws_frame_decode.rs`).
 //!
 //! The fix that makes `parse_frame` REJECT a frame carrying a duplicate
-//! top-level key (e.g. two `"action"` fields) lands on a LOWER stack branch
-//! (#14, the WS production-parser hardening) and is **not yet rebased into
-//! this working tree**. Asserting "duplicate key ⇒ Reject" unconditionally
-//! inside the `ws_frame_decode` libFuzzer target body would fail on every
-//! run on THIS tree, before #14 ever lands — so that assertion lives here
-//! instead, in an ORDINARY Cargo integration test (`fuzz/tests/`, not one of
-//! the `#![no_main]` libFuzzer binaries in `fuzz_targets/` — none of those
-//! are built or run by `cargo test`; see `test = false` on every `[[bin]]`
-//! in `fuzz/Cargo.toml`), gated by [`DUPLICATE_KEY_REJECTION_LANDED`]:
+//! top-level key (e.g. two `"action"` fields) landed on a LOWER stack branch
+//! (#14, the WS production-parser hardening) and is **now rebased into this
+//! tree**. The assertion lives here — in an ORDINARY Cargo integration test
+//! (`fuzz/tests/`, not one of the `#![no_main]` libFuzzer binaries in
+//! `fuzz_targets/` — none of those are built or run by `cargo test`; see
+//! `test = false` on every `[[bin]]` in `fuzz/Cargo.toml`) — rather than
+//! inside the `ws_frame_decode` libFuzzer body, which processes arbitrary
+//! bytes and cannot pin a specific seed's expected outcome. It is gated by
+//! [`DUPLICATE_KEY_REJECTION_LANDED`]:
 //!
-//! - **today** (`false`) it exercises and documents the CURRENT, pre-#14
-//!   behaviour: `parse_frame` resolves the duplicate `"action"` key
-//!   deterministically via `serde_json::Value`'s own last-key-wins insertion
-//!   semantics and never panics — either an `Action` or a `Reject` is a
-//!   valid outcome, so this branch accepts both;
-//! - **once #14 rebases in**, flip the constant to `true` and this SAME test
-//!   starts pinning the FIXED behaviour (a typed, non-terminal `Reject`)
-//!   instead — the assertion is already written below, not left as a
-//!   follow-up TODO.
+//! - now that #14 is present (`true`) it pins the FIXED behaviour: a
+//!   duplicate `"action"` key is a typed, **non-terminal** `Reject`;
+//! - before #14 landed (`false`) it accepted either an `Action` or a
+//!   `Reject`, documenting the pre-fix `serde_json::Value` last-key-wins
+//!   resolution (kept below so the pre-#14 contract stays on record).
 //!
 //! Runs under plain `cargo test --manifest-path fuzz/Cargo.toml` (this file
 //! needs no `#[cfg(test)]` wrapper — every file under `tests/` is already
@@ -29,9 +25,9 @@
 
 use fauxchange::gateway::ws::{FrameOutcome, parse_frame};
 
-/// Flip to `true` once stack branch #14 (the WS duplicate-top-level-key
-/// rejection fix) is rebased into this tree.
-const DUPLICATE_KEY_REJECTION_LANDED: bool = false;
+/// `true` now that stack branch #14 (the WS duplicate-top-level-key rejection
+/// fix) is rebased into this tree — the test pins the typed-`Reject` behaviour.
+const DUPLICATE_KEY_REJECTION_LANDED: bool = true;
 
 /// The committed corpus seed for this scenario
 /// (`fuzz/corpus/ws_frame_decode/duplicate_action_field.json`) — two
