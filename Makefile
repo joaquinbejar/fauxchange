@@ -124,7 +124,7 @@ clean: ## cargo clean
 
 # --- Performance regression gate (#053, docs/07-performance-budgets.md §6) --
 
-bench-regression: ## Reduced-sample hot-path benches + the bench-regression gate — mirrors CI job `bench-regression` (HP-2 flatness report-only at this scale, BENCH.md §13.6)
+bench-regression: ## Reduced-sample hot-path benches + the bench-regression gate — mirrors CI job `bench-regression` (HP-2 flatness gated at the 40% PR-path tolerance, BENCH.md §13.6)
 	@mkdir -p target/bench-out
 	scripts/record_bench_run_conditions.sh smoke | tee target/bench-out/run-conditions.txt
 	HP1_WARMUP_OPS=1000 HP1_MEASURED_OPS=5000 HP1_OPEN_LOOP_OPS=200 $(CARGO) bench --bench hp1_order_path | tee target/bench-out/hp1.log
@@ -133,7 +133,7 @@ bench-regression: ## Reduced-sample hot-path benches + the bench-regression gate
 	HP4_WARMUP_OPS=500 HP4_MEASURED_OPS=2000 HP4_OPEN_LOOP_OPS=200 $(CARGO) bench --bench mm_requote_hdr | tee target/bench-out/hp4.log
 	HP5_WARMUP_OPS=30 HP5_MEASURED_OPS=150 HP5_OPEN_LOOP_OPS=20 $(CARGO) bench --bench hp5_durable_append | tee target/bench-out/hp5.log
 	ALLOC_WARMUP_OPS=2000 ALLOC_MEASURED_OPS=10000 ALLOC_MM_WARMUP_OPS=500 ALLOC_MM_MEASURED_OPS=2000 $(CARGO) bench --bench alloc_profile | tee target/bench-out/alloc.log
-	BENCH_REGRESSION_GATE_FLATNESS=0 python3 scripts/bench_regression_gate.py target/bench-out/*.log
+	BENCH_REGRESSION_GATE_FLATNESS=1 BENCH_FANOUT_FLATNESS_TOLERANCE_PCT=40 python3 scripts/bench_regression_gate.py target/bench-out/*.log
 
 bench-regression-full: ## Full default-sample hot-path benches + the bench-regression gate — mirrors CI job `bench-regression-nightly` (HP-2 flatness genuinely gated; needs local Docker for HP-5)
 	@mkdir -p target/bench-out

@@ -19,12 +19,20 @@ ordinary cross-machine noise or (if loosened enough to avoid that) become
 meaningless. Every ceiling below is derived from the WORST disclosed
 measured p99/p99.9 across every BENCH.md run (and this gate's own
 `#053` re-verification run, `BENCH.md` §13) for that series, multiplied by a
-documented margin (10x for series already at or above ~100 us, a 1 ms floor
-for series still at low-microsecond scale) — generous enough to absorb
+documented margin: 10x for series already at or above ~100 us of measured
+latency (HP-1, HP-2, HP-4, HP-5); for HP-3's sub-microsecond decode/encode, a
+STEEPER per-series multiplier (~50-100x) with an absolute floor sized against
+that series' own worst disclosed p99.99 outlier, REPLACING an earlier flat
+1 ms floor that a review finding correctly identified as 400-2000x the
+measured value — generous enough to be a coarse blowup catcher but not a
+meaningful regression gate. Every ceiling is generous enough to absorb
 cross-machine noise and the known, still-open HP-1 append-tail issue
 (#91, not yet landed when this gate was armed) without being vacuous: it
 still fails a genuine multi-x regression. See `BENCH.md` §13 for the full
-derivation and the noise-margin / baseline-update procedure.
+derivation and the noise-margin / baseline-update procedure, and this
+module's `LATENCY_CEILINGS_NS` / `ALLOC_CEILINGS_PER_OP` comments for the
+per-series numbers and which ones are a TIGHT no-regression bound versus a
+COARSE blowup catcher (never silently the same thing).
 
 This script is deliberately dependency-free (Python 3 stdlib only) so no new
 Cargo or pip dependency is needed to arm the gate — `devops` does not add
@@ -35,23 +43,42 @@ Usage:
 
 Environment:
     BENCH_REGRESSION_GATE_FLATNESS=1  Gate on the HP-2 fan-out flatness sweep
-        (fail the build if it breaches tolerance). Unset/`0` (the default,
-        used by the reduced-sample per-PR `bench-regression` job): the
-        flatness percentage is still COMPUTED and PRINTED every run, but a
-        breach does not fail the build. BENCH.md §13.2 measured worst
-        |delta p99| = 13.3% at 10,000 ops — only 1.7 percentage points under
-        the 15% tolerance — so gating this at the smaller per-PR sample size
-        (3,000 ops, fewer tail samples) risked a spurious >15% on an
-        unrelated PR (a gate that cries wolf gets overridden, which is worse
-        than not gating it at all at that scale). The `bench-regression-nightly`
-        job (full default sample, matching BENCH.md's own §4 methodology)
-        sets this to `1` and genuinely gates flatness. See BENCH.md §13.6.
+        (fail the build if it breaches tolerance). Default `1` (gated) — a
+        review finding on the original #053 design flagged that leaving this
+        report-only on the per-PR path lets a genuine fan-out regression
+        merge before the nightly job ever sees it, defeating a REQUIRED PR
+        gate's purpose. Both `bench-regression` (per-PR) and
+        `bench-regression-nightly` now set this to `1` explicitly.
+    BENCH_FANOUT_FLATNESS_TOLERANCE_PCT=<float>  The flatness tolerance, as a
+        percentage. Defaults to `FANOUT_FLATNESS_TOLERANCE_PCT_FULL` (15.0,
+        matching `FLATNESS_TOLERANCE_PCT` in `benches/hp2_ws_fanout.rs` and
+        BENCH.md §4's own full-sample methodology) when unset. The per-PR
+        `bench-regression` job sets this to `40` (wider) because its smaller
+        HP2_MEASURED_OPS=3000 sample is noisier than the nightly job's full
+        30,000-op sample — BENCH.md §13.2 measured worst |delta p99| = 13.3%
+        at 10,000 ops, only 1.7 percentage points under the 15% tolerance, so
+        gating the SAME 15% bound at an even smaller, noisier sample risked a
+        spurious fail on an unrelated PR. 40% is NOT a fresh measurement at
+        3,000 ops (none was taken) — it is a disclosed extrapolation from
+        BENCH.md's two real data points (3.7% at 30,000 ops, 13.3% at 10,000
+        ops): a naive 1/sqrt(N) scaling from the 10,000-op point predicts
+        ~24% at 3,000 ops, but the empirical ratio between the two disclosed
+        points (13.3/3.7 ~ 3.6x noise for a 3x drop in N) is already steeper
+        than 1/sqrt(N) predicts (1.7x), so a purely theoretical extrapolation
+        would likely UNDERSTATE the true smoke-scale noise; applying that
+        same empirical ratio again for the further ~3.3x drop from 10,000 to
+        3,000 ops gives ~48%. 40% sits inside that disclosed [24%, 48%]
+        bracket, still a small fraction of the many-times-the-baseline
+        signature a genuine O(N) fan-out regression produces (BENCH.md §4),
+        so it remains a real, meaningful gate on the PR path, not a
+        rubber stamp. See BENCH.md §13.6 for the original per-PR design this
+        refines.
 
 Exit status: 0 if every gated series (latency ceilings, allocation ceilings,
-and — only when `BENCH_REGRESSION_GATE_FLATNESS=1` — HP-2 fan-out flatness)
-is within bounds; 1 on any breach (including a gated series that never
-appears in the provided logs — a silent bench crash or renamed report string
-must never pass the gate vacuously).
+and — unless `BENCH_REGRESSION_GATE_FLATNESS=0` is set explicitly — HP-2
+fan-out flatness) is within bounds; 1 on any breach (including a gated series
+that never appears in the provided logs — a silent bench crash or renamed
+report string must never pass the gate vacuously).
 """
 
 from __future__ import annotations
@@ -80,20 +107,47 @@ LATENCY_CEILINGS_NS: dict[str, dict[str, int]] = {
     # gate is not "born red" on that already-disclosed, tracked issue.
     "hp1_full_turn_closed_loop": {"p99_ns": 15_000_000, "p999_ns": 25_000_000},
     # HP-2 fan-out, all four swept N. Worst disclosed post-#34 p99 229,503 ns
-    # (N=1000), p99.9 325,375 ns (N=1000). The PRIMARY HP-2 gate is the
-    # flatness check below; this is a defense-in-depth absolute sanity bound
-    # (catches "flat but uniformly terrible", which flatness alone would not).
-    "hp2_fanout_n1": {"p99_ns": 5_000_000, "p999_ns": 6_000_000},
-    "hp2_fanout_n10": {"p99_ns": 5_000_000, "p999_ns": 6_000_000},
-    "hp2_fanout_n100": {"p99_ns": 5_000_000, "p999_ns": 6_000_000},
-    "hp2_fanout_n1000": {"p99_ns": 5_000_000, "p999_ns": 6_000_000},
-    # HP-3 decode/encode. Worst disclosed closed-loop p99 2,251 ns (decode) /
-    # 625 ns (encode) — low-single-digit microseconds. 10x would be a few
-    # tens of microseconds, too tight given CI-runner noise at this scale;
-    # the 1 ms floor dominates, which is still 400-2000x the measured value
-    # (genuinely "sits an order of magnitude inside", per docs/07 §5).
-    "hp3_decode_d_closed_loop": {"p99_ns": 1_000_000, "p999_ns": 1_000_000},
-    "hp3_encode_8_closed_loop": {"p99_ns": 1_000_000, "p999_ns": 1_000_000},
+    # (N=1000), p99.9 325,375 ns (N=1000), BENCH.md §4. The PRIMARY HP-2 gate
+    # is the flatness check below; this is a defense-in-depth absolute sanity
+    # bound (catches "flat but uniformly terrible", which flatness alone
+    # would not). Tightened (review finding) from a prior 5,000,000/6,000,000
+    # ns ceiling (~22x/18x the worst disclosed value — wider than the
+    # documented 10x-once-above-~100us policy this table otherwise follows,
+    # with no disclosed baseline instability like #91/#126 to justify the
+    # extra slack) down to ~10x, matching every other >=100us series here:
+    # 229,503 * 10 ~ 2,295,030, rounded up to 2,500,000; 325,375 * 10 ~
+    # 3,253,750, rounded up to 3,500,000.
+    "hp2_fanout_n1": {"p99_ns": 2_500_000, "p999_ns": 3_500_000},
+    "hp2_fanout_n10": {"p99_ns": 2_500_000, "p999_ns": 3_500_000},
+    "hp2_fanout_n100": {"p99_ns": 2_500_000, "p999_ns": 3_500_000},
+    "hp2_fanout_n1000": {"p99_ns": 2_500_000, "p999_ns": 3_500_000},
+    # HP-3 decode/encode. Worst disclosed closed-loop (BENCH.md §11.1, 3
+    # independent runs): p99 2,251 ns / p99.9 2,543 ns (decode), p99 625 ns /
+    # p99.9 750 ns (encode) — low-single-digit microseconds. Tightened
+    # (review finding) from a flat 1,000,000 ns (1 ms) floor on every
+    # quantile — which BENCH.md §13.1 itself already named as "400-2000x the
+    # measured value," i.e. an order of magnitude past "generous" into
+    # "would not catch an ordinary regression" — to a per-series multiplier
+    # with an absolute floor: `max(50x the worst disclosed quantile, a
+    # 20,000/30,000 ns floor)`, then rounded to a round number. The 50x
+    # multiplier (vs the 10x used for series already at/above ~100us) and
+    # the floor both exist for the SAME disclosed reason the original 1 ms
+    # bound cited — CI-runner scheduling noise is a roughly FIXED number of
+    # nanoseconds (a preemption, a cache-cold branch), which is a much
+    # larger fraction of a sub-microsecond baseline than of a 100+us one; a
+    # bare 10x multiplier here (~22,510 ns for decode p99) risks exactly the
+    # false-positive BENCH.md §13.1 disclosed rejecting. The floor is sized
+    # against the worst DISCLOSED p99.99 in the SAME closed-loop sections
+    # (decode 20,047 ns, encode 6,419 ns, BENCH.md §11.1) so a single-sample
+    # scheduler-preemption outlier — already disclosed as real, not
+    # fabricated — does not by itself breach the ceiling: decode p99
+    # 150,000 ns (~67x worst p99, ~7.5x worst disclosed p99.99); decode
+    # p99.9 200,000 ns (~79x); encode p99 50,000 ns (~80x worst p99, ~7.8x
+    # worst disclosed p99.99); encode p99.9 75,000 ns (~100x). Still one to
+    # two orders of magnitude tighter than the prior 1 ms floor, and still a
+    # real, meaningful ceiling rather than a coarse blowup-only catcher.
+    "hp3_decode_d_closed_loop": {"p99_ns": 150_000, "p999_ns": 200_000},
+    "hp3_encode_8_closed_loop": {"p99_ns": 50_000, "p999_ns": 75_000},
     # HP-4 requote (10-contract chain), both closed-loop sections. Worst
     # disclosed + this gate's own #053 re-run p99 ~160,767 ns, p99.9
     # ~216,447 ns.
@@ -108,6 +162,25 @@ LATENCY_CEILINGS_NS: dict[str, dict[str, int]] = {
     "hp5_persistent_full_turn_closed_loop": {"p99_ns": 15_000_000, "p999_ns": 45_000_000},
 }
 
+@dataclass
+class AllocCeiling:
+    """One gated `alloc_profile` section's ceiling, and what KIND of bound it is.
+
+    `kind` and `note` are printed in every run's summary and verdict (not
+    just this source comment) so a reader of the CI log never has to open
+    this file to know whether a PASS here means "no regression" or merely
+    "no order-of-magnitude blowup" — see BENCH.md §13.3 / issue #126 for the
+    disclosed baseline-instability finding this distinction exists to be
+    honest about. This gate NEVER claims docs/07 §4's "zero steady-state
+    allocation" criterion is met for a `coarse-blowup-catcher-pending-#126`
+    section — only `tight-no-regression` sections carry that claim.
+    """
+
+    ceiling: float
+    kind: str  # "tight-no-regression" | "coarse-blowup-catcher-pending-#126"
+    note: str
+
+
 # Allocation ceilings (allocs/op = allocations + reallocations, per op),
 # keyed by a substring match against the `[alloc-profile] <label>: N measured
 # ops` line `benches/alloc_profile.rs::report_window` prints for that
@@ -115,21 +188,28 @@ LATENCY_CEILINGS_NS: dict[str, dict[str, int]] = {
 # "zero steady-state allocation" wording; the measured common actor turn is
 # real, non-zero, and disclosed as such in BENCH.md §6 and §13).
 #
-# Precision matters here, per architect review (#053): the two `tokio`-driven
-# sections below (`UnderlyingActor::handle` direct, `ActorHandle::submit`)
-# get a COARSE MULTI-X ALLOC-REGRESSION CATCHER, not a tight no-regression
-# bound — the ceiling sits ~2.2-2.5x above the freshly re-verified baseline
-# (BENCH.md §13.3 / #126: the baseline itself is currently UNSTABLE, a
-# disclosed ~2.3-2.6x divergence from the previously committed §6 figure with
-# no code change), so a real but modest regression (e.g. 1.5x, to ~300-500
-# allocs/op) would still pass. It genuinely catches an order-of-magnitude
-# blowup, nothing finer, until #126 resolves which baseline is the honest
-# reference. The THIRD section below (`MarketMakerEngine::update_price`) is
-# different in kind: it is exactly reproducible (zero disclosed variance
-# across every run, historical and #053's own re-verification alike), so its
-# ceiling genuinely IS a tight no-regression bound — any deviation there is a
-# real signal, not noise.
-ALLOC_CEILINGS_PER_OP: dict[str, float] = {
+# Precision matters here, per architect review (#053) and a later review
+# finding that sharpened it further: the two `tokio`-driven sections below
+# (`UnderlyingActor::handle` direct, `ActorHandle::submit`) get a COARSE
+# MULTI-X ALLOC-REGRESSION CATCHER, not a tight no-regression bound, and this
+# gate says so explicitly at run time (`kind`, printed in the summary and the
+# verdict) — it does NOT claim docs/07 §4's "zero steady-state allocation"
+# criterion is met for them. The ceiling sits ~2.2-2.5x above the freshly
+# re-verified baseline (BENCH.md §13.3 / #126: the baseline itself is
+# currently UNSTABLE, a disclosed ~2.3-2.6x divergence from the previously
+# committed §6 figure with no code change), so a real but modest regression
+# (e.g. 1.5x, to ~300-500 allocs/op) would still pass. It genuinely catches
+# an order-of-magnitude blowup, nothing finer, until #126 resolves which
+# baseline is the honest reference — gating the CURRENT accepted (disclosed)
+# budget, explicitly marked pending #126, not a fabricated tight bound. The
+# THIRD section below (`MarketMakerEngine::update_price`) is different in
+# kind: it is exactly reproducible (zero disclosed variance across every
+# run, historical and #053's own re-verification alike — ten total
+# measurements, all 343.000), so its ceiling is set to that EXACT value with
+# no slack — a genuine, tight no-regression bound: any allocs/op above the
+# exactly-reproduced 343.000 is, by this section's own disclosed evidence, a
+# real regression, not noise.
+ALLOC_CEILINGS_PER_OP: dict[str, AllocCeiling] = {
     # `UnderlyingActor::handle` direct — the exact "append -> match -> append
     # -> enqueue" common actor turn docs/07 §4 names. BENCH.md §6's committed
     # baseline (77.374, range 62.577-82.657 across 3 disclosed runs); this
@@ -139,29 +219,79 @@ ALLOC_CEILINGS_PER_OP: dict[str, float] = {
     # divergence). COARSE catcher, not tight no-regression: ~2.2x the higher,
     # freshly-observed cluster (~202) — still fails a genuine multi-x
     # regression, would NOT catch a 1.5x-2x one.
-    "UnderlyingActor::handle (direct": 450.0,
+    "UnderlyingActor::handle (direct": AllocCeiling(
+        ceiling=450.0,
+        kind="coarse-blowup-catcher-pending-#126",
+        note=(
+            "BENCH.md §6 committed baseline 77.374 allocs/op (range "
+            "62.577-82.657, 3 runs); this gate's #053 re-verification "
+            "measured a reproducible cluster of 180.355-202.160 across 5 "
+            "fresh runs, SAME machine/code/Cargo.lock (BENCH.md §13.3, "
+            "issue #126, UNRESOLVED). Ceiling ~2.2x the freshly-observed "
+            "cluster's high end. The docs/07 §4 'zero steady-state "
+            "allocation' criterion is NOT claimed met here, pending #126."
+        ),
+    ),
     # `ActorHandle::submit` round-trip (async mailbox + oneshot reply) — the
     # production gateway-facing API, expected to allocate a bit more than the
     # direct section (a fresh oneshot channel + mpsc send slot per call).
     # Baseline 82.657 (committed) / ~189.7-199.7 (#053 re-verification).
     # COARSE catcher, same caveat as above: ~2.5x the freshly-observed
     # cluster (~200).
-    "ActorHandle::submit (async": 500.0,
+    "ActorHandle::submit (async": AllocCeiling(
+        ceiling=500.0,
+        kind="coarse-blowup-catcher-pending-#126",
+        note=(
+            "BENCH.md §6 committed baseline 82.657 allocs/op; this gate's "
+            "#053 re-verification measured ~189.7-199.7 across fresh runs, "
+            "SAME machine/code/Cargo.lock (BENCH.md §13.3, issue #126, "
+            "UNRESOLVED). Ceiling ~2.5x the freshly-observed cluster. The "
+            "docs/07 §4 'zero steady-state allocation' criterion is NOT "
+            "claimed met here, pending #126."
+        ),
+    ),
     # `MarketMakerEngine::update_price` steady-state requote (HP-4, #050) —
     # UNLIKE the two sections above, this section is exactly reproducible:
     # 343.000 allocs/op with ZERO disclosed variance across every historical
-    # run AND this gate's own #053 re-verification runs. A TIGHT ceiling
-    # (~2% margin) is legitimate and higher-value here: any deviation is a
-    # real signal, not noise absorption.
-    "MarketMakerEngine::update_price": 350.0,
+    # run AND this gate's own #053 re-verification runs (ten total
+    # measurements). The ceiling is the exact reproduced value, no slack —
+    # a genuine no-regression bound: any deviation is a real signal, not
+    # noise absorption.
+    "MarketMakerEngine::update_price": AllocCeiling(
+        ceiling=343.0,
+        kind="tight-no-regression",
+        note=(
+            "Exactly reproducible: 343.000 allocs/op with ZERO disclosed "
+            "variance across ten total measurements (3 BENCH.md §6 runs + "
+            "7 #053 re-verification runs, BENCH.md §13.3) — synchronous, no "
+            "tokio, no DashMap hasher randomization, a fixed seeded price "
+            "stream against a freshly built engine each run. Ceiling set to "
+            "the exact reproduced value: any measurement above 343.000 is, "
+            "by this section's own disclosed evidence, a real regression."
+        ),
+    ),
 }
 
-# HP-2 fan-out flatness tolerance — MUST match `FLATNESS_TOLERANCE_PCT` in
-# `benches/hp2_ws_fanout.rs` (the bench's own printed verdict uses the same
-# constant; this gate recomputes it independently from the parsed quantiles
-# rather than trusting the printed PASS/WARN string, so a future change to
-# the bench's print statements can never silently defeat the gate).
-FANOUT_FLATNESS_TOLERANCE_PCT = 15.0
+# HP-2 fan-out flatness tolerance.
+#
+# FULL (nightly, full 30,000-op default sample) MUST match
+# `FLATNESS_TOLERANCE_PCT` in `benches/hp2_ws_fanout.rs` (the bench's own
+# printed verdict uses the same constant; this gate recomputes it
+# independently from the parsed quantiles rather than trusting the printed
+# PASS/WARN string, so a future change to the bench's print statements can
+# never silently defeat the gate). BENCH.md §4 measured 3.7% worst |Δp99| at
+# this scale, §13.2 re-verified 13.3% at a reduced 10,000-op sample — 15%
+# sits with real margin over both.
+FANOUT_FLATNESS_TOLERANCE_PCT_FULL = 15.0
+
+# SMOKE (per-PR, reduced HP2_MEASURED_OPS=3000 default sample) — see this
+# module's docstring `BENCH_FANOUT_FLATNESS_TOLERANCE_PCT` entry for the full
+# derivation (a disclosed extrapolation from BENCH.md's two real data points,
+# not a fresh measurement at 3,000 ops). Both jobs pass their tolerance in
+# explicitly via `BENCH_FANOUT_FLATNESS_TOLERANCE_PCT`; this constant is only
+# the fallback used if that env var is unset.
+FANOUT_FLATNESS_TOLERANCE_PCT_SMOKE = 40.0
+
 FANOUT_SERIES_IN_N_ORDER = [
     "hp2_fanout_n1",
     "hp2_fanout_n10",
@@ -347,7 +477,7 @@ def check_latency_ceilings(result: ParseResult) -> list[Violation]:
 
 def check_alloc_ceilings(result: ParseResult) -> list[Violation]:
     violations: list[Violation] = []
-    for needle, ceiling in ALLOC_CEILINGS_PER_OP.items():
+    for needle, alloc_ceiling in ALLOC_CEILINGS_PER_OP.items():
         match = next((v for k, v in result.alloc.items() if needle in k), None)
         if match is None:
             violations.append(
@@ -358,30 +488,31 @@ def check_alloc_ceilings(result: ParseResult) -> list[Violation]:
                 )
             )
             continue
-        if match.allocs_per_op > ceiling:
+        if match.allocs_per_op > alloc_ceiling.ceiling:
             violations.append(
                 Violation(
                     f"alloc section '{needle}' measured {match.allocs_per_op:.3f} "
-                    f"allocs/op, exceeding the documented ceiling "
-                    f"{ceiling:.3f} allocs/op (see ALLOC_CEILINGS_PER_OP's "
-                    "comment for whether this is a tight no-regression bound "
-                    "or a coarse multi-x catcher for this specific series)"
+                    f"allocs/op, exceeding the documented [{alloc_ceiling.kind}] "
+                    f"ceiling {alloc_ceiling.ceiling:.3f} allocs/op — "
+                    f"{alloc_ceiling.note}"
                 )
             )
     return violations
 
 
 def check_fanout_flatness(
-    result: ParseResult, gate: bool
+    result: ParseResult, gate: bool, tolerance_pct: float
 ) -> tuple[list[Violation], float | None]:
     """Computes the HP-2 fan-out flatness verdict.
 
     Always PARSES and returns the worst |p99 delta| percentage so it can be
     printed regardless of `gate`. Only turns a tolerance breach into a
-    `Violation` (build-failing) when `gate` is `True` — see this module's
-    docstring / `BENCH_REGRESSION_GATE_FLATNESS` for why the per-PR smoke job
-    runs with `gate=False` (report-only) while the nightly full-sample job
-    runs with `gate=True` (BENCH.md §13.6).
+    `Violation` (build-failing) when `gate` is `True`. Both the per-PR
+    `bench-regression` job and the `bench-regression-nightly` job now gate
+    (a review finding on the original #053 design found the per-PR job's
+    report-only default let a genuine fan-out regression merge) — they
+    differ only in `tolerance_pct`, wider on the per-PR job's smaller,
+    noisier sample. See this module's docstring / BENCH.md §13.6.
     """
     violations: list[Violation] = []
     values: dict[str, int] = {}
@@ -402,11 +533,11 @@ def check_fanout_flatness(
         delta = values[name] - baseline
         pct = 0.0 if baseline == 0 else 100.0 * delta / baseline
         worst_pct = max(worst_pct, abs(pct))
-    if worst_pct > FANOUT_FLATNESS_TOLERANCE_PCT and gate:
+    if worst_pct > tolerance_pct and gate:
         violations.append(
             Violation(
                 f"HP-2 fan-out flatness: worst |p99 delta| across the N sweep "
-                f"was {worst_pct:.1f}%, exceeding the {FANOUT_FLATNESS_TOLERANCE_PCT:.0f}% "
+                f"was {worst_pct:.1f}%, exceeding the {tolerance_pct:.0f}% "
                 "tolerance (docs/07 §4 DESIGN TARGET: HP-1 p99 must stay flat in N)"
             )
         )
@@ -447,19 +578,20 @@ def print_summary(result: ParseResult) -> None:
                 f"(n={q.samples})"
             )
     print(
-        "\n-- Gated allocation series (the two tokio-driven sections are a "
-        "COARSE multi-x catcher over an unstable baseline, #126 — not a "
-        "tight no-regression bound; the MarketMakerEngine::update_price "
-        "section IS a tight bound, it is exactly reproducible) --"
+        "\n-- Gated allocation series — docs/07 §4's 'zero steady-state "
+        "allocation' criterion is NOT claimed met for any "
+        "[coarse-blowup-catcher-pending-#126] section below; only "
+        "[tight-no-regression] sections carry that claim --"
     )
-    for needle, ceiling in ALLOC_CEILINGS_PER_OP.items():
+    for needle, alloc_ceiling in ALLOC_CEILINGS_PER_OP.items():
         match = next((v for k, v in result.alloc.items() if needle in k), None)
         if match is None:
-            print(f"  {needle}: MISSING")
+            print(f"  {needle}: MISSING [{alloc_ceiling.kind}]")
         else:
             print(
                 f"  {needle}: {match.allocs_per_op:.3f} allocs/op "
-                f"(ceiling {ceiling:.3f}), {match.bytes_per_op:.1f} bytes/op"
+                f"(ceiling {alloc_ceiling.ceiling:.3f}) [{alloc_ceiling.kind}], "
+                f"{match.bytes_per_op:.1f} bytes/op"
             )
 
 
@@ -468,7 +600,26 @@ def main(argv: list[str]) -> int:
         print(f"usage: {argv[0]} <bench-log-file> [<bench-log-file> ...]", file=sys.stderr)
         return 2
 
-    gate_flatness = os.environ.get("BENCH_REGRESSION_GATE_FLATNESS", "0") == "1"
+    # Default to GATED — a review finding on the original #053 design found
+    # the per-PR job's report-only default let a genuine fan-out regression
+    # merge before the nightly job ever saw it. Both `bench-regression.yml`
+    # jobs now set this to `1` explicitly; the default only matters for an
+    # ad hoc local invocation that does not set it at all.
+    gate_flatness = os.environ.get("BENCH_REGRESSION_GATE_FLATNESS", "1") == "1"
+
+    tolerance_env = os.environ.get("BENCH_FANOUT_FLATNESS_TOLERANCE_PCT")
+    if tolerance_env is None:
+        flatness_tolerance_pct = FANOUT_FLATNESS_TOLERANCE_PCT_FULL
+    else:
+        try:
+            flatness_tolerance_pct = float(tolerance_env)
+        except ValueError:
+            print(
+                f"error: BENCH_FANOUT_FLATNESS_TOLERANCE_PCT={tolerance_env!r} "
+                "is not a valid number",
+                file=sys.stderr,
+            )
+            return 2
 
     result = ParseResult()
     for path in argv[1:]:
@@ -485,18 +636,32 @@ def main(argv: list[str]) -> int:
     violations: list[Violation] = []
     violations += check_latency_ceilings(result)
     violations += check_alloc_ceilings(result)
-    fanout_violations, worst_pct = check_fanout_flatness(result, gate=gate_flatness)
+    fanout_violations, worst_pct = check_fanout_flatness(
+        result, gate=gate_flatness, tolerance_pct=flatness_tolerance_pct
+    )
     violations += fanout_violations
 
     print("\n=== bench-regression: verdict ===")
     if worst_pct is not None:
-        mode = "GATED" if gate_flatness else "reported only, NOT gated at this sample scale — BENCH.md §13.6"
+        mode = "GATED" if gate_flatness else "reported only, NOT gated (BENCH_REGRESSION_GATE_FLATNESS=0 set explicitly)"
         print(
             f"HP-2 fan-out flatness: worst |p99 delta| across N = "
-            f"{worst_pct:.1f}% (tolerance {FANOUT_FLATNESS_TOLERANCE_PCT:.0f}%) [{mode}]"
+            f"{worst_pct:.1f}% (tolerance {flatness_tolerance_pct:.0f}%) [{mode}]"
         )
     else:
         print("HP-2 fan-out flatness: could not be computed (a swept-N series was missing)")
+
+    # Explicit, machine-visible criterion status for the allocation gate —
+    # never leave "zero steady-state allocation" ambiguous in a passing run's
+    # log. See ALLOC_CEILINGS_PER_OP / BENCH.md §13.3, issue #126.
+    coarse = [n for n, c in ALLOC_CEILINGS_PER_OP.items() if c.kind != "tight-no-regression"]
+    tight = [n for n, c in ALLOC_CEILINGS_PER_OP.items() if c.kind == "tight-no-regression"]
+    print(
+        "\ndocs/07 §4 'zero steady-state allocation' criterion: NOT claimed "
+        f"met for {coarse} (coarse blowup catcher, pending issue #126's "
+        f"baseline-instability resolution — BENCH.md §13.3); enforced as a "
+        f"tight no-regression bound for {tight}."
+    )
 
     if violations:
         print(f"FAIL — {len(violations)} violation(s):")

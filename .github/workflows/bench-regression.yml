@@ -74,30 +74,40 @@
 #   15 ms ceiling, so this job mainly catches catastrophic
 #   (order-of-magnitude) regressions cheaply on every push.
 #
-#   HP-2 FAN-OUT FLATNESS IS **NOT** GATED AT THIS SCALE (`BENCH_REGRESSION_-
-#   GATE_FLATNESS` unset, defaults to report-only) — BENCH.md §13.2 measured
-#   worst |Δp99| = 13.3% at 10,000 ops, only 1.7 percentage points under the
-#   15% tolerance; at this job's smaller 3,000-op sample (fewer tail
-#   samples), gating flatness risked a spurious >15% on an unrelated PR (a
-#   gate that cries wolf gets overridden — worse than not gating it at this
-#   scale). The flatness percentage is still computed and printed every run
-#   (never silently dropped), just not build-failing here. See BENCH.md
-#   §13.6.
+#   HP-2 FAN-OUT FLATNESS IS **GATED AT THIS SCALE TOO** (post-review fix —
+#   the original #053 design left this report-only on PRs; a 🟠 review
+#   finding on `stack/53-regression-gate` correctly flagged that a
+#   report-only PR check lets a genuine fan-out regression merge before the
+#   nightly job ever sees it, which defeats the point of a REQUIRED PR gate).
+#   BENCH.md §13.2 measured worst |Δp99| = 13.3% at 10,000 ops, only 1.7
+#   percentage points under the 15% tolerance the nightly job uses; at this
+#   job's smaller 3,000-op sample (fewer tail samples per N), gating at the
+#   SAME 15% tolerance risked a spurious fail on an unrelated PR. Instead of
+#   disabling the check, the smoke-scale tolerance is WIDENED to 40%
+#   (`BENCH_FANOUT_FLATNESS_TOLERANCE_PCT`, derivation in
+#   `scripts/bench_regression_gate.py`'s module doc) — wide enough to absorb
+#   the extra sampling noise at 3,000 ops, still a small fraction of the
+#   many-times-the-baseline signature a genuine O(N) fan-out regression
+#   produces (BENCH.md §4), so it still fails a real blowup on a PR. The
+#   flatness percentage is always computed and printed (never silently
+#   dropped) regardless of scale. See BENCH.md §13.6 for the original
+#   per-PR design this refines.
 #
 # `bench-regression-nightly`: `schedule` (03:17 UTC nightly) + manual
 # `workflow_dispatch`. FULL default sample counts — identical op counts to
 # `BENCH.md`'s own committed methodology (100 000 measured ops for HP-1/HP-3,
 # 30 000 for HP-2, 2 000 for HP5, 5 000 for HP-4, 50 000 for alloc_profile) —
-# the authoritative, high-fidelity run, and the ONE THAT GENUINELY GATES
-# HP-2 FLATNESS (`BENCH_REGRESSION_GATE_FLATNESS=1`), at the same sample
+# the authoritative, high-fidelity run, gating HP-2 flatness at the TIGHTER
+# 15% tolerance (`BENCH_FANOUT_FLATNESS_TOLERANCE_PCT=15`), the same sample
 # scale BENCH.md §4's own flatness finding was measured at. Uploads a
 # longer-retention artifact.
 #
 # Both jobs run the SAME gate script (`scripts/bench_regression_gate.py`)
-# against the SAME documented latency/allocation ceiling tables, so "smoke"
-# and "nightly" can never silently diverge on what counts as a regression —
-# only the flatness-gating toggle and the sample scale differ, both
-# explicit env vars, both documented here and in BENCH.md §13.6.
+# against the SAME documented latency/allocation ceiling tables and GATE HP-2
+# flatness unconditionally, so "smoke" and "nightly" can never silently
+# diverge on what counts as a regression or on whether flatness is enforced
+# — only the flatness TOLERANCE and the sample scale differ, both explicit
+# env vars, both documented here and in BENCH.md §13.6.
 
 name: bench-regression
 
@@ -142,10 +152,17 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     env:
-      # Report-only for HP-2 flatness at this reduced sample scale — see the
-      # top-of-file "WHEN THIS RUNS" note and BENCH.md §13.6. Explicit "0"
-      # (not merely unset) so a reader never has to guess the default.
-      BENCH_REGRESSION_GATE_FLATNESS: "0"
+      # HP-2 flatness IS gated on this REQUIRED PR path (never disabled —
+      # see the top-of-file "WHEN THIS RUNS" note and BENCH.md §13.6 for the
+      # per-PR design this was tightened from). Explicit "1" so a reader
+      # never has to guess the default.
+      BENCH_REGRESSION_GATE_FLATNESS: "1"
+      # Wider tolerance than the nightly job's 15%, to absorb this job's
+      # smaller HP2_MEASURED_OPS=3000 sample's extra noise without ever
+      # disabling the check — see scripts/bench_regression_gate.py's module
+      # doc for the derivation from BENCH.md's two disclosed data points
+      # (3.7% at 30,000 ops, 13.3% at 10,000 ops).
+      BENCH_FANOUT_FLATNESS_TOLERANCE_PCT: "40"
       # Reduced-sample overrides — see the top-of-file "WHEN THIS RUNS" note.
       HP1_WARMUP_OPS: "1000"
       HP1_MEASURED_OPS: "5000"
@@ -166,11 +183,11 @@ jobs:
       ALLOC_MM_WARMUP_OPS: "500"
       ALLOC_MM_MEASURED_OPS: "2000"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: bench-regression
       - run: mkdir -p bench-out
@@ -196,7 +213,7 @@ jobs:
       - name: Upload bench-regression artifact (always, for triage on either
           a pass or a fail)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-regression-smoke-${{ github.run_id }}
           path: bench-out/
@@ -208,16 +225,19 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     env:
-      # The ONE job that genuinely gates HP-2 fan-out flatness — full
-      # default sample scale, matching BENCH.md §4's own methodology. See
-      # the top-of-file "WHEN THIS RUNS" note and BENCH.md §13.6.
+      # The full-fidelity job — gates HP-2 fan-out flatness at the TIGHT
+      # 15% tolerance, matching BENCH.md §4's own methodology (both jobs now
+      # gate flatness; this one just uses the narrower, better-calibrated
+      # bound the full 30,000-op sample scale supports). See the top-of-file
+      # "WHEN THIS RUNS" note and BENCH.md §13.6.
       BENCH_REGRESSION_GATE_FLATNESS: "1"
+      BENCH_FANOUT_FLATNESS_TOLERANCE_PCT: "15"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: bench-regression-nightly
       - run: mkdir -p bench-out
@@ -240,7 +260,7 @@ jobs:
         run: python3 scripts/bench_regression_gate.py bench-out/*.log
       - name: Upload bench-regression-nightly artifact (always)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-regression-nightly-${{ github.run_id }}
           path: bench-out/
