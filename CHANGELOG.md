@@ -11,6 +11,32 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **HP-4 market-maker requote budget and the requote-isolation assertion — the
+  v0.5 performance gate** (#50,
+  [07 §3-4](docs/07-performance-budgets.md#3-latency-budgets-design-targets)).
+  Tests/benches-only, no public-surface change. `benches/mm_requote_hdr.rs`
+  measures the real, persona-driven requote pipeline
+  (`MarketMakerEngine::update_price` → `requote_symbol` → the edge calc →
+  `update_quote` → the generated `VenueCommand`s handed to a `CommandSink`,
+  #47) over a 10-contract chain, reporting p50/p99/p99.9/p99.99 via
+  `hdrhistogram` (never criterion's mean) in two sections — engine-only (pure
+  compute, `CountingSink`) and mailbox-wired (the real `ActorCommandSink` onto
+  a real spawned actor) — closed-loop and open-loop (coordinated-omission
+  corrected). `BENCH.md` §12 carries the measured DESIGN-TARGET baseline, the
+  run conditions, and a disclosed 2-vs-4-worker scheduler-contention tuning
+  finding. `tests/requote_isolation.rs` asserts the milestone's central
+  acceptance criterion: a continuous, concurrent, realistic-cadence requote
+  sharing a client's own underlying actor mailbox does not inflate the
+  client's HP-1-style p99 beyond a documented, honestly-derived tolerance
+  factor (5/5 real runs at ~1.0x — no measurable inflation at this
+  configuration). `benches/alloc_profile.rs` gains a third section proving the
+  steady-state requote's allocation count (343 allocs/op over a 10-contract
+  chain — non-zero, honestly reported as the regression-signal baseline docs/07
+  §4 asks for). Shared fixtures land in `benches/support/mm_workload.rs`
+  (the persona-bound chain + `CountingSink`) and `benches/support/workload.rs`
+  (`jitter_stream`), reused by all three. The CI bench-regression *gate* stays
+  unarmed (#053, v1.0) — this bench/test pair runs non-gating, same as every
+  other hot path in `BENCH.md`.
 - **Scenario failure-mode determinism + the out-of-range knob rejection matrix —
   the v0.5 capstone** (#49,
   [05 §11](docs/05-microstructure-config.md#11-determinism-of-microstructure)).

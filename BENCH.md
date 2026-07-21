@@ -2,9 +2,9 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), and the HP-3 FIX parse/encode budget (`#043`, §11); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only), on routinely-rebased working trees at those dates |
-| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
+| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), and the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only); 2026-07-18 (§12, `#050`), on routinely-rebased working trees at those dates |
+| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
 > **Every number in this document is a DESIGN TARGET comparison, never an
@@ -41,7 +41,7 @@
 | `hdrhistogram` / `criterion` | `7.5.4` / `0.8.2` (from `Cargo.lock`) |
 | Journal mode | **in-memory** (`InMemoryVenueJournal`) for HP-1/HP-2/allocation profile; **durable** (`PgVenueJournal` against a real ephemeral `postgres:18-alpine`, `testcontainers`) for HP-5 (§5, new in `#035`) |
 | Docker | `29.6.1` (HP-5's `testcontainers` containers only; every other bench needs no Docker) |
-| `tokio` runtime | `hp1_order_path` / `hp2_ws_fanout`: multi-thread, 2 workers, `enable_time`; `hp5_durable_append`: multi-thread, 4 workers, `enable_all` (the durable append's sync→async `sqlx` bridge needs the IO driver too, `src/db/journal.rs`); `alloc_profile` Section 1: none (synchronous `UnderlyingActor::handle`); Section 2: current-thread |
+| `tokio` runtime | `hp1_order_path` / `hp2_ws_fanout`: multi-thread, 2 workers, `enable_time`; `hp5_durable_append`: multi-thread, 4 workers, `enable_all` (the durable append's sync→async `sqlx` bridge needs the IO driver too, `src/db/journal.rs`); `mm_requote_hdr` (HP-4): multi-thread, 4 workers, `enable_all` (§12.2's 2-vs-4-worker finding); `requote_isolation` test: multi-thread, `enable_all`; `alloc_profile` Section 1: none (synchronous `UnderlyingActor::handle`); Section 2: current-thread; Section 3: none (synchronous `MarketMakerEngine::update_price`) |
 | Machine otherwise idle | Standard developer laptop session (editor, terminal, no other CPU-heavy load intentionally running); not a dedicated, isolated bench host — see Limitations |
 
 ## 2. How to reproduce
@@ -51,14 +51,17 @@ cargo bench --bench hp1_order_path
 cargo bench --bench hp2_ws_fanout
 cargo bench --bench hp3_fix_parse          # #043 — no Docker, no order path (pure decode/encode)
 cargo bench --bench hp5_durable_append     # needs a local Docker daemon (testcontainers)
+cargo bench --bench mm_requote_hdr         # #050 — no Docker, in-process only
 cargo bench --bench alloc_profile
 cargo bench --bench criterion_match_cost   # supplementary, NOT BENCH.md evidence (§7)
+cargo test --test requote_isolation -- --nocapture   # #050 — the requote-isolation assertion
 
 # Reduced-sample local runs (every knob is an env var):
 HP1_WARMUP_OPS=500 HP1_MEASURED_OPS=5000 HP1_OPEN_LOOP_OPS=500 cargo bench --bench hp1_order_path
 HP2_WARMUP_OPS=500 HP2_MEASURED_OPS=5000 cargo bench --bench hp2_ws_fanout
 HP3_WARMUP_OPS=500 HP3_MEASURED_OPS=5000 HP3_OPEN_LOOP_OPS=500 cargo bench --bench hp3_fix_parse
 HP5_WARMUP_OPS=50 HP5_MEASURED_OPS=200 HP5_OPEN_LOOP_OPS=50 cargo bench --bench hp5_durable_append
+HP4_WARMUP_OPS=200 HP4_MEASURED_OPS=1000 HP4_OPEN_LOOP_OPS=300 cargo bench --bench mm_requote_hdr
 ALLOC_WARMUP_OPS=1000 ALLOC_MEASURED_OPS=10000 cargo bench --bench alloc_profile
 ```
 
@@ -514,7 +517,8 @@ targets zero heap allocation on the common path." `benches/alloc_profile.rs`
 installs `stats_alloc::StatsAlloc<System>` as the `#[global_allocator]` — a
 `std::alloc::System` wrapper with atomic alloc/dealloc/realloc/byte counters
 — and reports the delta across a 50 000-op measured window (after 5 000
-warmup ops, same seeded workload as HP-1) in two sections.
+warmup ops, same seeded workload as HP-1) in three sections (`#050` adds the
+third).
 
 > **Methodology note (updated after `#75`/`#112`).** The first baseline
 > (recorded 2026-07-16, see the git history of this file) used a hand-rolled
@@ -536,6 +540,7 @@ warmup ops, same seeded workload as HP-1) in two sections.
 |---|---|---|
 | `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **77.374** | 10 881.6 |
 | `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **82.657** | 11 102.3 |
+| `MarketMakerEngine::update_price` steady-state requote (HP-4, `#050`, no `tokio` — a 10-contract chain, `CountingSink`) | **343.000** | 6 663.3 |
 
 **Target status: NOT MET — disclosed gap, not partial credit.** docs/07 §4's
 criterion is *zero* steady-state allocation on the common path; the measured
@@ -561,6 +566,20 @@ exactly when an internal shard's table resizes within a fixed 50 000-op
 window that starts from a freshly constructed actor each run), the same
 general class of "container still growing" effect §3.4 isolates for the
 journal specifically; not investigated further here.
+
+**The `#050` requote section, disclosed separately.** Unlike the two sections
+above, three consecutive runs of the `MarketMakerEngine::update_price` section
+(`ALLOC_MM_WARMUP_OPS=1000 ALLOC_MM_MEASURED_OPS=5000`) produced the
+**IDENTICAL** `343.000` allocs/op and `6 663.3` bytes/op every time — no
+variance at all. This is expected, not suspicious: this section runs entirely
+synchronously with no `tokio` runtime at all (`CountingSink::enqueue` is a
+bare atomic increment), driven by a fixed, seeded price stream against a
+`MarketMakerEngine` built fresh each run in the same sequence — there is no
+async task scheduling, no `DashMap`/hasher randomization in this path, and no
+other source of run-to-run nondeterminism the two `tokio`-driven sections
+above are subject to. See §12 for the full interpretation (a 10-contract
+requote at ~34 allocations per instrument, non-zero and honestly reported as
+the DESIGN TARGET's regression-signal baseline, matching the framing below).
 
 **Method and what this does / does not prove.** This is a **process-wide**
 allocation-pressure profile of the measured loop (every allocation on any
@@ -616,7 +635,13 @@ here only to show the target genuinely runs, not skipped to make the suite
   `#043` adds the real decode(`D`)/encode(`8`) quantiles, closed- and
   open-loop, once the dialect landed (#036) — see §11 for the numbers and the
   open-loop-overhead disclosure there in particular.
-- **HP-4 (market-maker requote)** — out of scope for #020; lands v0.5 (#050).
+- **HP-4 (market-maker requote) — now measured (`#050`, §12)**, no longer an
+  omission: out of scope for `#020` (the persona-driven requote path landed
+  `#47`, v0.5); `#050` adds the real `MarketMakerEngine::update_price`
+  closed-/open-loop quantiles, the allocation profile's third section (§6),
+  and the requote-isolation assertion (`tests/requote_isolation.rs`) — see
+  §12 for the numbers, the 2-vs-4-worker scheduler-contention disclosure, and
+  the isolation tolerance rationale.
 - **HP-5, durable/PostgreSQL journal append — now measured (`#035`, §5)**, no
   longer an omission: out of scope for `#020` (in-memory journal mode only),
   `#035` adds the real durable-append quantiles, the persistent-mode
@@ -700,23 +725,34 @@ superseded by §5's real measurements, `#035`), not duplicated here.
 
 - `benches/hp1_order_path.rs`, `benches/hp2_ws_fanout.rs`,
   `benches/hp3_fix_parse.rs` (`#043`), `benches/hp5_durable_append.rs`
-  (`#035`), `benches/alloc_profile.rs`, `benches/criterion_match_cost.rs` —
-  the six registered `[[bench]]` targets (`harness = false`), `Cargo.toml`.
+  (`#035`), `benches/mm_requote_hdr.rs` (`#050`), `benches/alloc_profile.rs`,
+  `benches/criterion_match_cost.rs` — the seven registered `[[bench]]`
+  targets (`harness = false`), `Cargo.toml`.
 - `benches/support/` — the reusable `bench-hdr` harness: `hdr.rs` (the
   `hdrhistogram` quantile report — unit-tested via `tests/bench_harness.rs`),
-  `workload.rs` (the seeded, deterministic command-stream builder),
-  `timing.rs` (the paired `TimingExecutor`/`TimingJournal` instrumentation
-  seams, reused unchanged by `hp5_durable_append` against the durable
-  journal), `openloop.rs` (the coordinated-omission-corrected load
-  generator; `#043` adds `run_open_loop_pure` alongside the original
-  `ActorHandle`-shaped `run_open_loop`), `fix_fixtures.rs` (`#043` — the
-  fixed, golden-shaped `NewOrderSingle (D)` / `ExecutionReport (8)`
-  fixtures HP-3 measures).
+  `workload.rs` (the seeded, deterministic command-stream builder; `#050`
+  adds `jitter_stream`, the price-tick generator `mm_requote_hdr` and
+  `alloc_profile`'s third section share), `timing.rs` (the paired
+  `TimingExecutor`/`TimingJournal` instrumentation seams, reused unchanged by
+  `hp5_durable_append` against the durable journal), `openloop.rs` (the
+  coordinated-omission-corrected load generator; `#043` adds
+  `run_open_loop_pure` alongside the original `ActorHandle`-shaped
+  `run_open_loop`, reused unchanged by `#050`), `fix_fixtures.rs` (`#043` —
+  the fixed, golden-shaped `NewOrderSingle (D)` / `ExecutionReport (8)`
+  fixtures HP-3 measures), `mm_workload.rs` (`#050` — the shared 10-contract
+  persona-bound `MarketMakerEngine` fixture and `CountingSink`, reused by
+  `mm_requote_hdr`, `alloc_profile`'s third section, and
+  `tests/requote_isolation.rs` so the three never independently reconstruct,
+  and possibly drift from, the same requote shape).
 - `tests/bench_harness.rs` — 7 unit tests: the original 5 proving the
   histogram/quantile plumbing itself is correct against known distributions
   (uniform, constant, bimodal, empty, and a `report`-return-value consistency
   check), plus 2 added by `#043` proving the HP-3 `D`/`8` fixtures decode to
   themselves (never a silent reject-path measurement).
+- `tests/requote_isolation.rs` (`#050`) — the requote-isolation assertion: a
+  continuous, concurrent, real persona-driven requote sharing a client's own
+  underlying actor mailbox must not inflate the client's HP-1-style p99
+  beyond a documented, disclosed tolerance factor — see §12.3.
 - `tests/docker_smoke.rs` (#027) — the Docker e2e smoke test that measures §9's
   cold-bring-up number and proves the one-order REST → WS-fill round-trip
   against the real container.
@@ -858,3 +894,228 @@ comparable sample counts) and should not be read as a stable figure.
   to landing the measured baseline; the CI `bench-regression` gate arms
   before v1.0 (#053, [07 §6](docs/07-performance-budgets.md#6-ci-regression-gate)),
   same as every other hot path in this document.
+
+## 12. HP-4 — market-maker requote, and the requote-isolation assertion (`#050`)
+
+`benches/mm_requote_hdr.rs`: an underlying price update
+([`MarketMakerEngine::update_price`](src/market_maker/engine.rs)) →
+`requote_symbol` → the persona-driven edge calc (`Quoter::generate_quote`
+inside `update_quote`, `#47`) → the generated `VenueCommand`s handed to a
+`CommandSink`. `update_price` is the engine's only **public** entry point onto
+this pipeline (`requote_symbol` / `update_quote` are private to
+`src/market_maker/engine.rs`), so every number below times a REAL call to it —
+never a stand-in for the `#47` persona-driven requote path. Registered chain
+(`benches/support/mm_workload.rs::chain_symbols`): 5 strikes × {call, put} = 10
+instruments, each bound to a shared persona, so a steady-state requote tick
+enqueues up to 4 × 10 = 40 commands (20 cancels + 20 fresh adds; the first
+tick is 20 adds only).
+
+Two sections, mirroring `alloc_profile.rs`'s "direct vs round-trip" shape:
+**engine-only** (`support::mm_workload::CountingSink` — no channel, no actor,
+no `tokio` at all: the PURE requote-compute cost) and **mailbox-wired** (the
+REAL `fauxchange::market_maker::ActorCommandSink`, wired to a REAL spawned
+actor: the same computation plus a real bounded-channel `try_send`). Because
+`update_price` never awaits the actor's own turn (the sink's `enqueue` is
+`try_send`, non-blocking, fire-and-forget — `src/market_maker/sink.rs`'s
+documented "off the client path"), matching (`MatchingExecutor::execute`)
+never runs inside either timed span — it happens later, asynchronously, on
+the actor's own task, off this bench entirely. **This is the structural
+reason match time stays separated from venue overhead here**: there is no
+fused number to decompose, because the production wiring itself decouples the
+two, not a bench-side approximation. The mailbox-wired section's sink and
+actor-mailbox capacity are sized (`total_ops × 4 × n_instruments + margin`) so
+this run's total generated command count cannot exceed either — a simple
+arithmetic guarantee of zero drops regardless of how fast the forwarder
+happens to drain, isolating the enqueue's own added cost from the actor's
+downstream processing rate (a different question the isolation assertion,
+§12.3, exists to answer).
+
+Run conditions are identical to §1 (same host, same toolchain, no Docker/
+Postgres needed — this bench is pure in-process CPU work), same pinned
+upstream crate versions as §1/§3.6, `hdrhistogram`/`criterion` `7.5.4`/`0.8.2`.
+
+### 12.1 Closed-loop, 1 000 warmup + 5 000 measured ops (discarded warmup)
+
+Three real, independent `cargo bench --bench mm_requote_hdr` runs on this
+machine, identical configuration, disclosed side by side (the same "show the
+variance, don't hide it" convention §3.1/§3.6/§11.1 use):
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| `hp4_requote_engine_only_closed_loop` p50 | 115 519 ns | 117 503 ns | 120 767 ns |
+| `hp4_requote_engine_only_closed_loop` p99 | 136 319 ns | 138 239 ns | 137 599 ns |
+| `hp4_requote_engine_only_closed_loop` p99.9 | 149 759 ns | 145 663 ns | 145 407 ns |
+| `hp4_requote_engine_only_closed_loop` p99.99 | 165 887 ns | 255 999 ns | 171 775 ns |
+| `hp4_requote_engine_only_closed_loop` min / max | 95 104 / 165 887 ns | 95 360 / 255 999 ns | 97 152 / 171 775 ns |
+| `hp4_requote_mailbox_closed_loop` p50 | 122 367 ns | 121 599 ns | 120 959 ns |
+| `hp4_requote_mailbox_closed_loop` p99 | 142 719 ns | 142 591 ns | 142 079 ns |
+| `hp4_requote_mailbox_closed_loop` p99.9 | 165 887 ns | 162 175 ns | 150 911 ns |
+| `hp4_requote_mailbox_closed_loop` p99.99 | 187 007 ns | 175 103 ns | 180 863 ns |
+| `hp4_requote_mailbox_closed_loop` min / max | 95 360 / 187 007 ns | 95 872 / 175 103 ns | 96 000 / 180 863 ns |
+
+**Interpretation — DESIGN TARGET grounding, not yet a stated numeric budget.**
+docs/07 §3-HP4 (mirroring HP-3's own precedent before `#043`) carried no
+numeric budget prior to this measurement. Both sections land at p50
+~116–123 µs and p99 ~136–143 µs across a full **10-contract chain requote**
+(not one instrument) — comfortably inside even a strict "sub-millisecond"
+reading, with real headroom. The mailbox-wired section is consistently ~5–7 µs
+slower at p50 than engine-only (~5–6%) — a small, real, and expected delta:
+`ActorCommandSink::enqueue`'s `try_send` onto a real (if drop-free-sized)
+bounded channel is genuinely more work than `CountingSink`'s bare atomic
+increment, but it is a small fraction of the requote's own compute cost (10
+`Quoter::generate_quote` calls, each running a real `optionstratlib`
+Black-Scholes evaluation, dominates both numbers). **Stating the actual
+numeric HP-4 budget in `docs/07-performance-budgets.md` §3-HP4 is an
+`architect` follow-up against this grounding data** — outside this bench's own
+scope (measure and report, not set the design-doc target), the same precedent
+`#043` set for HP-3.
+
+### 12.2 Open-loop, coordinated-omission corrected, 3 000 ops at a ~2 ms intended interval
+
+`support::openloop::run_open_loop_pure` — the same generator HP-3 uses for its
+`decode`/`encode` spans (`update_price` has no bounded-mailbox/rejection
+concept of its own; that concept lives downstream, inside the `CommandSink`).
+
+**A disclosed tuning finding: 2 workers vs 4.** This bench's mailbox-wired
+sections run a REAL `ActorCommandSink` forwarder + a REAL actor continuously
+draining a (deliberately oversized, tens-of-thousands-of-commands) backlog in
+the background, long after the open-loop dispatch window's own sends finish.
+At `worker_threads(2)` (HP-1/HP-3's own default), this background drain
+measurably starved the open-loop dispatch tasks for CPU — a real, reproduced
+effect, not noise:
+
+| | 2 workers, run 1 | 2 workers, run 2 |
+|---|---|---|
+| `hp4_requote_mailbox_open_loop_sojourn` p50 | 438 783 ns | 483 583 ns |
+| `hp4_requote_mailbox_open_loop_sojourn` p99 | 1 671 167 ns | 1 709 055 ns |
+| `hp4_requote_mailbox_open_loop_sojourn` p99.9 | 1 878 015 ns | 1 952 767 ns |
+| `hp4_requote_engine_only_open_loop_sojourn` p50 (same run, for contrast) | 138 623 ns | 139 135 ns |
+| `hp4_requote_engine_only_open_loop_sojourn` p99 (same run, for contrast) | 161 279 ns | 161 919 ns |
+
+A 3–4× scheduler-contention effect from an **unrelated background task** (the
+forwarder+actor still draining backlog), not the enqueue cost this section
+exists to isolate. Raising the runtime to `worker_threads(4)` gives the
+background drain room without starving the measured section — the numbers
+below are all at 4 workers (see `benches/mm_requote_hdr.rs`'s doc comment for
+the same disclosure, kept next to the code):
+
+| | Run 1 | Run 2 | Run 3 |
+|---|---|---|---|
+| `hp4_requote_engine_only_open_loop_sojourn` p50 | 142 463 ns | 142 719 ns | 142 591 ns |
+| `hp4_requote_engine_only_open_loop_sojourn` p99 | 225 919 ns | 162 559 ns | 166 399 ns |
+| `hp4_requote_engine_only_open_loop_sojourn` p99.9 | 880 127 ns | 217 855 ns | 231 679 ns |
+| `hp4_requote_engine_only_open_loop_sojourn` p99.99 | 4 923 391 ns | 745 983 ns | 501 247 ns |
+| `hp4_requote_mailbox_open_loop_sojourn` p50 | 149 119 ns | 148 863 ns | 148 607 ns |
+| `hp4_requote_mailbox_open_loop_sojourn` p99 | 186 495 ns | 182 015 ns | 185 599 ns |
+| `hp4_requote_mailbox_open_loop_sojourn` p99.9 | 214 143 ns | 213 887 ns | 214 271 ns |
+| `hp4_requote_mailbox_open_loop_sojourn` p99.99 | 219 391 ns | 231 807 ns | 229 247 ns |
+
+**Interpretation.** At 4 workers, both sections' p50 (~143–149 µs) sit close
+to their closed-loop counterparts (§12.1: ~116–123 µs) — the open-loop
+dispatch overhead (task spawn + schedule, mirroring HP-1's/HP-3's own
+disclosed open-loop-vs-closed-loop gap) accounts for the difference, not
+queueing (0 rejections are possible here — `update_price` has no rejection
+path of its own). The **engine-only** section's p99.9/p99.99 are the more
+volatile of the two, run to run (880 µs / 4.9 ms in run 1 vs 218–232 µs /
+501–746 µs in runs 2–3) — at 3 000 samples this quantile is resolved by
+roughly the 3 slowest samples, so a single OS-scheduler preemption on this
+shared, un-pinned developer laptop can move it by an order of magnitude
+without the underlying `update_price` call doing anything different, the same
+disclosed pattern HP-1 (§3.5) and HP-3 (§11.2) both name at comparable sample
+counts. The **mailbox-wired** section is, by contrast, tightly reproducible
+across all three runs even at p99.99 (219–231 µs) — plausibly because the
+real actor+forwarder machinery running alongside it keeps the runtime's
+scheduler more uniformly busy (less idle-to-burst variance) than the
+engine-only section's otherwise-idle 3 remaining workers; this is an
+observation, not a measured causal claim.
+
+### 12.3 The requote-isolation assertion (`tests/requote_isolation.rs`) — the v0.5 acceptance criterion that matters most
+
+Proves a **continuous, concurrent, real** persona-driven market-maker requote
+— sharing the SAME underlying's actor mailbox as a client's own orders, the
+realistic (harder) case, not an easier cross-underlying setup — does not
+inflate a client `AddOrder`'s HP-1-style p99 beyond a documented, bounded
+tolerance. Method: two fresh `AppState`s (never sharing journal depth, the
+same "fresh instance per measurement" convention `hp1_order_path.rs`'s own
+open-loop section uses), each hosting one underlying (`BTC`), a 4 096-entry
+mailbox (matching `hp1_order_path.rs`'s own bench convention, wider than the
+venue's `DEFAULT_MAILBOX_CAPACITY = 1 024`): **quiet** (500 warmup + 3 000
+measured client `AddOrder`/`CancelOrder` commands via `AppState::submit`, no
+MM activity) vs **concurrent** (the IDENTICAL client workload, run while a
+background task drives the SAME 10-contract persona-bound chain through
+`update_price` every 20 ms — a realistic fast-moving-underlying cadence, not
+an artificial flood — each tick's ≤40 commands routed through the REAL
+`ActorCommandSink` onto the client's own actor).
+
+Five real, independent `cargo test --test requote_isolation --release --
+--nocapture` runs on this machine:
+
+| Run | quiet p50 | quiet p99 | quiet p99.9 | concurrent p50 | concurrent p99 | concurrent p99.9 |
+|---|---|---|---|---|---|---|
+| 1 | 25 631 ns | 49 695 ns | 91 263 ns | 25 423 ns | 48 255 ns | 81 471 ns |
+| 2 | 25 423 ns | 48 095 ns | 70 847 ns | 25 599 ns | 48 095 ns | 63 135 ns |
+| 3 | 25 599 ns | 51 295 ns | 106 751 ns | 25 631 ns | 49 919 ns | 83 711 ns |
+| 4 | 25 807 ns | 50 047 ns | 83 455 ns | 25 919 ns | 50 431 ns | 72 255 ns |
+| 5 | 24 879 ns | 48 191 ns | 58 751 ns | 25 503 ns | 49 695 ns | 107 711 ns |
+
+**Result: no measurable inflation at this configuration.** Across all 5 runs
+the concurrent p99 is statistically indistinguishable from — sometimes even
+below — the quiet p99 (ratio 0.96×–1.03×); the concurrent condition's p99.9
+is noisier (as expected — a smaller quantile at 3 000 samples) but shows no
+systematic direction either. **The test asserts `concurrent.p99 ≤ max(quiet.p99, 200 µs) × 6`**
+(`TOLERANCE_FACTOR` + `FLOOR_NS`, `tests/requote_isolation.rs`). Be precise
+about what that bound actually is: because the observed quiet p99 (~50 µs)
+sits **below** the 200 µs floor, the floor dominates and the effective bound
+is `200 µs × 6 = 1.2 ms` — roughly **24× the observed ~50 µs concurrent p99**,
+not 6×. That is deliberately loose, and the threshold is NOT the isolation
+evidence: the assertion's job is to catch **unbounded** inflation (a
+stalled/starved client dragged toward the millisecond scale), not to police
+ordinary FIFO-mailbox-sharing queueing, which is an expected structural
+consequence of the single-writer actor (a client `AddOrder` and a concurrent
+MM pair genuinely share one mailbox when they target the same underlying). The
+floor exists so a near-zero quiet p99 can't make the ratio spuriously tight.
+The real isolation evidence is the measured **~1.0× ratio across 5/5 runs**
+(above) plus the 1 ms-cadence sensitivity diagnostic (below); the wide
+threshold only backstops a catastrophic stall on this noisy, un-pinned laptop
+(§3.1: a ~13% p99 swing on HP-1 with ZERO code change) without flaking (a stalled/starved client, not
+ordinary FIFO-mailbox-sharing queueing — the venue's single-writer actor
+means a client `AddOrder` and a concurrent MM `CancelOrder`/`AddOrder` pair
+genuinely share ONE FIFO mailbox when they target the same underlying, so
+SOME added queueing from shared traffic is an expected, structural
+consequence of the architecture, not a bug the tolerance needs to reject at
+1.0×). **A diagnostic-only run at a 10× more aggressive tick cadence (1 ms,
+not committed)** confirms the test is not vacuously easy to pass: concurrent
+p99 rose to ~76 µs against a quiet ~51 µs (~1.5×) — a real, meaningfully
+measurable, but still well-bounded effect, evidence this assertion is
+genuinely sensitive to load rather than trivially always green.
+
+### 12.4 What this section does and does not prove
+
+- **Proves**: `MarketMakerEngine::update_price` (the real, persona-driven,
+  `#47` requote pipeline) requotes a realistic 10-contract chain at p50
+  ~116–123 µs / p99 ~136–143 µs, comfortably inside a sub-millisecond reading,
+  on this host, with match time structurally excluded (not merely subtracted)
+  from the span; and that a continuous, concurrent, realistic-cadence requote
+  sharing a client's own underlying mailbox produces no measurable client
+  HP-1 p99 inflation at 5/5 real runs, asserted against a documented bound of
+  `max(quiet.p99, 200 µs) × 6` — floor-dominated at the current ~50 µs quiet
+  p99, so an effective ~1.2 ms ≈ 24× backstop against unbounded inflation, not
+  a 6× regression policer (see §12.3; the ~1.0× measured ratio is the evidence,
+  the threshold is only a catastrophe backstop).
+- **Does not prove**: a production SLA (one un-pinned developer laptop, §1's
+  own disclosed limitation); a stated HP-4 numeric budget in
+  `docs/07-performance-budgets.md` (an `architect` follow-up against this
+  data, §12.1); isolation under an arbitrarily aggressive requote cadence
+  (§12.3's 1 ms diagnostic shows the effect is real and grows with load, just
+  not yet at the 20 ms cadence this assertion commits to); or a
+  call-stack-attributed allocation breakdown for the 343 allocs/op the
+  allocation profile's third section reports (§6 — the same process-wide,
+  not call-stack-scoped, limitation §6 already discloses for its other two
+  sections).
+- **CI regression gate**: not armed by this change — `#050` is scope-limited
+  to landing the measured baseline and the isolation assertion (a `cargo
+  test`, so it runs as a normal, always-on correctness check, not a
+  budget-breaching *bench* gate); the CI `bench-regression` gate over the
+  `bench-hdr` quantiles arms before v1.0 (#053,
+  [07 §6](docs/07-performance-budgets.md#6-ci-regression-gate)), same as
+  every other hot path in this document.
