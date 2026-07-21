@@ -13,7 +13,11 @@
 //! golden` to (re)generate the fixtures after an intentional shape change, then
 //! review the diff.
 
-use fauxchange::exchange::{Cents, EventTimestamp, SequenceNumber, SignedCents, Symbol};
+use fauxchange::exchange::{
+    CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as VenueFill, Hash32, LineageId,
+    SequenceNumber, Side as SeamSide, SignedCents, Symbol, TimeInForce as SeamTif, VenueCommand,
+    VenueEvent, VenueOutcome,
+};
 use fauxchange::{
     AccountId, BookSide, BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, ClientOrderId,
     CreateSnapshotResponse, ExecutionId, ExecutionRecord, ExecutionSummary, ExecutionsListResponse,
@@ -573,4 +577,165 @@ fn test_golden_ws_error_message() {
         VenueError::Forbidden(Permission::Trade).ws_error(Some("req-1".to_string())),
     );
     assert_golden("ws/error_message.json", &msg);
+}
+
+// ============================================================================
+// Venue envelope golden (venue.v1 — the durable journal record)
+// ============================================================================
+
+#[test]
+fn test_golden_venue_add_order_event() {
+    // A representative `venue.v1` VenueEvent: an AddOrder carrying the identity
+    // the upstream command drops (account/owner/TIF/STP) with a captured
+    // two-leg-per-match `Added` outcome. Pins the mandatory `schema` tag, the
+    // PascalCase variant tags, the seam Side (`BUY`/`SELL`) / TimeInForce (`GTC`)
+    // / STPMode (`None`) wire forms, the Hash32 hex owner, and money as integer
+    // cents — so a field rename or a casing drift is a hard decode error.
+    let lineage = LineageId::new("run-1");
+    let seq = SequenceNumber::new(7);
+    let execution_id = lineage.execution_id("BTC", seq, 0);
+    let taker_id = lineage.venue_order_id("BTC", seq, 0);
+    let maker_id = lineage.venue_order_id("BTC", SequenceNumber::new(1), 0);
+    let taker_owner = Hash32([0x22; 32]);
+    let maker_owner = Hash32([0x11; 32]);
+
+    let command = VenueCommand::AddOrder {
+        symbol: sym("BTC-20240329-50000-C"),
+        order_id: taker_id.clone(),
+        account: AccountId::new("taker-acct"),
+        owner: taker_owner,
+        client_order_id: Some(ClientOrderId::new("client-42")),
+        side: SeamSide::Buy,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(50_000)),
+        quantity: 2,
+        time_in_force: SeamTif::Gtc,
+        stp_mode: fauxchange::exchange::STPMode::None,
+    };
+    let outcome = VenueOutcome::Added {
+        fills: vec![
+            VenueFill {
+                execution_id: execution_id.clone(),
+                order_id: maker_id,
+                account: AccountId::new("maker-acct"),
+                owner: maker_owner,
+                side: SeamSide::Sell,
+                liquidity: LiquidityFlag::Maker,
+                price: Cents::new(50_000),
+                quantity: 2,
+                fee: SignedCents::new(-10),
+            },
+            VenueFill {
+                execution_id,
+                order_id: taker_id,
+                account: AccountId::new("taker-acct"),
+                owner: taker_owner,
+                side: SeamSide::Buy,
+                liquidity: LiquidityFlag::Taker,
+                price: Cents::new(50_000),
+                quantity: 2,
+                fee: SignedCents::new(15),
+            },
+        ],
+        resting_quantity: 0,
+        // No STP fired on this add: the always-present vec serialises as `[]`.
+        stp_cancelled: vec![],
+    };
+    let event = VenueEvent::new(
+        seq,
+        EventTimestamp::new(1_700_000_000_000),
+        command,
+        outcome,
+    );
+
+    assert_golden("venue/add_order_event.json", &event);
+    // The schema tag is present and the money fields are integer cents.
+    let golden = load_golden("venue/add_order_event.json");
+    assert_eq!(golden["schema"], serde_json::json!("venue.v1"));
+    // The empty STP vec is present on the wire, not elided.
+    assert_eq!(
+        golden["outcome"]["Added"]["stp_cancelled"],
+        serde_json::json!([])
+    );
+    if let Some(fills) = golden["outcome"]["Added"]["fills"].as_array() {
+        for fill in fills {
+            assert_no_float_money(fill, &["price", "fee"]);
+        }
+    }
+}
+
+#[test]
+fn test_golden_venue_add_order_stp_cancelled_event() {
+    // A cancel-maker AddOrder whose incoming aggressor removed a same-owner
+    // resting leg via self-trade prevention in the one add turn — pins the
+    // `stp_cancelled` branch (there is no separate cancel command / sequence) so
+    // the lossless STP-cancellation record is frozen into the venue.v1 shape.
+    let lineage = LineageId::new("run-1");
+    let seq = SequenceNumber::new(9);
+    let execution_id = lineage.execution_id("BTC", seq, 0);
+    let taker_id = lineage.venue_order_id("BTC", seq, 0);
+    let taker_owner = Hash32([0x22; 32]);
+    // A different-owner resting maker that actually filled.
+    let counterparty_owner = Hash32([0x33; 32]);
+    // The same-owner resting maker the aggressor removed via STP.
+    let self_maker_id = lineage.venue_order_id("BTC", SequenceNumber::new(3), 0);
+
+    let command = VenueCommand::AddOrder {
+        symbol: sym("BTC-20240329-50000-C"),
+        order_id: taker_id.clone(),
+        account: AccountId::new("taker-acct"),
+        owner: taker_owner,
+        client_order_id: None,
+        side: SeamSide::Buy,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(50_000)),
+        quantity: 2,
+        time_in_force: SeamTif::Gtc,
+        stp_mode: fauxchange::exchange::STPMode::CancelMaker,
+    };
+    let outcome = VenueOutcome::Added {
+        fills: vec![
+            VenueFill {
+                execution_id: execution_id.clone(),
+                order_id: lineage.venue_order_id("BTC", SequenceNumber::new(2), 0),
+                account: AccountId::new("counterparty-acct"),
+                owner: counterparty_owner,
+                side: SeamSide::Sell,
+                liquidity: LiquidityFlag::Maker,
+                price: Cents::new(50_000),
+                quantity: 1,
+                fee: SignedCents::new(-5),
+            },
+            VenueFill {
+                execution_id,
+                order_id: taker_id,
+                account: AccountId::new("taker-acct"),
+                owner: taker_owner,
+                side: SeamSide::Buy,
+                liquidity: LiquidityFlag::Taker,
+                price: Cents::new(50_000),
+                quantity: 1,
+                fee: SignedCents::new(8),
+            },
+        ],
+        resting_quantity: 0,
+        stp_cancelled: vec![CancelledLeg {
+            order_id: self_maker_id,
+            owner: taker_owner,
+            reason: CancelReason::SelfTradePrevention,
+        }],
+    };
+    let event = VenueEvent::new(
+        seq,
+        EventTimestamp::new(1_700_000_000_000),
+        command,
+        outcome,
+    );
+
+    assert_golden("venue/add_order_stp_cancelled_event.json", &event);
+    let golden = load_golden("venue/add_order_stp_cancelled_event.json");
+    assert_eq!(
+        golden["outcome"]["Added"]["stp_cancelled"][0]["reason"],
+        serde_json::json!("SelfTradePrevention")
+    );
 }

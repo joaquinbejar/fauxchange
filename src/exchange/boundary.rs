@@ -15,6 +15,7 @@
 //! | [`TimestampMs`]  | `option_chain_orderbook::TimestampMs`          | `pricelevel`     |
 //! | [`Hash32`]       | `option_chain_orderbook::Hash32`               | `pricelevel`     |
 //! | [`InstrumentStatus`] | `option_chain_orderbook::InstrumentStatus` | `option-chain-orderbook` |
+//! | [`STPMode`]      | `option_chain_orderbook::STPMode`              | `orderbook-rs`   |
 //! | [`OptionStyle`]  | `optionstratlib::OptionStyle`                  | `optionstratlib` |
 //! | [`ExpirationDate`] | `optionstratlib::ExpirationDate`             | `optionstratlib` |
 //!
@@ -24,12 +25,19 @@
 //! [`SymbolParser`] / [`ParsedSymbol`] grammar service is also re-exported here
 //! so the venue routes every symbol parse through the single upstream source of
 //! truth ([`crate::exchange::symbol`]).
+//!
+//! [`STPMode`] (the self-trade-prevention mode carried on a venue `AddOrder`
+//! envelope) is re-exported from the **default** `option-chain-orderbook` crate
+//! surface — it is not gated behind the `sequencer` feature, so the venue names
+//! it without pulling in the journal/store machinery
+//! ([01 §8](../../../docs/01-domain-model.md),
+//! [05 §6](../../../docs/05-microstructure-config.md)).
 
 // Boundary newtypes from `orderbook-rs` / `pricelevel`, surfaced through
 // `option-chain-orderbook`.
 pub use option_chain_orderbook::ParsedSymbol;
 pub use option_chain_orderbook::{
-    Hash32, InstrumentStatus, OrderId, Price, Quantity, Side, SymbolParser, TimeInForce,
+    Hash32, InstrumentStatus, OrderId, Price, Quantity, STPMode, Side, SymbolParser, TimeInForce,
     TimestampMs,
 };
 
@@ -59,5 +67,14 @@ mod tests {
         // The venue lifecycle sequence is Active -> Settling -> Expired.
         assert!(InstrumentStatus::Active < InstrumentStatus::Settling);
         assert!(InstrumentStatus::Settling < InstrumentStatus::Expired);
+    }
+
+    #[test]
+    fn test_stp_mode_reexport_is_upstream_type() {
+        // Naming the STP variants proves the re-export resolves to the upstream
+        // enum, and that it is reachable without the `sequencer` feature.
+        assert_eq!(STPMode::default(), STPMode::None);
+        assert_ne!(STPMode::CancelTaker, STPMode::CancelMaker);
+        assert!(STPMode::CancelBoth.is_enabled());
     }
 }

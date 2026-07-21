@@ -11,6 +11,54 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- Versioned `VenueCommand` / `VenueEvent` v1 envelope + lossless outcomes (#5)
+  in `src/exchange/` (`envelope.rs`, `identity.rs`) — the venue's own internal
+  instruction set, carrying the account/owner/TIF/order-type/STP identity the
+  upstream `OptionChainCommand` drops **in** and the captured fills **out**,
+  while invoking upstream matching unchanged
+  ([ADR-0006](docs/adr/0006-venue-command-envelope-and-single-writer-journal.md),
+  [ADR-0009](docs/adr/0009-lossless-venue-envelope-outcomes.md)). Adds
+  `VenueCommand` (`AddOrder` / `CancelOrder` / `Replace` / `MassCancel` /
+  `SetInstrumentStatus` / `EvictExpiredOrders` and the control-plane
+  `MarketMakerControl` / `Clock` / `SimStep`), the `VenueEvent`
+  (`{ schema, underlying_sequence, venue_ts, command, outcome }`, mandatory
+  `schema = "venue.v1"` tag), and the lossless `VenueOutcome` branches —
+  `Added { fills, resting_quantity, stp_cancelled }`,
+  `Market { fills, unfilled_quantity, stp_cancelled }` (the empty-book zero-fill
+  case representable), `Replace { cancelled, add: AddOutcome
+  (Filled { fills, stp_cancelled } / Rested { fills, resting_quantity,
+  stp_cancelled } / Rejected) }` (explicitly non-atomic),
+  `MassCancelled { affected: ordered Vec<CancelledLeg> }` (count derived),
+  `Cancelled` / `InstrumentStatusChanged` / `Evicted` / `ControlApplied` /
+  `Rejected { reason }`. Because a self-trade-prevention removal
+  (`cancel_maker` / `cancel_both`) is a side-effect of a single add turn (one
+  sequence, one event, no separate cancel command), the add-side outcomes carry
+  a `stp_cancelled: Vec<CancelledLeg>` (`CancelReason::SelfTradePrevention`,
+  empty when no STP fired) so the affected resting legs are recorded losslessly
+  ([ADR-0009 §4](docs/adr/0009-lossless-venue-envelope-outcomes.md)); `Rejected`
+  carries none because an STP removal is itself a book mutation. Models the
+  **two linked legs per match** with the
+  lossless internal `Fill` (adds the STP `owner: Hash32` and the seam `Side` to
+  the #004 DTO `Fill`, sharing one `execution_id` across the maker + taker leg,
+  each with its own account/side/liquidity/fee) and the venue-owned
+  `CancelReason`. Adds the run `LineageId` with the deterministic composite-id
+  grammar `"{lineage_id}:{underlying}:{underlying_sequence}:{index}"` for venue
+  order ids and `execution_id`s (collision-free across runs and underlyings —
+  `BTC:1 ≠ ETH:1`) and the `JournalHeader { schema_version, lineage_id }`.
+  Re-exports the upstream `STPMode` at the boundary (available without the
+  `sequencer` feature). Envelope serde pins `PascalCase` variant tags,
+  `snake_case` fields, and `deny_unknown_fields`, and reuses the upstream seam
+  newtypes (`Side` → `BUY`/`SELL`, `TimeInForce` → `GTC`, `Hash32` hex) with
+  cents as integers. `MassCancelScope` / `MassCancelType` are owned venue-side
+  mirrors of the upstream enums (which sit behind the `sequencer` feature that
+  pulls the on-disk journal store #005 excludes), mapped 1:1 by the #006 actor.
+  New tests: per-variant construction / serde units, id-grammar determinism +
+  cross-underlying uniqueness + two-leg `execution_id` sharing, the
+  `venue_envelope_serde_identity` and `venue_id_grammar_collision_free` property
+  tests in `tests/property.rs`, and the `venue.v1` golden
+  (`tests/golden/venue/add_order_event.json`) in `tests/golden.rs`. No new
+  dependencies.
+
 - REST/WS DTO layer (#4) in `src/models.rs`: the venue value objects and their
   `serde` + `utoipa::ToSchema` projection onto the wire, prices in integer cents
   and timestamps in venue-clock milliseconds. Covers the whole inherited Backend
