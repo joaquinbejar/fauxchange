@@ -55,6 +55,11 @@
 //! across every protocol surface — and are re-exported at the crate
 //! root. [`config`] is cross-cutting: venue configuration.
 //!
+//! [`conformance`] is the packaged `fauxchange conformance` harness (a
+//! transport/bootstrap-layer artifact over [`state`]): it spins ephemeral
+//! in-process venues, drives the frozen parity + conformance suites across
+//! REST/WS/FIX, and emits a machine-readable report a downstream CI gates on.
+//!
 //! No module outside `gateway/` reaches into another gateway's
 //! internals, and nothing in `src/` imports back from this crate root —
 //! see `CLAUDE.md` "Module Boundaries" for the enforced rules.
@@ -86,6 +91,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod conformance;
 pub mod db;
 pub mod error;
 pub mod exchange;

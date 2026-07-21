@@ -11,6 +11,23 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Packaged `fauxchange conformance` harness across REST, WS, and FIX** (#51) —
+  a runnable `conformance` subcommand (`src/conformance/`) that spins ephemeral
+  in-process parity venues behind the real REST server and FIX 4.4 acceptor, and
+  drives the frozen cross-surface parity + conformance suites: order-entry parity
+  REST ≡ FIX (place / partial / cancel-replace / STP / per-leg fees / reject /
+  same-payload retry, under the docs/03 §7 normalization rule — protocol-only
+  fields normalized, venue ids compared verbatim), observation parity REST/WS/FIX
+  on the documented join keys, control parity REST/WS (no FIX control message),
+  the FIX session/order/market-data conformance script plus every docs/03 §8
+  reject row with a redacted `Text (58)`, and REST/WS conformance (OpenAPI shape,
+  tokenless `/health`, permission gating, subscribe → snapshot → sequenced
+  deltas with a monotonic `instrument_sequence`). Emits a machine-readable
+  `conformance.v1` JSON report (per surface, per case) — every failure `detail`
+  is length-bounded and **redacted** so the report never carries a secret / JWT /
+  `DATABASE_URL` / credential echo — and exits **non-zero on any surface
+  failure** so a downstream CI can gate on it
+  ([03 §7](docs/03-protocol-surfaces.md), [TESTING.md §6–§7](docs/TESTING.md)).
 - **HP-4 market-maker requote budget and the requote-isolation assertion — the
   v0.5 performance gate** (#50,
   [07 §3-4](docs/07-performance-budgets.md#3-latency-budgets-design-targets)).
