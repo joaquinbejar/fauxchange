@@ -35,7 +35,9 @@ use axum::extract::{Extension, Path, Query, State};
 
 use crate::auth::Authorized;
 use crate::error::VenueError;
-use crate::exchange::{STPMode, SymbolParser, VenueCommand, VenueOutcome};
+use crate::exchange::{
+    MassCancelScope, MassCancelType, STPMode, SymbolParser, VenueCommand, VenueOutcome,
+};
 use crate::gateway::rest::middleware::require;
 use crate::gateway::rest::support::{
     add_order_command, build_symbol, mint_order_id, owner_for, parse_style, seam_side, seam_tif,
@@ -705,38 +707,71 @@ pub async fn bulk_cancel_orders(
     }))
 }
 
-/// Cancel all matching orders. **Not yet servable**: a filtered cancel-all is a
-/// venue-wide / underlying-scoped `MassCancel`, which the per-underlying submit
-/// path does not route (that broadcast routing is a control-plane concern). A
-/// per-book `MassCancel` (fully specified contract) is the routable form the
-/// control-plane issue wires; until then this returns a typed `400`.
+/// Cancel every resting order the **authenticated account** owns — an
+/// owner-scoped venue-wide [`VenueCommand::MassCancel`] (#97).
+///
+/// The sweep is scoped to the caller via [`MassCancelType::ByUser`] keyed on the
+/// account's STP owner [`Hash32`](crate::exchange::Hash32), so an account can only
+/// ever cancel its OWN orders — never another account's (the executor's owner
+/// filter enforces the isolation). It fans across every hosted underlying and
+/// returns the **complete** cancelled set aggregated across them
+/// ([`AppState::submit_mass_cancel`]), so `canceled_count` is the account's true
+/// total (never one representative underlying's). A second cancel-all with nothing
+/// left to sweep reports `canceled_count: 0`.
+///
+/// **Fine-grained filters are refused, not silently ignored.** The `MassCancelType`
+/// is single-axis (`ByUser` XOR `BySide`), so an `underlying` / `expiration` /
+/// `side` / `style` filter cannot combine with the mandatory owner scoping. A
+/// request carrying any filter is a typed `400` rather than a sweep that cancels
+/// more than the caller asked for.
 #[utoipa::path(
     delete,
     path = "/api/v1/orders/cancel-all",
     tag = "orders",
     params(
-        ("underlying" = Option<String>, Query, description = "Filter by underlying"),
-        ("expiration" = Option<String>, Query, description = "Filter by expiration YYYYMMDD"),
-        ("side" = Option<crate::models::Side>, Query, description = "Filter by side"),
-        ("style" = Option<crate::models::OptionStyle>, Query, description = "Filter by style"),
+        ("underlying" = Option<String>, Query, description = "Filter by underlying (not yet supported — a filtered request is a 400)"),
+        ("expiration" = Option<String>, Query, description = "Filter by expiration YYYYMMDD (not yet supported — a filtered request is a 400)"),
+        ("side" = Option<crate::models::Side>, Query, description = "Filter by side (not yet supported — a filtered request is a 400)"),
+        ("style" = Option<crate::models::OptionStyle>, Query, description = "Filter by style (not yet supported — a filtered request is a 400)"),
     ),
     responses(
-        (status = 200, description = "Cancel-all outcome", body = CancelAllResponse),
-        (status = 400, description = "Venue-wide mass-cancel routing not yet wired"),
+        (status = 200, description = "Owner-scoped cancel-all outcome (count of the account's swept orders)", body = CancelAllResponse),
+        (status = 400, description = "A filtered cancel-all is not supported; omit filters for an owner-scoped cancel-all"),
         (status = 401, description = "Missing or invalid token"),
         (status = 403, description = "Missing Trade permission"),
+        (status = 429, description = "Rate limited"),
     ),
     security(("bearer_jwt" = [])),
 )]
 pub async fn cancel_all_orders(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Authorized>,
-    Query(_query): Query<CancelAllQuery>,
+    Query(query): Query<CancelAllQuery>,
 ) -> Result<Json<CancelAllResponse>, VenueError> {
     require(&auth, Permission::Trade)?;
-    Err(VenueError::InvalidOrder(
-        "venue-wide / underlying-scoped cancel-all is a MassCancel the per-underlying submit \
-         path does not route; the control-plane mass-cancel routing is not yet wired"
-            .to_string(),
-    ))
+    // A filter cannot combine with the mandatory owner scoping (the MassCancelType
+    // is single-axis), so refuse rather than sweep more than the client asked for.
+    if query.underlying.is_some()
+        || query.expiration.is_some()
+        || query.side.is_some()
+        || query.style.is_some()
+    {
+        return Err(VenueError::InvalidOrder(
+            "filtered cancel-all is not supported; omit filters for an owner-scoped cancel-all"
+                .to_string(),
+        ));
+    }
+    let account = auth.claims.account().clone();
+    let owner = owner_for(&state, &account)?;
+    let affected = state
+        .submit_mass_cancel(VenueCommand::MassCancel {
+            scope: MassCancelScope::Underlying,
+            cancel_type: MassCancelType::ByUser(owner),
+            account,
+        })
+        .await?;
+    Ok(Json(CancelAllResponse {
+        canceled_count: affected.len(),
+        failed_count: 0,
+    }))
 }

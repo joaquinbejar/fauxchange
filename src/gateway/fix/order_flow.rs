@@ -593,6 +593,49 @@ pub(crate) fn render_cancel_report(
     }
 }
 
+/// One `ExecutionReport (8) Canceled` for a resting order swept by an accepted
+/// `OrderMassCancelRequest (q)` ([03 §5.3](../../../docs/03-protocol-surfaces.md#53-order-entry-and-execution-reports)).
+///
+/// The same shape as [`render_cancel_report`] — `CumQty`/`LeavesQty` are `0` (the
+/// swept order is gone and the receipt does not surface the pre-cancel fill count,
+/// the same honest limitation the single-cancel path documents) — but it takes the
+/// leg's `index` so each order in one sweep gets a **collision-free** composite
+/// `ExecID` under the shared mass-cancel `underlying_sequence`
+/// (`"{lineage}:{underlying}:{sequence}:{index}"`). `SecondaryExecID (527)` is that
+/// same `underlying_sequence`, so a client can join every per-order report to the
+/// one sequenced sweep turn.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_mass_cancel_leg_report(
+    symbol: Symbol,
+    side: OrderSide,
+    order_id: VenueOrderId,
+    sequence: SequenceNumber,
+    lineage: &LineageId,
+    underlying: &str,
+    index: u32,
+) -> ExecReportSpec {
+    ExecReportSpec {
+        order_id,
+        exec_id: lineage.execution_id(underlying, sequence, index),
+        exec_type: ExecType::Canceled,
+        ord_status: OrdStatus::Canceled,
+        symbol,
+        side,
+        leaves_qty: 0,
+        cum_qty: 0,
+        last_qty: None,
+        last_px: None,
+        price: None,
+        secondary_exec_id: sequence,
+        commission: None,
+        comm_type: None,
+        last_liquidity_ind: None,
+        ord_rej_reason: None,
+        text: None,
+    }
+}
+
 /// The `ExecutionReport (8)` current-status report for an `OrderStatusRequest (H)`
 /// over the orders the session observed placed.
 ///

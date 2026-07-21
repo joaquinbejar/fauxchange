@@ -331,6 +331,16 @@ pub fn cancel_frame(
     frame_with_body(body.as_bytes())
 }
 
+/// An `OrderMassCancelRequest (q)` — `All (530=7)` cancels the account's whole
+/// resting set; a `Symbol (55)` would make it a per-security (`530=1`) sweep.
+#[must_use]
+pub fn mass_cancel_frame(sender: &str, seq: u64, cl_ord_id: &str) -> Vec<u8> {
+    let body = format!(
+        "35=q\x0149={sender}\x0156={VENUE}\x0134={seq}\x0152=20240329-12:00:00.000\x0111={cl_ord_id}\x01530=7\x01"
+    );
+    frame_with_body(body.as_bytes())
+}
+
 /// An `OrderCancelReplaceRequest (G)` referencing `orig_cl_ord_id`.
 #[must_use]
 pub fn replace_frame(
@@ -599,6 +609,15 @@ impl FixClient {
         side: &str,
     ) -> Vec<Vec<u8>> {
         let frame = cancel_frame(&self.sender, self.seq, orig_cl_ord_id, cl_ord_id, side);
+        self.seq += 1;
+        self.round_trip(frame).await
+    }
+
+    /// Sends an `OrderMassCancelRequest (q)` (`All` scope) and reads the reply —
+    /// the accepted `OrderMassCancelReport (r)` plus one `ExecutionReport (8)`
+    /// `Canceled` per swept order, or a single `r Rejected`.
+    pub async fn mass_cancel(&mut self, cl_ord_id: &str) -> Vec<Vec<u8>> {
+        let frame = mass_cancel_frame(&self.sender, self.seq, cl_ord_id);
         self.seq += 1;
         self.round_trip(frame).await
     }

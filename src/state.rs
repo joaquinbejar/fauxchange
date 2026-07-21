@@ -77,10 +77,11 @@ use crate::auth::{
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, ExpirationDate, FanoutSummary,
-    InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
-    JournalHeader, JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink,
-    MassCancelScope, Receipt, StoreFanOut, Symbol, TeeFanOut, VenueCommand, check_price_band,
+    ActorConfig, ActorHandle, CancelledLeg, EventTimestamp, ExecutionsStore, ExpirationDate,
+    FanoutSummary, InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal,
+    InstrumentStatus, JournalHeader, JournalSnapshot, LineageId, MarkPriceBook,
+    MarketMakerControlSink, MassCancelScope, Receipt, SequenceNumber, StoreFanOut,
+    Symbol, TeeFanOut, VenueCommand, VenueOutcome, check_price_band,
     spawn_matching_actor_with_registry_and_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
@@ -657,6 +658,38 @@ fn is_venue_global(command: &VenueCommand) -> bool {
     }
 }
 
+/// One order swept by a client [`VenueCommand::MassCancel`], paired with the
+/// `underlying_sequence` of the sweeping command **on that order's underlying** —
+/// the join key a per-order render needs (the FIX `ExecutionReport (8)`
+/// `SecondaryExecID (527)`, and the composite `ExecID` grammar) that a bare
+/// [`CancelledLeg`] does not carry (#97).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweptLeg {
+    /// The swept order's leg — its venue order id, STP owner, and cancel reason.
+    pub leg: CancelledLeg,
+    /// The sweeping `MassCancel` command's `underlying_sequence` on this order's
+    /// underlying — distinct per underlying in a venue-global fan.
+    pub sequence: SequenceNumber,
+}
+
+/// The swept legs captured on a committed `MassCancel` receipt (each tagged with
+/// the receipt's `underlying_sequence`), or empty for any other outcome (a
+/// rejected sweep carries no legs). Cloned rather than moved so the fan can
+/// aggregate across receipts without consuming them.
+#[must_use]
+fn swept_legs_of(receipt: &Receipt) -> Vec<SweptLeg> {
+    match &receipt.outcome {
+        Some(VenueOutcome::MassCancelled { affected }) => affected
+            .iter()
+            .map(|leg| SweptLeg {
+                leg: leg.clone(),
+                sequence: receipt.underlying_sequence,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 impl AppState {
     /// Assembles an [`AppState`] behind an `Arc`, spawning **one single-writer
     /// actor per configured underlying** and wiring the real order path
@@ -1219,6 +1252,101 @@ impl AppState {
             // typed rejection rather than fabricate a receipt.
             (None, None) => Err(VenueError::JournalUnavailable),
         }
+    }
+
+    /// Submits a client-requested [`VenueCommand::MassCancel`] and returns the
+    /// **complete** set of swept orders aggregated across every underlying the
+    /// sweep reached — the gateway-facing entry point REST `cancel-all` and FIX
+    /// `q` share (#97).
+    ///
+    /// A non-`Book` mass cancel is venue-global ([`is_venue_global`]): it fans to
+    /// every hosted underlying's actor, each of which sweeps its own resting
+    /// registry filtered by the command's [`MassCancelType`] and journals its own
+    /// [`VenueOutcome::MassCancelled`]. The representative-receipt `submit` fan
+    /// (#118) surfaces only ONE underlying's outcome — inadequate for a client
+    /// cancel-all on a multi-underlying venue — so this method concatenates every
+    /// actor's affected legs (each already in its deterministic venue-id sweep
+    /// order, iterated over the sorted underlying set) into the account's full
+    /// cancelled set. A `Book` scope names one instrument, routes to that
+    /// underlying's actor, and returns its swept legs directly.
+    ///
+    /// Owner scoping ([`MassCancelType::ByUser`]) is enforced **inside each
+    /// actor's executor**, so a caller only ever sweeps its OWN resting orders
+    /// regardless of scope; cross-account isolation is a property of the sequenced
+    /// sweep, not of this fan. Each per-underlying `MassCancel` is journaled with
+    /// its own `underlying_sequence`, so replay reproduces the identical sweeps.
+    ///
+    /// # Errors
+    ///
+    /// - [`VenueError::InvalidOrder`] if `command` is not a
+    ///   [`VenueCommand::MassCancel`];
+    /// - [`VenueError::NotFound`] if a `Book` scope names an unhosted underlying,
+    ///   or a venue-global sweep reaches a venue hosting no underlyings;
+    /// - the first actor's typed rejection if **every** targeted underlying
+    ///   rejected the sweep. A **partial** fan-out (some underlyings committed,
+    ///   some rejected) is surfaced as a `WARN` and the committed legs are still
+    ///   returned — the venue does not promise atomic venue-wide fan-out.
+    pub async fn submit_mass_cancel(
+        &self,
+        command: VenueCommand,
+    ) -> Result<Vec<SweptLeg>, VenueError> {
+        if !matches!(command, VenueCommand::MassCancel { .. }) {
+            return Err(VenueError::InvalidOrder(
+                "submit_mass_cancel requires a MassCancel command".to_string(),
+            ));
+        }
+        // A `Book`-scoped sweep names one instrument → one actor, one receipt that
+        // carries the full swept set for that book.
+        if !is_venue_global(&command) {
+            let handle = self.route(&command)?;
+            let receipt = handle.submit(command).await?;
+            return Ok(swept_legs_of(&receipt));
+        }
+        // Venue-global fan: aggregate every underlying's swept legs, in the
+        // deterministic sorted-underlying then venue-id sweep order.
+        let correlation_id = self.next_correlation_id();
+        let tickers: Vec<String> = self.underlyings().into_iter().map(str::to_string).collect();
+        if tickers.is_empty() {
+            return Err(VenueError::NotFound(
+                "no hosted underlyings for a venue-global mass cancel".to_string(),
+            ));
+        }
+        let total = tickers.len();
+        let mut aggregated: Vec<SweptLeg> = Vec::new();
+        let mut first_error: Option<VenueError> = None;
+        let mut ok_count = 0usize;
+        for ticker in &tickers {
+            let result = match self.handle_for(ticker) {
+                Ok(handle) => handle.submit(command.clone()).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(receipt) => {
+                    // Checked (rule 9); bounded by the hosted-underlying set.
+                    ok_count = ok_count.checked_add(1).unwrap_or(ok_count);
+                    aggregated.extend(swept_legs_of(&receipt));
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if ok_count == 0 {
+            // Every underlying rejected the sweep — surface the first rejection
+            // rather than an empty "success".
+            return Err(first_error.unwrap_or(VenueError::JournalUnavailable));
+        }
+        if ok_count != total {
+            tracing::warn!(
+                correlation_id = %correlation_id,
+                committed = ok_count,
+                total,
+                "venue-global mass cancel fan-out was partial across underlyings"
+            );
+        }
+        Ok(aggregated)
     }
 
     /// Admits a price-bearing order command against the venue-owned price band

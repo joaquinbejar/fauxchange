@@ -1811,6 +1811,88 @@ fn test_mass_cancel_replays_identically() {
     assert_replay_equals(&recording, &replayed);
 }
 
+/// An **owner-scoped** `MassCancel` (`MassCancelType::ByUser`) — the exact command
+/// a client cancel-all (REST) / `OrderMassCancelRequest (q)` (FIX) submits (#97) —
+/// sweeps only the requesting owner's resting orders, leaving every other owner's
+/// untouched, and replays to the identical event stream + top-of-book witness. This
+/// is what makes cross-account isolation a **journaled, deterministic** property:
+/// the same journal re-cancels exactly the same owner's orders on replay.
+#[test]
+fn test_owner_scoped_mass_cancel_replays_identically() {
+    let lineage = LineageId::new("run-mass-cancel-by-user");
+    let commands = vec![
+        // Owner 0x11 rests two buys; owner 0x22 rests one buy, all on the call.
+        add(
+            &lineage,
+            0,
+            CALL,
+            "trader-1",
+            0x11,
+            Side::Buy,
+            49_900,
+            3,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            1,
+            CALL,
+            "trader-1",
+            0x11,
+            Side::Buy,
+            49_800,
+            2,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            2,
+            CALL,
+            "trader-2",
+            0x22,
+            Side::Buy,
+            49_950,
+            4,
+            TimeInForce::Gtc,
+        ),
+        // Owner 0x11 cancels ALL of ITS OWN orders (ByUser) — never owner 0x22's.
+        VenueCommand::MassCancel {
+            scope: MassCancelScope::Underlying,
+            cancel_type: MassCancelType::ByUser(Hash32([0x11; 32])),
+            account: AccountId::new("trader-1"),
+        },
+    ];
+    let recording = record(&commands, &lineage, &witnesses());
+
+    // Exactly owner 0x11's two orders are swept, in venue-order-id sorted order; the
+    // affected legs carry 0x11's owner, never 0x22's.
+    let own_0 = lineage.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0);
+    let own_1 = lineage.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0);
+    match &recording.events[3].outcome {
+        VenueOutcome::MassCancelled { affected } => {
+            let ids: Vec<_> = affected.iter().map(|leg| leg.order_id.clone()).collect();
+            let mut expected = vec![own_0, own_1];
+            expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            assert_eq!(ids, expected, "only owner 0x11's two orders, sorted by id");
+            assert!(
+                affected.iter().all(|leg| leg.owner == Hash32([0x11; 32])),
+                "every swept leg is owner 0x11's — never 0x22's (cross-account isolation)"
+            );
+        }
+        other => panic!("expected a MassCancelled outcome, got {other:?}"),
+    }
+    // Owner 0x22's resting buy at 49_950 survives as the top of book.
+    let call_top = recording.tops.last().map(|row| row[0]).unwrap_or_default();
+    assert_eq!(
+        call_top.best_bid,
+        Some(Cents::new(49_950)),
+        "owner 0x22's order survives an owner-scoped sweep of owner 0x11"
+    );
+
+    let replayed = replay(&recording);
+    assert_replay_equals(&recording, &replayed);
+}
+
 /// A per-`Book` `MassCancel` (`MassCancelType::All`) sweeps only the named leaf, and
 /// replays identically — proving the scope filter is journal-deterministic (#47).
 #[test]
