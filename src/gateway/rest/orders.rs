@@ -34,8 +34,8 @@ use crate::error::VenueError;
 use crate::exchange::{STPMode, SymbolParser, VenueCommand};
 use crate::gateway::rest::middleware::require;
 use crate::gateway::rest::support::{
-    build_symbol, immediate_fills, mint_order_id, owner_for, parse_style, seam_side, seam_tif,
-    vwap_cents,
+    add_order_command, build_symbol, immediate_fills, mint_order_id, owner_for, parse_style,
+    seam_side, seam_tif, vwap_cents,
 };
 use crate::models::{
     BulkCancelRequest, BulkCancelResponse, BulkCancelResultItem, BulkOrderRequest,
@@ -147,19 +147,18 @@ pub async fn place_limit_order(
     let order_id = mint_order_id(state.lineage_id(), &underlying);
 
     let receipt = state
-        .submit(VenueCommand::AddOrder {
+        .submit(add_order_command(
             symbol,
-            order_id: order_id.clone(),
-            account: account.clone(),
+            order_id.clone(),
+            account.clone(),
             owner,
-            client_order_id: request.client_order_id.clone(),
-            side: seam_side(request.side),
-            order_type: OrderType::Limit,
-            limit_price: Some(request.price),
-            quantity: request.quantity,
-            time_in_force: tif,
-            stp_mode: STPMode::None,
-        })
+            request.client_order_id.clone(),
+            seam_side(request.side),
+            OrderType::Limit,
+            Some(request.price),
+            request.quantity,
+            tif,
+        ))
         .await?;
 
     let fills = immediate_fills(&state, &account, &order_id, receipt.underlying_sequence);
@@ -218,19 +217,18 @@ pub async fn place_market_order(
     let order_id = mint_order_id(state.lineage_id(), &underlying);
 
     let receipt = state
-        .submit(VenueCommand::AddOrder {
+        .submit(add_order_command(
             symbol,
-            order_id: order_id.clone(),
-            account: account.clone(),
+            order_id.clone(),
+            account.clone(),
             owner,
-            client_order_id: request.client_order_id.clone(),
-            side: seam_side(request.side),
-            order_type: OrderType::Market,
-            limit_price: None,
-            quantity: request.quantity,
-            time_in_force: crate::exchange::TimeInForce::Ioc,
-            stp_mode: STPMode::None,
-        })
+            request.client_order_id.clone(),
+            seam_side(request.side),
+            OrderType::Market,
+            None,
+            request.quantity,
+            crate::exchange::TimeInForce::Ioc,
+        ))
         .await?;
 
     let fills = immediate_fills(&state, &account, &order_id, receipt.underlying_sequence);

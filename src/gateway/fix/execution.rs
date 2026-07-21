@@ -295,6 +295,53 @@ impl FixBody for OrderMassCancelReport {
     }
 }
 
+/// `BusinessMessageReject (j)` — a well-formed application message the venue
+/// understood but cannot business-process (an application `MsgType` with no
+/// handler). Outbound; the order-level rejects (`8`/`9`) are preferred for
+/// `D`/`F`/`G`, so `j` is the reject of last resort for an unsupported
+/// application message ([03 §8](../../../docs/03-protocol-surfaces.md#8-error-mapping-across-surfaces)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusinessMessageReject {
+    /// Standard header.
+    pub header: StandardHeader,
+    /// `RefSeqNum (45)` — the `MsgSeqNum` of the rejected message.
+    pub ref_seq_num: SequenceNumber,
+    /// `RefMsgType (372)` — the `MsgType (35)` of the rejected message.
+    pub ref_msg_type: String,
+    /// `BusinessRejectReason (380)`.
+    pub business_reject_reason: u16,
+    /// `Text (58)` — a redacted reason.
+    pub text: Option<String>,
+}
+
+impl FixBody for BusinessMessageReject {
+    const MSG_TYPE: &'static str = "j";
+
+    fn header(&self) -> &StandardHeader {
+        &self.header
+    }
+
+    fn decode_body(header: StandardHeader, fields: &FieldBag<'_>) -> Result<Self, FixDecodeError> {
+        Ok(Self {
+            header,
+            ref_seq_num: SequenceNumber::new(fields.req_u64(tags::REF_SEQ_NUM)?),
+            ref_msg_type: fields.req_str(tags::REF_MSG_TYPE)?.to_string(),
+            business_reject_reason: fields.req_u16(tags::BUSINESS_REJECT_REASON)?,
+            text: fields.opt_str(tags::TEXT)?.map(str::to_string),
+        })
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut writer = FieldWriter::new(Self::MSG_TYPE);
+        self.header.encode(&mut writer);
+        writer.u64(tags::REF_SEQ_NUM, self.ref_seq_num.get());
+        writer.str(tags::REF_MSG_TYPE, &self.ref_msg_type);
+        writer.u16(tags::BUSINESS_REJECT_REASON, self.business_reject_reason);
+        writer.opt_str(tags::TEXT, self.text.as_deref());
+        writer.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::header::UtcTimestamp;
@@ -472,6 +519,22 @@ mod tests {
                 assert_eq!(back.affected_orders[2].as_str(), "run-1:BTC:9:0");
             }
             other => panic!("expected OrderMassCancelReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_business_message_reject_round_trips() {
+        let reject = BusinessMessageReject {
+            header: header(),
+            ref_seq_num: SequenceNumber::new(42),
+            ref_msg_type: "AE".to_string(),
+            business_reject_reason: 3,
+            text: Some("unsupported message type".to_string()),
+        };
+        let bytes = reject.encode();
+        match decode(&bytes) {
+            Ok(DecodedMessage::BusinessMessageReject(back)) => assert_eq!(back, reject),
+            other => panic!("expected BusinessMessageReject, got {other:?}"),
         }
     }
 

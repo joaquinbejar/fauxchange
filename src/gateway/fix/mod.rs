@@ -30,6 +30,7 @@ pub mod header;
 pub mod limits;
 pub mod marketdata;
 pub mod order;
+pub mod order_flow;
 pub mod price;
 pub mod session;
 pub mod store;
@@ -133,6 +134,8 @@ pub enum DecodedMessage {
     OrderCancelReject(execution::OrderCancelReject),
     /// `OrderMassCancelReport (r)`.
     OrderMassCancelReport(execution::OrderMassCancelReport),
+    /// `BusinessMessageReject (j)`.
+    BusinessMessageReject(execution::BusinessMessageReject),
     /// `MarketDataRequest (V)`.
     MarketDataRequest(marketdata::MarketDataRequest),
     /// `MarketDataSnapshotFullRefresh (W)`.
@@ -163,6 +166,7 @@ impl DecodedMessage {
             Self::ExecutionReport(m) => m.encode(),
             Self::OrderCancelReject(m) => m.encode(),
             Self::OrderMassCancelReport(m) => m.encode(),
+            Self::BusinessMessageReject(m) => m.encode(),
             Self::MarketDataRequest(m) => m.encode(),
             Self::MarketDataSnapshotFullRefresh(m) => m.encode(),
             Self::MarketDataIncrementalRefresh(m) => m.encode(),
@@ -268,6 +272,9 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedMessage, FixDecodeError> {
         )),
         MsgType::OrderMassCancelReport => Ok(DecodedMessage::OrderMassCancelReport(
             execution::OrderMassCancelReport::decode_body(header, &fields)?,
+        )),
+        MsgType::BusinessMessageReject => Ok(DecodedMessage::BusinessMessageReject(
+            execution::BusinessMessageReject::decode_body(header, &fields)?,
         )),
         MsgType::MarketDataRequest => Ok(DecodedMessage::MarketDataRequest(
             marketdata::MarketDataRequest::decode_body(header, &fields)?,

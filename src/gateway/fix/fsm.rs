@@ -35,21 +35,35 @@
 //! venue's own `Logon (A)` ack is hand-built **without** `553`/`554`, so no
 //! credential is ever emitted.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use ironfix_core::types::{CompId, SeqNum};
 
 use crate::auth::{AccountStore, RateLimitKey, RevocationOracle};
-use crate::models::{AccountId, ExecutionId, Permission, VenueOrderId};
+use crate::error::{FixReject, FixRejectContext, VenueError};
+use crate::exchange::{Cents, Symbol, SymbolParser, TimeInForce as SeamTif};
+use crate::gateway::rest::support::{
+    immediate_execution_records, mint_order_id, owner_for, taker_legs_for_order,
+};
+use crate::models::{AccountId, ClientOrderId, ExecutionId, Permission, VenueOrderId};
 use crate::state::AppState;
 
 use super::codec::{FieldWriter, tags};
-use super::enums::{CxlRejResponseTo, ExecType, MassCancelResponse, OrdStatus};
+use super::enums::{
+    CxlRejResponseTo, ExecType, MassCancelResponse, OrdStatus, OrdType, OrderSide,
+    TimeInForce as FixTif,
+};
 use super::error::SessionRejectReason;
-use super::execution::{ExecutionReport, OrderCancelReject, OrderMassCancelReport};
+use super::execution::{
+    BusinessMessageReject, ExecutionReport, OrderCancelReject, OrderMassCancelReport,
+};
 use super::header::{StandardHeader, UtcTimestamp};
+use super::order::{
+    NewOrderSingle, OrderCancelReplaceRequest, OrderCancelRequest, OrderStatusRequest,
+};
+use super::order_flow::{self, ExecReportSpec};
 use super::store::{
     FixSessionStore, ResetTrigger, SequenceResetEvent, SessionCounters, SessionKey, StoredOutbound,
 };
@@ -61,10 +75,13 @@ use super::acceptor::{FixSession, FixSessionFactory, SessionControl, SessionOutb
 /// The FIX `MsgType (35)` for the venue-built `Logon (A)` ack.
 const MSG_TYPE_LOGON: &str = "A";
 
-/// The `OrdRejReason (103)` the venue emits for a permission-denied order — `6`
-/// (`Unknown Order`) is the closest standard code for "this session may not act";
-/// the redacted `Text (58)` names the cause without leaking a secret.
-const ORD_REJ_REASON_NOT_AUTHORIZED: u16 = 6;
+/// The `OrdRejReason (103)` the venue emits for a permission-denied order — `0`
+/// (`Broker / Exchange option`), the FIX 4.4 catch-all for a venue-policy reject;
+/// the redacted `Text (58)` names the cause without leaking a secret. Distinct
+/// from [`order_flow::ORD_REJ_REASON_DUPLICATE`] (`6`, `Duplicate Order`) so a
+/// compliant client can tell "not authorized" from "duplicate `ClOrdID`" by the
+/// reason code alone (`6` is `Duplicate Order` in FIX 4.4, not `Unknown Order`).
+const ORD_REJ_REASON_NOT_AUTHORIZED: u16 = 0;
 
 /// The `CxlRejReason (102)` the venue emits for a permission-denied cancel /
 /// replace — `6` (`Duplicate ClOrdID` is not it; `2` is broker/exchange option),
@@ -194,6 +211,26 @@ impl Reaction {
             control: SessionControl::Close,
         }
     }
+}
+
+/// The outcome of one in-order [`SessionFsm::handle_active`] step: either a
+/// fully-resolved synchronous [`Reaction`] (session admin, gap resend, a
+/// permission / attribution reject) or a **permitted, in-order, attributed**
+/// order-entry message the async [`VenueFixSession`] must route onto the
+/// sequenced order path (`D`/`F`/`G`/`q`/`H`, #039).
+///
+/// Splitting the synchronous session mechanics (which the FSM owns and unit-tests
+/// drive directly) from the async order submission (which awaits the single-writer
+/// actor) is what lets the FSM stay socket-free while the order path stays on the
+/// same `AppState::submit` seam REST uses. When a message routes, the inbound
+/// `MsgSeqNum` counter has already been advanced — the message is consumed.
+#[derive(Debug)]
+pub enum ActiveDisposition {
+    /// A synchronous reply the FSM has already fully built.
+    Reacted(Reaction),
+    /// A permitted order-entry message to submit onto the sequenced path (boxed —
+    /// a [`DecodedMessage`] is large relative to a [`Reaction`]).
+    Route(Box<DecodedMessage>),
 }
 
 /// The synchronous, testable core state machine — everything except the async
@@ -515,19 +552,23 @@ impl SessionFsm {
         message: DecodedMessage,
         now_ms: u64,
         revoked: bool,
-    ) -> Result<Reaction, SessionError> {
+    ) -> Result<ActiveDisposition, SessionError> {
         self.on_inbound(header_of(&message), now_ms);
 
         // Per-message revocation: a revoke bumps the epoch and drops the session.
         if revoked {
-            return self.logout_close(now_ms, "account revoked");
+            return Ok(ActiveDisposition::Reacted(
+                self.logout_close(now_ms, "account revoked")?,
+            ));
         }
 
         let seq = header_of(&message).msg_seq_num.value();
 
         // `SequenceReset (4)` is processed regardless of a gap (it repairs one).
         if let DecodedMessage::SequenceReset(reset) = &message {
-            return self.handle_sequence_reset(reset, now_ms);
+            return Ok(ActiveDisposition::Reacted(
+                self.handle_sequence_reset(reset, now_ms)?,
+            ));
         }
 
         // Sequence-gap detection on the inbound stream.
@@ -545,7 +586,7 @@ impl SessionFsm {
                     }
                     .encode()
                 })?;
-                return Ok(Reaction::emit(vec![frame]));
+                return Ok(ActiveDisposition::Reacted(Reaction::emit(vec![frame])));
             }
             std::cmp::Ordering::Less => {
                 // Already seen (a duplicate / too-low): ignore, do not advance.
@@ -554,21 +595,91 @@ impl SessionFsm {
                     got = seq,
                     "fix inbound MsgSeqNum below expected; ignoring"
                 );
-                return Ok(Reaction::cont());
+                return Ok(ActiveDisposition::Reacted(Reaction::cont()));
             }
             std::cmp::Ordering::Equal => {}
         }
 
+        // An in-order application message is gated (permission + `Account (1)`
+        // attribution) here; a permitted order-entry message is then handed to the
+        // async order router (#039), and market data (`V`) is admitted for #040.
+        // Everything else is a synchronous session-admin reply.
+        if is_application_message(&message) {
+            return self.gate_application(message, now_ms);
+        }
+
         let reaction = self.dispatch_active_body(message, now_ms)?;
-        // Consume the in-order message: advance the checked inbound counter.
+        self.consume_inbound()?;
+        Ok(ActiveDisposition::Reacted(reaction))
+    }
+
+    /// Advances the checked inbound counter for a consumed in-order message and
+    /// leaves [`AwaitingResend`](SessionPhase::AwaitingResend) once the gap is
+    /// filled.
+    fn consume_inbound(&mut self) -> Result<(), SessionError> {
         self.advance_inbound()?;
         if self.phase == SessionPhase::AwaitingResend {
             self.phase = SessionPhase::Active;
         }
-        Ok(reaction)
+        Ok(())
     }
 
-    /// Routes an in-order [`Active`](SessionPhase::Active) message body.
+    /// The per-message permission gate + `Account (1)` attribution for an in-order
+    /// application message, then either a synchronous reject / market-data
+    /// admission or a [`Route`](ActiveDisposition::Route) onto the order path.
+    fn gate_application(
+        &mut self,
+        message: DecodedMessage,
+        now_ms: u64,
+    ) -> Result<ActiveDisposition, SessionError> {
+        let required = required_permission(&message);
+        if !self.has_permission(required) {
+            // Refuse in the message's own context (order-level), never a bare
+            // Reject (3) — ADR-0007 §2, 03 §8.
+            let reaction = self.permission_reject(&message, now_ms)?;
+            self.consume_inbound()?;
+            return Ok(ActiveDisposition::Reacted(reaction));
+        }
+
+        // `Account (1)` must be absent or equal to the authenticated account
+        // (ADR-0010 rule 4). Only `NewOrderSingle (D)` fields tag 1 in the v0.4
+        // dialect (F/G/q/H do not parse it), so the check is D-scoped — a mismatch
+        // is a session-level `Reject (3)` (no delegation).
+        if let DecodedMessage::NewOrderSingle(order) = &message
+            && let Some(named) = &order.account
+            && Some(named) != self.account.as_ref()
+        {
+            let reaction = self.session_reject(
+                now_ms,
+                SessionRejectReason::ValueIsIncorrect,
+                Some(tags::ACCOUNT),
+            )?;
+            self.consume_inbound()?;
+            return Ok(ActiveDisposition::Reacted(reaction));
+        }
+
+        // The message is consumed at the session level regardless of the order
+        // path's outcome; the async router emits its reports/rejects on the same
+        // outbound counter.
+        self.consume_inbound()?;
+
+        if is_order_entry_message(&message) {
+            // D/F/G/q/H → the async order router (#039).
+            return Ok(ActiveDisposition::Route(Box::new(message)));
+        }
+
+        // Market data (`V`) is admitted here; the W/X routing lands in #040.
+        tracing::debug!(
+            msg_type = super::message_type_str(&message),
+            "fix market-data request admitted at the session boundary (routing lands in #040)"
+        );
+        Ok(ActiveDisposition::Reacted(Reaction::cont()))
+    }
+
+    /// Routes an in-order session-admin (or defensively, an unexpected
+    /// venue-out / application) message body. Application order-entry and market
+    /// data are gated and routed in [`gate_application`](Self::gate_application)
+    /// before this is reached, so those arms here are defensive.
     fn dispatch_active_body(
         &mut self,
         message: DecodedMessage,
@@ -604,62 +715,25 @@ impl SessionFsm {
                 // A second logon on a live session is a protocol violation.
                 self.session_reject(now_ms, SessionRejectReason::InvalidMsgType, Some(35))
             }
+            // Application order-entry / market data are gated + routed before this
+            // dispatch (defensive; never reached), and venue-out messages must
+            // never arrive inbound — both are a session-level protocol violation.
             DecodedMessage::NewOrderSingle(_)
             | DecodedMessage::OrderCancelRequest(_)
             | DecodedMessage::OrderCancelReplaceRequest(_)
             | DecodedMessage::OrderMassCancelRequest(_)
             | DecodedMessage::OrderStatusRequest(_)
-            | DecodedMessage::MarketDataRequest(_) => self.handle_application(message, now_ms),
-            // Venue-out messages must never arrive inbound.
-            DecodedMessage::ExecutionReport(_)
+            | DecodedMessage::MarketDataRequest(_)
+            | DecodedMessage::ExecutionReport(_)
             | DecodedMessage::OrderCancelReject(_)
             | DecodedMessage::OrderMassCancelReport(_)
+            | DecodedMessage::BusinessMessageReject(_)
             | DecodedMessage::MarketDataSnapshotFullRefresh(_)
             | DecodedMessage::MarketDataIncrementalRefresh(_)
             | DecodedMessage::MarketDataRequestReject(_) => {
                 self.session_reject(now_ms, SessionRejectReason::InvalidMsgType, Some(35))
             }
         }
-    }
-
-    /// The per-message permission gate + `Account (1)` enforcement for an
-    /// application message.
-    fn handle_application(
-        &mut self,
-        message: DecodedMessage,
-        now_ms: u64,
-    ) -> Result<Reaction, SessionError> {
-        let required = required_permission(&message);
-        if !self.has_permission(required) {
-            // Refuse in the message's own context (order-level), never a bare
-            // Reject (3) — ADR-0007 §2, 03 §8.
-            return self.permission_reject(&message, now_ms);
-        }
-
-        // `Account (1)` must be absent or equal to the authenticated account
-        // (ADR-0010 rule 4). In the v0.4 dialect only `NewOrderSingle (D)` fields
-        // tag 1 (F/G/q/H do not parse it), so the check is D-scoped here — there
-        // is no attribution hole. Any future F/G/q coverage lands with the order
-        // path (#039).
-        if let DecodedMessage::NewOrderSingle(order) = &message
-            && let Some(named) = &order.account
-            && Some(named) != self.account.as_ref()
-        {
-            return self.session_reject(
-                now_ms,
-                SessionRejectReason::ValueIsIncorrect,
-                Some(tags::ACCOUNT),
-            );
-        }
-
-        // Permitted and correctly attributed: the D/F/G order path (#039) and the
-        // V market-data path (#040) plug in here. Until then the message is
-        // accepted at the session boundary and not yet routed.
-        tracing::debug!(
-            msg_type = super::message_type_str(&message),
-            "fix application message admitted at the session boundary (routing lands in #039/#040)"
-        );
-        Ok(Reaction::cont())
     }
 
     /// Builds the order-context reject for a permission-denied application message.
@@ -747,6 +821,187 @@ impl SessionFsm {
                 cxl_rej_response_to: response_to,
                 cxl_rej_reason: CXL_REJ_REASON_NOT_AUTHORIZED,
                 text: Some(TEXT_NOT_AUTHORIZED.to_string()),
+            }
+            .encode()
+        })?;
+        Ok(Reaction::emit(vec![frame]))
+    }
+
+    /// Emits a committed [`ExecReportSpec`] stream as sequenced, resend-persisted
+    /// `ExecutionReport (8)` frames — the render side of the order path (#039).
+    ///
+    /// Each report is stamped with the next checked sender `MsgSeqNum` and stored
+    /// for resend exactly like every other venue-originated frame.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure while emitting.
+    pub(crate) fn emit_report_specs(
+        &mut self,
+        specs: Vec<ExecReportSpec>,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let mut frames = Vec::with_capacity(specs.len());
+        for spec in specs {
+            let frame = self.emit(now_ms, |header| spec.into_report(header).encode())?;
+            frames.push(frame);
+        }
+        Ok(Reaction::emit(frames))
+    }
+
+    /// Emits an order-context `ExecutionReport (8)` `Rejected` for a runtime
+    /// [`VenueError`] on a `NewOrderSingle (D)` / `OrderStatusRequest (H)` — the
+    /// reject **message** is fixed by the `NewOrder` context, the numeric
+    /// `OrdRejReason (103)` comes from the error's reason category, and the
+    /// `Text (58)` is redacted (03 §8).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure.
+    pub(crate) fn emit_order_rejected(
+        &mut self,
+        symbol: Symbol,
+        side: OrderSide,
+        price: Option<Cents>,
+        reject: &FixReject,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        self.emit_order_rejected_code(
+            symbol,
+            side,
+            price,
+            order_flow::ord_rej_reason(reject.reason),
+            reject.text.clone(),
+            now_ms,
+        )
+    }
+
+    /// Emits an order-context `ExecutionReport (8)` `Rejected` with an **explicit**
+    /// `OrdRejReason (103)` code — the primitive [`emit_order_rejected`](Self::emit_order_rejected)
+    /// delegates to, and the seam the gateway uses for a reject whose reason is not
+    /// carried by a [`FixReject`] (a conflicting-`ClOrdID` reuse → `Duplicate Order`).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure.
+    pub(crate) fn emit_order_rejected_code(
+        &mut self,
+        symbol: Symbol,
+        side: OrderSide,
+        price: Option<Cents>,
+        ord_rej_reason: u16,
+        text: Option<String>,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        // A rejected order was never sequenced, so there is no venue order id or
+        // execution id; the ExecID is a session-local marker at the reply seq.
+        let seq = self.counters.next_sender_seq;
+        let frame = self.emit(now_ms, |header| {
+            ExecutionReport {
+                header,
+                order_id: VenueOrderId::new("NONE"),
+                exec_id: ExecutionId::new(format!("REJECT:{seq}")),
+                exec_type: ExecType::Rejected,
+                ord_status: OrdStatus::Rejected,
+                symbol,
+                side,
+                leaves_qty: 0,
+                cum_qty: 0,
+                last_qty: None,
+                last_px: None,
+                price,
+                secondary_exec_id: SequenceNumber::new(0),
+                commission: None,
+                comm_type: None,
+                last_liquidity_ind: None,
+                ord_rej_reason: Some(ord_rej_reason),
+                text,
+            }
+            .encode()
+        })?;
+        Ok(Reaction::emit(vec![frame]))
+    }
+
+    /// Emits an `OrderCancelReject (9)` for a runtime [`VenueError`] on an
+    /// `OrderCancelRequest (F)` / `OrderCancelReplaceRequest (G)` — the numeric
+    /// `CxlRejReason (102)` comes from the error's reason category and
+    /// `CxlRejResponseTo (434)` from the request kind (03 §8).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure.
+    pub(crate) fn emit_cancel_reject_error(
+        &mut self,
+        order_id: VenueOrderId,
+        orig_cl_ord_id: ClientOrderId,
+        cl_ord_id: ClientOrderId,
+        response_to: CxlRejResponseTo,
+        reject: &FixReject,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let reason = order_flow::cxl_rej_reason(reject.reason);
+        let text = reject.text.clone();
+        let frame = self.emit(now_ms, |header| {
+            OrderCancelReject {
+                header,
+                order_id,
+                cl_ord_id,
+                orig_cl_ord_id,
+                ord_status: OrdStatus::Rejected,
+                cxl_rej_response_to: response_to,
+                cxl_rej_reason: reason,
+                text,
+            }
+            .encode()
+        })?;
+        Ok(Reaction::emit(vec![frame]))
+    }
+
+    /// Emits an `OrderMassCancelReport (r)` `Rejected` — the honest response to an
+    /// `OrderMassCancelRequest (q)` while venue-wide mass-cancel routing is not
+    /// wired (the per-underlying submit path does not route a mass cancel, exactly
+    /// as the REST cancel-all handler returns `400`).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure.
+    pub(crate) fn emit_mass_cancel_rejected(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let frame = self.emit(now_ms, |header| {
+            OrderMassCancelReport {
+                header,
+                mass_cancel_response: MassCancelResponse::Rejected,
+                total_affected_orders: 0,
+                affected_orders: Vec::new(),
+            }
+            .encode()
+        })?;
+        Ok(Reaction::emit(vec![frame]))
+    }
+
+    /// Emits a `BusinessMessageReject (j)` for a well-formed application message
+    /// the venue cannot business-process (an unsupported application `MsgType`).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure.
+    pub(crate) fn emit_business_reject(
+        &mut self,
+        ref_seq_num: u64,
+        ref_msg_type: String,
+        business_reject_reason: u16,
+        text: Option<String>,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let frame = self.emit(now_ms, |header| {
+            BusinessMessageReject {
+                header,
+                ref_seq_num: SequenceNumber::new(ref_seq_num),
+                ref_msg_type,
+                business_reject_reason,
+                text,
             }
             .encode()
         })?;
@@ -927,15 +1182,33 @@ impl SessionFsm {
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
         use super::FixRejectRoute;
-        let (reason, ref_tag) = match error.reject_route() {
-            FixRejectRoute::SessionReject { reason, ref_tag } => (reason, ref_tag),
-            // No typed BusinessMessageReject (j) yet (that message lands with #039
-            // order routing); classify as an invalid MsgType session reject.
-            FixRejectRoute::BusinessMessageReject => {
-                (SessionRejectReason::InvalidMsgType, Some(35))
+        match error.reject_route() {
+            FixRejectRoute::SessionReject { reason, ref_tag } => {
+                self.session_reject(now_ms, reason, ref_tag)
             }
-        };
-        self.session_reject(now_ms, reason, ref_tag)
+            // A well-formed application `MsgType` the venue has no handler for →
+            // `BusinessMessageReject (j)` (never a bare `Reject (3)` for an
+            // application message, 03 §8). `RefMsgType (372)` is the unsupported
+            // type the decode error carries; `RefSeqNum (45)` is the expected
+            // inbound seq (the malformed frame's own seq is not recovered); the
+            // `Text (58)` is a fixed, non-secret policy string.
+            FixRejectRoute::BusinessMessageReject => {
+                let ref_msg_type = match error {
+                    super::FixDecodeError::UnsupportedApplicationMsgType { msg_type } => {
+                        msg_type.clone()
+                    }
+                    _ => String::new(),
+                };
+                let ref_seq = self.counters.next_target_seq;
+                self.emit_business_reject(
+                    ref_seq,
+                    ref_msg_type,
+                    order_flow::BUSINESS_REJECT_UNSUPPORTED_MSG_TYPE,
+                    Some("unsupported message type".to_string()),
+                    now_ms,
+                )
+            }
+        }
     }
 
     /// The logon-timeout / heartbeat-cadence / revocation tick, on the injected
@@ -1029,6 +1302,29 @@ impl SessionFsm {
     }
 }
 
+/// Whether `message` is an inbound **application** message (order entry or market
+/// data) — the messages that pass through the permission gate + `Account (1)`
+/// attribution, as opposed to session admin (authenticated by the logon).
+#[must_use]
+fn is_application_message(message: &DecodedMessage) -> bool {
+    is_order_entry_message(message) || matches!(message, DecodedMessage::MarketDataRequest(_))
+}
+
+/// Whether `message` is an inbound **order-entry** message the #039 order router
+/// submits onto the sequenced path (`D`/`F`/`G`/`q`/`H`). Market data (`V`) is
+/// application but routed by #040, not here.
+#[must_use]
+fn is_order_entry_message(message: &DecodedMessage) -> bool {
+    matches!(
+        message,
+        DecodedMessage::NewOrderSingle(_)
+            | DecodedMessage::OrderCancelRequest(_)
+            | DecodedMessage::OrderCancelReplaceRequest(_)
+            | DecodedMessage::OrderMassCancelRequest(_)
+            | DecodedMessage::OrderStatusRequest(_)
+    )
+}
+
 /// The permission a message class requires, or `None` for session admin
 /// ([ADR-0007 §2](../../../docs/adr/0007-fix-credentials-and-account-model.md),
 /// [03 §6](../../../docs/03-protocol-surfaces.md#6-authentication)). There is **no
@@ -1058,10 +1354,22 @@ pub fn required_permission(message: &DecodedMessage) -> Option<Permission> {
         DecodedMessage::ExecutionReport(_)
         | DecodedMessage::OrderCancelReject(_)
         | DecodedMessage::OrderMassCancelReport(_)
+        | DecodedMessage::BusinessMessageReject(_)
         | DecodedMessage::MarketDataSnapshotFullRefresh(_)
         | DecodedMessage::MarketDataIncrementalRefresh(_)
         | DecodedMessage::MarketDataRequestReject(_) => Some(Permission::Read),
     }
+}
+
+/// The underlying ticker of a validated [`Symbol`], via the upstream
+/// [`SymbolParser`] — used only to synthesize composite `ExecID`s / mint order
+/// ids. The symbol is validated at decode, so the parse succeeds; the empty
+/// fallback on the impossible failure keeps the caller total without an `unwrap`.
+#[must_use]
+fn underlying_of_symbol(symbol: &Symbol) -> String {
+    SymbolParser::parse(symbol.as_str())
+        .map(|parsed| parsed.underlying().to_string())
+        .unwrap_or_default()
 }
 
 /// The standard header of any decoded message.
@@ -1082,6 +1390,7 @@ fn header_of(message: &DecodedMessage) -> &StandardHeader {
         DecodedMessage::ExecutionReport(m) => m.header(),
         DecodedMessage::OrderCancelReject(m) => m.header(),
         DecodedMessage::OrderMassCancelReport(m) => m.header(),
+        DecodedMessage::BusinessMessageReject(m) => m.header(),
         DecodedMessage::MarketDataRequest(m) => m.header(),
         DecodedMessage::MarketDataSnapshotFullRefresh(m) => m.header(),
         DecodedMessage::MarketDataIncrementalRefresh(m) => m.header(),
@@ -1194,8 +1503,84 @@ impl Drop for SessionLease {
     }
 }
 
+/// The ceiling on the per-session `(ClOrdID → order)` correlation map — a memory
+/// DoS bound so a long-lived session that places without cancelling cannot grow an
+/// unbounded map. Once full, further placements still submit and report, but are
+/// no longer cancel/replace/status-correlatable by the gateway (an untracked
+/// `OrigClOrdID` then answers `OrderCancelReject (9)` / an unknown-order status).
+const MAX_TRACKED_ORDERS_PER_SESSION: usize = 100_000;
+
+/// A gateway-tracked order the session placed — the correlation the FIX client
+/// namespace (`ClOrdID`) needs to reach the venue order id the gateway minted.
+///
+/// `OrderCancelRequest (F)` / `OrderCancelReplaceRequest (G)` carry `OrigClOrdID`
+/// (the client's id), but the sequenced order path cancels by the venue
+/// [`VenueOrderId`] the gateway minted for the original `D`; this per-session map
+/// bridges the two. It is session-scoped: a cancel referencing an order placed on
+/// a *prior* connection is answered unknown-order (a documented v0.4 limitation —
+/// the durable `(account, ClOrdID) → order_id` index lands with a later
+/// idempotency issue).
+#[derive(Debug, Clone)]
+struct PlacedOrder {
+    order_id: VenueOrderId,
+    symbol: Symbol,
+    side: OrderSide,
+    quantity: u64,
+    /// The economic payload of the placing message, so a same-`ClOrdID` retry can
+    /// be classified byte-identical (re-render the real order) vs conflicting
+    /// (reject) — the gateway-side cross-protocol idempotency guard (#039).
+    fingerprint: OrderFingerprint,
+}
+
+/// The economically-meaningful fields of a `NewOrderSingle (D)` (or the add leg of
+/// a `G`) — everything that determines the derived `VenueCommand`, and nothing
+/// that changes across a legitimate retry (no `MsgSeqNum`, no `SendingTime`, no
+/// `TransactTime`). Two placements with the same fingerprint derive the same
+/// command, so a same-`ClOrdID` resend of one is a byte-identical retry, not a new
+/// order ([fix-dialect §4](../../../docs/specs/fix-dialect.md#4-identifiers-correlation-and-idempotency)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderFingerprint {
+    symbol: Symbol,
+    side: OrderSide,
+    ord_type: OrdType,
+    price: Option<Cents>,
+    order_qty: u64,
+    time_in_force: FixTif,
+    expire_time: Option<UtcTimestamp>,
+}
+
+impl OrderFingerprint {
+    /// The fingerprint of a `NewOrderSingle (D)`.
+    fn of_new_order(order: &NewOrderSingle) -> Self {
+        Self {
+            symbol: order.symbol.clone(),
+            side: order.side,
+            ord_type: order.ord_type,
+            price: order.price,
+            order_qty: order.order_qty,
+            time_in_force: order.time_in_force,
+            expire_time: order.expire_time.clone(),
+        }
+    }
+
+    /// The fingerprint of the add leg of an `OrderCancelReplaceRequest (G)` (the
+    /// replacement rests as `GTC`; a `G` carries no `ExpireTime`).
+    fn of_replace(replace: &OrderCancelReplaceRequest) -> Self {
+        Self {
+            symbol: replace.symbol.clone(),
+            side: replace.side,
+            ord_type: replace.ord_type,
+            price: replace.price,
+            order_qty: replace.order_qty,
+            time_in_force: FixTif::Gtc,
+            expire_time: None,
+        }
+    }
+}
+
 /// The real per-connection FIX session — the [`FixSession`] the acceptor drives,
-/// wrapping the synchronous [`SessionFsm`] with the async credential verify.
+/// wrapping the synchronous [`SessionFsm`] with the async credential verify and
+/// the async order-path routing (#039).
 pub struct VenueFixSession {
     peer: SocketAddr,
     state: Arc<AppState>,
@@ -1206,6 +1591,9 @@ pub struct VenueFixSession {
     /// The held lease for this session's `SessionKey`, set once the logon is
     /// admitted; its RAII drop releases the key so a later reconnect can re-admit.
     lease: Option<SessionLease>,
+    /// `ClOrdID → placed order` for this session's cancel/replace/status
+    /// correlation (bounded at [`MAX_TRACKED_ORDERS_PER_SESSION`]).
+    placed: HashMap<ClientOrderId, PlacedOrder>,
 }
 
 impl VenueFixSession {
@@ -1226,6 +1614,7 @@ impl VenueFixSession {
             fsm,
             leases,
             lease: None,
+            placed: HashMap::new(),
         }
     }
 
@@ -1385,6 +1774,431 @@ impl VenueFixSession {
         self.lease = Some(lease);
         Ok(reaction)
     }
+
+    // ------------------------------------------------------------------------
+    // Order-path routing (#039) — the async side of the sequenced order path
+    // ------------------------------------------------------------------------
+
+    /// The per-op rate-limit decision for a mutating order (`D`/`F`/`G`), keyed on
+    /// the bound account + its revocation epoch — the **same** sliding window
+    /// REST/WS enforce, so throttling is identical across surfaces. Records the hit.
+    fn rate_limited(&self) -> bool {
+        let Some(account) = self.fsm.account.clone() else {
+            return true;
+        };
+        !self
+            .state
+            .auth()
+            .rate_limiter()
+            .check_and_record_status(&RateLimitKey::Account {
+                account,
+                revocation_epoch: self.fsm.session_epoch,
+            })
+            .allowed
+    }
+
+    /// Tracks a placed order for cancel/replace/status correlation, bounded at
+    /// [`MAX_TRACKED_ORDERS_PER_SESSION`].
+    #[allow(clippy::too_many_arguments)]
+    fn track_placed(
+        &mut self,
+        cl_ord_id: ClientOrderId,
+        order_id: VenueOrderId,
+        symbol: Symbol,
+        side: OrderSide,
+        quantity: u64,
+        fingerprint: OrderFingerprint,
+    ) {
+        if self.placed.len() >= MAX_TRACKED_ORDERS_PER_SESSION
+            && !self.placed.contains_key(&cl_ord_id)
+        {
+            tracing::debug!(
+                peer = %self.peer,
+                "fix order-tracking map is full; order placed but not cancel-correlatable"
+            );
+            return;
+        }
+        self.placed.insert(
+            cl_ord_id,
+            PlacedOrder {
+                order_id,
+                symbol,
+                side,
+                quantity,
+                fingerprint,
+            },
+        );
+    }
+
+    /// Re-renders the true current state of a tracked order from the committed
+    /// executions store (`New` when resting/unfilled, `PartiallyFilled`/`Filled`
+    /// per the folded fills) — the byte-identical-retry response and the
+    /// `OrderStatusRequest (H)` response, so neither fabricates state.
+    fn render_tracked_status(
+        &mut self,
+        placed: &PlacedOrder,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let Some(account) = self.fsm.account.clone() else {
+            return Ok(Reaction::cont());
+        };
+        let legs = taker_legs_for_order(&self.state, &account, &placed.order_id);
+        let cum: u64 = legs
+            .iter()
+            .map(|leg| leg.quantity)
+            .fold(0u64, |acc, quantity| {
+                acc.checked_add(quantity).unwrap_or(acc)
+            });
+        let underlying = underlying_of_symbol(&placed.symbol);
+        let spec = order_flow::render_status_report(
+            placed.symbol.clone(),
+            placed.side,
+            placed.order_id.clone(),
+            placed.quantity,
+            cum,
+            legs.last(),
+            self.state.lineage_id(),
+            &underlying,
+        );
+        self.fsm.emit_report_specs(vec![spec], now_ms)
+    }
+
+    /// Routes a permitted, attributed order-entry message onto the sequenced path
+    /// (`handle_active` has already gated permission + attribution and consumed the
+    /// inbound seq).
+    async fn route_order(
+        &mut self,
+        message: DecodedMessage,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        match message {
+            DecodedMessage::NewOrderSingle(order) => self.route_new_order(order, now_ms).await,
+            DecodedMessage::OrderCancelRequest(cancel) => self.route_cancel(cancel, now_ms).await,
+            DecodedMessage::OrderCancelReplaceRequest(replace) => {
+                self.route_replace(replace, now_ms).await
+            }
+            DecodedMessage::OrderMassCancelRequest(_) => self.fsm.emit_mass_cancel_rejected(now_ms),
+            DecodedMessage::OrderStatusRequest(status) => self.route_status(status, now_ms),
+            // `handle_active` only routes order-entry messages here (unreachable).
+            _ => Ok(Reaction::cont()),
+        }
+    }
+
+    /// `NewOrderSingle (D)` → the identical [`VenueCommand::AddOrder`] REST
+    /// produces, submitted through the same [`AppState::submit`] seam, with the
+    /// committed fills rendered as `ExecutionReport (8)`. Any pre-submit or
+    /// runtime failure is a context-correct `8 Rejected` with the reason from the
+    /// error seam.
+    async fn route_new_order(
+        &mut self,
+        order: NewOrderSingle,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let Some(account) = self.fsm.account.clone() else {
+            return Ok(Reaction::cont());
+        };
+
+        // Cross-protocol idempotency, resolved at the gateway BEFORE any mint /
+        // submit. A same-session business retry re-sends the same `ClOrdID` with a
+        // NEW `MsgSeqNum` (the standard retry after a dropped ack) — the transport
+        // dup-seq guard does not catch it, so without this it would mint a fresh
+        // order id, journal a phantom command, overwrite the real correlation, and
+        // render a fabricated `New`. Instead:
+        //   - byte-identical retry → re-render the REAL order's current state, no
+        //     submit, correlation untouched (a later `F` still cancels the real
+        //     order);
+        //   - conflicting reuse (same `ClOrdID`, different economics) → reject
+        //     (`Duplicate Order`), never overwriting the real correlation.
+        // A cross-session resend on a fresh connection has an empty `placed` and
+        // falls through to a normal placement — the deferred Receipt-seam
+        // limitation tracked as
+        // [#99](https://github.com/joaquinbejar/fauxchange/issues/99).
+        let fingerprint = OrderFingerprint::of_new_order(&order);
+        if let Some(placed) = self.placed.get(&order.cl_ord_id).cloned() {
+            if placed.fingerprint == fingerprint {
+                return self.render_tracked_status(&placed, now_ms);
+            }
+            return self.fsm.emit_order_rejected_code(
+                order.symbol.clone(),
+                order.side,
+                order.price,
+                order_flow::ORD_REJ_REASON_DUPLICATE,
+                Some(order_flow::DUPLICATE_CLORDID_TEXT.to_string()),
+                now_ms,
+            );
+        }
+
+        if self.rate_limited() {
+            return self.reject_new_order(&order, &VenueError::RateLimited, now_ms);
+        }
+        let owner = match owner_for(&self.state, &account) {
+            Ok(owner) => owner,
+            Err(error) => return self.reject_new_order(&order, &error, now_ms),
+        };
+        let underlying = match SymbolParser::parse(order.symbol.as_str()) {
+            Ok(parsed) => parsed.underlying().to_string(),
+            Err(error) => return self.reject_new_order(&order, &VenueError::from(error), now_ms),
+        };
+        // The effective resolved TIF (market is the non-resting IOC primitive; a
+        // limit resolves + validates its GTD expiry) — used to render the terminal
+        // report and byte-identical to the command's own TIF.
+        let tif = match order.ord_type {
+            OrdType::Market => SeamTif::Ioc,
+            OrdType::Limit => {
+                match order_flow::seam_time_in_force(
+                    order.time_in_force,
+                    order.expire_time.as_ref(),
+                ) {
+                    Ok(tif) => tif,
+                    Err(error) => return self.reject_new_order(&order, &error, now_ms),
+                }
+            }
+        };
+        let order_id = mint_order_id(self.state.lineage_id(), &underlying);
+        let command =
+            match order_flow::to_add_command(&order, order_id.clone(), account.clone(), owner) {
+                Ok(command) => command,
+                Err(error) => return self.reject_new_order(&order, &error, now_ms),
+            };
+        match self.state.submit(command).await {
+            Ok(receipt) => {
+                self.track_placed(
+                    order.cl_ord_id.clone(),
+                    order_id.clone(),
+                    order.symbol.clone(),
+                    order.side,
+                    order.order_qty,
+                    fingerprint,
+                );
+                let legs = immediate_execution_records(
+                    &self.state,
+                    &account,
+                    &order_id,
+                    receipt.underlying_sequence,
+                );
+                let specs = order_flow::render_new_order_reports(
+                    &order,
+                    &order_id,
+                    receipt.underlying_sequence,
+                    self.state.lineage_id(),
+                    &underlying,
+                    tif,
+                    &legs,
+                );
+                self.fsm.emit_report_specs(specs, now_ms)
+            }
+            Err(error) => self.reject_new_order(&order, &error, now_ms),
+        }
+    }
+
+    /// The `8 Rejected` for a `NewOrderSingle` failure — the reject message is
+    /// fixed by the `NewOrder` context, the reason by the error.
+    fn reject_new_order(
+        &mut self,
+        order: &NewOrderSingle,
+        error: &VenueError,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let reject = error.fix_reject(FixRejectContext::NewOrder);
+        self.fsm.emit_order_rejected(
+            order.symbol.clone(),
+            order.side,
+            order.price,
+            &reject,
+            now_ms,
+        )
+    }
+
+    /// `OrderCancelRequest (F)` → [`VenueCommand::CancelOrder`], resolving the
+    /// client `OrigClOrdID` to the venue order id the gateway minted. A committed
+    /// cancel renders `ExecutionReport (8) Canceled`; an unknown order or a runtime
+    /// failure renders `OrderCancelReject (9)`.
+    async fn route_cancel(
+        &mut self,
+        cancel: OrderCancelRequest,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let Some(account) = self.fsm.account.clone() else {
+            return Ok(Reaction::cont());
+        };
+        if self.rate_limited() {
+            return self.reject_cancel(
+                VenueOrderId::new("NONE"),
+                &cancel.orig_cl_ord_id,
+                &cancel.cl_ord_id,
+                CxlRejResponseTo::OrderCancelRequest,
+                &VenueError::RateLimited,
+                now_ms,
+            );
+        }
+        let Some(placed) = self.placed.get(&cancel.orig_cl_ord_id).cloned() else {
+            return self.reject_cancel(
+                VenueOrderId::new("NONE"),
+                &cancel.orig_cl_ord_id,
+                &cancel.cl_ord_id,
+                CxlRejResponseTo::OrderCancelRequest,
+                &VenueError::NotFound("unknown order".to_string()),
+                now_ms,
+            );
+        };
+        let command = order_flow::to_cancel_command(&cancel, account, placed.order_id.clone());
+        match self.state.submit(command).await {
+            Ok(receipt) => {
+                let underlying = underlying_of_symbol(&placed.symbol);
+                let spec = order_flow::render_cancel_report(
+                    placed.symbol.clone(),
+                    placed.side,
+                    placed.order_id.clone(),
+                    receipt.underlying_sequence,
+                    self.state.lineage_id(),
+                    &underlying,
+                );
+                self.placed.remove(&cancel.orig_cl_ord_id);
+                self.fsm.emit_report_specs(vec![spec], now_ms)
+            }
+            Err(error) => self.reject_cancel(
+                placed.order_id.clone(),
+                &cancel.orig_cl_ord_id,
+                &cancel.cl_ord_id,
+                CxlRejResponseTo::OrderCancelRequest,
+                &error,
+                now_ms,
+            ),
+        }
+    }
+
+    /// `OrderCancelReplaceRequest (G)` → the non-atomic [`VenueCommand::Replace`].
+    /// A committed replace renders `ExecutionReport (8) Replaced` + the add leg's
+    /// fills; an unknown order or a runtime failure renders `OrderCancelReject (9)`.
+    async fn route_replace(
+        &mut self,
+        replace: OrderCancelReplaceRequest,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let Some(account) = self.fsm.account.clone() else {
+            return Ok(Reaction::cont());
+        };
+        if self.rate_limited() {
+            return self.reject_cancel(
+                VenueOrderId::new("NONE"),
+                &replace.orig_cl_ord_id,
+                &replace.cl_ord_id,
+                CxlRejResponseTo::OrderCancelReplaceRequest,
+                &VenueError::RateLimited,
+                now_ms,
+            );
+        }
+        let Some(placed) = self.placed.get(&replace.orig_cl_ord_id).cloned() else {
+            return self.reject_cancel(
+                VenueOrderId::new("NONE"),
+                &replace.orig_cl_ord_id,
+                &replace.cl_ord_id,
+                CxlRejResponseTo::OrderCancelReplaceRequest,
+                &VenueError::NotFound("unknown order".to_string()),
+                now_ms,
+            );
+        };
+        let underlying = underlying_of_symbol(&replace.symbol);
+        let new_order_id = mint_order_id(self.state.lineage_id(), &underlying);
+        let command = order_flow::to_replace_command(
+            &replace,
+            account.clone(),
+            placed.order_id.clone(),
+            new_order_id.clone(),
+        );
+        match self.state.submit(command).await {
+            Ok(receipt) => {
+                // The old order is replaced; re-key tracking under the new ClOrdID.
+                self.placed.remove(&replace.orig_cl_ord_id);
+                self.track_placed(
+                    replace.cl_ord_id.clone(),
+                    new_order_id.clone(),
+                    replace.symbol.clone(),
+                    replace.side,
+                    replace.order_qty,
+                    OrderFingerprint::of_replace(&replace),
+                );
+                let legs = immediate_execution_records(
+                    &self.state,
+                    &account,
+                    &new_order_id,
+                    receipt.underlying_sequence,
+                );
+                let specs = order_flow::render_replace_reports(
+                    &replace,
+                    &new_order_id,
+                    receipt.underlying_sequence,
+                    self.state.lineage_id(),
+                    &underlying,
+                    &legs,
+                );
+                self.fsm.emit_report_specs(specs, now_ms)
+            }
+            Err(error) => self.reject_cancel(
+                placed.order_id.clone(),
+                &replace.orig_cl_ord_id,
+                &replace.cl_ord_id,
+                CxlRejResponseTo::OrderCancelReplaceRequest,
+                &error,
+                now_ms,
+            ),
+        }
+    }
+
+    /// The `OrderCancelReject (9)` for an `F`/`G` failure.
+    fn reject_cancel(
+        &mut self,
+        order_id: VenueOrderId,
+        orig_cl_ord_id: &ClientOrderId,
+        cl_ord_id: &ClientOrderId,
+        response_to: CxlRejResponseTo,
+        error: &VenueError,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let reject = error.fix_reject(FixRejectContext::CancelReplace);
+        self.fsm.emit_cancel_reject_error(
+            order_id,
+            orig_cl_ord_id.clone(),
+            cl_ord_id.clone(),
+            response_to,
+            &reject,
+            now_ms,
+        )
+    }
+
+    /// `OrderStatusRequest (H)` → an `ExecutionReport (8)` current status folded
+    /// from the order's committed fills. The gateway cannot read the resting book,
+    /// so a resting-but-unfilled order reports `New`; an order not tracked this
+    /// session (unknown, prior-session, or past the tracking cap) is an honest
+    /// unknown-order rejection.
+    fn route_status(
+        &mut self,
+        status: OrderStatusRequest,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let placed = match (&status.order_id, &status.cl_ord_id) {
+            (Some(order_id), _) => self
+                .placed
+                .values()
+                .find(|placed| &placed.order_id == order_id)
+                .cloned(),
+            (None, Some(cl_ord_id)) => self.placed.get(cl_ord_id).cloned(),
+            // Decode requires one of OrderID(37)/ClOrdID(11); this is defensive.
+            (None, None) => None,
+        };
+        let Some(placed) = placed else {
+            let reject = VenueError::NotFound("order not found or not readable".to_string())
+                .fix_reject(FixRejectContext::NewOrder);
+            return self.fsm.emit_order_rejected(
+                status.symbol.clone(),
+                OrderSide::Buy,
+                None,
+                &reject,
+                now_ms,
+            );
+        };
+        self.render_tracked_status(&placed, now_ms)
+    }
 }
 
 impl FixSession for VenueFixSession {
@@ -1411,7 +2225,14 @@ impl FixSession for VenueFixSession {
             },
             SessionPhase::Active | SessionPhase::AwaitingResend => {
                 let revoked = self.revoked();
-                self.fsm.handle_active(message, now_ms, revoked)
+                match self.fsm.handle_active(message, now_ms, revoked) {
+                    // A synchronous session-admin reply or a gated reject.
+                    Ok(ActiveDisposition::Reacted(reaction)) => Ok(reaction),
+                    // A permitted order-entry message: submit onto the sequenced
+                    // path and render its reports on the same outbound counter.
+                    Ok(ActiveDisposition::Route(order)) => self.route_order(*order, now_ms).await,
+                    Err(error) => Err(error),
+                }
             }
             SessionPhase::Closing => Ok(Reaction::close_silent()),
         };
@@ -1536,6 +2357,17 @@ mod tests {
         fsm.admit_logon(AccountId::new("acct-1"), permissions, 0, 30, false, 1, 0)
             .expect("admit");
         fsm
+    }
+
+    /// Unwraps a synchronous [`ActiveDisposition::Reacted`], panicking on a
+    /// [`Route`](ActiveDisposition::Route) (the message unexpectedly routed).
+    fn reacted(disposition: ActiveDisposition) -> Reaction {
+        match disposition {
+            ActiveDisposition::Reacted(reaction) => reaction,
+            ActiveDisposition::Route(message) => {
+                panic!("expected a synchronous Reacted, got Route({message:?})")
+            }
+        }
     }
 
     fn heartbeat(seq: u64) -> DecodedMessage {
@@ -1855,7 +2687,7 @@ mod tests {
     #[test]
     fn test_in_order_heartbeat_advances_inbound_counter() {
         let mut fsm = active_fsm(store(), vec![Permission::Trade]);
-        let reaction = fsm.handle_active(heartbeat(2), 0, false).expect("ok");
+        let reaction = reacted(fsm.handle_active(heartbeat(2), 0, false).expect("ok"));
         assert!(reaction.frames().is_empty());
         assert_eq!(fsm.counters().next_target_seq, 3);
     }
@@ -1867,7 +2699,7 @@ mod tests {
             header: header(CLIENT, VENUE, 2),
             test_req_id: "PING-42".to_string(),
         });
-        let reaction = fsm.handle_active(test, 0, false).expect("ok");
+        let reaction = reacted(fsm.handle_active(test, 0, false).expect("ok"));
         match decode(&reaction.frames()[0]) {
             Ok(DecodedMessage::Heartbeat(hb)) => {
                 assert_eq!(hb.test_req_id.as_deref(), Some("PING-42"));
@@ -1880,7 +2712,7 @@ mod tests {
     fn test_inbound_gap_triggers_resend_request_and_awaiting_resend() {
         let mut fsm = active_fsm(store(), vec![Permission::Trade]);
         // Expected seq 2; a seq-5 message is a gap.
-        let reaction = fsm.handle_active(heartbeat(5), 0, false).expect("ok");
+        let reaction = reacted(fsm.handle_active(heartbeat(5), 0, false).expect("ok"));
         assert_eq!(fsm.phase(), SessionPhase::AwaitingResend);
         // The inbound counter is NOT advanced past the gap.
         assert_eq!(fsm.counters().next_target_seq, 2);
@@ -1896,7 +2728,7 @@ mod tests {
     #[test]
     fn test_permission_gate_refuses_order_from_read_only_session_order_level() {
         let mut fsm = active_fsm(store(), vec![Permission::Read]);
-        let reaction = fsm.handle_active(new_order(2, None), 0, false).expect("ok");
+        let reaction = reacted(fsm.handle_active(new_order(2, None), 0, false).expect("ok"));
         match decode(&reaction.frames()[0]) {
             Ok(DecodedMessage::ExecutionReport(report)) => {
                 assert_eq!(report.ord_status, OrdStatus::Rejected);
@@ -1909,11 +2741,16 @@ mod tests {
     }
 
     #[test]
-    fn test_permission_gate_admits_order_from_trade_session() {
+    fn test_permission_gate_routes_order_from_trade_session() {
         let mut fsm = active_fsm(store(), vec![Permission::Trade]);
-        let reaction = fsm.handle_active(new_order(2, None), 0, false).expect("ok");
-        // Admitted at the session boundary; routing is #039, so no reject frame.
-        assert!(reaction.frames().is_empty());
+        // A permitted, attributed order routes to the async order path (#039); the
+        // inbound seq is consumed and no synchronous reject frame is produced.
+        match fsm.handle_active(new_order(2, None), 0, false).expect("ok") {
+            ActiveDisposition::Route(message) => {
+                assert!(matches!(*message, DecodedMessage::NewOrderSingle(_)));
+            }
+            other => panic!("expected Route(NewOrderSingle), got {other:?}"),
+        }
         assert_eq!(fsm.counters().next_target_seq, 3);
     }
 
@@ -1921,9 +2758,10 @@ mod tests {
     fn test_account_field_mismatch_is_a_session_reject() {
         let mut fsm = active_fsm(store(), vec![Permission::Trade]);
         let foreign = Some(AccountId::new("someone-else"));
-        let reaction = fsm
-            .handle_active(new_order(2, foreign), 0, false)
-            .expect("ok");
+        let reaction = reacted(
+            fsm.handle_active(new_order(2, foreign), 0, false)
+                .expect("ok"),
+        );
         match decode(&reaction.frames()[0]) {
             Ok(DecodedMessage::Reject(reject)) => {
                 assert_eq!(reject.ref_tag_id, Some(tags::ACCOUNT));
@@ -1937,17 +2775,21 @@ mod tests {
     }
 
     #[test]
-    fn test_account_field_equal_to_authenticated_is_accepted() {
+    fn test_account_field_equal_to_authenticated_routes() {
         let mut fsm = active_fsm(store(), vec![Permission::Trade]);
         let same = Some(AccountId::new("acct-1"));
-        let reaction = fsm.handle_active(new_order(2, same), 0, false).expect("ok");
-        assert!(reaction.frames().is_empty());
+        match fsm.handle_active(new_order(2, same), 0, false).expect("ok") {
+            ActiveDisposition::Route(message) => {
+                assert!(matches!(*message, DecodedMessage::NewOrderSingle(_)));
+            }
+            other => panic!("expected Route(NewOrderSingle), got {other:?}"),
+        }
     }
 
     #[test]
     fn test_revoked_session_is_logged_out_and_closed() {
         let mut fsm = active_fsm(store(), vec![Permission::Trade]);
-        let reaction = fsm.handle_active(heartbeat(2), 0, true).expect("ok");
+        let reaction = reacted(fsm.handle_active(heartbeat(2), 0, true).expect("ok"));
         assert_eq!(reaction.control(), SessionControl::Close);
         assert!(matches!(
             decode(&reaction.frames()[0]),
@@ -1992,7 +2834,7 @@ mod tests {
             begin_seq_no: SeqNum::new(1),
             end_seq_no: SeqNum::new(3),
         });
-        let reaction = fsm.handle_active(resend, 0, false).expect("ok");
+        let reaction = reacted(fsm.handle_active(resend, 0, false).expect("ok"));
         // The replay covers seqs 1..=3 (some as gap-fills, some as replayed frames).
         assert!(!reaction.frames().is_empty());
     }
@@ -2021,7 +2863,7 @@ mod tests {
                 begin_seq_no: SeqNum::new(1),
                 end_seq_no: SeqNum::new(hostile_end),
             });
-            let reaction = fsm.handle_active(resend, 0, false).expect("ok");
+            let reaction = reacted(fsm.handle_active(resend, 0, false).expect("ok"));
             assert!(
                 reaction.frames().len() <= 8,
                 "resend to EndSeqNo={hostile_end} produced {} frames — not clamped to last-sent",

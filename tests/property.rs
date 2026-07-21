@@ -50,10 +50,12 @@ use fauxchange::gateway::fix::enums::{
 use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
 use fauxchange::gateway::fix::marketdata::{MarketDataSnapshotFullRefresh, SnapshotEntry};
 use fauxchange::gateway::fix::order::NewOrderSingle;
+use fauxchange::gateway::fix::order_flow::to_add_command;
 use fauxchange::gateway::fix::price::{
     PriceScale, parse_decimal_to_cents, render_cents_to_decimal,
 };
 use fauxchange::gateway::fix::{DecodedMessage, decode};
+use fauxchange::gateway::rest::support::add_order_command;
 use fauxchange::market_maker::{QuoteInput, Quoter};
 use fauxchange::simulation::{JournalStream, replay_streams};
 use fauxchange::subscription::OrderbookSubscriptionManager;
@@ -1358,5 +1360,90 @@ proptest! {
             .load_counters(&account_a)
             .map_err(|e| TestCaseError::fail(format!("load a: {e:?}")))?;
         prop_assert_eq!(a_after.next_target_seq, reset_to);
+    }
+}
+
+proptest! {
+    /// REST ≡ FIX order-entry parity **by construction** ([03 §7](../docs/03-protocol-surfaces.md#7-protocol-parity-guarantees)):
+    /// for the same logical order (side, price, quantity, time-in-force), the FIX
+    /// `NewOrderSingle (D)` translation and the REST order handler derive the
+    /// byte-identical `VenueCommand::AddOrder` and carry the same account-scoped
+    /// idempotency key (the client order id). Both call the one shared
+    /// `add_order_command` builder, so the command cannot diverge across surfaces —
+    /// this proves the FIX wire-enum → matching-seam mapping agrees with the REST
+    /// one over the whole admitted domain.
+    #[test]
+    fn rest_and_fix_order_derive_the_same_command_and_idempotency_key(
+        is_buy in any::<bool>(),
+        price in 1u64..=1_000_000u64,
+        quantity in 1u64..=10_000u64,
+        tif_index in 0usize..3,
+    ) {
+        let symbol = Symbol::parse("BTC-20240329-50000-C")
+            .map_err(|e| TestCaseError::fail(format!("symbol: {e:?}")))?;
+        let account = AccountId::new("acct-1");
+        let owner = Hash32([0x11; 32]);
+        // The gateways mint DIFFERENT provisional order ids (a per-surface label,
+        // not a venue decision — 03 §7 normalization), so the parity assertion
+        // holds the order id equal and compares the rest.
+        let order_id = VenueOrderId::new("run-1:BTC:g0:0");
+        let cl_ord_id = ClientOrderId::new("CLIENT-42");
+
+        let (fix_side, seam_side) = if is_buy {
+            (OrderSide::Buy, SeamSide::Buy)
+        } else {
+            (OrderSide::Sell, SeamSide::Sell)
+        };
+        let (fix_tif, seam_tif) = match tif_index {
+            0 => (FixTif::Gtc, SeamTif::Gtc),
+            1 => (FixTif::Ioc, SeamTif::Ioc),
+            _ => (FixTif::Fok, SeamTif::Fok),
+        };
+
+        // The FIX twin's typed message.
+        let fix_order = NewOrderSingle {
+            header: StandardHeader::new(
+                CompId::new("CLIENT").expect("comp"),
+                CompId::new("FAUXCHANGE").expect("comp"),
+                SeqNum::new(7),
+                UtcTimestamp::from_epoch_ms(0),
+            ),
+            cl_ord_id: cl_ord_id.clone(),
+            account: None,
+            symbol: symbol.clone(),
+            side: fix_side,
+            transact_time: UtcTimestamp::from_epoch_ms(0),
+            ord_type: FixOrdType::Limit,
+            price: Some(Cents::new(price)),
+            order_qty: quantity,
+            time_in_force: fix_tif,
+            expire_time: None,
+        };
+        let fix_command = to_add_command(&fix_order, order_id.clone(), account.clone(), owner)
+            .map_err(|e| TestCaseError::fail(format!("fix command: {e:?}")))?;
+
+        // The REST twin — the same shared builder the REST order handler calls,
+        // with the seam values REST's `seam_side` / `seam_tif` resolve to.
+        let rest_command = add_order_command(
+            symbol,
+            order_id,
+            account,
+            owner,
+            Some(cl_ord_id.clone()),
+            seam_side,
+            OrderType::Limit,
+            Some(Cents::new(price)),
+            quantity,
+            seam_tif,
+        );
+
+        prop_assert_eq!(&fix_command, &rest_command);
+        // The idempotency key rides the command's client_order_id.
+        match &fix_command {
+            VenueCommand::AddOrder { client_order_id, .. } => {
+                prop_assert_eq!(client_order_id.as_ref(), Some(&cl_ord_id));
+            }
+            other => return Err(TestCaseError::fail(format!("expected AddOrder, got {other:?}"))),
+        }
     }
 }
