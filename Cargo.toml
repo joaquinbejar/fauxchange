@@ -31,7 +31,22 @@ option-chain-orderbook = { version = "0.7", features = ["sequencer"] }
 # + `spawn`), `sync` (`mpsc` / `oneshot`), and `macros` (`#[tokio::test]`); the
 # `sequencer` feature above already activates tokio `rt` + `sync`, so this adds
 # only the `macros` proc-macro to the tree. MIT, maintained by the tokio project.
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
+# The async runtime. #006 needed only `rt` + `sync` + `macros` (the actor
+# mailbox); #013 runs the live REST server and the periodic rate-limit
+# `sweep_expired` task, so the feature set grows to what serving needs:
+#   - `rt-multi-thread` — the binary's multi-thread runtime (`main.rs`).
+#   - `net`             — `TcpListener` for `axum::serve`.
+#   - `time`            — `tokio::time::interval` driving the bounded
+#     `RateLimiter::sweep_expired` reclaim task (#011 seam obligation).
+# Still no new crate — these are feature flags on the already-present tokio 1.
+tokio = { version = "1", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "macros",
+    "net",
+    "time",
+] }
 # Needed directly only to name `OptionStyle` / `ExpirationDate`: upstream
 # `option-chain-orderbook` v0.7.0 does not re-export them, so they must come
 # from `optionstratlib` at the seam. `default-features = false` keeps the build
@@ -45,12 +60,44 @@ optionstratlib = { version = "0.17", default-features = false }
 # dependency adds NO new version to the tree. MIT/Apache-2.0, maintained by the
 # `xacrimon/dashmap` project.
 dashmap = "6"
-# REST/WS boundary rendering: `IntoResponse` for `VenueError`, `Json` bodies,
-# and the `http` status/header types (re-exported through `axum::http`). Lean
-# feature set — only `json`, no server/runtime features — because #003 renders
-# responses but does not run the Axum server (that lands with the REST gateway,
-# #012). MIT, maintained by the tokio project.
-axum = { version = "0.8", default-features = false, features = ["json"] }
+# REST/WS boundary + the live Axum server (#013). `#003` needed only `json`
+# (render `VenueError` / `Json` bodies); #013 turns the router into a running
+# server, so the feature set grows to what the server actually uses:
+#   - `json`   — `Json<T>` request/response bodies (unchanged from #003).
+#   - `query`  — the `Query<T>` extractor for the list/OHLC query DTOs.
+#   - `http1`  — the HTTP/1 protocol `axum::serve` speaks (no HTTP/2 dep pulled).
+#   - `tokio`  — `axum::serve`, `TcpListener` wiring, and
+#     `into_make_service_with_connect_info::<SocketAddr>()` so the REAL socket
+#     peer reaches the rate-limit key (the `PeerAddr` seam, #011/#013).
+# `Path`, `State`, and `middleware::from_fn*` need no feature flag. No new crate
+# enters the tree — these are feature flags on the already-present axum 0.8.
+# MIT, maintained by the tokio project.
+axum = { version = "0.8", default-features = false, features = [
+    "json",
+    "query",
+    "http1",
+    "tokio",
+] }
+# Swagger UI served at boot (#013). `utoipa-swagger-ui` 9.x is the version that
+# targets **axum 0.8** + **utoipa 5** (verified against the crate manifest:
+# `[dependencies.axum] version = "0.8.0"`, `[dependencies.utoipa] version =
+# "5.0.0"`), matching the pinned `utoipa = "5"`. Feature set is deliberately
+# minimal and OFFLINE-SAFE:
+#   - `axum`     — the axum 0.8 `SwaggerUi` router integration.
+#   - `vendored` — serve the Swagger UI assets from the cached
+#     `utoipa-swagger-ui-vendored` crate, so the build NEVER downloads assets
+#     over the network (the default build.rs path pulls `reqwest`; the `reqwest`
+#     feature is left OFF, so that build-dependency is not compiled).
+# `default-features = false` drops the `url` default (unused here). Audit note:
+# this adds `rust-embed` 8, `zip` 3 (build-dep, unpacks the vendored asset zip),
+# `mime` 0.3, and `utoipa-swagger-ui-vendored` 0.1 to the tree — all pure-Rust,
+# permissively licensed, and already resolved in the local cache; `cargo audit`
+# / `cargo deny` (#019) gate them. MIT/Apache-2.0, maintained by the utoipa
+# project.
+utoipa-swagger-ui = { version = "9", default-features = false, features = [
+    "axum",
+    "vendored",
+] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 # Structured logging for the actor lifecycle and its degraded paths — the venue
@@ -61,6 +108,19 @@ thiserror = "2"
 # upstream stack, so this direct dependency adds NO new version to the tree.
 # MIT, maintained by the tokio project.
 tracing = "0.1"
+# The `tracing` subscriber the binary installs at startup (#013): without a
+# subscriber every `tracing` event is silently dropped, so the server must
+# install one before it logs. `default-features = false` + `["fmt","env-filter"]`
+# gives exactly a formatting subscriber filtered by `RUST_LOG` — no ANSI/JSON
+# extras pulled unless asked. It is the standard tokio-project subscriber (the
+# canonical pair for `tracing`); it enters the tree at the binary only. `fmt`
+# depends only on `tracing-core`; `env-filter` adds `regex`/`matchers`
+# (already resolved via the dev/`proptest` tree). MIT, maintained by the tokio
+# project; `cargo audit` / `cargo deny` (#019) gate it.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+    "env-filter",
+] }
 # OpenAPI schema derivation: `ToSchema` on every REST/WS DTO and on the shared
 # error envelopes, so #013 can register them in the OpenAPI document. Version 5
 # (`5.5.0`) is already resolved transitively via the upstream stack, so this

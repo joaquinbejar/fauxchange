@@ -628,8 +628,14 @@ pub struct PlaceMarketOrderResponse {
 /// Response for canceling an order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CancelOrderResponse {
-    /// Whether the order was canceled.
+    /// Whether the cancel command was **accepted and sequenced** (not a
+    /// confirmation the resting order existed — the found/not-found outcome is
+    /// not carried on the receipt until the `Receipt`→`VenueOutcome` seam lands).
     pub success: bool,
+    /// The `underlying_sequence` of the resulting event, for cross-surface
+    /// correlation with the WS/FIX fan-out ([03 §3](../docs/03-protocol-surfaces.md)).
+    #[schema(value_type = u64)]
+    pub sequence: SequenceNumber,
     /// Human-readable, client-safe message.
     pub message: String,
 }
@@ -705,6 +711,21 @@ pub struct OrderListResponse {
 // Bulk and cancel-all
 // ============================================================================
 
+/// The maximum number of orders one `POST /api/v1/orders/bulk` request may
+/// carry — a **DoS bound** ([08 §5](../docs/08-threat-model.md)). Axum's 2 MB
+/// body cap alone still admits thousands of items, and each accepted item is
+/// submitted **sequentially** onto one underlying's single-writer actor mailbox
+/// (bounded, [`DEFAULT_MAILBOX_CAPACITY`](crate::state::DEFAULT_MAILBOX_CAPACITY)
+/// = 1024), so an unbounded batch lets one `Trade` account monopolize an
+/// underlying. `500` is a generous batch that stays well under the mailbox
+/// capacity even if every item routes to the same underlying; the gateway
+/// rejects an over-limit request with a `400` before the loop begins.
+pub const MAX_BULK_ORDER_ITEMS: usize = 500;
+
+/// The maximum number of order ids one `DELETE /api/v1/orders/bulk` request may
+/// carry — the same DoS bound as [`MAX_BULK_ORDER_ITEMS`], for the cancel path.
+pub const MAX_BULK_CANCEL_ITEMS: usize = 500;
+
 /// A single item in a bulk limit-order submission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -758,6 +779,12 @@ pub struct BulkOrderResultItem {
     /// The assigned venue order id, if accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub order_id: Option<VenueOrderId>,
+    /// The `underlying_sequence` of the resulting event, for cross-surface
+    /// correlation — present only for an accepted item (a rejected item never
+    /// reached the sequencer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<u64>)]
+    pub sequence: Option<SequenceNumber>,
     /// Outcome for this order.
     pub status: BulkOrderStatus,
     /// Error message, if rejected (client-safe).
@@ -1624,16 +1651,23 @@ pub struct UpdateParametersResponse {
     pub directional_skew: f64,
 }
 
-/// Response for toggling an instrument's quoting.
+/// Response for an instrument status toggle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InstrumentToggleResponse {
-    /// Whether the toggle succeeded.
+    /// Whether the toggle command was **accepted and sequenced** — not a
+    /// confirmation the halt/resume took effect (the applied/rejected outcome is
+    /// not carried on the receipt until the `Receipt`→`VenueOutcome` seam lands).
     pub success: bool,
-    /// The canonical contract symbol toggled.
+    /// The canonical contract symbol addressed.
     #[schema(value_type = String)]
     pub symbol: Symbol,
-    /// The new enabled state.
+    /// The **requested** enabled state (`true` = resume, `false` = halt) — the
+    /// state the caller asked for, not an observed effect.
     pub enabled: bool,
+    /// The `underlying_sequence` of the resulting event, for cross-surface
+    /// correlation.
+    #[schema(value_type = u64)]
+    pub sequence: SequenceNumber,
 }
 
 /// A per-instrument control status entry.
@@ -1726,11 +1760,17 @@ pub struct RestoreSnapshotResponse {
 
 /// Request body for `POST /api/v1/auth/token`, gated by the operator bootstrap
 /// secret ([03 §6](../docs/03-protocol-surfaces.md)).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+///
+/// [`std::fmt::Debug`] is **hand-rolled to redact** the bootstrap secret — a
+/// derived `Debug` would print it in a log/error line
+/// ([08 §7](../docs/08-threat-model.md#7-secrets-handling)), matching the
+/// redacting pattern on `BootstrapGate` / `AccountProvision` in
+/// [`crate::auth`].
+#[derive(Clone, PartialEq, Eq, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TokenRequest {
     /// The operator bootstrap secret (`AUTH_BOOTSTRAP_SECRET`). A secret —
-    /// never logged or echoed.
+    /// never logged or echoed (redacted in `Debug`).
     pub secret: String,
     /// The account to mint a token for (its `sub`).
     pub account: AccountId,
@@ -1739,6 +1779,18 @@ pub struct TokenRequest {
     /// Optional token lifetime, in **seconds** (defaults to the server TTL).
     #[serde(default)]
     pub ttl_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for TokenRequest {
+    /// Redacts the bootstrap `secret` so it never reaches a log or error line.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenRequest")
+            .field("secret", &"<redacted>")
+            .field("account", &self.account)
+            .field("permissions", &self.permissions)
+            .field("ttl_secs", &self.ttl_secs)
+            .finish()
+    }
 }
 
 /// Response for `POST /api/v1/auth/token`.
@@ -2257,6 +2309,24 @@ mod tests {
             Err(_) => {}
             Ok(parsed) => panic!("expected an unknown-field rejection, parsed {parsed:?}"),
         }
+    }
+
+    #[test]
+    fn test_token_request_debug_redacts_the_bootstrap_secret() {
+        let request = TokenRequest {
+            secret: "SUPER-SECRET-BOOTSTRAP-VALUE".to_string(),
+            account: AccountId::new("acct-1"),
+            permissions: vec![Permission::Trade],
+            ttl_secs: Some(3_600),
+        };
+        let debug = format!("{request:?}");
+        assert!(
+            !debug.contains("SUPER-SECRET-BOOTSTRAP-VALUE"),
+            "Debug must not leak the bootstrap secret, got: {debug}"
+        );
+        assert!(debug.contains("<redacted>"));
+        // The non-secret fields still render, so Debug stays useful.
+        assert!(debug.contains("acct-1"));
     }
 
     // ---- Money serialises as bare integer cents ---------------------------

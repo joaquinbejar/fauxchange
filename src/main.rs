@@ -1,29 +1,65 @@
 //! Bootstrap entry point for the `fauxchange` binary.
 //!
-//! This stub compiles and does nothing yet; it exists so the crate has a
-//! single binary target from the start (`docs/00-design-bootstrap.md`
-//! §6, module map). The bootstrap sequence below is the target shape —
-//! each step lands with the module it wires, not here:
+//! This wires the minimum honest bootstrap of the REST gateway (#013): install a
+//! `tracing` subscriber, build the shared [`AppState`](fauxchange::state::AppState),
+//! then serve the router ([`fauxchange::gateway::rest::serve`]) with the
+//! rate-limit sweeper and the real-socket-peer connect-info. The fuller bootstrap
+//! sequence — declarative venue config, structured/JSON log output, account
+//! provisioning, and the WS/FIX gateways + background tasks — lands with the
+//! modules that own it (`config` #022, observability #06, WS #014, FIX v0.4);
+//! this file grows with them.
 //!
-//! 1. Load venue configuration (`fauxchange::config`) — instruments,
-//!    microstructure profiles, gateway ports.
-//! 2. Initialize the `tracing` subscriber (`EnvFilter`, JSON output in
-//!    production images).
-//! 3. Assemble `AppState` (`fauxchange::state`) — wires the exchange,
-//!    market maker, simulation, microstructure, db, and auth layers.
-//! 4. Spawn the gateways (`fauxchange::gateway::rest`,
-//!    `fauxchange::gateway::ws`, `fauxchange::gateway::fix`) and the
-//!    background tasks (simulator, market-maker requote loop, OHLC
-//!    aggregator).
+//! **Security posture.** The embedded dev JWT keypair is refused in a released
+//! image unless dev mode is set (`FAUXCHANGE_DEV=1`), via the
+//! [`JwtAuth::release_gated`](fauxchange::auth::JwtAuth::release_gated) gate — so
+//! a published image never runs on the well-known dev keys by default. Token
+//! issuance additionally requires `AUTH_BOOTSTRAP_SECRET` and a provisioned
+//! account (operator config).
 //!
-//! `anyhow` is permitted in this file only, per Override O-3
-//! (`docs/governance-precedence.md` §2) — every other layer keeps typed
-//! `thiserror` errors. It is not yet added: there is nothing fallible to
-//! bootstrap.
+//! Environment:
+//! - `FAUXCHANGE_REST_ADDR` — REST bind address (default `127.0.0.1:8080`).
+//! - `FAUXCHANGE_UNDERLYINGS` — comma-separated underlyings (default `BTC,ETH`).
+//! - `FAUXCHANGE_DEV` — `1`/`true` admits the dev JWT keypair for local use.
+//! - `AUTH_BOOTSTRAP_SECRET` — gates `POST /api/v1/auth/token`.
 
-fn main() {
-    // 1. config::load()            — see fauxchange::config
-    // 2. tracing subscriber init   — see docs/06-deployment.md §9 (Observability)
-    // 3. state::AppState::new(...) — see fauxchange::state
-    // 4. tokio::spawn gateway::{rest, ws, fix}::serve(...) + background tasks
+use std::net::SocketAddr;
+
+use fauxchange::auth::{DevMode, JwtAuth};
+use fauxchange::gateway::rest;
+use fauxchange::state::{AppState, AppStateConfig, AuthConfig};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install the `tracing` subscriber FIRST — without one every event is
+    // dropped. Filter by `RUST_LOG`, defaulting to `info` for the crate.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    let addr: SocketAddr = std::env::var("FAUXCHANGE_REST_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        .parse()?;
+
+    let underlyings: Vec<String> = std::env::var("FAUXCHANGE_UNDERLYINGS")
+        .unwrap_or_else(|_| "BTC,ETH".to_string())
+        .split(',')
+        .map(|ticker| ticker.trim().to_string())
+        .filter(|ticker| !ticker.is_empty())
+        .collect();
+
+    // Dev keypair, refused in a released image unless dev mode is set.
+    let jwt = JwtAuth::dev()?.release_gated(DevMode::from_env())?;
+    let mut auth = AuthConfig::with_jwt(jwt);
+    // Token issuance gate: unset or empty `AUTH_BOOTSTRAP_SECRET` disables it.
+    if let Ok(secret) = std::env::var("AUTH_BOOTSTRAP_SECRET")
+        && !secret.is_empty()
+    {
+        auth = auth.with_bootstrap_secret(secret);
+    }
+
+    let state = AppState::new(AppStateConfig::new(underlyings).with_auth(auth))?;
+    tracing::info!(underlyings = state.underlying_count(), "AppState assembled");
+
+    rest::serve(state, addr).await?;
+    Ok(())
 }
