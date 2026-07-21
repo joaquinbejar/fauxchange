@@ -39,11 +39,11 @@
 //! ([05 §2](../docs/05-microstructure-config.md#2-config-model)). As of #24 the
 //! `[accounts.*]`, `[instruments.*]`, and `[market_maker.*]` sections are **real,
 //! validated** [`SeedManifest`] structs carrying `#[serde(deny_unknown_fields)]`,
-//! so a typo *inside* a seeded account or instrument now aborts startup naming the
-//! key (the [`IgnoredAny`] placeholder used to swallow it). The remaining
-//! `[microstructure.*]` and `[rate_limits]` sections are still **accepted but not
-//! validated** ([`IgnoredAny`]) — #44–#47 swap each for a real struct without
-//! reshaping the loader.
+//! so a typo *inside* a seeded account or instrument aborts startup naming the
+//! key. As of #044–#046 the `[microstructure.*]` and `[rate_limits]` sections are
+//! **real, validated** structs too ([`MicrostructureConfig`] / [`RateLimitConfig`]),
+//! resolved from the file layer on the same `deny_unknown_fields` contract — every
+//! `[…]` extension point is now a typed section, none an ignored placeholder.
 //!
 //! The seed sections resolve into a [`SeedManifest`] on [`Config::seed`]: the
 //! account registry provisions, the instrument set + opening prices, and the
@@ -62,9 +62,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use serde::de::IgnoredAny;
 
-use crate::auth::{AccountProvision, CompIdBinding};
+use crate::auth::{
+    AccountProvision, CompIdBinding, DEFAULT_RATE_LIMIT_PER_WINDOW, RateLimitBudgets,
+};
 use crate::exchange::{
     Cents, Hash32, Instrument, InstrumentStatus, LineageId, OptionStyle, Symbol, SymbolError,
     SymbolParser, validate_venue_expiry,
@@ -181,6 +182,15 @@ pub const DEFAULT_CLOCK_STEP_INTERVAL_MS: u64 = crate::simulation::DEFAULT_STEP_
 /// Default log format (`FAUXCHANGE_LOG_FORMAT`) — human-readable locally; the
 /// production image sets `json` ([06 §9](../docs/06-deployment.md#9-observability)).
 pub const DEFAULT_LOG_FORMAT: LogFormat = LogFormat::Pretty;
+
+/// Default rate-limit sliding window in **seconds** (`[rate_limits] window_secs`)
+/// — the carried-over 60 s window
+/// ([05 §5](../docs/05-microstructure-config.md#5-rate-limits)).
+pub const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// The inclusive maximum for `[rate_limits] window_secs` (`86_400` = 24 h) — a
+/// coarse ceiling so a typo cannot set an effectively-unbounded window, and the
+/// seconds→milliseconds conversion stays well inside `u64`.
+pub const RATE_LIMIT_MAX_WINDOW_SECS: u64 = 86_400;
 
 /// Default **operational expiry** time-of-day (`[expiry_lifecycle] expiry_time`) —
 /// `08:00:00 UTC`, the upstream `ExpiryCycleConfig` default (verified
@@ -490,6 +500,22 @@ pub enum ConfigError {
         /// The offending value.
         value: String,
         /// What the field expected (a type or a range).
+        reason: String,
+    },
+    /// A `[rate_limits]` knob (`window_secs` / `read_per_window` /
+    /// `trade_per_window` / `admin_per_window`) was **non-positive** or out of
+    /// range. Rate limits are a security control, so a nonsensical `0` window or
+    /// budget fails the process fast at boot rather than admitting an unbounded (or
+    /// deny-everything) limiter ([05 §5](../docs/05-microstructure-config.md#5-rate-limits)).
+    /// Names the field, value, and the expectation.
+    #[error("invalid rate_limits value '{value}' for {field}: {reason}")]
+    BadRateLimitValue {
+        /// The config field (`window_secs` / `read_per_window` /
+        /// `trade_per_window` / `admin_per_window`).
+        field: &'static str,
+        /// The offending value.
+        value: String,
+        /// What the field expected (positive, or a range).
         reason: String,
     },
     /// An `[expiry_lifecycle]` operational time (`expiry_time` / `settlement_time`)
@@ -909,6 +935,123 @@ pub struct LoggingConfig {
     pub format: LogFormat,
 }
 
+/// The `[rate_limits]` section: the per-permission-tier sliding-window budgets and
+/// the shared window, wired into the existing venue-clock [`RateLimiter`](crate::auth::RateLimiter)
+/// (#046, [05 §5](../docs/05-microstructure-config.md#5-rate-limits)).
+///
+/// One budget applies **per authenticated principal** (`AccountId`) across every
+/// surface (REST/WS/FIX), selected by the account's tier (its highest held
+/// permission); an unauthenticated peer falls back to the restrictive `Read`
+/// budget. The window is keyed on the **injected venue clock**, so throttling
+/// replays deterministically.
+///
+/// Every field carries a `#[serde(default)]`, so a partial `[rate_limits]` table
+/// inherits the venue default for the knobs it omits; `#[serde(deny_unknown_fields)]`
+/// rejects a typo. A **non-positive** window or budget is refused at load with a
+/// typed [`ConfigError::BadRateLimitValue`] ([`validate`](Self::validate)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitConfig {
+    /// The sliding window, in **seconds** (default 60 s). Must be positive and at
+    /// or below [`RATE_LIMIT_MAX_WINDOW_SECS`].
+    #[serde(default = "default_rate_limit_window_secs")]
+    pub window_secs: u64,
+    /// The `Read`-tier per-window request budget (must be positive).
+    #[serde(default = "default_rate_limit_per_window")]
+    pub read_per_window: u32,
+    /// The `Trade`-tier per-window request budget (must be positive).
+    #[serde(default = "default_rate_limit_per_window")]
+    pub trade_per_window: u32,
+    /// The `Admin`-tier per-window request budget (must be positive).
+    #[serde(default = "default_rate_limit_per_window")]
+    pub admin_per_window: u32,
+}
+
+/// The default `[rate_limits] window_secs` for serde.
+fn default_rate_limit_window_secs() -> u64 {
+    DEFAULT_RATE_LIMIT_WINDOW_SECS
+}
+
+/// The default per-tier `[rate_limits]` budget for serde — the carried-over
+/// uniform budget, so a venue with no `[rate_limits]` section behaves as before.
+fn default_rate_limit_per_window() -> u32 {
+    DEFAULT_RATE_LIMIT_PER_WINDOW
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
+            read_per_window: DEFAULT_RATE_LIMIT_PER_WINDOW,
+            trade_per_window: DEFAULT_RATE_LIMIT_PER_WINDOW,
+            admin_per_window: DEFAULT_RATE_LIMIT_PER_WINDOW,
+        }
+    }
+}
+
+impl RateLimitConfig {
+    /// Validates the window and per-tier budgets, rejecting a **non-positive** (or
+    /// out-of-range) value with a typed [`ConfigError`] at load — rate limits are a
+    /// security control, so a nonsensical config fails the process fast.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::BadRateLimitValue`] if `window_secs` is `0` or above
+    /// [`RATE_LIMIT_MAX_WINDOW_SECS`], or any per-tier budget is `0`.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.window_secs == 0 {
+            return Err(ConfigError::BadRateLimitValue {
+                field: "window_secs",
+                value: self.window_secs.to_string(),
+                reason: "must be a positive number of seconds".to_string(),
+            });
+        }
+        if self.window_secs > RATE_LIMIT_MAX_WINDOW_SECS {
+            return Err(ConfigError::BadRateLimitValue {
+                field: "window_secs",
+                value: self.window_secs.to_string(),
+                reason: format!("must be at or below {RATE_LIMIT_MAX_WINDOW_SECS} seconds"),
+            });
+        }
+        for (field, value) in [
+            ("read_per_window", self.read_per_window),
+            ("trade_per_window", self.trade_per_window),
+            ("admin_per_window", self.admin_per_window),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::BadRateLimitValue {
+                    field,
+                    value: value.to_string(),
+                    reason: "must be a positive per-window budget".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The resolved per-tier [`RateLimitBudgets`] the venue-clock
+    /// [`RateLimiter`](crate::auth::RateLimiter) enforces — the window in
+    /// milliseconds plus the three per-tier budgets. Call [`validate`](Self::validate)
+    /// first; a validated config never overflows the seconds→milliseconds product.
+    #[must_use]
+    #[allow(clippy::manual_saturating_arithmetic)]
+    pub fn to_budgets(&self) -> RateLimitBudgets {
+        // `validate` bounds `window_secs <= RATE_LIMIT_MAX_WINDOW_SECS` (24 h), so
+        // the product is far inside `u64`; the overflow arm is unreachable and pinned
+        // at the ceiling explicitly. The repo rules forbid `saturating_*` (it hides
+        // overflow), so clippy's `manual_saturating_arithmetic` suggestion — which
+        // would reintroduce `saturating_mul` — is allowed here (matching
+        // `RateLimiter::denied_capacity` / `decide`).
+        let window_ms = self.window_secs.checked_mul(1_000).unwrap_or(u64::MAX);
+        RateLimitBudgets::new(
+            window_ms,
+            self.read_per_window,
+            self.trade_per_window,
+            self.admin_per_window,
+        )
+    }
+}
+
 /// The fully-resolved, validated venue configuration — the effective merge of
 /// defaults → file → environment → CLI ([06 §4](../docs/06-deployment.md#4-configuration)).
 ///
@@ -960,6 +1103,13 @@ pub struct Config {
     /// default when no `--config` file is supplied. The checked-fee startup proof
     /// has already passed by the time this is populated.
     pub microstructure: MicrostructureConfig,
+    /// The resolved, validated `[rate_limits]` per-tier sliding-window budgets
+    /// (#046). Populated **only** from the file layer (like [`seed`](Self::seed)
+    /// and [`microstructure`](Self::microstructure), the `[rate_limits]` section has
+    /// no env/CLI override); the carried-over uniform 60 s / 100-per-window default
+    /// when no `--config` file (or no `[rate_limits]` section) is supplied. Wired
+    /// into the venue-clock [`RateLimiter`](crate::auth::RateLimiter) at boot.
+    pub rate_limits: RateLimitConfig,
 }
 
 impl Config {
@@ -1006,28 +1156,32 @@ impl Config {
         F: Fn(&str) -> Option<String>,
     {
         let cli = parse_cli(args)?;
-        // The seed and microstructure sections live on the file layer only (no
-        // env/CLI override), so the file config is parsed once and its raw scalar
-        // layer + resolved seed manifest + resolved microstructure are extracted
-        // together (both borrow before `into_raw` moves). The microstructure
-        // resolution runs the checked-fee startup proof.
-        let (file, seed, microstructure) = match &cli.config_path {
+        // The seed, microstructure, and rate-limit sections live on the file layer
+        // only (no env/CLI override), so the file config is parsed once and its raw
+        // scalar layer + resolved seed manifest + resolved microstructure + resolved
+        // rate limits are extracted together (all borrow before `into_raw` moves).
+        // The microstructure resolution runs the checked-fee startup proof; the
+        // rate-limit resolution rejects a non-positive window/budget.
+        let (file, seed, microstructure, rate_limits) = match &cli.config_path {
             Some(path) => {
                 let file_config = read_file_config(path)?;
                 let seed = file_config.seed_manifest()?;
                 let microstructure = file_config.microstructure_config()?;
-                (file_config.into_raw(), seed, microstructure)
+                let rate_limits = file_config.rate_limits_config()?;
+                (file_config.into_raw(), seed, microstructure, rate_limits)
             }
             None => (
                 RawConfig::default(),
                 SeedManifest::default(),
                 MicrostructureConfig::default(),
+                RateLimitConfig::default(),
             ),
         };
         let env = raw_from_env(env);
         let mut config = Self::assemble(file, env, cli.raw)?;
         config.seed = seed;
         config.microstructure = microstructure;
+        config.rate_limits = rate_limits;
         Ok(config)
     }
 
@@ -1066,6 +1220,8 @@ impl Config {
              expiry_lifecycle.expiry_time={expiry_time} \
              expiry_lifecycle.settlement_time={settlement_time} \
              determinism.seed={seed} \
+             rate_limits.window_secs={rl_window} rate_limits.read_per_window={rl_read} \
+             rate_limits.trade_per_window={rl_trade} rate_limits.admin_per_window={rl_admin} \
              auth.bootstrap_secret={bootstrap_secret} logging.format={log}",
             http = self.server.http_addr,
             fix_enabled = self.fix.enabled,
@@ -1081,6 +1237,10 @@ impl Config {
             expiry_time = self.expiry_lifecycle.expiry_time,
             settlement_time = self.expiry_lifecycle.settlement_time,
             seed = self.determinism.seed,
+            rl_window = self.rate_limits.window_secs,
+            rl_read = self.rate_limits.read_per_window,
+            rl_trade = self.rate_limits.trade_per_window,
+            rl_admin = self.rate_limits.admin_per_window,
             log = self.logging.format.as_str(),
         )
     }
@@ -1345,6 +1505,11 @@ impl RawConfig {
             // resolved config (after the checked-fee proof). Direct `assemble`
             // callers (tests) get the default.
             microstructure: MicrostructureConfig::default(),
+            // The rate limits are file-only too (#046); `Config::load_from`
+            // overwrites this carried-over uniform default with the resolved,
+            // validated `[rate_limits]` budgets. Direct `assemble` callers (tests)
+            // get the default.
+            rate_limits: RateLimitConfig::default(),
         })
     }
 }
@@ -1824,11 +1989,11 @@ fn parse_pool_u64(
 /// The TOML file document. Every named section is optional (a partial file is
 /// valid); an unrecognised top-level key is a startup [`ConfigError::UnknownKey`].
 ///
-/// The extension-point sections (`accounts` / `instruments` / `microstructure` /
-/// `market_maker` / `rate_limits`) are **accepted but ignored** here
-/// ([`IgnoredAny`]) so a forward-looking config file is not rejected; a later
-/// issue (#24 seed, #44–#47 microstructure) swaps each for a real
-/// `deny_unknown_fields` struct without reshaping this loader.
+/// Every section — including the former extension points (`accounts` /
+/// `instruments` / `microstructure` / `market_maker` / `rate_limits`) — is now a
+/// **real, validated** `deny_unknown_fields` struct resolved from the file layer
+/// (#024 seed, #044–#046 microstructure + rate limits), so a typo inside any of
+/// them aborts startup naming the key.
 ///
 /// Deliberately **not** `Debug` (SECURITY): it holds the seeded `[accounts.*]`
 /// plaintext FIX passwords and the `[auth]` / `[persistence]` secrets, so — like
@@ -1855,8 +2020,8 @@ struct FileConfig {
     logging: Option<FileLogging>,
     // ---- seed manifest sections (real, validated as of #024) ----
     // The seed sections carry `#[serde(deny_unknown_fields)]` on their leaf
-    // structs, so a typo INSIDE a seeded account / instrument / persona table now
-    // aborts startup naming the key (the `IgnoredAny` placeholder swallowed it).
+    // structs, so a typo INSIDE a seeded account / instrument / persona table
+    // aborts startup naming the key.
     // They resolve into `Config::seed` via `seed_manifest`.
     #[serde(default)]
     accounts: Option<BTreeMap<String, FileAccount>>,
@@ -1871,15 +2036,13 @@ struct FileConfig {
     // validation run there).
     #[serde(default)]
     microstructure: Option<FileMicrostructure>,
-    // ---- remaining extension point (accepted, validated by #46) ----
-    // `rate_limits` is still a forward-looking placeholder so serde ACCEPTS a
-    // forward config without rejecting an unknown top-level key; the content is
-    // ignored here and validated by #046. It is read only by serde during
-    // deserialization, so Rust's dead-code analysis (which does not count that) is
-    // scoped-silenced.
+    // ---- rate limits (real, validated as of #046) ----
+    // `[rate_limits]` resolves into `Config::rate_limits` via `rate_limits_config`
+    // (the non-positive-window/budget rejection runs there). Its leaf struct carries
+    // `#[serde(deny_unknown_fields)]`, so a typo inside `[rate_limits]` aborts
+    // startup naming the key.
     #[serde(default)]
-    #[allow(dead_code)]
-    rate_limits: Option<IgnoredAny>,
+    rate_limits: Option<RateLimitConfig>,
 }
 
 impl FileConfig {
@@ -2029,6 +2192,21 @@ impl FileConfig {
             }
         }
         Ok(MicrostructureConfig::resolve(file, &instrument_specs)?)
+    }
+
+    /// Resolves and **validates** the `[rate_limits]` section into a
+    /// [`RateLimitConfig`] (#046), rejecting a non-positive window or per-tier
+    /// budget at load. An omitted section resolves to the carried-over uniform
+    /// default (60 s / 100-per-window across every tier).
+    ///
+    /// # Errors
+    ///
+    /// A [`ConfigError::BadRateLimitValue`] on a non-positive (or out-of-range)
+    /// `window_secs` / `read_per_window` / `trade_per_window` / `admin_per_window`.
+    fn rate_limits_config(&self) -> Result<RateLimitConfig, ConfigError> {
+        let config = self.rate_limits.unwrap_or_default();
+        config.validate()?;
+        Ok(config)
     }
 }
 
@@ -2896,9 +3074,8 @@ mod tests {
         }
     }
 
-    /// `[microstructure.*]` is a real, validated section as of #044; `[rate_limits]`
-    /// is the remaining extension-point placeholder (owned by #046), accepted and
-    /// ignored, not rejected.
+    /// `[microstructure.*]` and `[rate_limits]` are both real, validated sections
+    /// as of #044/#046 — a config carrying them parses cleanly.
     #[test]
     fn test_config_extension_point_sections_are_accepted() -> Result<(), ConfigError> {
         let document = "\
@@ -2914,6 +3091,107 @@ read_per_window = 6000
         let config = Config::assemble(raw, raw_from_env(|_| None), RawConfig::default())?;
         assert_eq!(config.determinism.seed, 0);
         Ok(())
+    }
+
+    // ---- rate limits (#046) ----------------------------------------------
+
+    #[test]
+    fn test_rate_limits_default_is_uniform_60s_window() {
+        let config = RateLimitConfig::default();
+        assert_eq!(config.window_secs, DEFAULT_RATE_LIMIT_WINDOW_SECS);
+        assert_eq!(config.read_per_window, DEFAULT_RATE_LIMIT_PER_WINDOW);
+        assert_eq!(config.trade_per_window, DEFAULT_RATE_LIMIT_PER_WINDOW);
+        assert_eq!(config.admin_per_window, DEFAULT_RATE_LIMIT_PER_WINDOW);
+        // Resolves to a uniform per-tier budget over a 60 s (60_000 ms) window.
+        let budgets = config.to_budgets();
+        assert_eq!(budgets.window_ms(), 60_000);
+        assert_eq!(budgets.read(), DEFAULT_RATE_LIMIT_PER_WINDOW);
+        assert_eq!(budgets.admin(), DEFAULT_RATE_LIMIT_PER_WINDOW);
+    }
+
+    #[test]
+    fn test_rate_limits_resolves_per_tier_budgets() -> Result<(), ConfigError> {
+        let document = "\
+[rate_limits]
+window_secs = 30
+read_per_window = 60
+trade_per_window = 300
+admin_per_window = 1000
+";
+        let resolved = parse_file_config(document)?.rate_limits_config()?;
+        assert_eq!(resolved.window_secs, 30);
+        let budgets = resolved.to_budgets();
+        assert_eq!(budgets.window_ms(), 30_000);
+        assert_eq!(budgets.read(), 60);
+        assert_eq!(budgets.trade(), 300);
+        assert_eq!(budgets.admin(), 1_000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limits_partial_table_inherits_defaults() -> Result<(), ConfigError> {
+        // A partial `[rate_limits]` inherits the venue default for the omitted knobs.
+        let document = "\
+[rate_limits]
+admin_per_window = 5000
+";
+        let resolved = parse_file_config(document)?.rate_limits_config()?;
+        assert_eq!(resolved.window_secs, DEFAULT_RATE_LIMIT_WINDOW_SECS);
+        assert_eq!(resolved.read_per_window, DEFAULT_RATE_LIMIT_PER_WINDOW);
+        assert_eq!(resolved.admin_per_window, 5_000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rate_limits_rejects_zero_window() {
+        let document = "\
+[rate_limits]
+window_secs = 0
+";
+        match parse_file_config(document).and_then(|file| file.rate_limits_config()) {
+            Err(ConfigError::BadRateLimitValue { field, .. }) => assert_eq!(field, "window_secs"),
+            other => panic!("expected BadRateLimitValue(window_secs), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rate_limits_rejects_zero_budget() {
+        let document = "\
+[rate_limits]
+trade_per_window = 0
+";
+        match parse_file_config(document).and_then(|file| file.rate_limits_config()) {
+            Err(ConfigError::BadRateLimitValue { field, .. }) => {
+                assert_eq!(field, "trade_per_window");
+            }
+            other => panic!("expected BadRateLimitValue(trade_per_window), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rate_limits_rejects_over_ceiling_window() {
+        let document = format!(
+            "[rate_limits]\nwindow_secs = {}\n",
+            RATE_LIMIT_MAX_WINDOW_SECS + 1
+        );
+        match parse_file_config(&document).and_then(|file| file.rate_limits_config()) {
+            Err(ConfigError::BadRateLimitValue { field, .. }) => assert_eq!(field, "window_secs"),
+            other => panic!("expected BadRateLimitValue(window_secs), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_rate_limits_rejects_unknown_key() {
+        // `deny_unknown_fields` names the offending key inside `[rate_limits]`.
+        let document = "\
+[rate_limits]
+read_per_windo = 100
+";
+        match parse_file_config(document) {
+            Err(ConfigError::UnknownKey { key }) => assert_eq!(key, "read_per_windo"),
+            Err(other) => panic!("expected UnknownKey(read_per_windo), got {other:?}"),
+            Ok(_) => panic!("expected UnknownKey(read_per_windo), got Ok"),
+        }
     }
 
     /// `[microstructure.*]` + per-underlying `[instruments."X".specs]` resolve into

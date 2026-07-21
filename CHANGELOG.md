@@ -11,6 +11,23 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Per-tier rate limits and per-instrument microstructure profiles** (#46) — the
+  `[rate_limits]` config section surfaces a validated `RateLimitConfig`
+  (`window_secs`, `read_per_window` / `trade_per_window` / `admin_per_window`,
+  `#[serde(deny_unknown_fields)]`, non-positive values rejected at load with a
+  typed `ConfigError::BadRateLimitValue`) wired into the existing sliding-window
+  `RateLimiter` from #11. A `RateLimitTier` (`Read` / `Trade` / `Admin`, highest
+  held permission) rides the authenticated `RateLimitKey::Account` so one
+  `AccountId` keeps **one** budget across REST / WS / FIX, and the window stays
+  keyed on the injected venue clock so throttling replays deterministically. A
+  `MicrostructureProfile` resolves the active knobs per instrument / per
+  underlying on the order path with venue-default inheritance (specs + price band
+  vary per instrument today; fees / STP / latency are venue-wide and personas
+  join in #47), applied identically on the live and replay seams so a
+  profiled instrument reconstructs exactly from a bundle
+  ([05 §5](docs/05-microstructure-config.md#5-rate-limits),
+  [05 §7](docs/05-microstructure-config.md#7-per-instrument-profiles)). REST / WS
+  overflow returns `429` with `X-RateLimit-*` headers.
 - **Seeded latency injection on the virtual clock** (#45) — a new
   `src/microstructure/latency.rs` surfacing `[microstructure.latency]` as a
   validated `LatencyConfig` with a `model` selector

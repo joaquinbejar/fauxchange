@@ -19,7 +19,7 @@ use axum::http::{Request, StatusCode, header};
 use serde_json::Value;
 use tower::ServiceExt;
 
-use fauxchange::auth::{AccountProvision, DEFAULT_RATE_LIMIT_PER_WINDOW};
+use fauxchange::auth::{AccountProvision, DEFAULT_RATE_LIMIT_PER_WINDOW, RateLimitBudgets};
 use fauxchange::exchange::{
     Cents, ExecutionsStore, Hash32, JournalRecord, SequenceNumber, Symbol, VenueCommand,
 };
@@ -61,6 +61,34 @@ fn venue(limit: u32) -> Arc<AppState> {
             .with_bootstrap_secret(SECRET)
             .with_accounts(accounts)
             .with_rate_limit(limit),
+        Err(error) => panic!("dev auth must build: {error}"),
+    };
+    match AppState::new(AppStateConfig::new(["BTC", "ETH"]).with_auth(auth)) {
+        Ok(state) => state,
+        Err(error) => panic!("AppState must build: {error}"),
+    }
+}
+
+/// Builds the same four-account venue but with explicit **per-tier** rate-limit
+/// budgets (#046), so a Read caller and an Admin caller get distinct budgets.
+fn venue_with_budgets(budgets: RateLimitBudgets) -> Arc<AppState> {
+    let accounts = vec![
+        AccountProvision::new(
+            AccountId::new("admin-1"),
+            Hash32([1; 32]),
+            vec![Permission::Admin],
+        ),
+        AccountProvision::new(
+            AccountId::new("reader-1"),
+            Hash32([4; 32]),
+            vec![Permission::Read],
+        ),
+    ];
+    let auth = match AuthConfig::dev() {
+        Ok(auth) => auth
+            .with_bootstrap_secret(SECRET)
+            .with_accounts(accounts)
+            .with_rate_limit_budgets(budgets),
         Err(error) => panic!("dev auth must build: {error}"),
     };
     match AppState::new(AppStateConfig::new(["BTC", "ETH"]).with_auth(auth)) {
@@ -393,6 +421,132 @@ async fn test_rate_limit_returns_429_over_budget() {
     )
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// Sends one request and returns `(status, body_json, [ratelimit_limit,
+/// ratelimit_remaining, ratelimit_reset, retry_after])` header strings.
+async fn send_with_headers(
+    state: &Arc<AppState>,
+    request: Request<Body>,
+) -> (StatusCode, Value, [Option<String>; 4]) {
+    let router: Router = create_router(Arc::clone(state));
+    let response = match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(e) => panic!("router must be infallible: {e}"),
+    };
+    let status = response.status();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let headers = [
+        header("x-ratelimit-limit"),
+        header("x-ratelimit-remaining"),
+        header("x-ratelimit-reset"),
+        header("retry-after"),
+    ];
+    let bytes = match to_bytes(response.into_body(), usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(e) => panic!("reading the body must succeed: {e}"),
+    };
+    let json = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    };
+    (status, json, headers)
+}
+
+#[tokio::test]
+async fn test_rate_limit_429_envelope_and_headers() {
+    // Golden #046: a REST overflow is `429` with the stable error envelope and the
+    // `X-RateLimit-*` header shape (limit, remaining=0, reset) plus `Retry-After`.
+    let state = venue(1);
+    let bearer = token(&state, "reader-1");
+
+    // First request is admitted and already carries the rate-limit headers.
+    let (ok_status, _, ok_headers) = send_with_headers(
+        &state,
+        build_request("GET", "/api/v1/stats", Some(&bearer), None),
+    )
+    .await;
+    assert_eq!(ok_status, StatusCode::OK);
+    assert_eq!(ok_headers[0].as_deref(), Some("1")); // X-RateLimit-Limit
+    assert_eq!(ok_headers[1].as_deref(), Some("0")); // X-RateLimit-Remaining
+    assert!(
+        ok_headers[2].is_some(),
+        "X-RateLimit-Reset present on admit"
+    );
+
+    // The over-budget request is throttled with the full envelope + headers.
+    let (status, body, headers) = send_with_headers(
+        &state,
+        build_request("GET", "/api/v1/stats", Some(&bearer), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // The stable error envelope (schema/code/message).
+    assert_eq!(body["code"], "throttled");
+    assert_eq!(body["message"], "rate limited");
+    assert!(body["schema"].is_string(), "envelope carries a schema tag");
+    // The `X-RateLimit-*` header shape.
+    assert_eq!(headers[0].as_deref(), Some("1"), "X-RateLimit-Limit");
+    assert_eq!(headers[1].as_deref(), Some("0"), "X-RateLimit-Remaining");
+    assert!(headers[2].is_some(), "X-RateLimit-Reset present");
+    assert!(headers[3].is_some(), "Retry-After present on a 429");
+}
+
+#[tokio::test]
+async fn test_rate_limit_per_tier_budgets_over_rest() {
+    // Integration #046: distinct per-tier budgets applied over REST — a Read caller
+    // gets 1/window, an Admin caller 3/window, each keyed on its own account.
+    let budgets = RateLimitBudgets::new(60_000, 1, 2, 3);
+    let state = venue_with_budgets(budgets);
+
+    // The reader is throttled after a single request (Read budget = 1).
+    let reader = token(&state, "reader-1");
+    let (first, _) = send(
+        &state,
+        build_request("GET", "/api/v1/stats", Some(&reader), None),
+    )
+    .await;
+    assert_eq!(first, StatusCode::OK);
+    let (second, _) = send(
+        &state,
+        build_request("GET", "/api/v1/stats", Some(&reader), None),
+    )
+    .await;
+    assert_eq!(
+        second,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the Read tier is throttled after its 1-request budget"
+    );
+
+    // The admin gets three requests before throttling (Admin budget = 3), and its
+    // 429 reports the Admin limit in the header.
+    let admin = token(&state, "admin-1");
+    for _ in 0..3 {
+        let (status, _, _) = send_with_headers(
+            &state,
+            build_request("GET", "/api/v1/stats", Some(&admin), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _, headers) = send_with_headers(
+        &state,
+        build_request("GET", "/api/v1/stats", Some(&admin), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        headers[0].as_deref(),
+        Some("3"),
+        "the Admin tier's budget is reflected in X-RateLimit-Limit"
+    );
 }
 
 // ---- OpenAPI doc + Swagger UI served --------------------------------------

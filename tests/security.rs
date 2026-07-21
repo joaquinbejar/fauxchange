@@ -36,7 +36,7 @@ use tokio::sync::broadcast;
 use tower::ServiceExt;
 
 use fauxchange::auth::{
-    AccountProvision, AccountStore, FixLoginOutcome, RateLimitKey, RateLimiter,
+    AccountProvision, AccountStore, FixLoginOutcome, RateLimitKey, RateLimitTier, RateLimiter,
 };
 use fauxchange::exchange::{
     ActorConfig, Cents, EventTimestamp, FixedClock, Hash32, InMemoryVenueJournal, JournalHeader,
@@ -746,6 +746,7 @@ fn test_dos_rate_limiter_enforces_one_budget_per_account() {
     let key = RateLimitKey::Account {
         account: AccountId::new("flooder"),
         revocation_epoch: 0,
+        tier: RateLimitTier::Read,
     };
     for i in 0..3 {
         assert!(

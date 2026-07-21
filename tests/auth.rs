@@ -23,7 +23,7 @@ use tower::ServiceExt;
 use fauxchange::auth::{
     AccountProvision, AccountRegistry, AccountStore, Argon2Hasher, AuthGuard, AuthService,
     BootstrapGate, Claims, FixLoginOutcome, JwtAuth, RATE_LIMIT_WINDOW_MS, RateLimitClock,
-    RateLimitKey, RateLimiter, RevocationOracle, auth_middleware,
+    RateLimitKey, RateLimitTier, RateLimiter, RevocationOracle, auth_middleware,
 };
 use fauxchange::exchange::Hash32;
 use fauxchange::models::{AccountId, Permission};
@@ -224,7 +224,7 @@ proptest! {
     #[test]
     fn rate_limiter_window_bound(limit in 1u32..=10, requests in 1usize..=50) {
         let limiter = RateLimiter::with_window(TestClock::new(0), limit, RATE_LIMIT_WINDOW_MS);
-        let key = RateLimitKey::Account { account: AccountId::new("acct"), revocation_epoch: 0 };
+        let key = RateLimitKey::Account { account: AccountId::new("acct"), revocation_epoch: 0, tier: RateLimitTier::Read };
         let mut allowed = 0u32;
         for _ in 0..requests {
             if limiter.check_and_record_status(&key).allowed {
@@ -356,6 +356,7 @@ fn test_rate_limit_decision_is_replay_stable_across_fresh_venues() {
         let key = RateLimitKey::Account {
             account: AccountId::new("acct-1"),
             revocation_epoch: 0,
+            tier: RateLimitTier::Read,
         };
         timeline
             .iter()

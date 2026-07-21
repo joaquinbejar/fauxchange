@@ -238,11 +238,37 @@ impl MicrostructureConfig {
     #[must_use]
     #[inline]
     pub fn price_bounds_for(&self, underlying: &str) -> PriceBounds {
-        self.specs_for(underlying).price_bounds()
+        self.profile_for(underlying).price_bounds()
+    }
+
+    /// Resolves the active [`MicrostructureProfile`] for `underlying` — the fee
+    /// schedule, STP mode, contract specs, latency distribution, and venue-owned
+    /// price band, with every **unset** per-instrument knob **inherited from the
+    /// venue default** (#046, [05 §7](../../../docs/05-microstructure-config.md#7-contract-specs-tick-and-lot)).
+    ///
+    /// This is the per-instrument resolution the order path consults ([`admit_price`](Self::admit_price)
+    /// resolves through it). It is a **pure function** of the shared config — no
+    /// wall-clock, RNG, or map-iteration-order input — so a book vivified during
+    /// replay resolves an identical profile and a profiled instrument replays
+    /// exactly ([02 §5](../../../docs/02-matching-architecture.md#5-determinism)).
+    ///
+    /// Only the contract specs (and their price band) carry a per-underlying
+    /// override surface today; the fee schedule, STP mode, and latency distribution
+    /// are venue-wide, so every underlying inherits the venue default for them. The
+    /// per-instrument **persona** knob joins this profile with #047.
+    #[must_use]
+    pub fn profile_for(&self, underlying: &str) -> MicrostructureProfile {
+        MicrostructureProfile {
+            fees: self.fees,
+            stp: self.stp,
+            specs: self.specs_for(underlying),
+            latency: self.latency,
+        }
     }
 
     /// Admits `price` for `underlying` against the venue-owned price band — the
-    /// check the order-admission and replay seams run **before matching**.
+    /// check the order-admission and replay seams run **before matching**, resolved
+    /// through the per-instrument [`profile_for`](Self::profile_for).
     ///
     /// # Errors
     ///
@@ -250,7 +276,7 @@ impl MicrostructureConfig {
     /// `[min_price_cents, max_price_cents]` band.
     #[inline]
     pub fn admit_price(&self, underlying: &str, price: Cents) -> Result<(), PriceBoundError> {
-        self.price_bounds_for(underlying).admit(price)
+        self.profile_for(underlying).admit_price(price)
     }
 
     /// A stable, deterministic fingerprint of the resolved config content — the
@@ -288,6 +314,84 @@ impl MicrostructureConfig {
         // config change still yields a distinct fingerprint.
         out.push_str(&self.latency.fingerprint_fragment());
         out
+    }
+}
+
+/// The **resolved microstructure profile** for a single instrument / underlying —
+/// the active fee schedule, STP mode, contract specs, latency distribution, and
+/// venue-owned price band, with every unset per-instrument knob **inherited from
+/// the venue default**.
+///
+/// Produced by [`MicrostructureConfig::profile_for`] on the order path. Because it
+/// is a pure function of the shared config (`Copy`, no interior state), a book
+/// vivified during replay resolves an identical profile — per-instrument
+/// microstructure does not break determinism ([05 §11](../../../docs/05-microstructure-config.md#11-determinism-of-microstructure)).
+///
+/// `Eq` is **not** derived: the [`latency`](Self::latency) config carries an `f64`
+/// `sigma`, for which `Eq`'s reflexivity contract does not hold (consistent with
+/// [`MicrostructureConfig`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MicrostructureProfile {
+    fees: FeeConfig,
+    stp: StpConfig,
+    specs: ResolvedContractSpecs,
+    latency: LatencyConfig,
+}
+
+impl MicrostructureProfile {
+    /// The venue fee config for this instrument.
+    #[must_use]
+    #[inline]
+    pub fn fees(&self) -> FeeConfig {
+        self.fees
+    }
+
+    /// The upstream `FeeSchedule` the leaf applies for this instrument.
+    #[must_use]
+    #[inline]
+    pub fn fee_schedule(&self) -> FeeSchedule {
+        self.fees.to_fee_schedule()
+    }
+
+    /// The upstream `STPMode` the leaf applies for this instrument.
+    #[must_use]
+    #[inline]
+    pub fn stp_mode(&self) -> STPMode {
+        self.stp.to_stp_mode()
+    }
+
+    /// The resolved contract specs for this instrument (its per-underlying override,
+    /// or the inherited venue default).
+    #[must_use]
+    #[inline]
+    pub fn specs(&self) -> ResolvedContractSpecs {
+        self.specs
+    }
+
+    /// The latency-injection distribution for this instrument (venue-wide today).
+    #[must_use]
+    #[inline]
+    pub fn latency(&self) -> LatencyConfig {
+        self.latency
+    }
+
+    /// The venue-owned price-band admission bounds for this instrument.
+    #[must_use]
+    #[inline]
+    pub fn price_bounds(&self) -> PriceBounds {
+        self.specs.price_bounds()
+    }
+
+    /// Admits `price` against this instrument's venue-owned price band — the check
+    /// the order-admission and replay seams run **before matching**.
+    ///
+    /// # Errors
+    ///
+    /// A [`PriceBoundError`] if `price` falls outside the instrument's
+    /// `[min_price_cents, max_price_cents]` band.
+    #[inline]
+    pub fn admit_price(&self, price: Cents) -> Result<(), PriceBoundError> {
+        self.price_bounds().admit(price)
     }
 }
 
@@ -471,6 +575,81 @@ mod tests {
         // The fee schedule surfaces the configured bps.
         assert_eq!(config.fee_schedule().maker_fee_bps, -10);
         assert_eq!(config.fee_schedule().taker_fee_bps, 35);
+    }
+
+    #[test]
+    fn test_profile_resolves_default_when_unset() {
+        // A per-instrument profile resolves on the order path; an unset knob inherits
+        // the venue default (#046). BTC overrides its tick; ETH has no override, so
+        // its profile equals the venue-default profile.
+        let file = FileMicrostructure {
+            fees: Some(FeeConfig {
+                maker_bps: -10,
+                taker_bps: 35,
+            }),
+            specs: Some(ContractSpecsConfig {
+                max_price_cents: Some(200_000_000),
+                ..ContractSpecsConfig::default()
+            }),
+            ..FileMicrostructure::default()
+        };
+        let mut per_instrument = BTreeMap::new();
+        per_instrument.insert(
+            "BTC".to_string(),
+            ContractSpecsConfig {
+                tick_size_cents: Some(5),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let config = MicrostructureConfig::resolve(&file, &per_instrument).expect("resolves");
+
+        // An unconfigured underlying inherits the venue default across every knob.
+        let eth = config.profile_for("ETH");
+        assert_eq!(eth.specs(), config.default_specs());
+        assert_eq!(eth.fee_schedule().taker_fee_bps, 35);
+        assert_eq!(eth.stp_mode(), config.stp_mode());
+        assert_eq!(eth.latency(), config.latency());
+        assert_eq!(eth.price_bounds(), config.price_bounds_for("ETH"));
+
+        // BTC's profile overrides the tick but inherits the venue-default max_price
+        // (an unset per-instrument knob inherits the venue default).
+        let btc = config.profile_for("BTC");
+        assert_eq!(btc.specs().tick_size_cents(), 5);
+        assert_eq!(btc.specs().max_price_cents(), 200_000_000);
+        // Venue-wide knobs (fees/stp/latency) are identical across instruments.
+        assert_eq!(
+            btc.fee_schedule().maker_fee_bps,
+            eth.fee_schedule().maker_fee_bps
+        );
+        assert_eq!(btc.stp_mode(), eth.stp_mode());
+    }
+
+    #[test]
+    fn test_profile_is_pure_function_for_replay() {
+        // Determinism: two resolutions of the same underlying's profile are equal, so
+        // a book vivified during replay resolves an identical profile.
+        let file = FileMicrostructure {
+            specs: Some(ContractSpecsConfig {
+                tick_size_cents: Some(5),
+                ..ContractSpecsConfig::default()
+            }),
+            ..FileMicrostructure::default()
+        };
+        let mut per_instrument = BTreeMap::new();
+        per_instrument.insert(
+            "BTC".to_string(),
+            ContractSpecsConfig {
+                max_order_qty: Some(10_000),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let config = MicrostructureConfig::resolve(&file, &per_instrument).expect("resolves");
+        assert_eq!(config.profile_for("BTC"), config.profile_for("BTC"));
+        assert_eq!(config.profile_for("ETH"), config.profile_for("ETH"));
+        // The profiled BTC book admits within its band; an over-band price is refused
+        // identically on every resolution (the order-path admission check).
+        let btc = config.profile_for("BTC");
+        assert_eq!(btc.admit_price(Cents::new(50_000)), Ok(()));
     }
 
     #[test]

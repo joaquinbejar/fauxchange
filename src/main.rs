@@ -96,7 +96,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Dev keypair, refused in a released image unless dev mode is set.
     let jwt = JwtAuth::dev()?.release_gated(DevMode::from_env())?;
-    let mut auth = AuthConfig::with_jwt(jwt);
+    // The per-tier venue rate-limit budgets (#046) — resolved and validated by the
+    // config loader; wired into the venue-clock rate limiter so throttling is
+    // configurable per deployment and replays deterministically.
+    let mut auth =
+        AuthConfig::with_jwt(jwt).with_rate_limit_budgets(config.rate_limits.to_budgets());
     // Token issuance gate: an unset `AUTH_BOOTSTRAP_SECRET` disables it. The
     // config wraps it in `Secret`; expose the plaintext only here, for the gate.
     if let Some(secret) = config.auth.bootstrap_secret_value() {

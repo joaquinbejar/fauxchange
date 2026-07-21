@@ -2348,6 +2348,91 @@ async fn test_fee_stp_sensitive_scenario_replays_exactly_from_bundle() {
     }
 }
 
+/// A resolved venue microstructure whose **BTC** carries a per-underlying spec
+/// override (tick 5) over the venue default — the #046 per-instrument profile
+/// surface. The scenario prices (50_000 / 51_000) are on-tick multiples of 5.
+fn ms_config_with_btc_tick() -> MicrostructureConfig {
+    let file = FileMicrostructure {
+        fees: Some(FeeConfig {
+            maker_bps: -10,
+            taker_bps: 35,
+        }),
+        stp: Some(StpConfig {
+            mode: StpMode::CancelTaker,
+        }),
+        ..FileMicrostructure::default()
+    };
+    let mut per_underlying = BTreeMap::new();
+    per_underlying.insert(
+        UNDERLYING.to_string(),
+        ContractSpecsConfig {
+            tick_size_cents: Some(5),
+            ..ContractSpecsConfig::default()
+        },
+    );
+    MicrostructureConfig::resolve(&file, &per_underlying).expect("microstructure resolves")
+}
+
+/// #046 determinism: a **profiled instrument** (BTC's per-underlying tick 5)
+/// recorded live and replayed from the journal + bundled config reconstructs
+/// IDENTICAL fills, events, and top-of-book — the fresh replay book inherits the
+/// per-instrument profile. An unconfigured underlying's profile inherits the venue
+/// default (asserted directly), so per-instrument microstructure does not break
+/// determinism.
+#[tokio::test]
+async fn test_per_instrument_profile_replays_exactly_from_bundle() {
+    let micro = ms_config_with_btc_tick();
+    // The profile resolves per instrument: BTC overrides the tick; an unconfigured
+    // underlying inherits the venue default (unset knob → venue default).
+    assert_eq!(micro.profile_for("BTC").specs().tick_size_cents(), 5);
+    assert_eq!(micro.profile_for("ETH").specs(), micro.default_specs());
+
+    let state = ms_state(micro.clone());
+    run_fee_stp_scenario(&state).await;
+
+    let filter = ExecutionFilter::default();
+    let live_maker = state
+        .executions()
+        .list(&AccountId::new("mkr"), &filter)
+        .expect("list mkr");
+    assert_eq!(live_maker.len(), 1, "the on-tick crossing fill recorded");
+
+    // The exported bundle carries the per-instrument profile so the fresh replay
+    // book inherits it, and the recorded fingerprint matches.
+    let bundle = state.export_bundle().await.expect("export bundle");
+    assert_eq!(bundle.microstructure, micro);
+    assert_eq!(
+        bundle
+            .microstructure
+            .profile_for("BTC")
+            .specs()
+            .tick_size_cents(),
+        5,
+        "the bundle carries the profiled BTC tick"
+    );
+    assert_eq!(
+        bundle.microstructure.fingerprint(),
+        bundle.manifest.microstructure_fingerprint,
+    );
+
+    // Replay from the journal + bundled config: `Ok` is the identical-events proof
+    // (the oracle halts on any re-derived VenueEvent that differs), and the
+    // reconstructed fills reproduce byte-for-byte.
+    let report = replay_bundle(&bundle).expect("profiled scenario replays exactly");
+    let replay_maker = report
+        .executions
+        .list(&AccountId::new("mkr"), &filter)
+        .expect("replay mkr");
+    assert_eq!(
+        replay_maker, live_maker,
+        "a profiled instrument reconstructs its fills identically on replay"
+    );
+    let replay = report.underlying(UNDERLYING).expect("BTC replay");
+    let top_a = replay.top_of_book(&Symbol::parse(MS_CALL_A).expect("A parses"));
+    assert_eq!(top_a.best_ask, Some(Cents::new(50_000)));
+    assert_eq!(top_a.ask_depth, 1);
+}
+
 // ============================================================================
 // Latency injection (#045): a seeded, venue-owned, virtual-clock sub-stream
 // ============================================================================
