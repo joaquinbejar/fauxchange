@@ -11,6 +11,38 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Armed the CI performance regression gate — the v1.0 performance gate**
+  (#53, [07 §6](docs/07-performance-budgets.md#6-ci-regression-gate),
+  [BENCH.md §13](BENCH.md#13-ci-regression-gate-ceilings-re-verification-and-the-dry-run-053)).
+  New `.github/workflows/bench-regression.yml`: a `bench-regression` job
+  (armed on every push and PR to `main`/`release/**`, reduced sample counts)
+  plus a `bench-regression-nightly` job (`schedule` + `workflow_dispatch`,
+  full default sample counts matching `BENCH.md`'s own methodology). Both run
+  the new `scripts/bench_regression_gate.py` (stdlib-only, no new
+  dependency) against a documented, generous absolute ceiling per hot path —
+  never a same-machine p99 delta against the M4-Max-laptop-recorded
+  `BENCH.md` baselines, since this repo has no self-hosted CI runner (the two
+  rejected approaches — a pinned self-hosted runner class, a first
+  CI-runner-established baseline — are named and their infeasibility
+  documented in `BENCH.md` §13). The gate covers all five hot paths
+  (HP-1..HP-5), the allocation-counting profile (a no-regression-over-
+  baseline gate, not a literal-zero gate — the measured common actor turn is
+  real and non-zero, `BENCH.md` §6/§13), and the HP-2 fan-out flatness sweep
+  (recomputed independently from the parsed quantiles, not merely trusting
+  the bench's own printed verdict). A real, injected 20 ms slowdown
+  (temporarily added to `benches/hp1_order_path.rs`, reverted before commit —
+  `src/` was never touched) proved the gate fails on a genuine regression
+  before it was reverted; a synthetic log proved the alloc/flatness/missing-
+  series branches too; the real, un-injected re-verification run proves a
+  clean baseline passes. `BENCH.md` §13 also discloses an unresolved,
+  reproducible ~2.3-2.6x divergence between this re-verification's freshly
+  measured allocation counts and the previously committed §6 figures (same
+  machine, same code, same `Cargo.lock`) — named as a follow-up for
+  `matching-expert`/`architect` with a real call-stack profiler, not silently
+  reconciled. `Makefile` gains `bench-regression` / `bench-regression-full`
+  local targets mirroring the two CI jobs, and `workflow-<job-id>` now points
+  `act` at the whole `.github/workflows/` directory (not just `ci.yml`) so it
+  keeps mapping to every job id across both workflow files.
 - **Packaged `fauxchange conformance` harness across REST, WS, and FIX** (#51) —
   a runnable `conformance` subcommand (`src/conformance/`) that spins ephemeral
   in-process parity venues behind the real REST server and FIX 4.4 acceptor, and

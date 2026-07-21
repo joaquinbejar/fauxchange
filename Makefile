@@ -19,7 +19,8 @@ LOGLEVEL ?= WARN
 
 .PHONY: all help build release run run-seeded check test test-conformance \
 	docker-smoke fmt fmt-check lint lint-fix fix clean doc readme coverage \
-	coverage-html audit deny check-spanish pre-push publish
+	coverage-html audit deny check-spanish pre-push publish \
+	bench-regression bench-regression-full
 
 all: help ## Alias for `help`
 
@@ -31,10 +32,11 @@ help: ## List the common targets
 		| sort \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 	@echo ""
-	@echo "  workflow-<job-id>  Run a .github/workflows/ci.yml job locally via act"
+	@echo "  workflow-<job-id>  Run a .github/workflows/*.yml job locally via act"
 	@echo "                     (fmt, clippy, test, build-release, doctests, msrv,"
 	@echo "                     golden, determinism, parity, fuzz, migrations, cargo-audit,"
-	@echo "                     cargo-deny, image-build, docker-smoke)"
+	@echo "                     cargo-deny, image-build, docker-smoke, bench-regression,"
+	@echo "                     bench-regression-nightly)"
 
 # --- Build / run -------------------------------------------------------
 
@@ -120,6 +122,30 @@ coverage-html: ## cargo tarpaulin — HTML report under target/tarpaulin
 clean: ## cargo clean
 	$(CARGO) clean
 
+# --- Performance regression gate (#053, docs/07-performance-budgets.md §6) --
+
+bench-regression: ## Reduced-sample hot-path benches + the bench-regression gate — mirrors CI job `bench-regression` (HP-2 flatness gated at the 100% PR-path tolerance, above the observed CI-runner noise floor; BENCH.md §13.6)
+	@mkdir -p target/bench-out
+	scripts/record_bench_run_conditions.sh smoke | tee target/bench-out/run-conditions.txt
+	HP1_WARMUP_OPS=1000 HP1_MEASURED_OPS=5000 HP1_OPEN_LOOP_OPS=200 $(CARGO) bench --bench hp1_order_path | tee target/bench-out/hp1.log
+	HP2_WARMUP_OPS=500 HP2_MEASURED_OPS=3000 $(CARGO) bench --bench hp2_ws_fanout | tee target/bench-out/hp2.log
+	HP3_WARMUP_OPS=1000 HP3_MEASURED_OPS=10000 HP3_OPEN_LOOP_OPS=200 $(CARGO) bench --bench hp3_fix_parse | tee target/bench-out/hp3.log
+	HP4_WARMUP_OPS=500 HP4_MEASURED_OPS=2000 HP4_OPEN_LOOP_OPS=200 $(CARGO) bench --bench mm_requote_hdr | tee target/bench-out/hp4.log
+	HP5_WARMUP_OPS=30 HP5_MEASURED_OPS=150 HP5_OPEN_LOOP_OPS=20 $(CARGO) bench --bench hp5_durable_append | tee target/bench-out/hp5.log
+	ALLOC_WARMUP_OPS=2000 ALLOC_MEASURED_OPS=10000 ALLOC_MM_WARMUP_OPS=500 ALLOC_MM_MEASURED_OPS=2000 $(CARGO) bench --bench alloc_profile | tee target/bench-out/alloc.log
+	BENCH_REGRESSION_GATE_FLATNESS=1 BENCH_FANOUT_FLATNESS_TOLERANCE_PCT=100 python3 scripts/bench_regression_gate.py target/bench-out/*.log
+
+bench-regression-full: ## Full default-sample hot-path benches + the bench-regression gate — mirrors CI job `bench-regression-nightly` (HP-2 flatness genuinely gated; needs local Docker for HP-5)
+	@mkdir -p target/bench-out
+	scripts/record_bench_run_conditions.sh full | tee target/bench-out/run-conditions.txt
+	$(CARGO) bench --bench hp1_order_path | tee target/bench-out/hp1.log
+	$(CARGO) bench --bench hp2_ws_fanout | tee target/bench-out/hp2.log
+	$(CARGO) bench --bench hp3_fix_parse | tee target/bench-out/hp3.log
+	$(CARGO) bench --bench mm_requote_hdr | tee target/bench-out/hp4.log
+	$(CARGO) bench --bench hp5_durable_append | tee target/bench-out/hp5.log
+	$(CARGO) bench --bench alloc_profile | tee target/bench-out/alloc.log
+	BENCH_REGRESSION_GATE_FLATNESS=1 python3 scripts/bench_regression_gate.py target/bench-out/*.log
+
 pre-push: fix fmt lint-fix test check-spanish release readme doc ## The canonical ready-to-push gate — mirrors every binding pre-submission item (run without -j)
 	@echo "pre-push: done — re-check 'git status' (readme may have staged README.md)."
 
@@ -131,10 +157,13 @@ publish: ## Publish fauxchange to crates.io (CARGO_REGISTRY_TOKEN); CONFIRM with
 
 # --- CI parity (act) --------------------------------------------------------
 #
-# `make workflow-<job-id>` runs the matching job from
-# .github/workflows/ci.yml locally via `act` (https://github.com/nektos/act).
-# Job ids are the stable contract: fmt, clippy, test, build-release,
-# doctests, msrv, golden, determinism, parity, fuzz, cargo-audit, cargo-deny.
-# Example: `make workflow-clippy`, `make workflow-cargo-deny`.
+# `make workflow-<job-id>` runs the matching job from ANY workflow file under
+# .github/workflows/ (ci.yml, bench-regression.yml, ...) locally via `act`
+# (https://github.com/nektos/act) — pointed at the directory, not one named
+# file, so job ids stay a single stable contract across every workflow file
+# in this repo. Job ids: fmt, clippy, test, build-release, doctests, msrv,
+# golden, determinism, parity, fuzz, migrations, cargo-audit, cargo-deny,
+# image-build, docker-smoke, bench-regression, bench-regression-nightly.
+# Example: `make workflow-clippy`, `make workflow-bench-regression`.
 workflow-%:
-	act push -j $* --workflows .github/workflows/ci.yml
+	act push -j $* --workflows .github/workflows

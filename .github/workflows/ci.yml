@@ -59,7 +59,11 @@
 #
 # Explicitly OUT of this workflow (see
 # milestones/v0.1-backend-core/019-ci-audit-deny-lint.md "Scope"):
-# the `bench-regression` gate (armed before v1.0). The `docker-smoke`
+# the `bench-regression` gate — armed (`#053`, v1.0) as its OWN, separate
+# workflow file, `.github/workflows/bench-regression.yml` (`bench-regression`
+# job on every push/PR; `bench-regression-nightly` on schedule +
+# workflow_dispatch), never appended here, so the hot-path bench suite never
+# slows down this workflow's fast per-push jobs. The `docker-smoke`
 # cold-bring-up + one-order-round-trip e2e stage (v0.2 #027) is wired below,
 # dedicated and DOCKER=1-gated — not on every unit-test job.
 #
