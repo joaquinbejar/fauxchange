@@ -11,6 +11,21 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **DoS-control security-gate suite — the five DoS bounds proven as security
+  controls, not merely fairness knobs — the v0.5 security gate** (#48,
+  [08 §5](docs/08-threat-model.md#5-denial-of-service-posture)). Tests-only, no
+  public-surface change: the new `tests/dos_controls.rs` floods each of the
+  five already-wired bounds far past its configured ceiling and asserts the
+  control's own bookkeeping stays bounded (not merely that the last request
+  was rejected) — the sliding-window `RateLimiter`'s tracked key-space under a
+  flood of thousands of distinct callers, and one `AccountId`'s **one budget
+  shared across REST and FIX**; the per-underlying actor's bounded `mpsc`
+  mailbox under a concurrent flood (never queues past capacity); the WS
+  broadcast fan-out's laggard-drop-and-resnapshot (a non-draining consumer
+  pays for one `Lagged` catch-up, never a message-by-message replay); the
+  venue connection cap and the per-connection (256) WS subscription cap under
+  flood; and the checked `u64` sequence counter's permanent seal at
+  exhaustion (seeded via the actor's own test seam, never counted to `2^64`).
 - **Market-maker personas, resting-liquidity shaping, and halt scenarios** (#47) —
   a typed `PersonaConfig` (`base_spread_bps`, `base_size`, `spread_multiplier`,
   `size_scalar`, `directional_skew`) surfaced from `[market_maker.personas.<name>]`,
