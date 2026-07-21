@@ -29,6 +29,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::middleware::{from_fn, from_fn_with_state};
 use axum::routing::{delete, get, post};
 use tokio::task::JoinHandle;
@@ -47,6 +48,19 @@ use crate::state::AppState;
 /// The path prefix under which per-contract routes live.
 const CONTRACT: &str =
     "/api/v1/underlyings/{underlying}/expirations/{expiration}/strikes/{strike}/options/{style}";
+
+/// The maximum inbound REST request-body size, in **bytes** — a **DoS control**
+/// bounding per-request memory ([08 §5](../../../docs/08-threat-model.md#5-denial-of-service-posture)).
+///
+/// Set **explicitly** (via [`DefaultBodyLimit`]) rather than relying on axum's
+/// undocumented framework default, so the body-size ceiling is a *named*
+/// resource bound the threat-model audit can point at. A body larger than this is
+/// rejected with a `413`/`4xx` before it is buffered — it pairs with the per-batch
+/// [`MAX_BULK_ORDER_ITEMS`](crate::models::MAX_BULK_ORDER_ITEMS) item cap so
+/// neither the byte size nor the item count of a bulk request is unbounded. `1`
+/// MiB is generous for the largest JSON body (a full bulk batch) while replacing
+/// axum's 2 MiB default. The live value becomes venue config (#046).
+pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 
 /// Builds the complete REST [`Router`] over the shared [`AppState`].
 ///
@@ -89,6 +103,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .merge(public)
         .merge(ws)
         .with_state(state)
+        // Cap the inbound request-body size EXPLICITLY (a named DoS ceiling), so an
+        // oversized body is a `413`/`4xx` before it is buffered rather than an
+        // unbounded read on the framework default ([08 §4/§5](../../../docs/08-threat-model.md)).
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         // The peer-injection layer is OUTERMOST so `PeerAddr` is set before the
         // auth layer reads it (per-route `route_layer`s run inside this).
         .layer(from_fn(peer_addr_middleware));
