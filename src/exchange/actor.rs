@@ -816,9 +816,11 @@ enum ActorMessage {
         command: VenueCommand,
         reply: oneshot::Sender<Result<Receipt, VenueError>>,
     },
-    /// Reply with a read-only snapshot of the journal.
+    /// Reply with a read-only snapshot of the journal, or the read error (a
+    /// journal read failure must propagate, never collapse to a false-empty
+    /// snapshot while `last_sequence` still reports records present).
     Snapshot {
-        reply: oneshot::Sender<JournalSnapshot>,
+        reply: oneshot::Sender<Result<JournalSnapshot, VenueError>>,
     },
 }
 
@@ -890,7 +892,12 @@ impl ActorHandle {
                 return Err(VenueError::JournalUnavailable);
             }
         }
-        reply_rx.await.map_err(|_| VenueError::JournalUnavailable)
+        // Flatten: the outer `Err` is a dropped reply (actor gone); the inner
+        // `Err` is a propagated journal read failure.
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(VenueError::JournalUnavailable),
+        }
     }
 }
 
@@ -912,14 +919,28 @@ where
                     let _ = reply.send(result);
                 }
                 ActorMessage::Snapshot { reply } => {
-                    let snapshot = JournalSnapshot {
-                        last_sequence: self.journal.last_sequence(),
-                        records: self
-                            .journal
-                            .read_from(SequenceNumber::START)
-                            .unwrap_or_else(|_| Vec::new()),
+                    // Read the records FIRST: a journal read failure must propagate
+                    // as an error, never be swallowed into an empty `records` vec
+                    // while `last_sequence` still reports the journal non-empty
+                    // (that internally-inconsistent snapshot would silently corrupt
+                    // recovery/replay). Only on a successful read is the consistent
+                    // `last_sequence` paired with it.
+                    let result = match self.journal.read_from(SequenceNumber::START) {
+                        Ok(records) => Ok(JournalSnapshot {
+                            last_sequence: self.journal.last_sequence(),
+                            records,
+                        }),
+                        Err(error) => {
+                            tracing::error!(
+                                underlying = %self.underlying,
+                                %error,
+                                "journal read failed while building snapshot; \
+                                 propagating error instead of a false-empty snapshot"
+                            );
+                            Err(VenueError::JournalUnavailable)
+                        }
                     };
-                    let _ = reply.send(snapshot);
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -1108,6 +1129,40 @@ mod tests {
 
         fn read_from(&self, from: SequenceNumber) -> Result<Vec<JournalRecord>, JournalError> {
             self.inner.read_from(from)
+        }
+
+        fn last_sequence(&self) -> Option<SequenceNumber> {
+            self.inner.last_sequence()
+        }
+    }
+
+    /// A [`VenueJournal`] whose `read_from` always fails while `last_sequence`
+    /// still reports records present — the exact #61 inconsistency the snapshot
+    /// path must propagate as an error rather than swallow into a false-empty
+    /// snapshot. Appends land normally (so `last_sequence` becomes non-empty).
+    struct ReadFailJournal {
+        inner: InMemoryVenueJournal,
+    }
+
+    impl ReadFailJournal {
+        fn new() -> Self {
+            Self { inner: journal() }
+        }
+    }
+
+    impl VenueJournal for ReadFailJournal {
+        fn header(&self) -> &JournalHeader {
+            self.inner.header()
+        }
+
+        fn append(&mut self, record: JournalRecord) -> Result<(), JournalError> {
+            self.inner.append(record)
+        }
+
+        fn read_from(&self, _from: SequenceNumber) -> Result<Vec<JournalRecord>, JournalError> {
+            Err(JournalError::Backend {
+                operation: "snapshot_read",
+            })
         }
 
         fn last_sequence(&self) -> Option<SequenceNumber> {
@@ -1644,5 +1699,63 @@ mod tests {
         };
         assert_eq!(receipt.underlying_sequence, SequenceNumber::new(0));
         assert_eq!(exec_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- snapshot: journal read failure propagates (#61) -----------------
+
+    #[tokio::test]
+    async fn test_snapshot_propagates_journal_read_failure_not_false_empty() {
+        // A journal whose `read_from` fails while `last_sequence` reports records
+        // present. Before #61 the actor swallowed the read error into an empty
+        // `records` vec (an internally-inconsistent snapshot that silently
+        // corrupts recovery); it must now propagate the error instead.
+        let (handle, join) = spawn_underlying_actor(
+            config(16),
+            ReadFailJournal::new(),
+            PlaceholderExecutor,
+            NoopFanOut,
+            CLOCK,
+        );
+        // Land one record so `last_sequence` is non-empty — the exact mismatch.
+        match handle.submit(cancel("seed")).await {
+            Ok(_) => {}
+            Err(e) => panic!("seed submit should commit: {e}"),
+        }
+        match handle.snapshot().await {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("read failure must propagate, got {other:?}"),
+        }
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_returns_consistent_records_on_healthy_journal() {
+        let (handle, join) = spawn_underlying_actor(
+            config(16),
+            journal(),
+            PlaceholderExecutor,
+            NoopFanOut,
+            CLOCK,
+        );
+        match handle.submit(cancel("one")).await {
+            Ok(_) => {}
+            Err(e) => panic!("submit should commit: {e}"),
+        }
+        match handle.snapshot().await {
+            Ok(snapshot) => {
+                assert!(
+                    snapshot.last_sequence.is_some(),
+                    "last_sequence must report the record present"
+                );
+                assert!(
+                    !snapshot.records.is_empty(),
+                    "records must be consistent with a non-empty last_sequence"
+                );
+            }
+            Err(e) => panic!("a healthy journal must snapshot: {e}"),
+        }
+        drop(handle);
+        let _ = join.await;
     }
 }

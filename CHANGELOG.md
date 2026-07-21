@@ -2297,6 +2297,11 @@ The full versioning and release-process policy lives in the design docs
     failure (fail-stop, logged at `ERROR`) instead of silently continuing, so
     the two authoritative projections can no longer diverge from the committed
     journal — a rebuild is the recovery.
+  - A journal read failure while building an actor **snapshot** now
+    **propagates** as a typed error instead of collapsing into a false-empty
+    `records` vec while `last_sequence` still reports records present — the
+    internally-inconsistent snapshot that would have silently corrupted
+    recovery/replay is refused.
   - The dampened mark advances **once per `execution_id`**, not once per
     account leg, so a single two-leg match no longer double-counts the mark.
   - REST enforces the **GTD ↔ `gtd_expires_at`** pairing at the DTO boundary
@@ -2308,14 +2313,16 @@ The full versioning and release-process policy lives in the design docs
     drop-in `Json` extractor instead of axum's default plaintext 422, and the
     error body is attached to every `#[utoipa::path]` route's OpenAPI
     responses (the `413` oversized-body contract is preserved).
-  - The `max_keys` issuance ceiling is now reserved **atomically** (a single
-    locked reserve-or-reject) so a concurrent token-issuance flood can't
-    exceed the cap.
+  - The `max_keys` issuance ceiling **and** the WS ticket-store cap are now
+    reserved **atomically** (a single locked reserve-or-reject) so a concurrent
+    flood can't exceed either cap.
   - WebSocket upgrades accept a **short-lived single-use ticket**
     (`POST /api/v1/auth/ws-ticket`, 30 s TTL, CSPRNG, DoS-capped) carrying the
     bearer's `Permission`, so the JWT no longer has to travel in the upgrade
     query string (the bearer path is retained for back-compat); the permission
-    model is identical.
+    model is identical. Redemption re-checks the account revocation epoch **and**
+    the bearer JWT's own `exp`, so a ticket cannot outlive a revoke or the
+    token's expiry.
   - A `broadcast` lag now **re-snapshots or emits a typed `Resync` marker on
     every subscribed channel** (`trades` / `quotes` / `prices` / `fills`, not
     just `orderbook`), so no channel silently drops messages after an overflow.

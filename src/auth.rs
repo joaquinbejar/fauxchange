@@ -1931,6 +1931,13 @@ struct WsTicketEntry {
 struct WsTicketStore {
     tickets: DashMap<String, WsTicketEntry>,
     max_tickets: usize,
+    /// Serializes the sweep + cap-check + insert in [`mint`](WsTicketStore::mint)
+    /// so the `max_tickets` ceiling holds atomically under a concurrent flood
+    /// (every ticket key is a fresh CSPRNG value, so unlike the rate limiter's
+    /// existing-key fast path EVERY mint takes the check-then-insert path). Mirrors
+    /// [`RateLimiter::new_key_gate`]. A poisoned gate is recovered — it guards a
+    /// unit with no state to corrupt.
+    mint_gate: Mutex<()>,
 }
 
 impl WsTicketStore {
@@ -1939,6 +1946,7 @@ impl WsTicketStore {
         Self {
             tickets: DashMap::new(),
             max_tickets: max_tickets.max(1),
+            mint_gate: Mutex::new(()),
         }
     }
 
@@ -1947,14 +1955,24 @@ impl WsTicketStore {
     /// cap is still reached ([`VenueError::RateLimited`]) or the CSPRNG read fails
     /// ([`VenueError::Overflow`], redacted) — never a partial / low-entropy ticket.
     fn mint(&self, claims: Claims, now_secs: u64) -> Result<String, VenueError> {
-        self.sweep_expired(now_secs);
-        if self.tickets.len() >= self.max_tickets {
-            return Err(VenueError::RateLimited);
-        }
         let expires_at_secs = now_secs
             .checked_add(WS_TICKET_TTL_SECS)
             .ok_or(VenueError::Overflow)?;
         let ticket = mint_opaque_ticket()?;
+
+        // Serialize the sweep + cap-check + insert through the mint gate so the
+        // `max_tickets` ceiling holds atomically (closes the check-then-insert
+        // TOCTOU where N racing mints could each observe `len < max_tickets` and
+        // all insert). The gate is acquired BEFORE any shard lock and nothing else
+        // holds it, so there is no lock-order cycle; poisoning is recovered.
+        let _gate = self
+            .mint_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.sweep_expired(now_secs);
+        if self.tickets.len() >= self.max_tickets {
+            return Err(VenueError::RateLimited);
+        }
         self.tickets.insert(
             ticket.clone(),
             WsTicketEntry {
@@ -2254,6 +2272,17 @@ impl<C: RateLimitClock> AuthService<C> {
         if !decision.allowed {
             return Admission::Rejected {
                 error: VenueError::RateLimited,
+                rate_limit: Some(decision),
+            };
+        }
+
+        // Token expiry: a ticket minted just before its bearer JWT's `exp` must not
+        // admit a session past that instant (mirrors `revalidate_session`, which the
+        // socket loop then re-runs). Credential-plane, wall-clock seconds, off the
+        // sequenced path.
+        if now_secs >= claims.exp {
+            return Admission::Rejected {
+                error: VenueError::Unauthorized,
                 rate_limit: Some(decision),
             };
         }
@@ -3224,6 +3253,74 @@ mod tests {
         match store.mint(claims, 1_000) {
             Err(VenueError::RateLimited) => {}
             other => panic!("expected a fail-closed RateLimited at the cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_ws_ticket_mint_ceiling_holds_under_concurrent_flood() {
+        // Every mint takes the check-then-insert path (fresh CSPRNG key each time),
+        // so a concurrent flood must not overshoot the cap (the mint-gate TOCTOU
+        // fix). N racing threads against a cap of 8 → exactly 8 tickets tracked.
+        const CAP: usize = 8;
+        const THREADS: usize = 200;
+        let store = std::sync::Arc::new(WsTicketStore::new(CAP));
+        let successes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let store = std::sync::Arc::clone(&store);
+            let successes = std::sync::Arc::clone(&successes);
+            handles.push(std::thread::spawn(move || {
+                let claims = Claims::new(
+                    AccountId::new("acct-1"),
+                    vec![Permission::Read],
+                    0,
+                    u64::MAX,
+                    0,
+                );
+                if store.mint(claims, 1_000).is_ok() {
+                    successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("mint thread must not panic");
+        }
+        assert_eq!(
+            store.tickets.len(),
+            CAP,
+            "the ticket ceiling must hold exactly under a concurrent flood"
+        );
+        assert_eq!(
+            successes.load(std::sync::atomic::Ordering::SeqCst),
+            CAP,
+            "exactly `CAP` mints succeed; the rest fail closed"
+        );
+    }
+
+    #[test]
+    fn test_admit_ws_ticket_expired_bearer_jwt_is_unauthorized() {
+        // A ticket minted just before its bearer JWT's `exp` must not admit a
+        // session past that instant, even while the ticket's own 30s TTL is live.
+        let service = service_for("acct-1", 0, TestClock::new(0), 100);
+        let claims = Claims::new(
+            AccountId::new("acct-1"),
+            vec![Permission::Read],
+            0,
+            1_005, // JWT expires at 1_005s
+            0,
+        );
+        let ticket = service
+            .mint_ws_ticket(&claims, 1_000)
+            .expect("mint succeeds");
+        // now=1_010 is inside the ticket TTL (1_000 + 30) but past the JWT `exp`.
+        match service.admit_ws_ticket(&ticket, ws_peer(), 1_010) {
+            Admission::Rejected {
+                error: VenueError::Unauthorized,
+                ..
+            } => {}
+            other => {
+                panic!("a ticket for an expired bearer JWT must be unauthorized, got {other:?}")
+            }
         }
     }
 
