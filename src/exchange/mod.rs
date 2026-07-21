@@ -27,8 +27,12 @@
 //!   ([`UnderlyingActor`] / [`ActorHandle`] / [`spawn_underlying_actor`]): the
 //!   bounded mailbox, the venue-owned checked sequence counter, and the
 //!   write-ahead durability protocol every book mutation flows through. The
-//!   execute + fill-capture seam ([`CommandExecutor`]) is filled by #007 and the
-//!   fan-out seam ([`FanOut`]) by #008.
+//!   fan-out seam ([`FanOut`]) is filled by #008.
+//! - [`executor`] — the real [`CommandExecutor`] ([`MatchingExecutor`]): routes
+//!   `AddOrder` / `CancelOrder` / `Replace` / market orders onto the upstream
+//!   `option-chain-orderbook` matching **unchanged** and captures the lossless
+//!   [`VenueOutcome`] (two-leg fills, resting remainder, STP removals), with the
+//!   ergonomic [`spawn_matching_actor`] wiring it into the actor.
 //!
 //! Snapshot/restore, recovery, and the durable journal store land in later
 //! issues; the envelope types remain **pure data**.
@@ -39,6 +43,7 @@ pub mod actor;
 pub mod boundary;
 pub mod envelope;
 pub mod event;
+pub mod executor;
 pub mod identity;
 pub mod instrument;
 pub mod journal;
@@ -59,6 +64,7 @@ pub use self::envelope::{
     VenueEvent, VenueOutcome,
 };
 pub use self::event::{EventTimestamp, SequenceNumber};
+pub use self::executor::{MatchingExecutor, TopOfBook, spawn_matching_actor};
 pub use self::identity::{JournalHeader, LineageId, VENUE_ENVELOPE_SCHEMA};
 pub use self::instrument::Instrument;
 pub use self::journal::{

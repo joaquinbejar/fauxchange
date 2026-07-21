@@ -11,6 +11,58 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- Real order path onto upstream matching (#7) in `src/exchange/`
+  (`executor.rs`) — the `CommandExecutor` seam #6 left open, now driving the
+  upstream `option-chain-orderbook` matching **unchanged** and capturing the
+  lossless `VenueOutcome`
+  ([02 §4–§5](docs/02-matching-architecture.md),
+  [ADR-0009](docs/adr/0009-lossless-venue-envelope-outcomes.md)). Adds
+  `MatchingExecutor`, which owns one per-underlying `UnderlyingOrderBook` and,
+  per command, **vivifies the target leaf** through the hierarchy's idempotent
+  `get_or_create_*` path (the same pure-function-of-the-symbol resolution the
+  upstream `SequencedUnderlyingOrderBook` uses, so replay rebuilds identical
+  structural state), drives the **account-preserving** `_full` leaf
+  (`add_limit_order_with_tif_and_user_full` → `TradeResult`) for a limit
+  `AddOrder`, and the **true non-resting market primitive**
+  (`orderbook_rs::OrderBook::submit_market_order_with_user` via
+  `OptionOrderBook::inner()`) for a market order — never a marketable-limit
+  substitute, with an empty-book fast path that returns zero-fill / fully
+  unfilled rather than an invented price. Captures every match as **two linked
+  legs** (maker + taker sharing one `execution_id`, per-leg account / owner /
+  fee) with the resting maker's identity recovered from the **journaled add
+  command** via a deterministic registry, not live book state
+  ([ADR-0009 §2](docs/adr/0009-lossless-venue-envelope-outcomes.md)). Captures
+  fills on **both** paths: on `Ok` from the returned `TradeResult`, and on the
+  **error-after-fills** `Err` path (an unfillable `Ioc` remainder, or an STP
+  cancel after earlier fills) via a single-writer-safe **before/after diff** of
+  the leaf's armed `last_trade_result()` capture slot (keyed on the strictly
+  monotonic `engine_seq`; upstream Option-Chain-OrderBook#148: last-write-wins,
+  no `take`/`clear`) — so a command that executed fills is **never** a bare
+  `Rejected` ([ADR-0009 §1](docs/adr/0009-lossless-venue-envelope-outcomes.md)).
+  Implements `CancelOrder` and the **non-atomic** `Replace` (cancel-then-add in
+  one turn, one `VenueEvent` at one sequence, explicit `Replace { cancelled,
+  add }` — no rollback if the add is rejected), and records STP-cancelled
+  same-owner resting makers (`stp_cancelled`, sorted for a deterministic sweep
+  order) recovered by an owner-scoped resting diff. Execution consults **no**
+  wall-clock, RNG, or map-iteration order: the engine order id is assigned
+  deterministically as `OrderId::sequential(underlying_sequence)` (the engine
+  never RNG-mints a `Uuid` on the path), and the engine's process-local trade
+  ids / wall-clock trade timestamps are excluded from the oracle
+  ([02 §5](docs/02-matching-architecture.md)). Adds the `TopOfBook` read
+  projection (the determinism oracle's read surface) and the ergonomic
+  `spawn_matching_actor` wiring the real executor into the #6 actor (the
+  `PlaceholderExecutor` stays for tests). Upstream methods verified against the
+  **locked** `option-chain-orderbook` 0.7.0 (with transitive `orderbook-rs`
+  0.10.5 / `pricelevel` 0.8.4); no new dependencies. New tests: unit
+  add/cancel/replace/market happy paths + rejections, error-after-fill diff
+  capture, empty-book + thin-book market, partial-replace (`cancelled: true`,
+  add `Rejected`), STP affected-id recording, and per-leg fee capture
+  (`executor.rs`); the `journal_replay_reconstructs_book` property
+  (`tests/property.rs`); `market` / partial-`replace` outcome goldens extending
+  the `venue.v1` set (`tests/golden.rs`); the seed → orders → matching →
+  captured-fills integration round-trip and the **binding** determinism test
+  (same journal → same fills + top-of-book) driven through the public actor /
+  executor surface (`tests/order_path.rs`).
 - Per-underlying single-writer actor + in-memory write-ahead envelope journal
   (#6) in `src/exchange/` (`actor.rs`, `journal.rs`) — the determinism
   foundation every book mutation flows through

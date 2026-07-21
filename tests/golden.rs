@@ -14,9 +14,9 @@
 //! review the diff.
 
 use fauxchange::exchange::{
-    CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as VenueFill, Hash32, LineageId,
-    SequenceNumber, Side as SeamSide, SignedCents, Symbol, TimeInForce as SeamTif, VenueCommand,
-    VenueEvent, VenueOutcome,
+    AddOutcome, CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as VenueFill, Hash32,
+    LineageId, SequenceNumber, Side as SeamSide, SignedCents, Symbol, TimeInForce as SeamTif,
+    VenueCommand, VenueEvent, VenueOutcome,
 };
 use fauxchange::{
     AccountId, BookSide, BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, ClientOrderId,
@@ -738,4 +738,129 @@ fn test_golden_venue_add_order_stp_cancelled_event() {
         golden["outcome"]["Added"]["stp_cancelled"][0]["reason"],
         serde_json::json!("SelfTradePrevention")
     );
+}
+
+#[test]
+fn test_golden_venue_market_order_event() {
+    // A representative `venue.v1` VenueEvent for the upstream true non-resting
+    // market primitive: a market `AddOrder` (no `limit_price`) with a captured
+    // `Market` outcome carrying a two-leg fill and the cancelled unfilled
+    // remainder — pins the always-present `fills` / `stp_cancelled` empty-vec
+    // convention and the `unfilled_quantity` field into the venue.v1 shape.
+    let lineage = LineageId::new("run-1");
+    let seq = SequenceNumber::new(11);
+    let execution_id = lineage.execution_id("BTC", seq, 0);
+    let taker_id = lineage.venue_order_id("BTC", seq, 0);
+    let maker_id = lineage.venue_order_id("BTC", SequenceNumber::new(4), 0);
+    let taker_owner = Hash32([0x22; 32]);
+    let maker_owner = Hash32([0x11; 32]);
+
+    let command = VenueCommand::AddOrder {
+        symbol: sym("BTC-20240329-50000-C"),
+        order_id: taker_id.clone(),
+        account: AccountId::new("taker-acct"),
+        owner: taker_owner,
+        client_order_id: None,
+        side: SeamSide::Buy,
+        order_type: OrderType::Market,
+        limit_price: None,
+        quantity: 5,
+        time_in_force: SeamTif::Ioc,
+        stp_mode: fauxchange::exchange::STPMode::None,
+    };
+    let outcome = VenueOutcome::Market {
+        fills: vec![
+            VenueFill {
+                execution_id: execution_id.clone(),
+                order_id: maker_id,
+                account: AccountId::new("maker-acct"),
+                owner: maker_owner,
+                side: SeamSide::Sell,
+                liquidity: LiquidityFlag::Maker,
+                price: Cents::new(50_000),
+                quantity: 2,
+                fee: SignedCents::new(0),
+            },
+            VenueFill {
+                execution_id,
+                order_id: taker_id,
+                account: AccountId::new("taker-acct"),
+                owner: taker_owner,
+                side: SeamSide::Buy,
+                liquidity: LiquidityFlag::Taker,
+                price: Cents::new(50_000),
+                quantity: 2,
+                fee: SignedCents::new(0),
+            },
+        ],
+        // 3 of the 5 contracts found no liquidity: cancelled, never rested, never
+        // assigned an invented price.
+        unfilled_quantity: 3,
+        stp_cancelled: vec![],
+    };
+    let event = VenueEvent::new(
+        seq,
+        EventTimestamp::new(1_700_000_000_000),
+        command,
+        outcome,
+    );
+
+    assert_golden("venue/market_order_event.json", &event);
+    let golden = load_golden("venue/market_order_event.json");
+    assert_eq!(golden["schema"], serde_json::json!("venue.v1"));
+    // A market command carries no `limit_price`; the unfilled remainder is present.
+    assert_eq!(
+        golden["command"]["AddOrder"]["limit_price"],
+        serde_json::json!(null)
+    );
+    assert_eq!(
+        golden["outcome"]["Market"]["unfilled_quantity"],
+        serde_json::json!(3)
+    );
+    assert_eq!(
+        golden["outcome"]["Market"]["stp_cancelled"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn test_golden_venue_replace_partial_event() {
+    // A representative `venue.v1` VenueEvent for a non-atomic `Replace` whose
+    // cancel leg succeeded but whose add leg was rejected — the defined,
+    // replayable partial state (old order gone, no new order rests), NOT a silent
+    // loss. Pins the explicit `Replace { cancelled, add: Rejected }` shape.
+    let lineage = LineageId::new("run-1");
+    let seq = SequenceNumber::new(13);
+    let command = VenueCommand::Replace {
+        symbol: sym("BTC-20240329-50000-C"),
+        order_id: lineage.venue_order_id("BTC", SequenceNumber::new(5), 0),
+        new_order_id: lineage.venue_order_id("BTC", seq, 0),
+        account: AccountId::new("acct-1"),
+        side: SeamSide::Buy,
+        limit_price: Some(Cents::new(40_000)),
+        quantity: 2,
+        time_in_force: SeamTif::Fok,
+        stp_mode: fauxchange::exchange::STPMode::None,
+    };
+    let outcome = VenueOutcome::Replace {
+        cancelled: true,
+        add: AddOutcome::Rejected {
+            reason: "order was not fillable and did not rest".to_string(),
+        },
+    };
+    let event = VenueEvent::new(
+        seq,
+        EventTimestamp::new(1_700_000_000_000),
+        command,
+        outcome,
+    );
+
+    assert_golden("venue/replace_partial_event.json", &event);
+    let golden = load_golden("venue/replace_partial_event.json");
+    assert_eq!(golden["schema"], serde_json::json!("venue.v1"));
+    assert_eq!(
+        golden["outcome"]["Replace"]["cancelled"],
+        serde_json::json!(true)
+    );
+    assert!(golden["outcome"]["Replace"]["add"]["Rejected"].is_object());
 }

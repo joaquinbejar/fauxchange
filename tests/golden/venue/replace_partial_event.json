@@ -1,0 +1,28 @@
+{
+  "command": {
+    "Replace": {
+      "account": "acct-1",
+      "limit_price": 40000,
+      "new_order_id": "run-1:BTC:13:0",
+      "order_id": "run-1:BTC:5:0",
+      "quantity": 2,
+      "side": "BUY",
+      "stp_mode": "None",
+      "symbol": "BTC-20240329-50000-C",
+      "time_in_force": "FOK"
+    }
+  },
+  "outcome": {
+    "Replace": {
+      "add": {
+        "Rejected": {
+          "reason": "order was not fillable and did not rest"
+        }
+      },
+      "cancelled": true
+    }
+  },
+  "schema": "venue.v1",
+  "underlying_sequence": 13,
+  "venue_ts": 1700000000000
+}
