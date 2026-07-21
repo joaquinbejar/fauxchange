@@ -88,7 +88,8 @@ use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
 use fauxchange::gateway::fix::order::NewOrderSingle;
 use fauxchange::gateway::fix::order_flow::to_add_command;
 use fauxchange::microstructure::{
-    ContractSpecsConfig, FeeConfig, FileMicrostructure, MicrostructureConfig, StpConfig, StpMode,
+    ContractSpecsConfig, FeeConfig, FileMicrostructure, LatencyConfig, MicrostructureConfig,
+    StpConfig, StpMode,
 };
 use fauxchange::simulation::{
     ClockMode, JournalStream, ReplayError, RunManifest, ScenarioBundle, SessionConfig,
@@ -2036,9 +2037,12 @@ fn test_seed_isolation_for_venue_owned_derivations() {
     // Seed isolation is asserted for the venue-owned derivation ONLY. Today the run
     // seed deterministically derives the run LINEAGE, which namespaces every
     // venue-minted id: the same seed reproduces the same id namespace, and DISTINCT
-    // seeds produce DISTINCT namespaces (no cross-run id collision). The stochastic
-    // RNG sub-streams (latency, persona jitter) are v0.5 forward-scoped and are NOT
-    // fabricated here; the price walk is reproduced from the journal, not the seed.
+    // seeds produce DISTINCT namespaces (no cross-run id collision). The latency
+    // sub-stream (#045) is now a real seed-reproducible venue-owned draw
+    // (`test_injected_latency_changes_arrival_order_only`,
+    // `test_latency_config_rides_the_bundle_and_gates_replay`); persona jitter stays
+    // v0.5 forward-scoped (#047); the price walk is reproduced from the journal, not
+    // the seed.
 
     // Reproducible: the same seed derives the identical lineage → identical ids.
     let a = lineage_for_seed(7);
@@ -2341,6 +2345,233 @@ async fn test_fee_stp_sensitive_scenario_replays_exactly_from_bundle() {
             assert_eq!(found, tampered.microstructure.fingerprint());
         }
         other => panic!("a fingerprint mismatch must refuse replay, got {other:?}"),
+    }
+}
+
+// ============================================================================
+// Latency injection (#045): a seeded, venue-owned, virtual-clock sub-stream
+// ============================================================================
+
+/// A canonical debug-string multiset of a command stream — order-independent, so
+/// two permutations of the same commands compare equal (proves latency only
+/// reorders, never mutates a command).
+fn command_multiset(commands: &[VenueCommand]) -> Vec<String> {
+    let mut rendered: Vec<String> = commands.iter().map(|c| format!("{c:?}")).collect();
+    rendered.sort();
+    rendered
+}
+
+/// **Latency changes arrival order ONLY.** Latency is designed to be applied at
+/// the gateway edge, *before* the sequencer: its sole output is a per-message
+/// virtual-clock offset used to reshape the ARRIVAL ORDER into the single writer —
+/// it never touches a `VenueCommand`. The live ingress-reorder buffer that consumes
+/// the offset is deferred to #111; this test synthesizes the arrival key directly to
+/// prove the invariant. So for a FIXED arrival order the journal (and the fills) are
+/// a pure function of the ordered commands, unperturbed by whether latency was drawn.
+///
+/// Distinct from the price walk: the latency sub-stream *is* seed-reproducible (the
+/// draw is a pure function of `(seed, session, msg_seq)`), whereas the walk is
+/// journal-driven and excluded from same-seed regeneration — the two are kept
+/// separate here.
+#[test]
+fn test_injected_latency_changes_arrival_order_only() {
+    let lineage = lineage_for_seed(0xABCD);
+    // Five independent resting sells and a crossing buy — every permutation is a
+    // valid arrival order (no command depends on an earlier one).
+    let base: Vec<VenueCommand> = vec![
+        add(
+            &lineage,
+            0,
+            CALL,
+            "m0",
+            0x10,
+            Side::Sell,
+            50_000,
+            1,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            1,
+            CALL,
+            "m1",
+            0x11,
+            Side::Sell,
+            50_000,
+            1,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            2,
+            CALL,
+            "m2",
+            0x12,
+            Side::Sell,
+            50_000,
+            1,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            3,
+            CALL,
+            "m3",
+            0x13,
+            Side::Sell,
+            50_000,
+            1,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            4,
+            CALL,
+            "m4",
+            0x14,
+            Side::Sell,
+            50_000,
+            1,
+            TimeInForce::Gtc,
+        ),
+        add(
+            &lineage,
+            5,
+            CALL,
+            "t5",
+            0x22,
+            Side::Buy,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+    ];
+
+    // The gateway edge would stamp each inbound message with (session_id, msg_seq) and
+    // a base virtual-clock arrival instant (1 ms apart), then add the seeded latency
+    // offset to form the effective arrival key it sequences on (the live buffer is
+    // #111; here the test synthesizes that key). A uniform 0..5_000 µs
+    // offset over 1 ms base spacing is wide enough to reorder arrivals.
+    let latency = LatencyConfig::Uniform {
+        min_us: 0,
+        max_us: 5_000,
+    };
+    let seed = 0xABCD_u64;
+    let mut keyed: Vec<(u64, usize, VenueCommand)> = base
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(seq, cmd)| {
+            let base_ms = 1_000 + seq as u64;
+            let arrival_us = latency
+                .draw(seed, "session-A", seq as u64)
+                .delayed_arrival_us(base_ms);
+            (arrival_us, seq, cmd)
+        })
+        .collect();
+    // A stable sort on the effective arrival key = the order the single writer sees.
+    keyed.sort_by_key(|(arrival_us, seq, _)| (*arrival_us, *seq));
+    let permuted: Vec<VenueCommand> = keyed.iter().map(|(_, _, c)| c.clone()).collect();
+
+    // Latency actually reshaped arrival (not the identity permutation)...
+    assert_ne!(
+        permuted, base,
+        "the latency offsets should reorder arrivals for this seed"
+    );
+    // ...but only as a permutation: the command multiset is unchanged (no command
+    // added, dropped, or mutated).
+    assert_eq!(
+        command_multiset(&permuted),
+        command_multiset(&base),
+        "latency reorders arrivals; it never alters the command set"
+    );
+
+    // For that FIXED (latency-determined) arrival order, record → replay reconstructs
+    // IDENTICAL events, fills, and top-of-book: matching is a pure function of the
+    // ordered commands — not perturbed by latency.
+    let recording = record(&permuted, &lineage, &witnesses());
+    let replay = replay(&recording);
+    assert_replay_equals(&recording, &replay);
+}
+
+/// **A latency-injected run is self-describing and replays under the oracle scope.**
+/// The resolved [`LatencyConfig`] rides in the microstructure config carried by the
+/// scenario bundle, its content feeds the recorded manifest fingerprint, and a
+/// fingerprint mismatch (a different latency distribution) refuses replay — exactly
+/// the fee/STP gate, now covering the latency sub-stream. Combined with
+/// `test_injected_latency_changes_arrival_order_only` (the journal replays
+/// identically) and the seed-reproducible draw (unit-tested in
+/// `src/microstructure/latency.rs`), a latency-injected scenario replays exactly.
+#[tokio::test]
+async fn test_latency_config_rides_the_bundle_and_gates_replay() {
+    let file = FileMicrostructure {
+        latency: Some(fauxchange::microstructure::FileLatency {
+            model: fauxchange::microstructure::LatencyModel::Lognormal,
+            us: None,
+            min_us: None,
+            max_us: None,
+            mean_us: None,
+            median_us: Some(250),
+            sigma: Some(0.4),
+        }),
+        ..FileMicrostructure::default()
+    };
+    let micro = MicrostructureConfig::resolve(&file, &BTreeMap::new()).expect("resolves");
+    assert_eq!(
+        micro.latency(),
+        LatencyConfig::Lognormal {
+            median_us: 250,
+            sigma: 0.4,
+        }
+    );
+
+    let state = ms_state(micro.clone());
+    run_fee_stp_scenario(&state).await;
+
+    // The exported bundle carries the resolved latency config, and the recorded
+    // manifest fingerprint (which now folds in the latency distribution) matches it.
+    let bundle = state.export_bundle().await.expect("export bundle");
+    assert_eq!(
+        bundle.microstructure, micro,
+        "the bundle carries the resolved latency config"
+    );
+    assert_eq!(
+        bundle.microstructure.fingerprint(),
+        bundle.manifest.microstructure_fingerprint,
+        "the recorded manifest fingerprint folds in the latency distribution"
+    );
+    assert!(
+        bundle
+            .manifest
+            .microstructure_fingerprint
+            .contains("latency=lognormal"),
+        "the latency distribution is scoped by the fingerprint"
+    );
+    // The latency-carrying bundle replays exactly (Ok is the identical-events proof).
+    replay_bundle(&bundle).expect("latency-injected scenario replays exactly");
+
+    // A DIFFERENT latency distribution shifts the fingerprint → replay is refused,
+    // never a divergent reproduction under the wrong arrival-shaping.
+    let other_file = FileMicrostructure {
+        latency: Some(fauxchange::microstructure::FileLatency {
+            model: fauxchange::microstructure::LatencyModel::Fixed,
+            us: Some(500),
+            min_us: None,
+            max_us: None,
+            mean_us: None,
+            median_us: None,
+            sigma: None,
+        }),
+        ..FileMicrostructure::default()
+    };
+    let mut tampered = bundle.clone();
+    tampered.microstructure =
+        MicrostructureConfig::resolve(&other_file, &BTreeMap::new()).expect("resolves");
+    match replay_bundle(&tampered) {
+        Err(ReplayError::VersionMismatch { kind, .. }) => {
+            assert_eq!(kind, "microstructure_fingerprint");
+        }
+        other => panic!("a latency-fingerprint mismatch must refuse replay, got {other:?}"),
     }
 }
 

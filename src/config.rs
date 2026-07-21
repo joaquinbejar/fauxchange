@@ -1864,11 +1864,11 @@ struct FileConfig {
     instruments: Option<BTreeMap<String, FileInstrument>>,
     #[serde(default)]
     market_maker: Option<FileMarketMaker>,
-    // ---- microstructure (real, validated as of #044) ----
-    // `[microstructure.fees]` / `[microstructure.stp]` / `[microstructure.specs]`
-    // resolve into `Config::microstructure` via `microstructure_config` (the
-    // checked-fee proof runs there); `[microstructure.latency]` is accepted and
-    // ignored inside `FileMicrostructure` until #045 owns it.
+    // ---- microstructure (real, validated as of #044/#045) ----
+    // `[microstructure.fees]` / `[microstructure.stp]` / `[microstructure.specs]` /
+    // `[microstructure.latency]` resolve into `Config::microstructure` via
+    // `microstructure_config` (the checked-fee proof and the latency-distribution
+    // validation run there).
     #[serde(default)]
     microstructure: Option<FileMicrostructure>,
     // ---- remaining extension point (accepted, validated by #46) ----

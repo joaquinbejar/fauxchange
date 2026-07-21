@@ -17,24 +17,21 @@
 use std::collections::BTreeMap;
 
 use option_chain_orderbook::{FeeSchedule, STPMode};
-use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use crate::exchange::Cents;
 use crate::microstructure::error::{MicrostructureConfigError, PriceBoundError};
 use crate::microstructure::fees::FeeConfig;
+use crate::microstructure::latency::{FileLatency, LatencyConfig};
 use crate::microstructure::specs::{ContractSpecsConfig, PriceBounds, ResolvedContractSpecs};
 use crate::microstructure::stp::StpConfig;
 use crate::simulation::DEFAULT_MICROSTRUCTURE_FINGERPRINT;
 
-/// The `[microstructure]` file section — the venue fee schedule, STP mode, and
-/// venue-default contract specs.
+/// The `[microstructure]` file section — the venue fee schedule, STP mode,
+/// venue-default contract specs, and latency-injection distribution.
 ///
-/// `latency` is accepted and **ignored** here: the latency-injection knob is owned
-/// by #045, so a forward-looking config carrying `[microstructure.latency]` is not
-/// rejected before that issue lands (the same "accept, resolve later" pattern the
-/// v0.2 loader used for the whole section). Every other unknown key inside
-/// `[microstructure]` is a startup error (`deny_unknown_fields`).
+/// Every unknown key inside `[microstructure]` is a startup error
+/// (`deny_unknown_fields`).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileMicrostructure {
@@ -48,10 +45,10 @@ pub struct FileMicrostructure {
     /// per-underlying `[instruments."X".specs]` inherits unset knobs from.
     #[serde(default)]
     pub specs: Option<ContractSpecsConfig>,
-    /// `[microstructure.latency]` — accepted and ignored here (owned by #045).
+    /// `[microstructure.latency]` — the seeded latency-injection distribution
+    /// (#045). Absent ⇒ no latency injection.
     #[serde(default)]
-    #[allow(dead_code)]
-    pub latency: Option<IgnoredAny>,
+    pub latency: Option<FileLatency>,
 }
 
 /// The resolved, validated venue microstructure — the fee schedule, STP mode, and
@@ -64,12 +61,23 @@ pub struct FileMicrostructure {
 /// fee/STP-sensitive scenario replays exactly, and the bundle's
 /// [`fingerprint`](Self::fingerprint) is checked against the recorded
 /// `RunManifest.microstructure_fingerprint` as an equality gate before replay.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is **not** derived: the [`latency`](Self::latency) config carries an `f64`
+/// `sigma` (`normal` / `lognormal`), for which `Eq`'s reflexivity contract does not
+/// hold. `PartialEq` is enough for the fingerprint's default check and the bundle's
+/// equality; no consumer bounds on `Eq` (consistent with `Config` and
+/// `ScenarioBundle`, which are also `PartialEq`-only).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MicrostructureConfig {
     fees: FeeConfig,
     stp: StpConfig,
     default_specs: ResolvedContractSpecs,
     per_underlying: BTreeMap<String, ResolvedContractSpecs>,
+    /// The seeded latency-injection distribution (#045). `#[serde(default)]` so a
+    /// legacy bundle without it decodes as [`LatencyConfig::Disabled`], preserving
+    /// the reserved default fingerprint.
+    #[serde(default)]
+    latency: LatencyConfig,
 }
 
 impl Default for MicrostructureConfig {
@@ -79,6 +87,7 @@ impl Default for MicrostructureConfig {
             stp: StpConfig::default(),
             default_specs: ResolvedContractSpecs::baseline(),
             per_underlying: BTreeMap::new(),
+            latency: LatencyConfig::default(),
         }
     }
 }
@@ -107,6 +116,13 @@ impl MicrostructureConfig {
         fees.validate()?;
         let stp = file.stp.unwrap_or_default();
 
+        // Latency: resolve + validate the `[microstructure.latency]` distribution
+        // (missing/negative params, non-finite/negative sigma, min > max).
+        let latency = match &file.latency {
+            Some(file_latency) => file_latency.resolve()?,
+            None => LatencyConfig::default(),
+        };
+
         // Venue default: [microstructure.specs] over the hard-coded baseline, then
         // proved against the fee schedule.
         let default_specs = file
@@ -128,6 +144,7 @@ impl MicrostructureConfig {
             stp,
             default_specs,
             per_underlying,
+            latency,
         })
     }
 
@@ -168,6 +185,8 @@ impl MicrostructureConfig {
     /// any per-underlying widest notional.
     pub fn validate(&self) -> Result<(), MicrostructureConfigError> {
         self.fees.validate()?;
+        // The latency distribution (deserialize bypassed `FileLatency::resolve`).
+        self.latency.validate()?;
         // The venue default: spec ranges (deserialize bypassed `validate`) then the
         // checked-fee proof against its widest notional.
         self.default_specs.validate()?;
@@ -179,6 +198,14 @@ impl MicrostructureConfig {
             self.fees.validate_notional_bound(specs.max_notional()?)?;
         }
         Ok(())
+    }
+
+    /// The resolved latency-injection distribution the gateway edge draws against
+    /// per inbound message (#045). [`LatencyConfig::Disabled`] when unconfigured.
+    #[must_use]
+    #[inline]
+    pub fn latency(&self) -> LatencyConfig {
+        self.latency
     }
 
     /// The venue fee config.
@@ -257,6 +284,9 @@ impl MicrostructureConfig {
         for (underlying, specs) in &self.per_underlying {
             out.push_str(&format!(";specs.{underlying}={}", specs_fragment(specs)));
         }
+        // The latency distribution (empty fragment when disabled), so a latency-only
+        // config change still yields a distinct fingerprint.
+        out.push_str(&self.latency.fingerprint_fragment());
         out
     }
 }
@@ -494,15 +524,71 @@ mod tests {
     }
 
     #[test]
-    fn test_file_microstructure_accepts_and_ignores_latency() {
-        // #045 owns latency; a forward config with [microstructure.latency] parses
-        // (accepted + ignored), and the fee/stp/specs still resolve.
+    fn test_file_microstructure_resolves_latency() {
+        // #045: `[microstructure.latency]` is a real, resolved section — the doc
+        // example parses and resolves alongside the fee schedule.
         let file: FileMicrostructure = toml::from_str(
-            "[fees]\nmaker_bps = -10\ntaker_bps = 35\n\n[latency]\nmodel = \"lognormal\"\nmedian_us = 250\n",
+            "[fees]\nmaker_bps = -10\ntaker_bps = 35\n\n[latency]\nmodel = \"lognormal\"\nmedian_us = 250\nsigma = 0.4\n",
         )
-        .expect("forward config with latency parses");
+        .expect("config with latency parses");
         let config = MicrostructureConfig::resolve(&file, &BTreeMap::new()).expect("resolves");
         assert_eq!(config.fee_schedule().taker_fee_bps, 35);
+        assert_eq!(
+            config.latency(),
+            crate::microstructure::LatencyConfig::Lognormal {
+                median_us: 250,
+                sigma: 0.4,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_rejects_invalid_latency() {
+        // A latency section missing its required `sigma` fails resolution as a
+        // typed microstructure config error.
+        let file: FileMicrostructure =
+            toml::from_str("[latency]\nmodel = \"normal\"\nmean_us = 100\n")
+                .expect("parses (validation is at resolve)");
+        match MicrostructureConfig::resolve(&file, &BTreeMap::new()) {
+            Err(MicrostructureConfigError::Latency(_)) => {}
+            other => panic!("expected a latency config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fingerprint_is_sensitive_to_latency() {
+        // A latency-only config change (fees/stp/specs all default) still yields a
+        // fingerprint distinct from the reserved default slot.
+        let file = FileMicrostructure {
+            latency: Some(crate::microstructure::FileLatency {
+                model: crate::microstructure::LatencyModel::Fixed,
+                us: Some(250),
+                min_us: None,
+                max_us: None,
+                mean_us: None,
+                median_us: None,
+                sigma: None,
+            }),
+            ..FileMicrostructure::default()
+        };
+        let config = MicrostructureConfig::resolve(&file, &BTreeMap::new()).expect("resolves");
+        assert_ne!(config.fingerprint(), DEFAULT_MICROSTRUCTURE_FINGERPRINT);
+        assert!(config.fingerprint().contains("latency=fixed"));
+        // And a different latency yields a different fingerprint.
+        let other_file = FileMicrostructure {
+            latency: Some(crate::microstructure::FileLatency {
+                model: crate::microstructure::LatencyModel::Fixed,
+                us: Some(500),
+                min_us: None,
+                max_us: None,
+                mean_us: None,
+                median_us: None,
+                sigma: None,
+            }),
+            ..FileMicrostructure::default()
+        };
+        let other = MicrostructureConfig::resolve(&other_file, &BTreeMap::new()).expect("resolves");
+        assert_ne!(config.fingerprint(), other.fingerprint());
     }
 
     #[test]

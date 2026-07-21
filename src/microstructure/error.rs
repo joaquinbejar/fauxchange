@@ -22,7 +22,13 @@
 /// `FeeSchedule::calculate_fee` saturating branch provably unreachable by
 /// bounding config, rather than the venue inventing private fee math
 /// ([05 §4.1](../../../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// `Eq` is intentionally **not** derived: the [`Latency`](Self::Latency) variant
+/// wraps a [`LatencyConfigError`] that carries the offending `sigma` (an `f64`, for
+/// which `Eq`'s reflexivity contract does not hold). `PartialEq` is enough for the
+/// `assert_eq!` in tests, and the config seam ([`crate::config::ConfigError`]) is
+/// `Debug`-only, so no consumer bounds on `Eq`.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum MicrostructureConfigError {
     /// The taker fee was negative. The upstream `FeeSchedule` contract requires a
     /// non-negative taker rate (only the maker rate may be a rebate).
@@ -97,6 +103,67 @@ pub enum MicrostructureConfigError {
     ContractSpecsRejected {
         /// The upstream rejection reason.
         reason: String,
+    },
+    /// The `[microstructure.latency]` distribution config was invalid — a missing /
+    /// negative parameter, a non-finite / negative `sigma`, or `min_us > max_us`
+    /// ([05 §3](../../../docs/05-microstructure-config.md#3-latency-injection)).
+    #[error("invalid latency config: {0}")]
+    Latency(#[from] LatencyConfigError),
+}
+
+/// A failure validating the `[microstructure.latency]` distribution config at boot
+/// ([05 §3](../../../docs/05-microstructure-config.md#3-latency-injection)).
+///
+/// Latency shapes *arrival order* at the gateway edge via a seeded per-message
+/// draw; a mis-parameterised distribution (a missing param, a negative delay, a
+/// non-finite / negative `sigma`, or an inverted `[min_us, max_us]` band) is
+/// rejected **at load**, before the venue serves a request, so an invalid draw can
+/// never reach the arrival path. Folded into
+/// [`MicrostructureConfigError::Latency`] at the config seam.
+///
+/// `Eq` is not derived — [`SigmaNotFinite`](Self::SigmaNotFinite) /
+/// [`SigmaNegative`](Self::SigmaNegative) carry an `f64`.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum LatencyConfigError {
+    /// The selected `model` requires a parameter that was absent
+    /// (`fixed` needs `us`; `uniform` needs `min_us` + `max_us`; `normal` needs
+    /// `mean_us` + `sigma`; `lognormal` needs `median_us` + `sigma`).
+    #[error("latency model '{model}' requires parameter '{param}'")]
+    MissingParam {
+        /// The selected model token.
+        model: &'static str,
+        /// The absent required parameter.
+        param: &'static str,
+    },
+    /// A microsecond delay parameter (`us` / `min_us` / `max_us` / `mean_us` /
+    /// `median_us`) was negative — a delay cannot run backwards on the virtual
+    /// clock.
+    #[error("latency parameter '{param}' must be non-negative (got {value} us)")]
+    NegativeMicros {
+        /// The offending parameter name.
+        param: &'static str,
+        /// The offending value in microseconds.
+        value: i64,
+    },
+    /// `sigma` was NaN or infinite — a distribution shape must be a finite number.
+    #[error("latency sigma must be finite (got {value})")]
+    SigmaNotFinite {
+        /// The offending non-finite value.
+        value: f64,
+    },
+    /// `sigma` was negative — a distribution's spread cannot be below zero.
+    #[error("latency sigma must be non-negative (got {value})")]
+    SigmaNegative {
+        /// The offending negative value.
+        value: f64,
+    },
+    /// A `uniform` band had `min_us` above `max_us` — an empty draw interval.
+    #[error("latency min_us ({min_us}) must be at or below max_us ({max_us})")]
+    MinExceedsMax {
+        /// The configured band floor (microseconds).
+        min_us: i64,
+        /// The configured band ceiling (microseconds).
+        max_us: i64,
     },
 }
 
