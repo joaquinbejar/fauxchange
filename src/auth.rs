@@ -61,7 +61,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use argon2::password_hash::SaltString;
 use argon2::{
@@ -108,6 +108,30 @@ pub const DEFAULT_MAX_RATE_LIMIT_KEYS: usize = 100_000;
 /// container health check qualifies — it must answer unconditionally
 /// ([03 §6](../docs/03-protocol-surfaces.md#6-authentication)).
 pub const EXEMPT_PATHS: &[&str] = &["/health"];
+
+/// The lifetime of a `GET /ws` handshake **ticket**, in **seconds** — deliberately
+/// tight ([03 §6](../docs/03-protocol-surfaces.md#6-authentication)).
+///
+/// A WS upgrade cannot safely carry a long-lived bearer JWT in the query string (it
+/// leaks into access logs, proxy logs, and browser history). Instead an
+/// authenticated REST caller mints a short-lived, single-use ticket bound to its
+/// verified [`Claims`]; the upgrade redeems it once within this window and proceeds
+/// with the SAME permission model the bearer would grant. A tight TTL keeps a
+/// leaked / observed ticket useless within seconds; single-use redemption means it
+/// cannot be replayed even inside the window. The live value is venue config
+/// (#046); this is the bounded default until then.
+pub const WS_TICKET_TTL_SECS: u64 = 30;
+
+/// The maximum number of live (unredeemed, unexpired) WS handshake tickets the
+/// venue tracks at once — a DoS bound on the ticket store
+/// ([08 §5](../docs/08-threat-model.md#5-resource-exhaustion)). Minting sweeps
+/// expired tickets first and, if still at the cap, **fails closed** (a throttle)
+/// rather than grow without bound. Generous for real fan-in yet bounded.
+pub const MAX_WS_TICKETS: usize = 65_536;
+
+/// The number of CSPRNG bytes in a WS ticket — 256 bits of entropy rendered as a
+/// 64-char lowercase-hex opaque string, unguessable by construction.
+const WS_TICKET_BYTES: usize = 32;
 
 /// The `X-RateLimit-Limit` response header (the window budget).
 pub const HEADER_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
@@ -892,6 +916,14 @@ pub struct RateLimiter<C> {
     budgets: RateLimitBudgets,
     max_keys: usize,
     windows: DashMap<RateLimitKey, Vec<u64>>,
+    /// Serializes the **new-key admission** path so the capacity check + insert are
+    /// atomic and the `max_keys` ceiling holds under a concurrent flood (closes the
+    /// check-then-insert TOCTOU). Only a would-be *new* key takes this gate; an
+    /// existing key proceeds on the lock-free fast path and never contends. Held
+    /// only across the non-blocking capacity check + insert — never across `.await`,
+    /// and always acquired *before* any `DashMap` shard lock (a consistent lock
+    /// order, so no deadlock with the fast path).
+    new_key_gate: Mutex<()>,
 }
 
 impl<C> std::fmt::Debug for RateLimiter<C> {
@@ -950,6 +982,7 @@ impl<C: RateLimitClock> RateLimiter<C> {
             budgets,
             max_keys: max_keys.max(1),
             windows: DashMap::new(),
+            new_key_gate: Mutex::new(()),
         }
     }
 
@@ -985,12 +1018,15 @@ impl<C: RateLimitClock> RateLimiter<C> {
     /// `X-RateLimit-*` context. An over-limit request is **not** recorded (the log
     /// stays bounded by `limit`).
     ///
-    /// **Key-space DoS bound.** An **existing** key always proceeds. A would-be
-    /// **new** key at the `max_keys` ceiling first triggers an opportunistic inline
-    /// [`sweep_expired`](Self::sweep_expired) of expired buckets; if the map is
-    /// still full, the request **fails closed** (a throttle) rather than insert a
-    /// new key — the tracked key-space never grows past `max_keys`
-    /// ([08 §5](../docs/08-threat-model.md#5-resource-exhaustion)).
+    /// **Key-space DoS bound.** An **existing** key always proceeds on the
+    /// lock-free fast path. A would-be **new** key is admitted through a
+    /// single-writer gate so the capacity check and the insert are **atomic**: it
+    /// first triggers an opportunistic inline [`sweep_expired`](Self::sweep_expired)
+    /// of expired buckets; if the map is still full, the request **fails closed** (a
+    /// throttle) rather than insert a new key. Because new-key admission is
+    /// serialized, the tracked key-space **never** grows past `max_keys` even under a
+    /// concurrent flood of distinct keys (no check-then-insert overshoot,
+    /// [08 §5](../docs/08-threat-model.md#5-resource-exhaustion)).
     #[must_use]
     pub fn check_and_record_status(&self, key: &RateLimitKey) -> RateLimitDecision {
         let now = self.clock.now_ms();
@@ -1006,8 +1042,27 @@ impl<C: RateLimitClock> RateLimiter<C> {
             return Self::decide(&mut timestamps, now, limit, window_ms);
         }
 
-        // Would-be NEW key: enforce the key-space ceiling (DoS control). No shard
-        // guard is held here, so the sweep/len calls cannot deadlock.
+        // Would-be NEW key: serialize the capacity-check + insert through the
+        // new-key gate so the `max_keys` ceiling holds atomically under a
+        // concurrent flood (closes the check-then-insert TOCTOU where N racing
+        // new keys could each observe `len < max_keys` and all insert). The gate
+        // is acquired BEFORE any shard lock, and the fast path never takes it, so
+        // there is no lock-order cycle. A poisoned gate (a panic while held) is
+        // recovered — the guarded unit carries no state to corrupt.
+        let _gate = self
+            .new_key_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Re-check under the gate: another writer may have inserted this exact key
+        // between the fast-path miss and acquiring the gate, so treat it as
+        // existing rather than miscount it against the ceiling.
+        if let Some(mut timestamps) = self.windows.get_mut(key) {
+            return Self::decide(&mut timestamps, now, limit, window_ms);
+        }
+
+        // Enforce the key-space ceiling (DoS control) atomically with the insert
+        // below, since the gate excludes every other new-key admission.
         if self.windows.len() >= self.max_keys {
             self.sweep_expired();
             if self.windows.len() >= self.max_keys {
@@ -1854,6 +1909,106 @@ impl AccountStore for AccountRegistry {
 }
 
 // ============================================================================
+// WebSocket handshake tickets
+// ============================================================================
+
+/// One live WS handshake ticket: the [`Claims`] it is bound to and its wall-clock
+/// expiry instant, in **seconds**.
+struct WsTicketEntry {
+    claims: Claims,
+    expires_at_secs: u64,
+}
+
+/// A short-lived, single-use, opaque WebSocket handshake **ticket** store.
+///
+/// The `GET /ws` upgrade cannot safely read a long-lived bearer JWT from the query
+/// string (it leaks into logs / proxies / history). Instead an authenticated REST
+/// caller mints a ticket bound to its verified [`Claims`]; the upgrade redeems it
+/// **once**, within a tight TTL, and proceeds with the SAME permission model the
+/// bearer would grant. Tickets are minted from the OS CSPRNG (unguessable) and
+/// removed on redemption (single-use). Owned by [`AuthService`]; never journaled
+/// and off the sequenced path (a CSPRNG source is fine here).
+struct WsTicketStore {
+    tickets: DashMap<String, WsTicketEntry>,
+    max_tickets: usize,
+}
+
+impl WsTicketStore {
+    /// Builds a store with the given DoS ceiling (clamped to at least `1`).
+    fn new(max_tickets: usize) -> Self {
+        Self {
+            tickets: DashMap::new(),
+            max_tickets: max_tickets.max(1),
+        }
+    }
+
+    /// Mints a single-use ticket bound to `claims`, expiring [`WS_TICKET_TTL_SECS`]
+    /// after `now_secs`. Sweeps expired tickets first; **fails closed** if the DoS
+    /// cap is still reached ([`VenueError::RateLimited`]) or the CSPRNG read fails
+    /// ([`VenueError::Overflow`], redacted) — never a partial / low-entropy ticket.
+    fn mint(&self, claims: Claims, now_secs: u64) -> Result<String, VenueError> {
+        self.sweep_expired(now_secs);
+        if self.tickets.len() >= self.max_tickets {
+            return Err(VenueError::RateLimited);
+        }
+        let expires_at_secs = now_secs
+            .checked_add(WS_TICKET_TTL_SECS)
+            .ok_or(VenueError::Overflow)?;
+        let ticket = mint_opaque_ticket()?;
+        self.tickets.insert(
+            ticket.clone(),
+            WsTicketEntry {
+                claims,
+                expires_at_secs,
+            },
+        );
+        Ok(ticket)
+    }
+
+    /// Redeems a ticket **once**: removes it (single-use) and returns its bound
+    /// claims only if it existed and has not expired at `now_secs`. A reused,
+    /// unknown, or expired ticket returns `None` (and, if expired, is reclaimed).
+    fn redeem(&self, ticket: &str, now_secs: u64) -> Option<Claims> {
+        let (_, entry) = self.tickets.remove(ticket)?;
+        if entry.expires_at_secs > now_secs {
+            Some(entry.claims)
+        } else {
+            None
+        }
+    }
+
+    /// Reclaims every ticket whose TTL has elapsed at `now_secs`.
+    fn sweep_expired(&self, now_secs: u64) {
+        self.tickets
+            .retain(|_ticket, entry| entry.expires_at_secs > now_secs);
+    }
+}
+
+/// Mints an unguessable opaque ticket: [`WS_TICKET_BYTES`] bytes from the OS
+/// CSPRNG rendered as lowercase hex. A CSPRNG read failure is a redacted internal
+/// error, never a weak fallback.
+fn mint_opaque_ticket() -> Result<String, VenueError> {
+    use rand_core::RngCore;
+    let mut bytes = [0u8; WS_TICKET_BYTES];
+    let mut rng = OsRng;
+    rng.try_fill_bytes(&mut bytes)
+        .map_err(|_| VenueError::Overflow)?;
+    Ok(hex_encode_lower(&bytes))
+}
+
+/// Renders bytes as a lowercase-hex string (no dependency, constant per-byte).
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    // Two hex chars per byte; a capacity hint only (never a protocol counter).
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+// ============================================================================
 // AuthService + admission
 // ============================================================================
 
@@ -1905,6 +2060,10 @@ pub struct AuthService<C> {
     jwt: JwtAuth,
     rate_limiter: RateLimiter<C>,
     revocation: Arc<dyn RevocationOracle>,
+    /// The short-lived, single-use WS handshake ticket store (owned internally so
+    /// the constructor signature is unchanged; both the REST mint route and the
+    /// `/ws` upgrade reach it through this one [`AuthService`]).
+    ws_tickets: WsTicketStore,
 }
 
 impl<C> std::fmt::Debug for AuthService<C> {
@@ -1928,6 +2087,7 @@ impl<C: RateLimitClock> AuthService<C> {
             jwt,
             rate_limiter,
             revocation,
+            ws_tickets: WsTicketStore::new(MAX_WS_TICKETS),
         }
     }
 
@@ -2032,6 +2192,81 @@ impl<C: RateLimitClock> AuthService<C> {
                 error: VenueError::Forbidden(required),
                 rate_limit: Some(decision),
             };
+        }
+
+        Admission::Admitted {
+            identity: Box::new(Authorized { claims }),
+            rate_limit: decision,
+        }
+    }
+
+    /// Mints a short-lived, single-use WebSocket handshake **ticket** bound to
+    /// `claims` (see [`WS_TICKET_TTL_SECS`]). Called by the authenticated REST mint
+    /// route so a browser (or any client) can authenticate `GET /ws` **without**
+    /// putting a long-lived bearer JWT in the query string. The ticket carries the
+    /// SAME [`Permission`] set the bearer would.
+    ///
+    /// `now_secs` is wall-clock **seconds** — the ticket TTL is a credential-plane
+    /// concern, off the sequenced path.
+    ///
+    /// # Errors
+    ///
+    /// [`VenueError::RateLimited`] when too many tickets are outstanding (the DoS
+    /// cap after a sweep), or [`VenueError::Overflow`] (redacted) on a CSPRNG /
+    /// arithmetic failure.
+    pub fn mint_ws_ticket(&self, claims: &Claims, now_secs: u64) -> Result<String, VenueError> {
+        self.ws_tickets.mint(claims.clone(), now_secs)
+    }
+
+    /// Admits a `GET /ws` handshake presenting a WS **ticket** instead of a bearer.
+    ///
+    /// Mirrors the admission gate of [`admit`](Self::admit) so the ticket and bearer
+    /// paths grant the identical permission model: the ticket is redeemed
+    /// **once** (single-use; a reused / unknown / expired ticket is a `401`), then
+    /// the resolved account is rate-limited and its **revocation epoch** re-checked
+    /// (a ticket minted before a revoke must not admit). A failed redemption is
+    /// rate-limited against the peer so ticket-guessing is bounded even before an
+    /// account is resolved.
+    ///
+    /// `now_secs` is wall-clock **seconds** (the credential plane), off the
+    /// sequenced path.
+    #[must_use]
+    pub fn admit_ws_ticket(&self, ticket: &str, peer: IpAddr, now_secs: u64) -> Admission {
+        // Single-use redeem first: an unknown / expired / reused ticket is refused,
+        // and the failed attempt is rate-limited against the peer (bounds guessing).
+        let Some(claims) = self.ws_tickets.redeem(ticket, now_secs) else {
+            let decision = self
+                .rate_limiter
+                .check_and_record_status(&RateLimitKey::Peer(peer));
+            return Admission::Rejected {
+                error: VenueError::Unauthorized,
+                rate_limit: Some(decision),
+            };
+        };
+
+        // Rate-limit on the resolved account key (identical to the bearer path).
+        let key = RateLimitKey::Account {
+            account: claims.sub.clone(),
+            revocation_epoch: claims.revocation_epoch,
+            tier: RateLimitTier::from_permissions(&claims.permissions),
+        };
+        let decision = self.rate_limiter.check_and_record_status(&key);
+        if !decision.allowed {
+            return Admission::Rejected {
+                error: VenueError::RateLimited,
+                rate_limit: Some(decision),
+            };
+        }
+
+        // Revocation: a ticket minted before the account was revoked must not admit.
+        match self.revocation.current_revocation_epoch(&claims.sub) {
+            Some(current) if claims.revocation_epoch >= current => {}
+            _ => {
+                return Admission::Rejected {
+                    error: VenueError::Unauthorized,
+                    rate_limit: Some(decision),
+                };
+            }
         }
 
         Admission::Admitted {
@@ -2865,6 +3100,214 @@ mod tests {
         clock.set(RATE_LIMIT_WINDOW_MS + 1);
         assert!(limiter.check_and_record_status(&peer_key(3)).allowed);
         assert!(limiter.tracked_keys() <= 2);
+    }
+
+    #[test]
+    fn test_rate_limiter_key_space_ceiling_holds_under_concurrent_flood() {
+        // N threads race to admit N DISTINCT new keys against a small ceiling. The
+        // atomic new-key gate must hold the ceiling EXACTLY — the check-then-insert
+        // TOCTOU (where racing threads each observe `len < max_keys` and all insert,
+        // overshooting the cap) is closed. Nothing expires (the clock never
+        // advances), so the tracked key-space settles at exactly `max_keys`.
+        use std::thread;
+
+        const MAX_KEYS: usize = 8;
+        const RACERS: u8 = 200;
+
+        let clock = TestClock::new(0);
+        let limiter = Arc::new(RateLimiter::with_capacity(
+            clock,
+            10,
+            RATE_LIMIT_WINDOW_MS,
+            MAX_KEYS,
+        ));
+
+        let mut handles = Vec::new();
+        for n in 0..RACERS {
+            let limiter = Arc::clone(&limiter);
+            handles.push(thread::spawn(move || {
+                let _ = limiter.check_and_record_status(&peer_key(n));
+            }));
+        }
+        for handle in handles {
+            if handle.join().is_err() {
+                panic!("a racing issuance thread panicked");
+            }
+        }
+
+        assert_eq!(
+            limiter.tracked_keys(),
+            MAX_KEYS,
+            "the key-space ceiling must hold exactly under a concurrent flood (no TOCTOU overshoot)"
+        );
+    }
+
+    // ---- WebSocket handshake tickets (#69) -------------------------------
+
+    fn ws_peer() -> IpAddr {
+        IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))
+    }
+
+    #[test]
+    fn test_ws_ticket_store_mint_and_redeem_roundtrips() {
+        let store = WsTicketStore::new(MAX_WS_TICKETS);
+        let claims = Claims::new(
+            AccountId::new("acct-1"),
+            vec![Permission::Trade],
+            0,
+            u64::MAX,
+            0,
+        );
+        let ticket = store.mint(claims, 1_000).expect("mint succeeds");
+        // 256 bits of CSPRNG entropy as 64 lowercase-hex chars (unguessable).
+        assert_eq!(ticket.len(), WS_TICKET_BYTES * 2);
+        assert!(
+            ticket
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        );
+        let redeemed = store
+            .redeem(&ticket, 1_010)
+            .expect("a fresh ticket redeems");
+        assert_eq!(redeemed.permissions, vec![Permission::Trade]);
+    }
+
+    #[test]
+    fn test_ws_ticket_is_single_use() {
+        let store = WsTicketStore::new(MAX_WS_TICKETS);
+        let claims = Claims::new(
+            AccountId::new("acct-1"),
+            vec![Permission::Read],
+            0,
+            u64::MAX,
+            0,
+        );
+        let ticket = store.mint(claims, 1_000).expect("mint succeeds");
+        assert!(
+            store.redeem(&ticket, 1_005).is_some(),
+            "the first redemption succeeds"
+        );
+        assert!(
+            store.redeem(&ticket, 1_006).is_none(),
+            "a reused ticket is refused (single-use)"
+        );
+    }
+
+    #[test]
+    fn test_ws_ticket_expires() {
+        let store = WsTicketStore::new(MAX_WS_TICKETS);
+        let claims = Claims::new(
+            AccountId::new("acct-1"),
+            vec![Permission::Read],
+            0,
+            u64::MAX,
+            0,
+        );
+        let ticket = store.mint(claims, 1_000).expect("mint succeeds");
+        assert!(
+            store.redeem(&ticket, 1_000 + WS_TICKET_TTL_SECS).is_none(),
+            "a ticket at/after its TTL is refused"
+        );
+    }
+
+    #[test]
+    fn test_ws_ticket_mint_fails_closed_at_cap() {
+        let store = WsTicketStore::new(1);
+        let claims = Claims::new(
+            AccountId::new("acct-1"),
+            vec![Permission::Read],
+            0,
+            u64::MAX,
+            0,
+        );
+        assert!(store.mint(claims.clone(), 1_000).is_ok());
+        match store.mint(claims, 1_000) {
+            Err(VenueError::RateLimited) => {}
+            other => panic!("expected a fail-closed RateLimited at the cap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_admit_ws_ticket_valid_admits_with_bearer_permissions() {
+        let service = service_for("acct-1", 0, TestClock::new(0), 100);
+        let claims = Claims::new(
+            AccountId::new("acct-1"),
+            vec![Permission::Trade],
+            0,
+            u64::MAX,
+            0,
+        );
+        let ticket = service
+            .mint_ws_ticket(&claims, 1_000)
+            .expect("mint succeeds");
+        match service.admit_ws_ticket(&ticket, ws_peer(), 1_010) {
+            Admission::Admitted { identity, .. } => {
+                // A ticket carries the SAME permission the bearer would.
+                assert_eq!(identity.claims.permissions, vec![Permission::Trade]);
+                assert_eq!(identity.claims.account(), &AccountId::new("acct-1"));
+            }
+            other => panic!("a valid ticket must admit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_admit_ws_ticket_reused_is_unauthorized() {
+        let service = service_for("acct-1", 0, TestClock::new(0), 100);
+        let claims = Claims::new(
+            AccountId::new("acct-1"),
+            vec![Permission::Read],
+            0,
+            u64::MAX,
+            0,
+        );
+        let ticket = service
+            .mint_ws_ticket(&claims, 1_000)
+            .expect("mint succeeds");
+        assert!(matches!(
+            service.admit_ws_ticket(&ticket, ws_peer(), 1_010),
+            Admission::Admitted { .. }
+        ));
+        match service.admit_ws_ticket(&ticket, ws_peer(), 1_011) {
+            Admission::Rejected {
+                error: VenueError::Unauthorized,
+                ..
+            } => {}
+            other => panic!("a reused ticket must be unauthorized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_admit_ws_ticket_expired_is_unauthorized() {
+        let service = service_for("acct-1", 0, TestClock::new(0), 100);
+        let claims = Claims::new(
+            AccountId::new("acct-1"),
+            vec![Permission::Read],
+            0,
+            u64::MAX,
+            0,
+        );
+        let ticket = service
+            .mint_ws_ticket(&claims, 1_000)
+            .expect("mint succeeds");
+        match service.admit_ws_ticket(&ticket, ws_peer(), 1_000 + WS_TICKET_TTL_SECS + 5) {
+            Admission::Rejected {
+                error: VenueError::Unauthorized,
+                ..
+            } => {}
+            other => panic!("an expired ticket must be unauthorized, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_admit_ws_ticket_unknown_is_unauthorized() {
+        let service = service_for("acct-1", 0, TestClock::new(0), 100);
+        match service.admit_ws_ticket("deadbeef-not-a-real-ticket", ws_peer(), 1_000) {
+            Admission::Rejected {
+                error: VenueError::Unauthorized,
+                ..
+            } => {}
+            other => panic!("an unknown ticket must be unauthorized, got {other:?}"),
+        }
     }
 
     #[test]

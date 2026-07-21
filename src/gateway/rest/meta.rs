@@ -9,14 +9,16 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 
-use crate::auth::DEFAULT_TOKEN_TTL_SECS;
+use crate::auth::{Authorized, DEFAULT_TOKEN_TTL_SECS, WS_TICKET_TTL_SECS};
 use crate::error::VenueError;
 use crate::exchange::SymbolParser;
+use crate::gateway::rest::extract::Json;
 use crate::gateway::rest::support::format_rfc3339_utc;
-use crate::models::{GlobalStatsResponse, HealthResponse, TokenRequest, TokenResponse};
+use crate::models::{
+    GlobalStatsResponse, HealthResponse, TokenRequest, TokenResponse, WsTicketResponse,
+};
 use crate::state::AppState;
 
 /// Liveness check — the container health probe. The **only** route exempt from
@@ -152,6 +154,49 @@ fn map_mint_error(error: crate::auth::AuthError) -> VenueError {
             VenueError::Overflow
         }
     }
+}
+
+/// Mints a short-lived, single-use WebSocket handshake **ticket** bound to the
+/// authenticated caller's permissions — the recommended way to authenticate
+/// `GET /ws` without leaking a long-lived bearer JWT into the query string (and
+/// thus into access logs, proxies, and browser history).
+///
+/// Requires the auth baseline (`Read`, the middleware's baseline); the ticket
+/// carries the SAME [`Permission`](crate::models::Permission) set the caller's
+/// bearer holds, so `/ws` control actions remain gated by `Admin` exactly as they
+/// are for a bearer handshake. The ticket is unguessable (CSPRNG), expires within
+/// [`WS_TICKET_TTL_SECS`] seconds, and is valid for exactly one upgrade.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/ws-ticket",
+    tag = "auth",
+    responses(
+        (status = 200, description = "A short-lived single-use WS handshake ticket", body = WsTicketResponse),
+        (status = 401, description = "Missing or invalid token"),
+        (status = 429, description = "Rate limited, or too many outstanding tickets"),
+    ),
+    security(("bearer_jwt" = [])),
+)]
+pub async fn issue_ws_ticket(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<Authorized>,
+) -> Result<Json<WsTicketResponse>, VenueError> {
+    // Wall-clock seconds: the ticket TTL is a credential-plane concern, off the
+    // sequenced path (never the venue clock).
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| VenueError::Overflow)?;
+    let ticket = state.auth().mint_ws_ticket(&auth.claims, now_secs)?;
+    let expires_at_secs = now_secs
+        .checked_add(WS_TICKET_TTL_SECS)
+        .ok_or(VenueError::Overflow)?;
+
+    Ok(Json(WsTicketResponse {
+        ticket,
+        expires_at: format_rfc3339_utc(expires_at_secs),
+        expires_in_secs: WS_TICKET_TTL_SECS,
+    }))
 }
 
 #[cfg(test)]

@@ -18,14 +18,21 @@
 //! ## Handshake authentication
 //!
 //! `GET /ws` authenticates through the venue's **one**
-//! [`AuthService::admit`](crate::auth::AuthService::admit) with a baseline
-//! [`Permission::Read`], reading the bearer JWT from the `Authorization` header
-//! **or** a `?token=` / `?access_token=` query parameter (a browser WebSocket
-//! cannot set headers). A missing / invalid token or an exhausted rate-limit
-//! budget **refuses the upgrade** (`401` / `429`) — the socket never opens. Once
-//! open, a per-action check gates the market-maker control actions behind
-//! [`Permission::Admin`] and passes them through the rate limiter, mirroring the
-//! REST control plane (control parity, REST ≡ WS).
+//! [`AuthService`](crate::auth::AuthService) with a baseline [`Permission::Read`].
+//! The **preferred** credential is a short-lived, single-use **ticket** (minted by
+//! the authenticated `POST /api/v1/auth/ws-ticket` and redeemed via
+//! [`AuthService::admit_ws_ticket`](crate::auth::AuthService::admit_ws_ticket)),
+//! read from the `X-WS-Ticket` header or a `?ticket=` query parameter — a browser
+//! cannot set headers, and a single-use ticket that expires in seconds is safe in a
+//! URL that lands in logs / proxies / history, unlike a long-lived bearer. The
+//! bearer path (`Authorization` header or `?token=` / `?access_token=` query,
+//! admitted through [`AuthService::admit`](crate::auth::AuthService::admit)) remains
+//! accepted for back-compat; **both grant the identical permission model** (a ticket
+//! carries the bearer's `Claims`). A missing / invalid credential or an exhausted
+//! rate-limit budget **refuses the upgrade** (`401` / `429`) — the socket never
+//! opens. Once open, a per-action check gates the market-maker control actions
+//! behind [`Permission::Admin`] and passes them through the rate limiter, mirroring
+//! the REST control plane (control parity, REST ≡ WS).
 //!
 //! ## Close vs continue
 //!
@@ -101,15 +108,24 @@ pub fn ws_routes() -> Router<Arc<AppState>> {
     Router::new().route("/ws", get(ws_handler))
 }
 
-/// The handshake token carried on the `GET /ws` query string, for clients that
-/// cannot set an `Authorization` header (browsers). Either `token` or
-/// `access_token` is accepted; the header takes precedence when both are present.
+/// The handshake credential carried on the `GET /ws` query string, for clients
+/// that cannot set request headers (browsers).
+///
+/// **Prefer the short-lived `ticket`** (minted by `POST /api/v1/auth/ws-ticket`):
+/// it is single-use and expires within seconds, so — unlike a long-lived bearer —
+/// it is safe in a URL that lands in access logs, proxies, and browser history. The
+/// bearer `token` / `access_token` fields remain accepted for back-compat; a
+/// header (`X-WS-Ticket` for the ticket, `Authorization` for the bearer) takes
+/// precedence over the query when both are present.
 #[derive(Debug, Default, Deserialize)]
 pub struct WsAuthQuery {
-    /// The bearer JWT (`?token=…`).
+    /// The short-lived single-use WS ticket (`?ticket=…`) — the preferred credential.
+    #[serde(default)]
+    pub ticket: Option<String>,
+    /// The bearer JWT (`?token=…`) — back-compat.
     #[serde(default)]
     pub token: Option<String>,
-    /// The bearer JWT (`?access_token=…`).
+    /// The bearer JWT (`?access_token=…`) — back-compat.
     #[serde(default)]
     pub access_token: Option<String>,
 }
@@ -117,11 +133,14 @@ pub struct WsAuthQuery {
 /// `GET /ws` — authenticates the handshake, reserves a connection slot, then
 /// upgrades to the `WsMessage` protocol.
 ///
-/// The bearer is read from the `Authorization` header or a `?token=` /
-/// `?access_token=` query parameter and admitted through the venue's one
-/// [`AuthService`](crate::auth::AuthService) with a baseline [`Permission::Read`];
-/// a rejection **refuses the upgrade** (the typed `401`/`429` response, with the
-/// rate-limit headers), so an unauthenticated socket never opens. After admission
+/// A short-lived single-use **ticket** (`X-WS-Ticket` header or `?ticket=` query,
+/// the preferred credential) is redeemed if present; otherwise the bearer is read
+/// from the `Authorization` header or a `?token=` / `?access_token=` query
+/// parameter. Either is admitted through the venue's one
+/// [`AuthService`](crate::auth::AuthService) with a baseline [`Permission::Read`],
+/// granting the identical permission model; a rejection **refuses the upgrade** (the
+/// typed `401`/`429` response, with the rate-limit headers), so an unauthenticated
+/// socket never opens. After admission
 /// a venue-wide connection slot ([`MAX_WS_CONNECTIONS`](crate::subscription::MAX_WS_CONNECTIONS))
 /// is reserved — at the cap the upgrade is refused (`503`) — and the inbound
 /// frame / message size is capped ([`MAX_WS_FRAME_BYTES`]).
@@ -132,15 +151,25 @@ pub async fn ws_handler(
     peer: Option<Extension<PeerAddr>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let token = extract_token(&headers, &auth_query);
     let peer_ip = peer
         .map(|Extension(peer)| peer.0)
         .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
 
-    match state
-        .auth()
-        .admit("/ws", token.as_deref(), peer_ip, Permission::Read)
-    {
+    // Prefer a short-lived, single-use WS ticket (keeps a long-lived bearer out of
+    // the query string / logs); fall back to the bearer path for back-compat. Both
+    // grant the identical permission model (a ticket carries the bearer's `Claims`).
+    let admission = if let Some(ticket) = extract_ticket(&headers, &auth_query) {
+        state
+            .auth()
+            .admit_ws_ticket(&ticket, peer_ip, wall_clock_secs())
+    } else {
+        let token = extract_token(&headers, &auth_query);
+        state
+            .auth()
+            .admit("/ws", token.as_deref(), peer_ip, Permission::Read)
+    };
+
+    match admission {
         Admission::Admitted {
             identity,
             rate_limit,
@@ -178,6 +207,21 @@ pub async fn ws_handler(
         // `/ws` is not on the exempt list, so this arm is defensively unauthorized.
         Admission::Exempt => VenueError::Unauthorized.into_response(),
     }
+}
+
+/// Extracts the short-lived WS ticket from the `X-WS-Ticket` header (preferred) or
+/// the `?ticket=` query string — the preferred handshake credential.
+fn extract_ticket(headers: &HeaderMap, query: &WsAuthQuery) -> Option<String> {
+    if let Some(value) = headers
+        .get("x-ws-ticket")
+        .and_then(|value| value.to_str().ok())
+    {
+        let ticket = value.trim();
+        if !ticket.is_empty() {
+            return Some(ticket.to_string());
+        }
+    }
+    query.ticket.clone().filter(|ticket| !ticket.is_empty())
 }
 
 /// Extracts the bearer token from the `Authorization` header (preferred) or the
@@ -275,8 +319,10 @@ async fn handle_socket(
                             break;
                         }
                     }
-                    // A laggard drops its backlog and re-snapshots every orderbook
-                    // subscription — a gap is repaired only by a fresh snapshot.
+                    // A laggard dropped an unknown span of messages: re-snapshot /
+                    // resync EVERY subscribed channel so none silently drops — the
+                    // orderbook replays a fresh snapshot, every event-stream channel
+                    // (trades/quotes/prices/fills) emits a typed Resync marker.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let messages = connection.resnapshot(&manager);
                         if send_all(&mut socket, messages).await {
@@ -828,26 +874,69 @@ impl Connection {
         Some(message)
     }
 
-    /// Re-snapshots every orderbook subscription after a laggard drop, resetting
-    /// each baseline to its fresh snapshot's sequence.
+    /// Re-snapshots / resyncs **every** subscribed channel after a laggard drop, so
+    /// no channel silently loses messages ([03 §4.1](../../../docs/03-protocol-surfaces.md)).
+    ///
+    /// A broadcast lag drops an unknown span of messages: the `orderbook` channel
+    /// replays a fresh [`WsMessage::OrderbookSnapshot`] (repairing the gap and
+    /// resetting its baseline), and every event-stream channel (`trades` / `quotes`
+    /// / `prices` / `fills`), which has no snapshot, emits a typed
+    /// [`WsMessage::Resync`] marker carrying the current market-data checkpoint so
+    /// the client re-fetches rather than assume gap-free delivery. Emitted in a
+    /// deterministic order regardless of map iteration order.
     fn resnapshot(&mut self, manager: &OrderbookSubscriptionManager) -> Vec<WsMessage> {
-        let orderbook: Vec<(String, Option<usize>)> = self
+        let mut subscriptions: Vec<(SubscriptionChannel, String, Option<usize>)> = self
             .subscriptions
             .iter()
-            .filter(|((channel, _), _)| *channel == SubscriptionChannel::Orderbook)
-            .map(|((_, key), depth)| (key.clone(), *depth))
+            .map(|((channel, key), depth)| (*channel, key.clone(), *depth))
             .collect();
+        subscriptions.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| (a.0 as u8).cmp(&(b.0 as u8))));
+
         let mut out = Vec::new();
-        for (key, depth) in orderbook {
-            if let Ok(symbol) = Symbol::parse(&key) {
-                let snapshot = manager.orderbook_snapshot(&symbol, depth);
-                if let WsMessage::OrderbookSnapshot { sequence, .. } = &snapshot {
-                    self.baselines.insert(key, *sequence);
+        for (channel, key, depth) in subscriptions {
+            if channel == SubscriptionChannel::Orderbook {
+                // Orderbook: a fresh snapshot IS the resync (and resets the baseline).
+                if let Ok(symbol) = Symbol::parse(&key) {
+                    let snapshot = manager.orderbook_snapshot(&symbol, depth);
+                    if let WsMessage::OrderbookSnapshot { sequence, .. } = &snapshot {
+                        self.baselines.insert(key.clone(), *sequence);
+                    }
+                    out.push(snapshot);
                 }
-                out.push(snapshot);
+            } else {
+                // Event-stream channel: no snapshot exists, so signal the gap.
+                out.push(resync_marker(channel, key, manager));
             }
         }
         out
+    }
+}
+
+/// Builds a [`WsMessage::Resync`] marker for a lagged event-stream channel.
+///
+/// The instrument-scoped channels (`trades` / `quotes` / `fills`) share the
+/// orderbook `instrument_sequence` namespace, so the marker carries that current
+/// checkpoint (read from the manager) as the client's resync point. The `prices`
+/// channel is underlying-scoped and has no per-instrument sequence, so the
+/// checkpoint is omitted.
+fn resync_marker(
+    channel: SubscriptionChannel,
+    symbol: String,
+    manager: &OrderbookSubscriptionManager,
+) -> WsMessage {
+    let sequence = match channel {
+        SubscriptionChannel::Prices => None,
+        _ => Symbol::parse(&symbol).ok().map(|parsed| {
+            match manager.orderbook_snapshot(&parsed, Some(0)) {
+                WsMessage::OrderbookSnapshot { sequence, .. } => sequence,
+                _ => 0,
+            }
+        }),
+    };
+    WsMessage::Resync {
+        channel,
+        symbol,
+        sequence,
     }
 }
 
@@ -1081,6 +1170,74 @@ mod tests {
         assert!(connection.filter(trade).is_none());
     }
 
+    #[test]
+    fn test_resnapshot_covers_every_channel_not_just_orderbook() {
+        // After a broadcast lag, EVERY subscribed channel must be re-established —
+        // the orderbook with a fresh snapshot, and each event-stream channel
+        // (trades/quotes/prices/fills) with a typed Resync marker rather than a
+        // silent hole.
+        let manager = OrderbookSubscriptionManager::new();
+        let mut connection = Connection::new(claims("reader", vec![Permission::Read]));
+        for channel in [
+            SubscriptionChannel::Orderbook,
+            SubscriptionChannel::Trades,
+            SubscriptionChannel::Quotes,
+            SubscriptionChannel::Fills,
+        ] {
+            connection.subscribe(
+                protocol::SubscribeParams {
+                    channel,
+                    symbol: "BTC-20240329-50000-C".to_string(),
+                    depth: None,
+                },
+                &manager,
+            );
+        }
+        connection.subscribe(
+            protocol::SubscribeParams {
+                channel: SubscriptionChannel::Prices,
+                symbol: "BTC".to_string(),
+                depth: None,
+            },
+            &manager,
+        );
+
+        let out = connection.resnapshot(&manager);
+        // Orderbook re-snapshots.
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, WsMessage::OrderbookSnapshot { .. })),
+            "orderbook must re-snapshot on lag"
+        );
+        // Every non-orderbook channel emits a Resync marker (no silent drop).
+        for expected in [
+            SubscriptionChannel::Trades,
+            SubscriptionChannel::Quotes,
+            SubscriptionChannel::Fills,
+            SubscriptionChannel::Prices,
+        ] {
+            assert!(
+                out.iter().any(
+                    |m| matches!(m, WsMessage::Resync { channel, .. } if *channel == expected)
+                ),
+                "channel {expected:?} must emit a Resync marker on lag, not silently drop"
+            );
+        }
+        // The prices (underlying-scoped) resync omits the per-instrument sequence;
+        // the instrument-scoped ones carry the current checkpoint.
+        for message in &out {
+            if let WsMessage::Resync {
+                channel, sequence, ..
+            } = message
+            {
+                match channel {
+                    SubscriptionChannel::Prices => assert!(sequence.is_none()),
+                    _ => assert!(sequence.is_some()),
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_control_without_admin_is_forbidden_and_non_terminal() {
         let state = crate::state::AppState::new(crate::state::AppStateConfig::new(["BTC"]))
@@ -1291,6 +1448,7 @@ mod tests {
             "Bearer header-token".parse().unwrap(),
         );
         let query = WsAuthQuery {
+            ticket: None,
             token: Some("query-token".to_string()),
             access_token: None,
         };
@@ -1305,12 +1463,39 @@ mod tests {
         );
         // `access_token` is accepted too.
         let query = WsAuthQuery {
+            ticket: None,
             token: None,
             access_token: Some("access-token".to_string()),
         };
         assert_eq!(
             extract_token(&HeaderMap::new(), &query).as_deref(),
             Some("access-token")
+        );
+    }
+
+    #[test]
+    fn test_extract_ticket_prefers_header_then_query() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ws-ticket", "header-ticket".parse().unwrap());
+        let query = WsAuthQuery {
+            ticket: Some("query-ticket".to_string()),
+            token: None,
+            access_token: None,
+        };
+        // The header wins when both are present.
+        assert_eq!(
+            extract_ticket(&headers, &query).as_deref(),
+            Some("header-ticket")
+        );
+        // Query fallback when no header is present.
+        assert_eq!(
+            extract_ticket(&HeaderMap::new(), &query).as_deref(),
+            Some("query-ticket")
+        );
+        // Absent on both is None (the handler falls back to the bearer path).
+        assert_eq!(
+            extract_ticket(&HeaderMap::new(), &WsAuthQuery::default()),
+            None
         );
     }
 

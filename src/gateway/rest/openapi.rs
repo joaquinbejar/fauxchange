@@ -29,6 +29,61 @@ impl Modify for SecurityAddon {
     }
 }
 
+/// Attaches the shared [`ErrorEnvelope`](crate::error::ErrorEnvelope) body schema
+/// to **every** route's error responses (`>= 400`) in the served document.
+///
+/// Every gateway error — including the malformed-JSON-body rejection wrapped by
+/// [`crate::gateway::rest::extract::Json`] — renders the typed `ErrorEnvelope`; the
+/// per-route `#[utoipa::path]` error entries carry only a `description`, so this
+/// addon fills in the missing `application/json` body reference uniformly rather
+/// than repeating `body = ErrorEnvelope` on ~50 routes. A success response
+/// (`< 400`, which already declares its own body) is left untouched.
+struct ErrorResponsesAddon;
+
+impl Modify for ErrorResponsesAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        use utoipa::openapi::{Content, Ref, RefOr};
+
+        for path_item in openapi.paths.paths.values_mut() {
+            let operations = [
+                path_item.get.as_mut(),
+                path_item.put.as_mut(),
+                path_item.post.as_mut(),
+                path_item.delete.as_mut(),
+                path_item.options.as_mut(),
+                path_item.head.as_mut(),
+                path_item.patch.as_mut(),
+                path_item.trace.as_mut(),
+            ];
+            for operation in operations.into_iter().flatten() {
+                for (status, response) in operation.responses.responses.iter_mut() {
+                    // Only error responses get the envelope; a success body is
+                    // whatever the handler declared.
+                    if !is_error_status(status) {
+                        continue;
+                    }
+                    if let RefOr::T(response) = response
+                        && response.content.is_empty()
+                    {
+                        response.content.insert(
+                            "application/json".to_string(),
+                            Content::new(Some(Ref::from_schema_name("ErrorEnvelope"))),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Whether an OpenAPI response status-code key names an error (`>= 400`).
+fn is_error_status(status: &str) -> bool {
+    status
+        .parse::<u16>()
+        .map(|code| code >= 400)
+        .unwrap_or(false)
+}
+
 /// The OpenAPI document for the `fauxchange` REST surface.
 #[derive(OpenApi)]
 #[openapi(
@@ -39,7 +94,7 @@ impl Modify for SecurityAddon {
                        path and return the resulting event's underlying_sequence.",
         version = env!("CARGO_PKG_VERSION"),
     ),
-    modifiers(&SecurityAddon),
+    modifiers(&SecurityAddon, &ErrorResponsesAddon),
     tags(
         (name = "meta", description = "Health and venue statistics"),
         (name = "auth", description = "JWT token issuance (bootstrap-gated)"),
@@ -57,6 +112,7 @@ impl Modify for SecurityAddon {
         crate::gateway::rest::meta::health,
         crate::gateway::rest::meta::stats,
         crate::gateway::rest::meta::issue_token,
+        crate::gateway::rest::meta::issue_ws_ticket,
         crate::gateway::rest::orders::place_limit_order,
         crate::gateway::rest::orders::place_market_order,
         crate::gateway::rest::orders::cancel_order,
@@ -136,6 +192,7 @@ impl Modify for SecurityAddon {
         crate::models::GlobalStatsResponse,
         crate::models::TokenRequest,
         crate::models::TokenResponse,
+        crate::models::WsTicketResponse,
         crate::models::Account,
         crate::models::InstrumentView,
         // Orders

@@ -49,6 +49,7 @@
 //! `realized + unrealized == net_cash − fees + net_quantity × mark`, which holds
 //! **exactly** because both halves are computed from one exact cost basis.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -959,10 +960,25 @@ impl PositionsStore for InMemoryPositionsStore {
 /// The stores are held behind `Arc` so the same instances are shared with the
 /// REST read handlers (wired through `AppState`, #013); cloning an `Arc` handle
 /// out before constructing the fan-out is the intended pattern.
+///
+/// ## Fan-out seal (projection integrity)
+///
+/// The executions log and the positions fold are **two authoritative
+/// projections of the same journal**. If either write fails, continuing would
+/// let them diverge from each other and from the committed journal. The fan-out
+/// therefore **seals** on the first projection failure — it logs at `ERROR`,
+/// stops projecting (no further leg, mark, or event), and reports the seal
+/// through [`is_sealed`](Self::is_sealed) — mirroring the actor's
+/// seal-on-post-mutation-failure fail-stop. Recovery rebuilds both projections
+/// from the authoritative journal, so a sealed fan-out is the observable signal
+/// that a journal-backed rebuild is required, never a silent divergence.
 pub struct StoreFanOut<E, P> {
     executions: Arc<E>,
     positions: Arc<P>,
     marks: Arc<MarkPriceBook>,
+    /// Set once a projection write fails: the fan-out is fail-stopped and drops
+    /// every subsequent event until the projections are rebuilt from the journal.
+    sealed: bool,
 }
 
 impl<E, P> StoreFanOut<E, P>
@@ -978,7 +994,31 @@ where
             executions,
             positions,
             marks,
+            sealed: false,
         }
+    }
+
+    /// Whether a projection failure has sealed the fan-out. A sealed fan-out has
+    /// stopped projecting; the executions / positions stores must be rebuilt from
+    /// the journal (recovery) before they are authoritative again.
+    #[must_use]
+    #[inline]
+    pub fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    /// Seals the fan-out on a projection failure: records the seal, logs the cause
+    /// at `ERROR` (observable), and — from here on — [`emit`](FanOut::emit) drops
+    /// every event. `projection` names which store failed.
+    fn seal(&mut self, event: &VenueEvent, projection: &'static str, error: &StoreError) {
+        self.sealed = true;
+        tracing::error!(
+            sequence = event.underlying_sequence.get(),
+            projection,
+            error = %error,
+            "store projection failed; sealing the fan-out — the executions/positions \
+             projections diverged from the journal and must be rebuilt from it"
+        );
     }
 
     /// The shared executions store handle — the snapshot cut reads/replaces it
@@ -1004,6 +1044,12 @@ where
     P: PositionsStore,
 {
     fn emit(&mut self, event: &VenueEvent) {
+        // A prior projection failure fail-stopped the fan-out: the projections
+        // diverged from the journal and must be rebuilt from it, so drop every
+        // further event rather than compound the divergence.
+        if self.sealed {
+            return;
+        }
         let Some(symbol) = command_symbol(&event.command) else {
             return;
         };
@@ -1023,14 +1069,15 @@ where
             return;
         };
 
+        // Project each leg into BOTH authoritative stores. On the FIRST failure,
+        // seal and stop — never silently continue into the sibling projection or
+        // the next leg, which is what would let the two stores (and the journal)
+        // diverge. The mark is advanced only after every leg projected cleanly.
         for fill in fills {
             let record = project_execution(event, symbol, &underlying, fill);
             if let Err(error) = self.executions.record(record) {
-                tracing::error!(
-                    sequence = event.underlying_sequence.get(),
-                    error = %error,
-                    "failed to record an execution leg; continuing fan-out"
-                );
+                self.seal(event, "executions", &error);
+                return;
             }
             let leg = PositionLeg {
                 account: &fill.account,
@@ -1042,13 +1089,21 @@ where
                 fee: fill.fee,
             };
             if let Err(error) = self.positions.apply(&leg) {
-                tracing::error!(
-                    sequence = event.underlying_sequence.get(),
-                    error = %error,
-                    "failed to fold a position leg; continuing fan-out"
-                );
+                self.seal(event, "positions", &error);
+                return;
             }
-            self.marks.on_trade(symbol, fill.price);
+        }
+
+        // Advance the dampened mark ONCE per `execution_id`: a match's two linked
+        // legs share one id (and one price), so the trade prints once — not once
+        // per account leg, which would double-advance the mark for a single trade.
+        // Deduped over the ordered `fills` (membership only; no map-iteration
+        // order), and the mark is live-only, excluded from the determinism oracle.
+        let mut printed: HashSet<&ExecutionId> = HashSet::new();
+        for fill in fills {
+            if printed.insert(&fill.execution_id) {
+                self.marks.on_trade(symbol, fill.price);
+            }
         }
     }
 }
@@ -1576,6 +1631,199 @@ mod tests {
                 .get(&AccountId::new("acct-1"), &sym(), None)
                 .expect("get")
                 .is_none()
+        );
+    }
+
+    // ---- mark dedup: one print per match, not per leg ----------------------
+
+    #[test]
+    fn test_fan_out_advances_mark_once_per_match_not_per_leg() {
+        // A match's two linked legs (maker + taker) share one `execution_id` and
+        // one price, so the trade must print to the mark ONCE — not once per
+        // account leg, which would double-advance the dampened mark for one trade.
+        let symbol = sym();
+        // Seed a starting mark different from the match price. The upstream
+        // dampening (default factor 0.01 → max ±ceil(prev*0.01) per step) makes
+        // one advance distinguishable from two, so the assertion is not vacuous.
+        let marks = Arc::new(MarkPriceBook::new());
+        marks.on_trade(&symbol, Cents::new(40_000));
+
+        let mut fan = StoreFanOut::new(
+            Arc::new(InMemoryExecutionsStore::new()),
+            Arc::new(InMemoryPositionsStore::new()),
+            Arc::clone(&marks),
+        );
+        // One 2-leg match at 50_000 — a single `execution_id`.
+        fan.emit(&added_event(1, 50_000, 2));
+
+        // Reference books built from the SAME seed: one advance vs two advances.
+        let once = MarkPriceBook::new();
+        once.on_trade(&symbol, Cents::new(40_000));
+        once.on_trade(&symbol, Cents::new(50_000));
+        let twice = MarkPriceBook::new();
+        twice.on_trade(&symbol, Cents::new(40_000));
+        twice.on_trade(&symbol, Cents::new(50_000));
+        twice.on_trade(&symbol, Cents::new(50_000));
+        // Guard: the dampening genuinely distinguishes one advance from two, so a
+        // double-advance bug cannot slip past this test as a false pass.
+        assert_ne!(
+            once.mark(&symbol),
+            twice.mark(&symbol),
+            "the dampening must distinguish one advance from two"
+        );
+        // The fan-out advanced the mark exactly once for the single match.
+        assert_eq!(
+            marks.mark(&symbol),
+            once.mark(&symbol),
+            "one mark print per execution_id (per match), not per account leg"
+        );
+    }
+
+    // ---- projection-failure seal (fan-out integrity) -----------------------
+
+    /// A fault-injecting [`ExecutionsStore`] that fails `record` on demand and
+    /// otherwise delegates — the store-side stand-in for a durable backend failure
+    /// (the in-memory store never fails in practice).
+    struct FaultyExecutions {
+        inner: InMemoryExecutionsStore,
+        fail_record: bool,
+    }
+
+    impl ExecutionsStore for FaultyExecutions {
+        fn record(&self, record: ExecutionRecord) -> Result<(), StoreError> {
+            if self.fail_record {
+                return Err(StoreError::Backend(
+                    "injected executions failure".to_string(),
+                ));
+            }
+            self.inner.record(record)
+        }
+        fn get(
+            &self,
+            execution_id: &ExecutionId,
+            account: &AccountId,
+        ) -> Result<Option<ExecutionRecord>, StoreError> {
+            self.inner.get(execution_id, account)
+        }
+        fn list(
+            &self,
+            account: &AccountId,
+            filter: &ExecutionFilter,
+        ) -> Result<Vec<ExecutionRecord>, StoreError> {
+            self.inner.list(account, filter)
+        }
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+    }
+
+    /// A fault-injecting [`PositionsStore`] that fails `apply` on demand and
+    /// otherwise delegates.
+    struct FaultyPositions {
+        inner: InMemoryPositionsStore,
+        fail_apply: bool,
+    }
+
+    impl PositionsStore for FaultyPositions {
+        fn apply(&self, leg: &PositionLeg<'_>) -> Result<(), StoreError> {
+            if self.fail_apply {
+                return Err(StoreError::Backend(
+                    "injected positions failure".to_string(),
+                ));
+            }
+            self.inner.apply(leg)
+        }
+        fn get(
+            &self,
+            account: &AccountId,
+            symbol: &Symbol,
+            mark: Option<Cents>,
+        ) -> Result<Option<Position>, StoreError> {
+            self.inner.get(account, symbol, mark)
+        }
+        fn list(
+            &self,
+            account: &AccountId,
+            marks: &dyn MarkSource,
+        ) -> Result<Vec<Position>, StoreError> {
+            self.inner.list(account, marks)
+        }
+    }
+
+    #[test]
+    fn test_fan_out_seals_on_executions_failure_without_diverging() {
+        // The executions write fails FIRST, so the sibling positions fold is never
+        // reached: the two authoritative projections do not diverge (both are
+        // consistently missing the fill), and the fan-out seals — the observable
+        // signal that a journal-backed rebuild is required.
+        let executions = Arc::new(FaultyExecutions {
+            inner: InMemoryExecutionsStore::new(),
+            fail_record: true,
+        });
+        let positions = Arc::new(InMemoryPositionsStore::new());
+        let mut fan = StoreFanOut::new(
+            Arc::clone(&executions),
+            Arc::clone(&positions),
+            Arc::new(MarkPriceBook::new()),
+        );
+        fan.emit(&added_event(1, 50_000, 2));
+
+        assert!(fan.is_sealed(), "a projection failure seals the fan-out");
+        assert!(
+            executions.inner.is_empty(),
+            "the failed executions write recorded nothing"
+        );
+        assert!(
+            positions
+                .get(&AccountId::new("taker"), &sym(), None)
+                .expect("get")
+                .is_none(),
+            "positions was never folded (no divergence between the two projections)"
+        );
+
+        // A subsequent healthy event is dropped while sealed: positions would fold
+        // cleanly if the loop were reached, but the seal short-circuits emit, so
+        // the projection never advances — no compounding divergence.
+        fan.emit(&added_event(2, 50_100, 1));
+        assert!(
+            positions
+                .get(&AccountId::new("taker"), &sym(), None)
+                .expect("get")
+                .is_none(),
+            "the sealed fan-out projects nothing further"
+        );
+    }
+
+    #[test]
+    fn test_fan_out_seals_on_positions_failure() {
+        // The positions fold fails after the leg was recorded. That single leg is a
+        // residual divergence the journal-backed rebuild reconciles; the seal makes
+        // it observable and stops any further (divergent) writes.
+        let executions = Arc::new(InMemoryExecutionsStore::new());
+        let positions = Arc::new(FaultyPositions {
+            inner: InMemoryPositionsStore::new(),
+            fail_apply: true,
+        });
+        let mut fan = StoreFanOut::new(
+            Arc::clone(&executions),
+            Arc::clone(&positions),
+            Arc::new(MarkPriceBook::new()),
+        );
+        fan.emit(&added_event(1, 50_000, 2));
+
+        assert!(
+            fan.is_sealed(),
+            "a positions-fold failure also seals the fan-out"
+        );
+        // Exactly the one pre-seal leg was recorded before the fold failed.
+        assert_eq!(executions.len(), 1, "only the pre-seal leg was recorded");
+
+        // The sealed fan-out drops every subsequent event.
+        fan.emit(&added_event(2, 50_100, 1));
+        assert_eq!(
+            executions.len(),
+            1,
+            "the sealed fan-out records nothing after the seal"
         );
     }
 

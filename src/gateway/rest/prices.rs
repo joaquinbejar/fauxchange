@@ -15,12 +15,12 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Extension, Path, State};
 
 use crate::auth::Authorized;
 use crate::error::VenueError;
 use crate::exchange::{EventTimestamp, VenueCommand};
+use crate::gateway::rest::extract::Json;
 use crate::gateway::rest::middleware::require;
 use crate::models::{InsertPriceRequest, InsertPriceResponse, LatestPriceResponse, Permission};
 use crate::state::AppState;

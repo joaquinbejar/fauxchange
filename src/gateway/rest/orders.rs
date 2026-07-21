@@ -30,7 +30,6 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 
 use crate::auth::Authorized;
@@ -38,6 +37,7 @@ use crate::error::{CANCEL_REJECT_MASKED_REASON, VenueError};
 use crate::exchange::{
     MassCancelScope, MassCancelType, STPMode, SymbolParser, VenueCommand, VenueOutcome,
 };
+use crate::gateway::rest::extract::Json;
 use crate::gateway::rest::middleware::require;
 use crate::gateway::rest::support::{
     add_order_command, build_symbol, mint_order_id, owner_for, parse_style, seam_side, seam_tif,
@@ -141,7 +141,11 @@ pub async fn place_limit_order(
     Json(request): Json<PlaceLimitOrderRequest>,
 ) -> Result<Json<PlaceLimitOrderResponse>, VenueError> {
     require(&auth, Permission::Trade)?;
-    request.validate()?;
+    // Validate the order shape AND the GTD ⟺ gtd_expires_at pairing against the
+    // venue clock (a future expiry, no stray expiry on non-GTD) before the
+    // sequenced path — a GTD expiry is journaled as an absolute instant, never a
+    // relative day offset.
+    request.validate(state.clock().now_ms())?;
 
     let style = parse_style(&style)?;
     let symbol = build_symbol(&underlying, &expiration, strike, style)?;
@@ -531,6 +535,9 @@ pub async fn bulk_place_orders(
     }
     let account = auth.claims.account().clone();
     let owner = owner_for(&state, &account)?;
+    // One venue-clock read for the whole batch, so every item's GTD ⟺ expiry
+    // pairing is validated against the same instant.
+    let now = state.clock().now_ms();
 
     let mut results: Vec<BulkOrderResultItem> = Vec::with_capacity(request.orders.len());
     let mut placed: Vec<(crate::exchange::Symbol, crate::models::VenueOrderId)> = Vec::new();
@@ -538,7 +545,7 @@ pub async fn bulk_place_orders(
     let mut aborted = false;
 
     for (index, item) in request.orders.iter().enumerate() {
-        if let Err(error) = item.validate() {
+        if let Err(error) = item.validate(now) {
             results.push(BulkOrderResultItem {
                 index,
                 order_id: None,
@@ -572,7 +579,7 @@ pub async fn bulk_place_orders(
                 continue;
             }
         };
-        let tif = match seam_tif(item.time_in_force.unwrap_or_default(), None) {
+        let tif = match seam_tif(item.time_in_force.unwrap_or_default(), item.gtd_expires_at) {
             Ok(tif) => tif,
             Err(error) => {
                 results.push(BulkOrderResultItem {

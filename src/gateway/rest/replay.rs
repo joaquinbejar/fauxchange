@@ -20,11 +20,11 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Extension, State};
 
 use crate::auth::Authorized;
 use crate::error::VenueError;
+use crate::gateway::rest::extract::Json;
 use crate::gateway::rest::middleware::require;
 use crate::models::{
     Permission, RecordControlRequest, RecordingStateResponse, ReplayReportResponse,

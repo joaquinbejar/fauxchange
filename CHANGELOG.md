@@ -2279,6 +2279,47 @@ The full versioning and release-process policy lives in the design docs
   true kind + reason stay in the journal/`tracing` as a detective control. Adds
   `RejectKind` to the journaled `Rejected` outcome, back-compatible via
   `#[serde(default)]` so a pre-#132 durable journal still replays.
+- **Validation / hardening backlog — boundary invariants across the exchange,
+  gateway, and auth seams** (#131). Nine defensive fixes that close
+  decode-time, TOCTOU, and observability gaps without changing any valid
+  wire form:
+  - `Instrument`/`Symbol` now deserialize **through** the validating
+    constructor (`#[serde(try_from)]` → `Instrument::try_new` + a
+    canonical-symbol cross-check), so a persisted/config record bearing
+    `ExpirationDate::Days` (replay-breaking) or coordinates that disagree with
+    its symbol is a typed decode error, not a silently-admitted book.
+  - The journaled `MarketMakerControl` persona floats
+    (`spread_multiplier` / `size_scalar` / `directional_skew`) reject
+    `NaN` / `±Inf` / out-of-range at the envelope decode boundary via
+    `deserialize_with` range guards, so a corrupt journal record can't poison
+    replay; valid values decode unchanged (no golden churn).
+  - The store fan-out **seals** on the first executions/positions projection
+    failure (fail-stop, logged at `ERROR`) instead of silently continuing, so
+    the two authoritative projections can no longer diverge from the committed
+    journal — a rebuild is the recovery.
+  - The dampened mark advances **once per `execution_id`**, not once per
+    account leg, so a single two-leg match no longer double-counts the mark.
+  - REST enforces the **GTD ↔ `gtd_expires_at`** pairing at the DTO boundary
+    (GTD requires a strictly-future expiry; any non-GTD TIF carrying an expiry
+    is rejected), for both the single and bulk/multi-leg place shapes; the
+    expiry lands as an absolute `ExpirationDate::DateTime`, never a `Days`
+    offset.
+  - A malformed JSON body now renders the typed `ErrorEnvelope` (400) via a
+    drop-in `Json` extractor instead of axum's default plaintext 422, and the
+    error body is attached to every `#[utoipa::path]` route's OpenAPI
+    responses (the `413` oversized-body contract is preserved).
+  - The `max_keys` issuance ceiling is now reserved **atomically** (a single
+    locked reserve-or-reject) so a concurrent token-issuance flood can't
+    exceed the cap.
+  - WebSocket upgrades accept a **short-lived single-use ticket**
+    (`POST /api/v1/auth/ws-ticket`, 30 s TTL, CSPRNG, DoS-capped) carrying the
+    bearer's `Permission`, so the JWT no longer has to travel in the upgrade
+    query string (the bearer path is retained for back-compat); the permission
+    model is identical.
+  - A `broadcast` lag now **re-snapshots or emits a typed `Resync` marker on
+    every subscribed channel** (`trades` / `quotes` / `prices` / `fills`, not
+    just `orderbook`), so no channel silently drops messages after an overflow.
+
 - **REST/WS JSON decoder fuzz targets, the journal/bundle deserialiser fuzz
   target, and the final `SECURITY.md` — the v1.0 security gate** (#52). Three
   `cargo fuzz` targets extend the FIX-primary fuzz set (#42) with the
