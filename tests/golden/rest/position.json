@@ -1,0 +1,11 @@
+{
+  "account": "acct-1",
+  "avg_price": 50000,
+  "current_price": 50500,
+  "delta_exposure": -2.5,
+  "net_quantity": -5,
+  "realized_pnl": 1200,
+  "symbol": "BTC-20240329-50000-C",
+  "underlying": "BTC",
+  "unrealized_pnl": -2500
+}

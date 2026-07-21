@@ -1,0 +1,16 @@
+{
+  "account": "acct-1",
+  "client_order_id": "client-42",
+  "filled_quantity": 4,
+  "id": "lin:BTC:7:0",
+  "limit_price": 50000,
+  "order_type": "limit",
+  "quantity": 10,
+  "remaining_quantity": 6,
+  "sequence": 7,
+  "side": "buy",
+  "status": "partial",
+  "submitted_at": 1700000000000,
+  "symbol": "BTC-20240329-50000-C",
+  "time_in_force": "GTC"
+}

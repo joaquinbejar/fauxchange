@@ -1,0 +1,17 @@
+{
+  "account": "acct-1",
+  "edge_cents": -50,
+  "executed_at": 1700000000000,
+  "execution_id": "lin:BTC:7:0",
+  "fee_cents": 15,
+  "instrument": "BTC-20240329-50000-C",
+  "latency_us": 250,
+  "liquidity": "taker",
+  "order_id": "lin:BTC:7:0",
+  "price_cents": 50000,
+  "quantity": 2,
+  "side": "buy",
+  "symbol": "BTC",
+  "theo_value_cents": 49950,
+  "underlying_sequence": 7
+}

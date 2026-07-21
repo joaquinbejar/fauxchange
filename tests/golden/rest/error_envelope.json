@@ -1,5 +1,5 @@
 {
-  "schema": "rest-error.v1",
   "code": "forbidden",
-  "message": "missing permission Trade"
+  "message": "missing permission Trade",
+  "schema": "rest-error.v1"
 }

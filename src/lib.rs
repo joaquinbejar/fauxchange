@@ -74,7 +74,10 @@ pub mod state;
 // `error` now exports the `VenueError` boundary and its HTTP / FIX / WS
 // renderings (#003), so its glob is live.
 pub use error::*;
-// `models` currently exposes `Permission` ahead of the full DTO surface (#004).
+// `models` exposes the full REST/WS DTO surface (#004): the value objects and
+// their `serde` + `ToSchema` projection, the wire enums, the identity newtypes,
+// the order-shape validation helper, and the `WsMessage` protocol. Its glob and
+// `error`'s share no names.
 pub use models::*;
 
 #[cfg(test)]

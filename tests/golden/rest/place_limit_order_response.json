@@ -1,0 +1,8 @@
+{
+  "filled_quantity": 0,
+  "message": "order accepted",
+  "order_id": "lin:BTC:7:0",
+  "remaining_quantity": 10,
+  "sequence": 7,
+  "status": "accepted"
+}

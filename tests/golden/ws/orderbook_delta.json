@@ -1,0 +1,19 @@
+{
+  "data": {
+    "changes": [
+      {
+        "price": 49900,
+        "quantity": 20,
+        "side": "bid"
+      },
+      {
+        "price": 50100,
+        "quantity": 0,
+        "side": "ask"
+      }
+    ],
+    "sequence": 43,
+    "symbol": "BTC-20240329-50000-C"
+  },
+  "type": "orderbook_delta"
+}
