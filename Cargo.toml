@@ -68,6 +68,20 @@ tracing = "0.1"
 # framework integration); the Swagger UI / `utoipa-axum` wiring lands with the
 # REST gateway (#013). MIT/Apache-2.0, maintained by the utoipa project.
 utoipa = "5"
+# JWT (RS256, x509 key pair) for REST/WS auth (#011): `mint_token` / `verify_token`
+# on the `JwtAuth` service. `default-features = false, features = ["use_pem"]`
+# keeps exactly the PEM path we need (the `pem` + `simple_asn1` decoder) and no
+# more; crucially, `DecodingKey::from_rsa_pem` extracts the RSA public key
+# straight from a `CERTIFICATE` PEM, so `from_paths(cert, key)` needs NO separate
+# x509 parser. The crypto backend is `ring` 0.17.14, which this dependency adds
+# NEW to the tree (it was not present before #011) along with its transitive
+# closure (`untrusted`, platform `windows_*` crates) — a native/asm RSA
+# implementation entering the trusted computing base; `ring` is the reputable,
+# widely audited crate `rustls` also uses, and `cargo audit`/`cargo deny` (#019)
+# gate it. RS256 verification pins the algorithm to `[RS256]` (rejects `alg:none`
+# and HS256 confusion before any crypto runs). MIT, maintained by the
+# Keats/jsonwebtoken project (widely used, actively maintained).
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
 
 [dev-dependencies]
 proptest = "1"
@@ -76,3 +90,9 @@ serde_json = "1"
 # (`#[tokio::test(flavor = "multi_thread")]`); additive to the `[dependencies]`
 # tokio features above.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
+# `ServiceExt::oneshot` to drive the `auth_middleware` through a real `axum::Router`
+# in `tests/auth.rs` (request flow → 401/403/429 + `X-RateLimit-*` headers) without
+# binding a TCP listener. `tower` 0.5.3 is ALREADY in the tree (axum depends on
+# it), so this dev-only dependency adds no new version; the `util` feature exposes
+# `oneshot`. MIT, maintained by the tower project.
+tower = { version = "0.5", features = ["util"] }
