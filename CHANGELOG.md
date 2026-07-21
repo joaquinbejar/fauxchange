@@ -11,6 +11,38 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **`AppState`: the shared `Arc` wiring of the venue core and services** (#10) in
+  `src/state.rs` — the application seam between the transport gateways and the
+  domain ([02 §6, §8](docs/02-matching-architecture.md)). `AppState::new` takes an
+  `AppStateConfig` (an explicit list of underlyings, since the config surface #22
+  has not landed) and spawns **one single-writer actor per underlying**, wiring
+  the real order path (`MatchingExecutor`) and post-journal fan-out (`StoreFanOut`,
+  #8) into each — the order path and fan-out are live, not placeholder. A
+  venue-wide `InstrumentRegistry` + `SymbolIndex` are created once and passed to
+  every actor **by handle** (via the new
+  `MatchingExecutor::new_with_registry_and_index` /
+  `spawn_matching_actor_with_registry_and_index` in `src/exchange/executor.rs`,
+  routing straight into the upstream `UnderlyingOrderBook::new_with_registry_and_index`
+  verified public at the locked `option-chain-orderbook` 0.7.0), so cross-underlying
+  lookups stay O(1) without coupling the writers (`BTC` and `ETH` sequence
+  concurrently). The single shared executions / positions / mark stores are the
+  **same `Arc` instances** each actor's `StoreFanOut` writes to and `AppState`
+  exposes for reads. `AppState::submit` is the **only** path onto the sequenced
+  order path: it routes a `VenueCommand` to the right underlying's actor (extracting
+  the underlying via the upstream `SymbolParser` / the command's ticker) and awaits
+  the `Receipt`, returning `VenueError::NotFound` for an unhosted underlying and
+  `VenueError::InvalidOrder` for a venue-global command that carries no single
+  routable underlying (broadcast/lifecycle routing lands with the control-plane
+  issues). The auth / subscription-manager / market-maker / simulator services are
+  stable-typed placeholders (`AuthPlaceholder` #11/#12, `SubscriptionsPlaceholder`
+  #14, `MarketMakerPlaceholder` #15, `SimulatorPlaceholder` #16) that slot in
+  without reshaping `AppState`. The shutdown path is dropping the last
+  `Arc<AppState>`, which closes each bounded mailbox (draining its backlog) and ends
+  the actor loop. Layering holds: `AppState` imports the domain, never
+  `src/gateway/*`. Unit + integration (`tests/state.rs`) tests cover the spawned
+  actor set, per-underlying routing, an unknown-underlying typed error, and an
+  end-to-end submit whose crossing fill lands in the shared executions store
+  `AppState` exposes.
 - Book **snapshot + restore** over a consistent cut with a fresh journal epoch
   (#9) in `src/exchange/` (`snapshot.rs`, plus executor / stores / actor /
   journal wiring) — the operator escape hatch that is an **explicit replay

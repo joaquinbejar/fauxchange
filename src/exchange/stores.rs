@@ -59,7 +59,7 @@ use crate::exchange::actor::FanOut;
 use crate::exchange::boundary::{Side as SeamSide, SymbolParser};
 use crate::exchange::envelope::{AddOutcome, Fill, VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::money::{Cents, SignedCents};
-use crate::exchange::snapshot::{ExecutionCapture, PositionCapture};
+use crate::exchange::snapshot::{ExecutionCapture, PositionCapture, SnapshotError};
 use crate::exchange::symbol::Symbol;
 use crate::models::{AccountId, ExecutionId, ExecutionRecord, LiquidityFlag, Position, Side};
 
@@ -176,6 +176,18 @@ impl MarkSource for NoMarks {
     fn mark(&self, _symbol: &Symbol) -> Option<Cents> {
         None
     }
+}
+
+/// Whether an executions leg belongs to `underlying` — the **single** ownership
+/// predicate the per-underlying partition is scoped by. An [`ExecutionRecord`]'s
+/// `symbol` field carries the underlying ticker (the same field
+/// [`InMemoryExecutionsStore::capture_for`] filters on). Capture, restore, and
+/// restore-validation all consult this one rule, so the partition can never
+/// diverge into a second, subtly different predicate.
+#[inline]
+#[must_use]
+fn execution_leg_belongs(record: &ExecutionRecord, underlying: &str) -> bool {
+    record.symbol.as_str() == underlying
 }
 
 // ============================================================================
@@ -299,14 +311,24 @@ impl InMemoryExecutionsStore {
         Self::default()
     }
 
-    /// Captures every recorded leg (with its insertion surrogate) for a snapshot
-    /// cut (#009), sorted by `ord` so the cut is deterministic regardless of map
-    /// iteration order.
+    /// Captures **only** `underlying`'s slice of the shared venue-wide log — the
+    /// legs whose [`ExecutionRecord::symbol`](crate::models::ExecutionRecord)
+    /// underlying ticker matches — sorted by `ord` so the cut is deterministic
+    /// regardless of map iteration order (#009).
+    ///
+    /// The store is shared by every per-underlying actor, but each actor writes
+    /// only its own underlying's legs, so this slice is exactly the (quiesced)
+    /// capturing actor's fills — a **consistent cut for that underlying**, never a
+    /// torn read of another underlying's concurrent writes
+    /// ([02 §9](../../../docs/02-matching-architecture.md)). This scoping is what
+    /// keeps a per-underlying snapshot from ever capturing (or, on restore,
+    /// erasing) another underlying's data.
     #[must_use]
-    pub fn capture(&self) -> Vec<ExecutionCapture> {
+    pub fn capture_for(&self, underlying: &str) -> Vec<ExecutionCapture> {
         let mut captures: Vec<ExecutionCapture> = self
             .records
             .iter()
+            .filter(|entry| execution_leg_belongs(&entry.record, underlying))
             .map(|entry| ExecutionCapture {
                 ord: entry.ord,
                 record: entry.record.clone(),
@@ -316,14 +338,73 @@ impl InMemoryExecutionsStore {
         captures
     }
 
-    /// Replaces the store's contents from a snapshot cut, in place, under actor
-    /// quiescence (the in-memory analogue of the durable "one transaction" swap,
-    /// #023). `next_ord` continues past the restored maximum so post-restore legs
-    /// sort after the cut.
-    pub fn restore(&self, captures: Vec<ExecutionCapture>) {
-        self.records.clear();
+    /// Validates that **every** leg in a restore cut belongs to `underlying`,
+    /// **without** mutating the store — the pre-mutation, all-or-nothing ownership
+    /// gate the actor's restore choreography runs in its preparation phase, before
+    /// the epoch marker is journaled and before any store is swapped
+    /// ([02 §9](../../../docs/02-matching-architecture.md)).
+    ///
+    /// The executions store is shared across every per-underlying actor and only
+    /// the target actor is quiesced during a restore, so a cut carrying another
+    /// underlying's legs is a **corrupt snapshot** that would otherwise inject or
+    /// overwrite a live underlying's data. It is refused **wholesale** here rather
+    /// than partially applied — a mixed-underlying cut is corruption, not a
+    /// partial-apply situation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::RebuildFailed`] if any leg's underlying ticker is
+    /// not `underlying`.
+    pub fn validate_restore(
+        &self,
+        underlying: &str,
+        captures: &[ExecutionCapture],
+    ) -> Result<(), SnapshotError> {
+        let foreign = captures
+            .iter()
+            .filter(|capture| !execution_leg_belongs(&capture.record, underlying))
+            .count();
+        if foreign > 0 {
+            return Err(SnapshotError::RebuildFailed(format!(
+                "executions restore cut for {underlying} carries {foreign} leg(s) for another underlying"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restores **only** `underlying`'s slice from a cut, replacing exactly that
+    /// underlying's legs in place and leaving every other underlying's legs
+    /// untouched — so restoring `BTC` never erases `ETH`'s (possibly newer)
+    /// executions ([02 §9](../../../docs/02-matching-architecture.md)). Runs under
+    /// the capturing actor's quiescence; other underlyings' actors need not quiesce
+    /// because their legs occupy a disjoint keyspace.
+    ///
+    /// **Fail-closed on ownership**: because the store is shared venue-wide and only
+    /// the target actor is quiesced, a leg belonging to another underlying is
+    /// **never** inserted — it is skipped and the drop is logged. The actor path
+    /// already refuses a mixed-underlying cut wholesale via [`validate_restore`]
+    /// before the marker is journaled; this skip is the last-line defence for any
+    /// direct caller, so foreign data can never land regardless of entry point.
+    ///
+    /// The insertion surrogate is a **shared, globally monotonic** counter, so it
+    /// is advanced past the restored maximum (never reset — a reset would regress
+    /// it below another underlying's newer legs); `checked_add` keeps the crate
+    /// free of `saturating_*`, and `2^64` legs is unreachable.
+    ///
+    /// [`validate_restore`]: Self::validate_restore
+    pub fn restore_for(&self, underlying: &str, captures: Vec<ExecutionCapture>) {
+        // Drop only this underlying's slice; every other underlying's legs stay.
+        self.records
+            .retain(|_, stored| !execution_leg_belongs(&stored.record, underlying));
         let mut max_ord: u64 = 0;
+        let mut skipped: usize = 0;
         for capture in captures {
+            if !execution_leg_belongs(&capture.record, underlying) {
+                // A foreign leg (a corrupt or hostile cut for another underlying)
+                // is never inserted — it cannot overwrite a live underlying's data.
+                skipped += 1;
+                continue;
+            }
             max_ord = max_ord.max(capture.ord);
             let key = ExecKey {
                 execution_id: capture.record.execution_id.clone(),
@@ -337,15 +418,19 @@ impl InMemoryExecutionsStore {
                 },
             );
         }
-        // The surrogate is an internal ordering index, not a venue sequence / id /
-        // money value, so it advances past the restored maximum; `2^64` legs is
-        // unreachable, and `checked_add` keeps the crate free of `saturating_*`.
-        let next = if self.records.is_empty() {
-            0
-        } else {
-            max_ord.checked_add(1).unwrap_or(max_ord)
-        };
-        self.next_ord.store(next, Ordering::Relaxed);
+        if skipped > 0 {
+            tracing::warn!(
+                underlying,
+                skipped,
+                "executions restore cut carried leg(s) for another underlying; skipped (foreign data never lands)"
+            );
+        }
+        // Keep the shared surrogate strictly ahead of every stored `ord` without
+        // regressing it below another underlying's newer legs (checked, never
+        // wrapping; `2^64` legs is unreachable).
+        if let Some(next) = max_ord.checked_add(1) {
+            self.next_ord.fetch_max(next, Ordering::Relaxed);
+        }
     }
 }
 
@@ -422,6 +507,18 @@ impl ExecutionsStore for InMemoryExecutionsStore {
     fn len(&self) -> usize {
         self.records.len()
     }
+}
+
+/// Whether a position fold belongs to `underlying` — the **single** ownership
+/// predicate the per-underlying partition is scoped by. A fold carries its
+/// underlying ticker in its `underlying` field (the same field
+/// [`InMemoryPositionsStore::capture_for`] filters on, surfaced on a capture as
+/// [`PositionCapture::underlying`]). Capture, restore, and restore-validation all
+/// consult this one rule so the partition can never diverge.
+#[inline]
+#[must_use]
+fn position_fold_belongs(fold_underlying: &str, underlying: &str) -> bool {
+    fold_underlying == underlying
 }
 
 // ============================================================================
@@ -701,14 +798,21 @@ impl InMemoryPositionsStore {
         Self::default()
     }
 
-    /// Captures every `(account, symbol)` fold's exact accumulators for a
-    /// snapshot cut (#009), sorted by `(account, symbol)` so the cut is
-    /// deterministic regardless of map iteration order.
+    /// Captures **only** `underlying`'s slice of the shared venue-wide fold — the
+    /// `(account, symbol)` folds whose [`PositionCapture::underlying`] matches —
+    /// sorted by `(account, symbol)` so the cut is deterministic regardless of map
+    /// iteration order (#009).
+    ///
+    /// Like [`InMemoryExecutionsStore::capture_for`], the slice is exactly the
+    /// (quiesced) capturing actor's folds — a **consistent cut for that
+    /// underlying**, never a torn read of another underlying's concurrent writes
+    /// ([02 §9](../../../docs/02-matching-architecture.md)).
     #[must_use]
-    pub fn capture(&self) -> Vec<PositionCapture> {
+    pub fn capture_for(&self, underlying: &str) -> Vec<PositionCapture> {
         let mut captures: Vec<PositionCapture> = self
             .positions
             .iter()
+            .filter(|entry| position_fold_belongs(entry.value().underlying.as_str(), underlying))
             .map(|entry| {
                 let (account, symbol) = entry.key();
                 entry.value().to_capture(account, symbol)
@@ -723,15 +827,76 @@ impl InMemoryPositionsStore {
         captures
     }
 
-    /// Replaces the fold contents from a snapshot cut, in place, under actor
-    /// quiescence (the in-memory analogue of the durable "one transaction" swap,
-    /// #023).
-    pub fn restore(&self, captures: Vec<PositionCapture>) {
-        self.positions.clear();
+    /// Validates that **every** fold in a restore cut belongs to `underlying`,
+    /// **without** mutating the store — the pre-mutation, all-or-nothing ownership
+    /// gate the actor's restore choreography runs in its preparation phase, before
+    /// the epoch marker is journaled and before any store is swapped
+    /// ([02 §9](../../../docs/02-matching-architecture.md)).
+    ///
+    /// The positions store is shared across every per-underlying actor and only the
+    /// target actor is quiesced during a restore, so a cut carrying another
+    /// underlying's folds is a **corrupt snapshot** that would otherwise inject or
+    /// overwrite a live underlying's data. It is refused **wholesale** here rather
+    /// than partially applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError::RebuildFailed`] if any fold's underlying ticker is
+    /// not `underlying`.
+    pub fn validate_restore(
+        &self,
+        underlying: &str,
+        captures: &[PositionCapture],
+    ) -> Result<(), SnapshotError> {
+        let foreign = captures
+            .iter()
+            .filter(|capture| !position_fold_belongs(capture.underlying.as_str(), underlying))
+            .count();
+        if foreign > 0 {
+            return Err(SnapshotError::RebuildFailed(format!(
+                "positions restore cut for {underlying} carries {foreign} fold(s) for another underlying"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Restores **only** `underlying`'s slice from a cut, replacing exactly that
+    /// underlying's folds in place and leaving every other underlying's folds
+    /// untouched — so restoring `BTC` never erases `ETH`'s (possibly newer)
+    /// positions ([02 §9](../../../docs/02-matching-architecture.md)). Runs under
+    /// the capturing actor's quiescence; other underlyings' actors need not quiesce
+    /// because their folds occupy a disjoint keyspace.
+    ///
+    /// **Fail-closed on ownership**: because the store is shared venue-wide and only
+    /// the target actor is quiesced, a fold belonging to another underlying is
+    /// **never** inserted — it is skipped and the drop is logged. The actor path
+    /// already refuses a mixed-underlying cut wholesale via [`validate_restore`]
+    /// before the marker is journaled; this skip is the last-line defence for any
+    /// direct caller, so foreign data can never land regardless of entry point.
+    ///
+    /// [`validate_restore`]: Self::validate_restore
+    pub fn restore_for(&self, underlying: &str, captures: Vec<PositionCapture>) {
+        // Drop only this underlying's slice; every other underlying's folds stay.
+        self.positions
+            .retain(|_, state| !position_fold_belongs(state.underlying.as_str(), underlying));
+        let mut skipped: usize = 0;
         for capture in captures {
+            if !position_fold_belongs(capture.underlying.as_str(), underlying) {
+                // A foreign fold (a corrupt or hostile cut for another underlying)
+                // is never inserted — it cannot overwrite a live underlying's data.
+                skipped += 1;
+                continue;
+            }
             let key = (capture.account.clone(), capture.symbol.clone());
             self.positions
                 .insert(key, PositionState::from_capture(&capture));
+        }
+        if skipped > 0 {
+            tracing::warn!(
+                underlying,
+                skipped,
+                "positions restore cut carried fold(s) for another underlying; skipped (foreign data never lands)"
+            );
         }
     }
 }
@@ -1377,11 +1542,11 @@ mod tests {
         );
         fan.emit(&added_event(1, 50_000, 2));
         fan.emit(&added_event(2, 50_100, 1));
-        let captured = fan.executions().capture();
+        let captured = fan.executions().capture_for("BTC");
         assert_eq!(captured.len(), 4, "two matches record four legs");
 
         let restored = InMemoryExecutionsStore::new();
-        restored.restore(captured);
+        restored.restore_for("BTC", captured);
         // The taker's list is identical (same legs, same journal order) on the
         // restored store.
         let taker = AccountId::new("taker");
@@ -1412,10 +1577,10 @@ mod tests {
             .expect("get")
             .expect("a position");
 
-        let captured = store.capture();
+        let captured = store.capture_for("BTC");
         assert_eq!(captured.len(), 1);
         let restored = InMemoryPositionsStore::new();
-        restored.restore(captured);
+        restored.restore_for("BTC", captured);
         let after = restored
             .get(&account, &symbol, mark)
             .expect("get")
@@ -1425,9 +1590,10 @@ mod tests {
     }
 
     #[test]
-    fn test_store_restore_replaces_prior_contents() {
-        // A store restore is a wholesale replace, not a merge: prior contents are
-        // dropped so post-restore reads are the cut, exactly.
+    fn test_restore_for_replaces_the_underlyings_prior_slice() {
+        // A restore of an underlying's slice is a wholesale replace of THAT
+        // underlying's legs, not a merge: the prior BTC contents are dropped so a
+        // post-restore read of BTC is the cut, exactly.
         let store = InMemoryExecutionsStore::new();
         let mut fan = StoreFanOut::new(
             Arc::new(InMemoryExecutionsStore::new()),
@@ -1435,20 +1601,246 @@ mod tests {
             Arc::new(MarkPriceBook::new()),
         );
         fan.emit(&added_event(1, 50_000, 2));
-        let cut = fan.executions().capture();
+        let cut = fan.executions().capture_for("BTC");
 
-        // A different store with unrelated content is fully replaced by the cut.
+        // A different store whose only content is other BTC legs is fully replaced
+        // by the BTC cut (both events are BTC, so the whole store is the slice).
         let mut other = StoreFanOut::new(
             Arc::new(store),
             Arc::new(InMemoryPositionsStore::new()),
             Arc::new(MarkPriceBook::new()),
         );
         other.emit(&added_event(9, 40_000, 5));
-        other.executions().restore(cut);
+        other.executions().restore_for("BTC", cut);
         assert_eq!(
             other.executions().len(),
             2,
-            "only the cut's two legs remain"
+            "only the cut's two BTC legs remain"
         );
+    }
+
+    /// Builds one authoritative [`ExecutionRecord`] directly for `underlying` — the
+    /// venue-wide store is keyed by `(execution_id, liquidity)` and filtered by the
+    /// `symbol` underlying ticker, so this stands in for a fan-out leg without a
+    /// full match.
+    fn exec_record(underlying: &str, instrument: &Symbol, exec_tag: &str) -> ExecutionRecord {
+        let lineage = lineage();
+        ExecutionRecord {
+            execution_id: ExecutionId::new(exec_tag),
+            order_id: lineage.venue_order_id(underlying, SequenceNumber::new(0), 0),
+            account: AccountId::new("acct-1"),
+            symbol: underlying.to_string(),
+            instrument: instrument.clone(),
+            side: Side::Buy,
+            liquidity: LiquidityFlag::Taker,
+            quantity: 1,
+            price_cents: Cents::new(50_000),
+            fee_cents: SignedCents::new(0),
+            theo_value_cents: Cents::new(50_000),
+            edge_cents: SignedCents::new(0),
+            underlying_sequence: SequenceNumber::new(0),
+            latency_us: 0,
+            executed_at: EventTimestamp::new(1_700_000_000_000),
+        }
+    }
+
+    #[test]
+    fn test_restore_for_one_underlying_preserves_another_underlyings_newer_data() {
+        // One shared venue-wide pair of stores, as `AppState` wires them across the
+        // per-underlying actors: each underlying writes only its own legs/folds.
+        let executions = InMemoryExecutionsStore::new();
+        let positions = InMemoryPositionsStore::new();
+
+        let btc = sym(); // BTC-20240329-50000-C
+        let eth = match Symbol::parse("ETH-20240329-3000-C") {
+            Ok(s) => s,
+            Err(e) => panic!("ETH fixture parse failed: {e:?}"),
+        };
+        let account = AccountId::new("acct-1");
+
+        // BTC records one leg/fold, then BTC's (quiesced) actor captures its slice.
+        executions
+            .record(exec_record("BTC", &btc, "e-btc"))
+            .expect("record BTC");
+        positions
+            .apply(&leg(&account, &btc, SeamSide::Buy, 2, 50_000, 0))
+            .expect("apply BTC");
+        let btc_exec_cut = executions.capture_for("BTC");
+        let btc_pos_cut = positions.capture_for("BTC");
+        assert_eq!(btc_exec_cut.len(), 1, "the BTC cut is scoped to BTC");
+        assert_eq!(btc_pos_cut.len(), 1);
+
+        // AFTER BTC's capture, ETH's independent actor writes NEWER executions and
+        // positions into the SAME shared stores.
+        executions
+            .record(exec_record("ETH", &eth, "e-eth"))
+            .expect("record ETH");
+        positions
+            .apply(&PositionLeg {
+                account: &account,
+                symbol: &eth,
+                underlying: "ETH",
+                side: SeamSide::Buy,
+                quantity: 5,
+                price: Cents::new(3_000),
+                fee: SignedCents::new(0),
+            })
+            .expect("apply ETH");
+
+        // BTC restores its (older) snapshot — this must touch ONLY BTC's slice.
+        executions.restore_for("BTC", btc_exec_cut);
+        positions.restore_for("BTC", btc_pos_cut);
+
+        // ETH's newer executions and positions SURVIVE the BTC restore.
+        let eth_execs = executions
+            .list(
+                &account,
+                &ExecutionFilter {
+                    underlying: Some("ETH".to_string()),
+                    limit: None,
+                },
+            )
+            .expect("list ETH");
+        assert_eq!(
+            eth_execs.len(),
+            1,
+            "ETH's newer execution must survive a BTC restore"
+        );
+        let eth_pos = positions
+            .get(&account, &eth, None)
+            .expect("get ETH")
+            .expect("ETH position survives");
+        assert_eq!(
+            eth_pos.net_quantity, 5,
+            "ETH's newer position must survive a BTC restore"
+        );
+
+        // BTC's slice is exactly the restored cut (unchanged, not erased).
+        let btc_execs = executions
+            .list(
+                &account,
+                &ExecutionFilter {
+                    underlying: Some("BTC".to_string()),
+                    limit: None,
+                },
+            )
+            .expect("list BTC");
+        assert_eq!(btc_execs.len(), 1, "BTC's slice is the restored cut");
+        let btc_pos = positions
+            .get(&account, &btc, None)
+            .expect("get BTC")
+            .expect("BTC position present");
+        assert_eq!(btc_pos.net_quantity, 2);
+    }
+
+    #[test]
+    fn test_restore_for_rejects_foreign_underlying_records() {
+        // A malformed or hostile snapshot cut for BTC that also carries an ETH leg
+        // must NEVER inject or overwrite ETH's rows — the store is shared across the
+        // per-underlying actors and only the BTC actor is quiesced during a restore.
+        let btc = sym(); // BTC-20240329-50000-C
+        let eth = match Symbol::parse("ETH-20240329-3000-C") {
+            Ok(s) => s,
+            Err(e) => panic!("ETH fixture parse failed: {e:?}"),
+        };
+        let mixed = vec![
+            ExecutionCapture {
+                ord: 0,
+                record: exec_record("BTC", &btc, "e-btc"),
+            },
+            ExecutionCapture {
+                ord: 1,
+                record: exec_record("ETH", &eth, "e-eth"),
+            },
+        ];
+
+        // The actor-facing gate refuses the mixed cut wholesale (all-or-nothing),
+        // before any mutation.
+        let store = InMemoryExecutionsStore::new();
+        match store.validate_restore("BTC", &mixed) {
+            Err(SnapshotError::RebuildFailed(_)) => {}
+            other => panic!("expected a foreign-leg rejection, got {other:?}"),
+        }
+        assert!(
+            store.is_empty(),
+            "validate_restore must not mutate the store"
+        );
+
+        // A direct restore is fail-closed: the foreign ETH leg is skipped, only the
+        // BTC leg lands.
+        store.restore_for("BTC", mixed);
+        assert_eq!(store.len(), 1, "the foreign ETH leg must not be inserted");
+        let account = AccountId::new("acct-1");
+        let eth_execs = store
+            .list(
+                &account,
+                &ExecutionFilter {
+                    underlying: Some("ETH".to_string()),
+                    limit: None,
+                },
+            )
+            .expect("list ETH");
+        assert!(
+            eth_execs.is_empty(),
+            "no ETH leg may be injected by a BTC restore"
+        );
+        let btc_execs = store
+            .list(
+                &account,
+                &ExecutionFilter {
+                    underlying: Some("BTC".to_string()),
+                    limit: None,
+                },
+            )
+            .expect("list BTC");
+        assert_eq!(btc_execs.len(), 1, "the BTC leg of the cut still lands");
+    }
+
+    #[test]
+    fn test_positions_restore_for_rejects_foreign_underlying_folds() {
+        // The same partition guarantee for the positions fold: a BTC cut carrying an
+        // ETH fold must never inject or overwrite ETH's position.
+        let btc = sym();
+        let eth = match Symbol::parse("ETH-20240329-3000-C") {
+            Ok(s) => s,
+            Err(e) => panic!("ETH fixture parse failed: {e:?}"),
+        };
+        let account = AccountId::new("acct-1");
+        let btc_cap = PositionCapture {
+            account: account.clone(),
+            symbol: btc.clone(),
+            underlying: "BTC".to_string(),
+            net_quantity: 2,
+            basis: 100_000,
+            cash_ex_fee: -100_000,
+            fees: 0,
+        };
+        let eth_cap = PositionCapture {
+            account: account.clone(),
+            symbol: eth.clone(),
+            underlying: "ETH".to_string(),
+            net_quantity: 5,
+            basis: 15_000,
+            cash_ex_fee: -15_000,
+            fees: 0,
+        };
+        let mixed = vec![btc_cap, eth_cap];
+
+        let store = InMemoryPositionsStore::new();
+        match store.validate_restore("BTC", &mixed) {
+            Err(SnapshotError::RebuildFailed(_)) => {}
+            other => panic!("expected a foreign-fold rejection, got {other:?}"),
+        }
+
+        store.restore_for("BTC", mixed);
+        assert!(
+            store.get(&account, &eth, None).expect("get ETH").is_none(),
+            "no ETH fold may be injected by a BTC restore"
+        );
+        let btc_pos = store
+            .get(&account, &btc, None)
+            .expect("get BTC")
+            .expect("the BTC fold of the cut still lands");
+        assert_eq!(btc_pos.net_quantity, 2);
     }
 }

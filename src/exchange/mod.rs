@@ -73,7 +73,10 @@ pub use self::envelope::{
     VenueEvent, VenueOutcome,
 };
 pub use self::event::{EventTimestamp, SequenceNumber};
-pub use self::executor::{MatchingExecutor, PreparedRestore, TopOfBook, spawn_matching_actor};
+pub use self::executor::{
+    MatchingExecutor, PreparedRestore, TopOfBook, spawn_matching_actor,
+    spawn_matching_actor_with_registry_and_index,
+};
 pub use self::identity::{JournalHeader, LineageId, VENUE_ENVELOPE_SCHEMA};
 pub use self::instrument::Instrument;
 pub use self::journal::{

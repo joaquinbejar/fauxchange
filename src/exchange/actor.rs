@@ -479,7 +479,7 @@ where
         self.epoch
     }
 
-    /// Captures a **consistent cut** of the four derived stores plus
+    /// Captures a **consistent cut** of this underlying's four derived stores plus
     /// config/version metadata, keyed by `snapshot_id`
     /// ([02 §9](../../../docs/02-matching-architecture.md)).
     ///
@@ -487,6 +487,13 @@ where
     /// log, the positions fold, and the idempotency map — non-journaled analytics
     /// (mark price, unrealised P&L, Greeks, registry ids) are **excluded** and
     /// recompute live after a restore.
+    ///
+    /// The executions/positions stores are shared venue-wide across every
+    /// per-underlying actor, so the cut is scoped to **this actor's underlying**
+    /// (`capture_for`): the leaf books and idempotency map are already this
+    /// underlying's, and slicing the shared stores by underlying keeps the cut a
+    /// consistent, single-writer read of only this underlying's data — it never
+    /// captures another underlying's concurrently-written legs.
     #[must_use]
     pub fn capture(
         &self,
@@ -502,8 +509,14 @@ where
         VenueSnapshot {
             metadata,
             executor: self.executor.capture_state(),
-            executions: self.fan_out.executions().capture(),
-            positions: self.fan_out.positions().capture(),
+            executions: self
+                .fan_out
+                .executions()
+                .capture_for(self.underlying.as_ref()),
+            positions: self
+                .fan_out
+                .positions()
+                .capture_for(self.underlying.as_ref()),
         }
     }
 
@@ -528,8 +541,9 @@ where
     ///
     /// - [`SnapshotError::MetadataMismatch`] if the snapshot does not match the
     ///   running venue;
-    /// - [`SnapshotError::RebuildFailed`] if the captured book cannot be rebuilt
-    ///   (rolls back — nothing swapped);
+    /// - [`SnapshotError::RebuildFailed`] if the captured book cannot be rebuilt,
+    ///   or an executions/positions cut carries a leg/fold for another underlying
+    ///   (both raised in the preparation phase — rolls back, nothing swapped);
     /// - [`SnapshotError::JournalUnavailable`] if the epoch marker cannot be
     ///   journaled (rolls back), or the underlying is sealed on the journal;
     /// - [`SnapshotError::SequenceExhausted`] if the underlying is sealed on
@@ -580,6 +594,19 @@ where
             &snapshot.executor.instrument_statuses,
         )?;
 
+        // Step 2a (cont.): validate the shared-store cuts belong to THIS underlying
+        // before any mutation or marker append. The executions/positions stores are
+        // shared venue-wide and only this actor is quiesced, so a cut carrying
+        // another underlying's legs/folds is a corrupt snapshot that could inject or
+        // overwrite a live underlying's rows. It is refused wholesale (all-or-nothing)
+        // here, so the marker is never journaled and no store is swapped.
+        self.fan_out
+            .executions()
+            .validate_restore(self.underlying.as_ref(), &snapshot.executions)?;
+        self.fan_out
+            .positions()
+            .validate_restore(self.underlying.as_ref(), &snapshot.positions)?;
+
         // Step 2b: append the epoch marker as the first record of the fresh
         // epoch (fallible). Done before any swap so a failure rolls back cleanly.
         let marker = SnapshotRestored::new(
@@ -597,15 +624,21 @@ where
             return Err(SnapshotError::JournalUnavailable);
         }
 
-        // Step 3: commit — swap all four stores infallibly under quiescence, then
-        // continue the `underlying_sequence` past the marker. The capacity was
-        // proven above (`next_sequence`), so this advance cannot exhaust and the
-        // commit cannot leave a half-restored, un-advanceable book.
+        // Step 3: commit — swap this underlying's four stores infallibly under
+        // quiescence, then continue the `underlying_sequence` past the marker. The
+        // executions/positions stores are shared venue-wide, so the swap is scoped to
+        // **this actor's underlying** (`restore_for`): it replaces only this
+        // underlying's slice and leaves every other underlying's (possibly newer)
+        // legs/folds untouched — a `BTC` restore never erases `ETH`. The sequence
+        // capacity was proven above (`next_sequence`), so this advance cannot exhaust
+        // and the commit cannot leave a half-restored, un-advanceable book.
         self.executor.commit_restore(prepared);
         self.fan_out
             .executions()
-            .restore(snapshot.executions.clone());
-        self.fan_out.positions().restore(snapshot.positions.clone());
+            .restore_for(self.underlying.as_ref(), snapshot.executions.clone());
+        self.fan_out
+            .positions()
+            .restore_for(self.underlying.as_ref(), snapshot.positions.clone());
         self.epoch = new_epoch;
         self.next_sequence = next_sequence;
 
