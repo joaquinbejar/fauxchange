@@ -30,6 +30,33 @@ The full versioning and release-process policy lives in the design docs
   sequenced path and render the real result (`r` accepted + one
   `ExecutionReport(8) Canceled` per swept order); an account can cancel only its
   own orders (owner-scoped).
+- **Boot-time journal recovery — a durable venue resumes on restart** (#85).
+  `AppState::new` now, when `DATABASE_URL` is set, reads each underlying's
+  durable journal header and — for a non-empty stream — runs the production
+  recovery reducer (`exchange::recover_into`, re-executing the journaled
+  records with the stored event as the integrity oracle, the SAME single
+  algorithm as offline replay, NEVER through `AppState::submit`), rebuilds the
+  book + executions + positions + mark state, rehydrates the venue run
+  `lineage_id`, and spawns each actor CONTINUING its stream at
+  `last_sequence + 1` (via the new `ActorConfig::with_start_sequence`) instead
+  of colliding at `0`. Before this, restarting against a non-empty journal hit
+  the unique key with a `Conflict` on the first post-restart command.
+  - **Fail-stop on a corrupt or too-new journal.** A `JournalCorruption` /
+    `SchemaTooNew` (or a re-execution that diverges from the stored event —
+    e.g. config drift) at boot is a typed fatal `AppStateError::Recovery`
+    naming the exact `(underlying, sequence)` — the venue refuses to serve
+    rather than silently start fresh over durable history. A contradictory
+    durable manifest (disagreeing persisted lineages) fails stop with
+    `RecoveryLineageConflict`; the `u64::MAX` edge is `RecoverySequenceExhausted`.
+  - **Seed-vs-recover precedence.** A recovered underlying is NOT re-seeded
+    (instrument registration + opening-price seeding skip it) — recover wins
+    for underlyings with journal history; seeding applies only to genuinely
+    fresh underlyings. The empty-journal fresh-boot path is unchanged.
+  - Determinism oracle (`tests/determinism.rs`): record → restart → continue,
+    and the continued run's events are identical to a never-restarted run
+    given the same post-restart commands. A `testcontainers` restart test
+    (`tests/recovery.rs`, `#[ignore]`-gated) drives boot → trade → kill →
+    re-boot against the same Postgres and resumes at the continued sequence.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;

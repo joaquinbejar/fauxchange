@@ -269,7 +269,21 @@ pub async fn apply_seed_phase(
     //    An instrument bound to a defined persona (#047) registers with that
     //    persona's base spread / size + knobs and its seeded per-`(persona, symbol)`
     //    jitter; an unbound instrument follows the engine's global config.
+    //
+    //    SEED-VS-RECOVER PRECEDENCE (#85): a **recovered** underlying (resumed from a
+    //    non-empty durable journal) is NOT re-seeded — recover wins. Its book /
+    //    executions / positions were reconstructed by re-execution and its actor
+    //    continues the journaled `underlying_sequence`; re-registering + re-pricing it
+    //    here would journal a duplicate opening `SimStep` onto the resumed stream.
+    //    Seed applies only to genuinely fresh underlyings.
     for set in manifest.instruments() {
+        if state.is_recovered(&set.underlying) {
+            tracing::info!(
+                underlying = %set.underlying,
+                "skipping seed registration for a recovered underlying (recover wins)"
+            );
+            continue;
+        }
         if let Some(existing) = market_maker.get_price(&set.underlying)
             && existing != set.opening_price.get()
         {
@@ -296,8 +310,13 @@ pub async fn apply_seed_phase(
     }
 
     // 4. Opening prices → a journaled `SimStep` + the market maker's requote,
-    //    whose `AddOrder`s vivify the leaf books onto the shared symbol index.
+    //    whose `AddOrder`s vivify the leaf books onto the shared symbol index. A
+    //    recovered underlying (#85) is SKIPPED here too — re-setting its opening price
+    //    would journal a duplicate `SimStep` onto the resumed stream (recover wins).
     for set in manifest.instruments() {
+        if state.is_recovered(&set.underlying) {
+            continue;
+        }
         state
             .simulator()
             .set_price(&set.underlying, set.opening_price)

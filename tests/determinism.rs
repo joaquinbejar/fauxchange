@@ -82,9 +82,9 @@ use fauxchange::exchange::{
     InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
     JournalCommand, JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook,
     MassCancelScope, MassCancelType, MatchingExecutor, NoopFanOut, PositionsStore, RecordKind,
-    RejectKind, STPMode, SequenceNumber, Side, SignedCents, StoreFanOut, Symbol, SymbolError,
-    SymbolParser, TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand, VenueEvent,
-    VenueJournal, VenueOutcome, recover, validate_venue_expiry,
+    RejectKind, Recovered, STPMode, SequenceNumber, Side, SignedCents, StoreFanOut, Symbol,
+    SymbolError, SymbolParser, TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand,
+    VenueEvent, VenueJournal, VenueOutcome, recover, recover_into, validate_venue_expiry,
 };
 use fauxchange::gateway::fix::enums::{OrdType as FixOrdType, OrderSide, TimeInForce as FixTif};
 use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
@@ -1046,6 +1046,149 @@ fn test_recovery_refuses_a_newer_than_binary_schema() {
         Err(JournalError::SchemaTooNew { found }) => assert_eq!(found, "venue.v2"),
         other => panic!("expected a SchemaTooNew refusal, got {other:?}"),
     }
+}
+
+// ---- boot recovery seam: recover_into (the #85 caller-provided-executor path) ----
+
+/// `recover_into` (the boot-time [`AppState`] resume seam that recovers into a
+/// caller-built shared-registry executor) is the SAME reducer as `recover`: on the
+/// same journal it re-derives the identical events + last sequence.
+#[test]
+fn test_recover_into_matches_recover_on_the_same_journal() {
+    let lineage = LineageId::new("run-into");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+
+    let via_recover = match recover(&recording.journal, UNDERLYING) {
+        Ok(r) => r,
+        Err(e) => panic!("recover must not halt on a clean journal: {e:?}"),
+    };
+    let via_into = match recover_into(&recording.journal, MatchingExecutor::new(UNDERLYING), None) {
+        Ok(r) => r,
+        Err(e) => panic!("recover_into must not halt on a clean journal: {e:?}"),
+    };
+    assert_eq!(
+        via_into.events, via_recover.events,
+        "recover_into re-derives the identical event stream as recover"
+    );
+    assert_eq!(
+        via_into.last_sequence, via_recover.last_sequence,
+        "recover_into leaves the underlying at the same last sequence as recover"
+    );
+}
+
+/// Boot recovery **refuses to serve** on a corrupt stream through `recover_into`,
+/// naming the exact `(underlying, sequence)` — the reducer-level half of the
+/// fail-stop the durable `AppState::new` boundary maps to `AppStateError::Recovery`.
+#[test]
+fn test_recover_into_halts_on_corruption_naming_underlying_and_sequence() {
+    let lineage = LineageId::new("run-into");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    let target = SequenceNumber::new(6);
+    let corrupted = corrupt_event_at(&recording, target);
+
+    match recover_into(&corrupted, MatchingExecutor::new(UNDERLYING), None) {
+        Err(JournalError::Corruption {
+            underlying,
+            sequence,
+        }) => {
+            assert_eq!(
+                underlying, UNDERLYING,
+                "the halt names the exact underlying"
+            );
+            assert_eq!(sequence, target, "the halt names the exact sequence N");
+        }
+        other => panic!("expected a Corruption halt at the exact (underlying, N), got {other:?}"),
+    }
+}
+
+/// Boot recovery through `recover_into` refuses a forward-incompatible (newer than
+/// this binary) envelope schema rather than mis-parse — the second fail-stop class.
+#[test]
+fn test_recover_into_refuses_a_newer_than_binary_schema() {
+    let lineage = LineageId::new("run-into");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    let newer = with_newer_schema(&recording);
+
+    match recover_into(&newer, MatchingExecutor::new(UNDERLYING), None) {
+        Err(JournalError::SchemaTooNew { found }) => assert_eq!(found, "venue.v2"),
+        other => panic!("expected a SchemaTooNew refusal, got {other:?}"),
+    }
+}
+
+/// The **restart-from-journal determinism oracle** (#85, #54): record a stream,
+/// "restart" by recovering the pre-restart journal into a fresh executor, then
+/// continue with the post-restart commands at the CONTINUED `underlying_sequence`.
+/// The restarted run's event stream (recovered ++ continued) is IDENTICAL,
+/// per-underlying and ordered, to a never-restarted run over the same full stream —
+/// the bounded oracle the resume path must uphold (standard exclusions: only the
+/// journaled events are compared, the same artifact the flagship oracle judges).
+#[test]
+fn test_recovery_then_continue_matches_a_never_restarted_run() {
+    let lineage = LineageId::new("run-resume");
+    let all = rich_stream(&lineage);
+    // Restart after the first four commands (sequences 0..=3); continue with 4..=6.
+    let split = 4usize;
+    let pre = &all[..split];
+    let post = &all[split..];
+
+    // The never-restarted baseline: one continuous executor over the FULL stream.
+    let baseline = record(&all, &lineage, &witnesses());
+
+    // The restarted run: record `pre`, recover its journal into a fresh executor
+    // (the `recover_into` boot seam), then continue with `post`.
+    let pre_rec = record(pre, &lineage, &witnesses());
+    let recovered = match recover_into(&pre_rec.journal, MatchingExecutor::new(UNDERLYING), None) {
+        Ok(r) => r,
+        Err(e) => panic!("recovery of a clean pre-restart journal must not halt: {e:?}"),
+    };
+    let Recovered {
+        events: recovered_events,
+        mut executor,
+        last_sequence,
+    } = recovered;
+    // Recovery reproduces the pre-restart events (the integrity oracle).
+    assert_eq!(
+        recovered_events, pre_rec.events,
+        "recovery re-executes the pre-restart journal to events equal to the stored ones"
+    );
+    let last = last_sequence.expect("a non-empty pre-restart stream has a last sequence");
+    let start = last
+        .checked_next()
+        .expect("the resumed sequence continues, never wraps");
+    assert_eq!(
+        start,
+        SequenceNumber::new(split as u64),
+        "the resume continues at last_sequence + 1, never resetting"
+    );
+
+    // Continue the RECOVERED executor with the post-restart commands at the continued
+    // sequences — exactly as the resumed actor does (start_sequence = last + 1).
+    let mut continued = Vec::with_capacity(post.len());
+    for (offset, command) in post.iter().enumerate() {
+        let sequence = SequenceNumber::new(start.get() + offset as u64);
+        let venue_ts = CLOCK.now_ms();
+        let outcome = executor.execute(ExecutionContext {
+            underlying: UNDERLYING,
+            lineage_id: &lineage,
+            sequence,
+            venue_ts,
+            command,
+        });
+        continued.push(VenueEvent::new(
+            sequence,
+            venue_ts,
+            command.clone(),
+            outcome,
+        ));
+    }
+
+    // The restarted stream (recovered ++ continued) equals the never-restarted
+    // baseline, per-underlying and ordered — the restart-from-journal oracle.
+    let restarted: Vec<VenueEvent> = recovered_events.into_iter().chain(continued).collect();
+    assert_eq!(
+        restarted, baseline.events,
+        "record → restart → continue reproduces the never-restarted event stream exactly"
+    );
 }
 
 // ============================================================================
