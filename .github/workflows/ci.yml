@@ -1,0 +1,237 @@
+# fauxchange CI pipeline
+#
+# Wires the CI-matrix jobs from docs/TESTING.md §11 plus the v0.1
+# supply-chain gate from docs/08-threat-model.md §8: fmt / clippy / test /
+# build-release / doctests / msrv / golden / determinism / parity /
+# cargo-audit / cargo-deny. All are non-negotiable per
+# rules/global_rules.md "Pre-Submission Checklist" and
+# docs/TESTING.md §12 — a green run here means all of them passed, nothing
+# is skipped to turn the pipeline green.
+#
+# Explicitly OUT of this workflow (see
+# milestones/v0.1-backend-core/019-ci-audit-deny-lint.md "Scope"):
+# the `fuzz` job (FIX gateway lands v0.4), the `bench-regression` gate
+# (armed before v1.0), the `migrations` job (lands with the optional
+# PostgreSQL persistence layer, v0.2 #023), and the `docker-smoke` /
+# `image-build` stages (land with the Dockerfile/compose topology and
+# container hardening, v0.2 #025/#026, and the cold-bring-up e2e smoke,
+# v0.2 #027).
+#
+# `make workflow-<job-id>` (see Makefile) runs any job here locally via
+# `act` — job ids below are the stable contract those targets rely on.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+    branches:
+      - "main"
+      - "release/**"
+
+# Cancel a superseded run on the same ref — this workflow has no deploy job,
+# so the whole pipeline is safe to cancel-in-progress.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The pinned stable toolchain (matches rust-toolchain.toml). Bump both
+  # together, deliberately.
+  RUST_TOOLCHAIN: "1.97.0"
+  # The verified MSRV floor — `expiration_date` (transitive via
+  # optionstratlib) requires rustc 1.96; `cargo +1.95.0 check --all-features`
+  # fails, `cargo +1.96.0 check --all-features` passes (verified on the
+  # branch that introduced this workflow). See rust-toolchain.toml.
+  RUST_MSRV: "1.96.0"
+  # cargo-audit / cargo-deny versions verified locally against this
+  # dependency tree (see .cargo/audit.toml and deny.toml). Bump deliberately
+  # and re-verify `cargo audit` / `cargo deny check` locally before bumping.
+  CARGO_AUDIT_VERSION: "0.22.1"
+  CARGO_DENY_VERSION: "0.19.2"
+  # Quiet logs on test runs, mirroring `make test` (Makefile).
+  LOGLEVEL: WARN
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: fmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: clippy
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: test
+      - run: cargo test --all-features
+
+  build-release:
+    name: build-release
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: build-release
+      - run: cargo build --release
+
+  doctests:
+    name: doctests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: doctests
+      - run: cargo test --doc --all-features
+
+  msrv:
+    name: msrv
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_MSRV }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: msrv
+      # rustup toolchain-selection precedence is: `+toolchain` override >
+      # `RUSTUP_TOOLCHAIN` env > `rust-toolchain(.toml)` file > `rustup
+      # default`. `dtolnay/rust-toolchain` only sets the rustup DEFAULT
+      # (lowest precedence) — the repo-root rust-toolchain.toml (pinning
+      # RUST_TOOLCHAIN, currently 1.97.0) OUTRANKS that default, so a bare
+      # `cargo check` here would silently compile under 1.97.0, never the
+      # MSRV floor this job exists to verify. The explicit `+toolchain`
+      # override below has the HIGHEST precedence and forces the actual
+      # RUST_MSRV floor regardless of rust-toolchain.toml.
+      - run: cargo +${{ env.RUST_MSRV }} check --all-features
+
+  golden:
+    name: golden
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: golden
+      - run: cargo test --test golden --all-features
+
+  determinism:
+    name: determinism
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: determinism
+      - run: cargo test --test determinism --all-features
+
+  parity:
+    name: parity
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: parity
+      - run: cargo test --test parity --all-features
+
+  # --- Supply-chain gate (docs/08-threat-model.md §8) -----------------------
+  # Both jobs install the REAL cargo-audit / cargo-deny binaries (pinned
+  # versions, checksummed by taiki-e/install-action) and run the exact same
+  # commands a developer runs locally via `make audit` / `make deny`, so CI
+  # and local never diverge in behavior. Configuration lives in
+  # `.cargo/audit.toml` and `deny.toml` (auto-discovered by each tool) — NOT
+  # duplicated here as step arguments.
+
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2.83.2
+        with:
+          tool: cargo-audit@${{ env.CARGO_AUDIT_VERSION }}
+      # Advisory DB changes daily; cache it but always re-fetch once a day so
+      # a NEW advisory is never missed.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cargo/advisory-db
+          key: advisory-db-${{ github.run_id }}
+          restore-keys: |
+            advisory-db-
+      # `cargo audit` picks up `.cargo/audit.toml` automatically (verified
+      # locally): the one ignored advisory (RUSTSEC-2024-0436, `paste`
+      # unmaintained — not a vulnerability) is documented there with a
+      # reason. A real vulnerability advisory is never added to that ignore
+      # list and fails this job.
+      - run: cargo audit
+
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2.83.2
+        with:
+          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
+      # `cargo deny check` picks up `deny.toml` automatically: the license
+      # allow-list, the RUSTSEC-2024-0436 advisory ignore (same reason as
+      # cargo-audit above), the bans (duplicate-version visibility, no
+      # wildcard versions) and sources (crates.io only) policy.
+      - run: cargo deny check
