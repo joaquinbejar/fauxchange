@@ -38,13 +38,26 @@ use crate::models::{
 };
 use crate::state::AppState;
 
-/// The typed refusal for a runtime hierarchy mutation — the instrument set is a
-/// seed-time manifest input, immutable once the venue is serving.
-fn manifest_refused(kind: &str) -> VenueError {
-    VenueError::InvalidOrder(format!(
-        "runtime {kind} create/delete is refused: the instrument set is a seed-time manifest \
-         input (a new run is required to change it)"
-    ))
+/// The typed, **phase-aware** refusal for a runtime hierarchy mutation (#024).
+///
+/// The instrument set is a seed-time manifest input: it is populated from the seed
+/// manifest during the bounded **seeding** phase (not by a runtime REST create —
+/// there is no sequenced hierarchy-CRUD command), and once the venue flips to
+/// **serving** it is immutable. Either way this is a typed `400` naming the
+/// manifest-input reason ([06 §7](../../../docs/06-deployment.md#7-seed-data-and-scenarios),
+/// [03 §10](../../../docs/03-protocol-surfaces.md#10-state-changing-operation-classification)).
+fn manifest_refused(kind: &str, serving: bool) -> VenueError {
+    if serving {
+        VenueError::InvalidOrder(format!(
+            "runtime {kind} create/delete is refused: the instrument set is a seed-time manifest \
+             input, immutable once the venue is serving (a new run is required to change it)"
+        ))
+    } else {
+        VenueError::InvalidOrder(format!(
+            "{kind} create/delete over REST is refused: the instrument set is populated from the \
+             seed manifest during the bounded seeding phase, not by a runtime hierarchy create"
+        ))
+    }
 }
 
 /// An empty two-sided quote — no observable resting quote yet.
@@ -121,11 +134,12 @@ pub async fn list_underlyings(State(state): State<Arc<AppState>>) -> Json<Underl
     security(("bearer_jwt" = [])),
 )]
 pub async fn create_underlying(
+    State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Authorized>,
     Path(_underlying): Path<String>,
 ) -> Result<Json<UnderlyingSummary>, VenueError> {
     require(&auth, Permission::Admin)?;
-    Err(manifest_refused("underlying"))
+    Err(manifest_refused("underlying", state.is_serving()))
 }
 
 /// Summary of one underlying — projected from the symbol index.
@@ -171,11 +185,12 @@ pub async fn get_underlying(
     security(("bearer_jwt" = [])),
 )]
 pub async fn delete_underlying(
+    State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Authorized>,
     Path(_underlying): Path<String>,
 ) -> Result<Json<DeleteUnderlyingResponse>, VenueError> {
     require(&auth, Permission::Admin)?;
-    Err(manifest_refused("underlying"))
+    Err(manifest_refused("underlying", state.is_serving()))
 }
 
 // ============================================================================
@@ -216,11 +231,12 @@ pub async fn list_expirations(
     security(("bearer_jwt" = [])),
 )]
 pub async fn create_expiration(
+    State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Authorized>,
     Path((_underlying, _expiration)): Path<(String, String)>,
 ) -> Result<Json<ExpirationSummary>, VenueError> {
     require(&auth, Permission::Admin)?;
-    Err(manifest_refused("expiration"))
+    Err(manifest_refused("expiration", state.is_serving()))
 }
 
 /// Summary of one expiration — projected from the symbol index.
@@ -363,11 +379,12 @@ pub async fn list_strikes(
     security(("bearer_jwt" = [])),
 )]
 pub async fn create_strike(
+    State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Authorized>,
     Path((_underlying, _expiration, _strike)): Path<(String, String, u64)>,
 ) -> Result<Json<StrikeSummary>, VenueError> {
     require(&auth, Permission::Admin)?;
-    Err(manifest_refused("strike"))
+    Err(manifest_refused("strike", state.is_serving()))
 }
 
 /// Summary of one strike (call and put books) — empty quotes until the book-read

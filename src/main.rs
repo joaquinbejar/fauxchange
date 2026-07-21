@@ -6,10 +6,13 @@
 //! with secrets redacted**, build the shared [`AppState`](fauxchange::state::AppState)
 //! from that config, then serve the router
 //! ([`fauxchange::gateway::rest::serve`]) with the rate-limit sweeper and the
-//! real-socket-peer connect-info. The fuller bootstrap sequence — structured/JSON
-//! log output (observability #06), the seed manifest (#024), the durable DB pool
-//! (#023), and the WS/FIX gateways + background tasks — lands with the modules
-//! that own it; this file grows with them.
+//! real-socket-peer connect-info. As of #024 it also runs the bounded **seeding
+//! phase**: the venue is assembled in the seeding phase, the scenario manifest
+//! ([`Config::seed`](fauxchange::config::Config)) is applied in fixed order
+//! ([`fauxchange::seed::apply_seed_phase`]), and the venue flips to serving before
+//! it binds. The fuller bootstrap sequence — structured/JSON log output
+//! (observability #06) and the WS/FIX gateways + background tasks — lands with the
+//! modules that own it; this file grows with them.
 //!
 //! **Security posture.** The embedded dev JWT keypair is refused in a released
 //! image unless dev mode is set (`FAUXCHANGE_DEV=1`), via the
@@ -28,14 +31,17 @@
 //! - `[determinism]` `FAUXCHANGE_SEED` / `--seed` — one run-level seed → run lineage.
 //! - `[auth]` `AUTH_BOOTSTRAP_SECRET` — gates `POST /api/v1/auth/token`.
 //! - `[logging]` `FAUXCHANGE_LOG_FORMAT` / `--log-format` — `json` | `pretty` (JSON emission #06).
-//! - `FAUXCHANGE_UNDERLYINGS` — comma-separated underlyings (default `BTC,ETH`;
-//!   the declarative `[instruments.*]` seed is #024).
+//! - `FAUXCHANGE_UNDERLYINGS` — comma-separated underlyings (default `BTC,ETH`),
+//!   the fallback when the config file declares no `[instruments.*]` seed.
+//! - `[accounts.*]` / `[instruments.*]` / `[market_maker.*]` (config file only) —
+//!   the scenario seed manifest (#024) applied by the bounded seeding phase.
 //! - `FAUXCHANGE_DEV` — `1`/`true` admits the dev JWT keypair for local use.
 
 use fauxchange::auth::{DevMode, JwtAuth};
 use fauxchange::config::Config;
 use fauxchange::db::{DatabasePool, DbPoolConfig};
 use fauxchange::gateway::rest;
+use fauxchange::seed;
 use fauxchange::state::{AppState, AppStateConfig, AuthConfig};
 
 #[tokio::main]
@@ -63,14 +69,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "effective venue config at boot"
     );
 
-    // Underlyings are seeded from the env for now; the declarative
-    // `[instruments.*]` manifest lands with the seed (#024).
-    let underlyings: Vec<String> = std::env::var("FAUXCHANGE_UNDERLYINGS")
-        .unwrap_or_else(|_| "BTC,ETH".to_string())
-        .split(',')
-        .map(|ticker| ticker.trim().to_string())
-        .filter(|ticker| !ticker.is_empty())
-        .collect();
+    // The scenario seed manifest (#024) rode through the layered loader onto
+    // `config.seed`. When it declares instruments they define the hosted
+    // underlyings; otherwise the venue falls back to the `FAUXCHANGE_UNDERLYINGS`
+    // env list (an empty-manifest, no-seeded-instruments run).
+    let manifest = &config.seed;
+    let underlyings: Vec<String> = if manifest.is_empty() {
+        std::env::var("FAUXCHANGE_UNDERLYINGS")
+            .unwrap_or_else(|_| "BTC,ETH".to_string())
+            .split(',')
+            .map(|ticker| ticker.trim().to_string())
+            .filter(|ticker| !ticker.is_empty())
+            .collect()
+    } else {
+        manifest.underlyings()
+    };
 
     // Dev keypair, refused in a released image unless dev mode is set.
     let jwt = JwtAuth::dev()?.release_gated(DevMode::from_env())?;
@@ -99,18 +112,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // The run lineage is derived from the seed, so ids namespace per seed.
+    // The run lineage is derived from the seed, so ids namespace per seed. The
+    // venue starts in the bounded SEEDING phase (`with_serving(false)`): the seed
+    // manifest is applied before any traffic, then the venue flips to serving.
+    // Accounts are provisioned by the seeding phase (not at construction), so the
+    // registry starts empty here.
+    //
+    // SECURITY: extract everything still needed AFTER seeding into owned locals so
+    // the `config` — whose seed manifest holds the plaintext `[accounts.*]` FIX
+    // passwords — can be dropped PROMPTLY once the seeding phase has hashed them
+    // into the registry, rather than living for the whole process lifetime (it was
+    // previously read again at `rest::serve` at the very end).
+    let http_addr = config.server.http_addr;
+    let lineage = config.determinism.lineage_id();
+    let assets = seed::asset_configs(manifest);
+    let manifest_summary = manifest.summary(); // secret-free counts only
     let app_config = AppStateConfig::new(underlyings)
-        .with_lineage(config.determinism.lineage_id())
+        .with_lineage(lineage)
         .with_auth(auth)
-        .with_db(db);
+        .with_assets(assets)
+        .with_db(db)
+        .with_serving(false);
     let state = AppState::new(app_config)?;
+
+    // The bounded seeding phase: apply the manifest in fixed order (accounts,
+    // instruments, opening prices, personas) BEFORE the venue serves. This is the
+    // LAST use of `manifest` (a borrow of `config`).
+    let report = seed::apply_seed_phase(&state, manifest).await?;
+    // The plaintext FIX passwords are now hashed into the registry; drop the
+    // config (and its plaintext copy) immediately rather than hold it to `serve`.
+    drop(config);
+    state.begin_serving();
     tracing::info!(
         underlyings = state.underlying_count(),
         durable = state.is_persistent(),
-        "AppState assembled"
+        seed = %report.summary(),
+        manifest = %manifest_summary,
+        "AppState assembled and seeded; venue is serving"
     );
 
-    rest::serve(state, config.server.http_addr).await?;
+    rest::serve(state, http_addr).await?;
     Ok(())
 }

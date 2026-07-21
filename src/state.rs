@@ -61,6 +61,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use option_chain_orderbook::{InstrumentRegistry, SymbolIndex, SymbolParser};
 
@@ -233,6 +234,12 @@ pub struct AppStateConfig {
     /// the fully in-memory venue; `Some` is the durable path
     /// (`DATABASE_URL` set), opened + migrated at boot by `main.rs` and passed in.
     pub db: Option<DatabasePool>,
+    /// Whether the venue starts in the **serving** phase (#024). `true` (the
+    /// default) is backward-compatible — the venue is immediately serving, and the
+    /// runtime hierarchy-create routes refuse (manifest input). The seed flow sets
+    /// this `false` to enter the bounded **seeding** phase, runs the seed manifest,
+    /// then flips to serving with [`AppState::begin_serving`].
+    pub start_serving: bool,
 }
 
 impl AppStateConfig {
@@ -251,7 +258,17 @@ impl AppStateConfig {
             assets: Vec::new(),
             simulation: SimulationConfig::default(),
             db: None,
+            start_serving: true,
         }
+    }
+
+    /// Sets whether the venue starts already **serving** (#024). Pass `false` to
+    /// enter the bounded seeding phase; the seed flow flips to serving after the
+    /// manifest is applied ([`AppState::begin_serving`]).
+    #[must_use]
+    pub fn with_serving(mut self, start_serving: bool) -> Self {
+        self.start_serving = start_serving;
+        self
     }
 
     /// Sets the optional durable persistence pool (#023). `None` (the default)
@@ -384,6 +401,13 @@ pub struct AppState {
     /// (promoting the durable store onto the fan-out is coupled to the v0.3
     /// journal + recovery, #029).
     db: Option<DatabasePool>,
+    /// The venue lifecycle phase gate (#024): `false` in the bounded **seeding**
+    /// phase, flipped to `true` (**serving**) once the seed manifest has been
+    /// applied. Read by the runtime hierarchy-create routes so they refuse a
+    /// mid-run mutation only once the venue is serving (the instrument set is a
+    /// seed-time manifest input, [03 §10](../docs/03-protocol-surfaces.md#10-state-changing-operation-classification)).
+    /// A monotonic one-way flip — never flipped back.
+    serving: AtomicBool,
 }
 
 impl AppState {
@@ -430,6 +454,7 @@ impl AppState {
             assets,
             simulation,
             db,
+            start_serving,
         } = config;
 
         // A deterministic fixed clock (`venue_ts` is not the journaled order); the
@@ -566,6 +591,7 @@ impl AppState {
             market_maker,
             simulator,
             db,
+            serving: AtomicBool::new(start_serving),
         }))
     }
 
@@ -829,6 +855,33 @@ impl AppState {
     pub fn simulator(&self) -> &Arc<PriceSimulator> {
         &self.simulator
     }
+
+    /// Whether the venue has flipped to the **serving** phase (#024).
+    ///
+    /// `false` during the bounded seeding phase, `true` once
+    /// [`begin_serving`](Self::begin_serving) has been called. The runtime
+    /// hierarchy-create routes gate on this: population happens in the seeding
+    /// window (from the seed manifest, not a runtime REST create), and once
+    /// serving a hierarchy create/delete is refused — the instrument set is a
+    /// seed-time manifest input ([06 §7](../docs/06-deployment.md#7-seed-data-and-scenarios),
+    /// [03 §10](../docs/03-protocol-surfaces.md#10-state-changing-operation-classification)).
+    #[must_use]
+    #[inline]
+    pub fn is_serving(&self) -> bool {
+        self.serving.load(Ordering::Acquire)
+    }
+
+    /// Flips the venue from **seeding** to **serving** — a monotonic, one-way
+    /// transition the seed flow calls once the manifest has been applied, before
+    /// binding the gateways. Idempotent (a second call is a harmless no-op); the
+    /// venue never flips back to seeding within a run.
+    pub fn begin_serving(&self) {
+        // `Release` pairs with the `Acquire` in `is_serving`, so a route observing
+        // `true` also observes every seeded write that happened-before the flip.
+        if !self.serving.swap(true, Ordering::Release) {
+            tracing::info!("venue flipped to serving; runtime hierarchy mutation now refused");
+        }
+    }
 }
 
 impl std::fmt::Debug for AppState {
@@ -926,6 +979,26 @@ mod tests {
         let state = new_state(config(&["BTC", "BTC", "ETH"]));
         assert_eq!(state.underlying_count(), 2);
         assert_eq!(state.underlyings(), vec!["BTC", "ETH"]);
+    }
+
+    // ---- serving-phase flag (#024) ---------------------------------------
+
+    #[tokio::test]
+    async fn test_default_state_starts_serving() {
+        // Backward-compatible: a plain construction is immediately serving.
+        let state = new_state(config(&["BTC"]));
+        assert!(state.is_serving());
+    }
+
+    #[tokio::test]
+    async fn test_seeding_phase_flag_flips_once() {
+        let state = new_state(config(&["BTC"]).with_serving(false));
+        assert!(!state.is_serving(), "starts in the bounded seeding phase");
+        state.begin_serving();
+        assert!(state.is_serving(), "flips to serving");
+        // Idempotent: a second flip is a harmless no-op.
+        state.begin_serving();
+        assert!(state.is_serving());
     }
 
     // ---- submit routes to the correct underlying's actor -----------------
