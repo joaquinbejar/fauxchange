@@ -53,6 +53,44 @@ pub fn validate_control_value(field: &str, value: f64, min: f64, max: f64) -> Re
     }
 }
 
+/// Validates the three runtime persona control knobs at the **gateway boundary**
+/// before a [`VenueCommand::MarketMakerControl`](crate::exchange::VenueCommand::MarketMakerControl)
+/// is journaled (rule 4): each present knob must be finite and within its clamp, so
+/// an out-of-range / `NaN` control is a typed rejection (`400` / WS validation error)
+/// and never enters the journal. `None` (unchanged) knobs are skipped; `enabled`
+/// carries no range.
+///
+/// # Errors
+///
+/// The first offending knob's client-safe message (from [`validate_control_value`]).
+#[inline]
+pub fn validate_control_knobs(
+    spread_multiplier: Option<f64>,
+    size_scalar: Option<f64>,
+    directional_skew: Option<f64>,
+) -> Result<(), String> {
+    if let Some(value) = spread_multiplier {
+        validate_control_value(
+            "spread_multiplier",
+            value,
+            SPREAD_MULTIPLIER_MIN,
+            SPREAD_MULTIPLIER_MAX,
+        )?;
+    }
+    if let Some(value) = size_scalar {
+        validate_control_value("size_scalar", value, SIZE_SCALAR_MIN, SIZE_SCALAR_MAX)?;
+    }
+    if let Some(value) = directional_skew {
+        validate_control_value(
+            "directional_skew",
+            value,
+            DIRECTIONAL_SKEW_MIN,
+            DIRECTIONAL_SKEW_MAX,
+        )?;
+    }
+    Ok(())
+}
+
 /// The market-maker persona-substrate configuration.
 ///
 /// The three knobs are held within their documented ranges by **rejection**: the

@@ -94,6 +94,7 @@ pub mod market_maker;
 pub mod microstructure;
 pub mod models;
 pub mod ohlc;
+pub(crate) mod rng;
 pub mod seed;
 pub mod simulation;
 pub mod state;

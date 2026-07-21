@@ -57,6 +57,7 @@ pub mod event;
 pub mod executor;
 pub mod identity;
 pub mod instrument;
+pub mod instrument_status;
 pub mod journal;
 pub mod mm_identity;
 pub mod money;
@@ -80,11 +81,12 @@ pub use self::envelope::{
 };
 pub use self::event::{EventTimestamp, SequenceNumber};
 pub use self::executor::{
-    MatchingExecutor, PreparedRestore, TopOfBook, spawn_matching_actor,
-    spawn_matching_actor_with_registry_and_index,
+    MarketMakerControlKnobs, MarketMakerControlSink, MatchingExecutor, PreparedRestore, TopOfBook,
+    spawn_matching_actor, spawn_matching_actor_with_registry_and_index,
 };
 pub use self::identity::{JournalHeader, LineageId, VENUE_ENVELOPE_SCHEMA};
 pub use self::instrument::Instrument;
+pub use self::instrument_status::{InstrumentStatusError, InstrumentStatusRegistry};
 pub use self::journal::{
     InMemoryVenueJournal, JournalCommand, JournalError, JournalRecord, MAX_JOURNAL_RECORD_BYTES,
     MAX_JOURNAL_RECORDS, MAX_JOURNAL_STREAM_BYTES, RecordKind, SnapshotRestored, VenueJournal,

@@ -59,6 +59,7 @@
 //! sequenced-path routing, and the clock service.
 
 pub mod clock;
+pub mod expiry;
 pub mod manifest;
 pub mod replay;
 pub mod session;
@@ -69,6 +70,10 @@ pub mod walk;
 pub use self::clock::{
     ClockMode, CorrelationId, DEFAULT_ACCEL_MULTIPLIER, DEFAULT_CLOCK_START_MS,
     DEFAULT_STEP_INTERVAL_MS, SimClock, VenueClockConfig,
+};
+pub use self::expiry::{
+    DEFAULT_EXPIRY_OFFSET_MS, DEFAULT_SETTLEMENT_OFFSET_MS, ExpiryPhase, ExpirySchedule,
+    ExpiryScheduleError,
 };
 pub use self::manifest::{DEFAULT_MICROSTRUCTURE_FINGERPRINT, DependencyVersions, RunManifest};
 pub use self::replay::{

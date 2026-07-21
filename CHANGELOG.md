@@ -11,6 +11,52 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Market-maker personas, resting-liquidity shaping, and halt scenarios** (#47) —
+  a typed `PersonaConfig` (`base_spread_bps`, `base_size`, `spread_multiplier`,
+  `size_scalar`, `directional_skew`) surfaced from `[market_maker.personas.<name>]`,
+  reusing the Backend `validate_control_value` clamps (NaN-rejecting;
+  `spread_multiplier ∈ [0.1, 10]`, `size_scalar ∈ [0, 1]`, `directional_skew ∈
+  [-1, 1]`) at **load and runtime control**
+  ([05 §8](docs/05-microstructure-config.md#8-market-maker-personas)). Personas are
+  resolved **per instrument / per underlying** (the seeding phase binds each
+  contract to its `PersonaConfig`; the engine's global config is a neutral runtime
+  overlay applied once on top), so a `tight` maker on one strike and a
+  `wide_skewed` maker on another differ in their **journaled** quotes — lifting the
+  former one-global-persona limit. Persona jitter (quote-size / skew noise) is
+  seeded per `(persona, symbol)` from the one run-level seed via a new shared
+  `SplitMix64`+FNV-1a primitive (`src/rng.rs`) under an **independent** `FauxPers`
+  domain tag (latency `src/microstructure/latency.rs` refactored onto the same
+  primitive), so it is reproducible for a fixed seed and replays identically.
+  Resting-liquidity shaping bounds the size at each quoted level via
+  `base_size` / `size_scalar` (+ jitter trim); **partial fills arise only from real
+  matching against finite resting liquidity — there is no synthetic
+  fill-probability / slice-sizing draw anywhere on the path**
+  ([05 §9](docs/05-microstructure-config.md#9-partial-fill-and-liquidity-shaping)).
+  Runtime knobs over WS control actions (`set_spread` / `set_size` / `set_skew` /
+  `kill` / `enable`) and REST `POST /api/v1/controls/{parameters,kill-switch}` now
+  validate at the boundary (`validate_control_knobs`) and **apply** the knob:
+  the sequenced `MarketMakerControl` fans out to every underlying's actor and, via
+  a late-bound `MarketMakerControlHub` (bound in `AppState::new`, installed only on
+  the live path — replay installs no sink), pushes the change onto the engine
+  inside the actor turn as an idempotent, requote-free state write; the requotes it
+  induces enter as their own journaled `AddOrder`s, so a control change replays
+  from the journal without a live engine. Halt scenarios run on the sequenced
+  execution plane (phase 1): the `InstrumentStatusRegistry` gates an order into a
+  non-`Active` instrument to a journaled `Rejected` that replays identically, and
+  `SetInstrumentStatus` / `MassCancel` (incl. `GTC`) / `EvictExpiredOrders` execute
+  and journal. A new `ExpirySchedule` (`src/simulation/expiry.rs`) uses the upstream
+  `ExpiryScheduler` operational times (default `08:00` / `08:30 UTC`) as a
+  **schedule source only** — never the book-mutating upstream lifecycle manager —
+  and `AppState::run_expiry_roll` issues the sequenced `MassCancel → Settling →
+  Expired` transitions forward-only; `AppState::evict_expired_orders` sweeps
+  intraday `Day` / `Gtd` TIF. Expiries use `ExpirationDate::DateTime` (no `Settled`
+  status — the lifecycle is `Settling → Expired`)
+  ([05 §10](docs/05-microstructure-config.md#10-halt-scenarios)). **Honest
+  limitations:** the halt/expiry reject is decided inside the actor turn and is
+  **journaled + replays**, but is not yet surfaced live through the
+  `Receipt`→`VenueOutcome` seam; `Day` / `Gtd` eviction is journaled and
+  replay-stable but its removal effect depends on the per-leaf clock the pinned
+  `option-chain-orderbook` 0.7.0 does not inject.
 - **Per-tier rate limits and per-instrument microstructure profiles** (#46) — the
   `[rate_limits]` config section surfaces a validated `RateLimitConfig`
   (`window_secs`, `read_per_window` / `trade_per_window` / `admin_per_window`,

@@ -60,7 +60,7 @@
 //! | `market_maker`  | [`crate::market_maker::MarketMakerEngine`] (real) | #015 |
 //! | `simulator`     | [`crate::simulation::PriceSimulator`] (real) | #016 |
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -77,18 +77,19 @@ use crate::auth::{
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, InMemoryExecutionsStore,
-    InMemoryPositionsStore, InMemoryVenueJournal, JournalHeader, JournalSnapshot, LineageId,
-    MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, TeeFanOut, VenueCommand,
-    check_price_band, spawn_matching_actor_with_registry_and_index,
+    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, ExpirationDate,
+    InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
+    JournalHeader, JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink,
+    MassCancelScope, Receipt, StoreFanOut, Symbol, TeeFanOut, VenueCommand, check_price_band,
+    spawn_matching_actor_with_registry_and_index,
 };
-use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
+use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
 use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
 use crate::models::AccountId;
 use crate::simulation::{
-    AssetConfig, ClockMode, CorrelationId, JournalStream, PriceSimulator, RecordingController,
-    ReplayError, ReplayReport, RunManifest, ScenarioBundle, SimClock, SimError, SimulationConfig,
-    SynthesizedChain, VenueClockConfig, VenueStepSink,
+    AssetConfig, ClockMode, CorrelationId, ExpiryPhase, ExpirySchedule, JournalStream,
+    PriceSimulator, RecordingController, ReplayError, ReplayReport, RunManifest, ScenarioBundle,
+    SimClock, SimError, SimulationConfig, SynthesizedChain, VenueClockConfig, VenueStepSink,
 };
 // The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
 // sibling of `crate::auth` / `crate::ohlc`), NOT a gateway. `AppState` owns the
@@ -527,6 +528,13 @@ pub struct AppState {
     /// as the config half of the determinism tuple: a replay applies the identical
     /// config, so a fee/STP-sensitive scenario reconstructs exactly.
     microstructure: Arc<MicrostructureConfig>,
+    /// The last operational lifecycle phase the scheduled-expiry driver (#047) drove
+    /// each `(underlying, expiration-day-ms)` to, so a repeated
+    /// [`run_expiry_roll`](Self::run_expiry_roll) only issues **forward** transitions
+    /// and never re-issues a settled expiration (avoiding an illegal regressive
+    /// `SetInstrumentStatus`). Live-only driver state; the sequenced commands it
+    /// issues are journaled and replay without it.
+    expiry_phases: std::sync::Mutex<std::collections::HashMap<(String, i64), ExpiryPhase>>,
 }
 
 /// The result of a venue-control clock advance fanned across the underlyings —
@@ -568,6 +576,84 @@ impl ClockAdvance {
     pub fn is_partial(&self) -> bool {
         let committed = self.committed_count();
         committed != 0 && committed != self.per_underlying.len()
+    }
+}
+
+/// The summary of one [`AppState::run_expiry_roll`] pass — how many expirations were
+/// advanced to each phase and how many sequenced commands were issued.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpiryRollReport {
+    /// Expirations advanced to `Settling` on this roll.
+    pub settling: usize,
+    /// Expirations advanced to `Expired` on this roll.
+    pub expired: usize,
+    /// Sequenced commands (`MassCancel` / `SetInstrumentStatus`) **committed** this
+    /// roll (a rejected command is not counted and does not advance a phase).
+    pub commands_issued: usize,
+}
+
+/// One expiration the scheduled roll could **not** advance because a required
+/// sequenced command — the scoped [`MassCancel`](crate::exchange::VenueCommand::MassCancel)
+/// (incl. `GTC`) or a
+/// [`SetInstrumentStatus`](crate::exchange::VenueCommand::SetInstrumentStatus) — was
+/// rejected on the sequenced order path (#47). The expiration is **left at its prior
+/// operational phase** so a later roll retries it; it is never recorded `Settling` /
+/// `Expired` while resting orders may remain live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiryRollFailure {
+    /// The underlying whose expiration could not advance.
+    pub underlying: String,
+    /// The expiration's UTC-day identity instant in **ms** (the group key), a pure
+    /// function of the expiration's `ExpirationDate::DateTime` — never a wall clock.
+    pub expiration_ms: i64,
+    /// The operational phase the roll was attempting to reach and did **not**.
+    pub attempted_phase: ExpiryPhase,
+    /// The **redacted**, client-safe rejection message from the sequenced submit —
+    /// the reason the required command did not commit. Never a secret or a cause chain.
+    pub reason: String,
+}
+
+/// A **partial** scheduled-expiry roll (#47): at least one expiration's required
+/// sequenced command was rejected, so that expiration was **not** advanced.
+///
+/// The operational phase (`Settling` / `Expired`) advances **only after every
+/// required sequenced command for that expiration commits**; a rejected `MassCancel`
+/// or `SetInstrumentStatus` leaves the expiration at its prior phase, never marking
+/// it `Expired` while resting orders remain live
+/// ([05 §10](../docs/05-microstructure-config.md#10-halt-scenarios)). The error carries
+/// the summary of the expirations that *did* fully commit ([`ExpiryRollReport`])
+/// alongside the typed list of the expirations that did **not**, so the caller retries
+/// the roll rather than treating a falsely-advanced instrument as settled.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExpiryRollError {
+    /// One or more expirations could not advance because a required sequenced command
+    /// was rejected. Carries the committed summary and the per-expiration failures, in
+    /// the roll's deterministic sorted order.
+    #[error(
+        "scheduled expiry roll partially applied: {} expiration(s) not advanced",
+        .failures.len()
+    )]
+    Partial {
+        /// The expirations that fully committed and advanced on this roll.
+        report: ExpiryRollReport,
+        /// The expirations left un-advanced (a required command was rejected), in the
+        /// roll's deterministic sorted order.
+        failures: Vec<ExpiryRollFailure>,
+    },
+}
+
+/// Whether `command` is **venue-global** — it names no single routable underlying
+/// and so fans out to every hosted underlying's actor (#47): a `MarketMakerControl`,
+/// an `EvictExpiredOrders`, or a hierarchy-wide (non-`Book`) `MassCancel`. A `Book`
+/// mass cancel names one instrument and routes per-underlying; a `Clock` advance
+/// enters through the clock coordinator, not this raw submit path, so neither is
+/// venue-global here.
+#[must_use]
+fn is_venue_global(command: &VenueCommand) -> bool {
+    match command {
+        VenueCommand::MarketMakerControl { .. } | VenueCommand::EvictExpiredOrders { .. } => true,
+        VenueCommand::MassCancel { scope, .. } => !matches!(scope, MassCancelScope::Book(_)),
+        _ => false,
     }
 }
 
@@ -684,6 +770,14 @@ impl AppState {
         // each actor's `StoreFanOut` (both consume the SAME post-journal event).
         let subscriptions = Arc::new(OrderbookSubscriptionManager::new());
 
+        // The late-bound market-maker control hub (#047): created BEFORE the actors
+        // (which take it as their sequenced control sink) and bound to the engine
+        // once it is constructed with their handles. Installed only on the live path;
+        // the replay/recovery executors carry no sink, so a `MarketMakerControl`
+        // replays as an identical `ControlApplied` without a live engine.
+        let mm_control_hub = MarketMakerControlHub::new();
+        let mm_control_sink: Arc<dyn MarketMakerControlSink> = Arc::clone(&mm_control_hub) as _;
+
         let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::with_capacity(underlyings.len());
         for underlying in underlyings {
             let ticker: Arc<str> = Arc::from(underlying);
@@ -740,6 +834,10 @@ impl AppState {
                         Arc::clone(&registry),
                         Arc::clone(&symbol_index),
                         &microstructure,
+                        // The market-maker control apply seam (#047): a committed
+                        // `MarketMakerControl` pushes its knobs onto the engine
+                        // through the late-bound hub, inside the actor turn.
+                        Some(Arc::clone(&mm_control_sink)),
                     )?
                 }
                 None => {
@@ -752,6 +850,7 @@ impl AppState {
                         Arc::clone(&registry),
                         Arc::clone(&symbol_index),
                         &microstructure,
+                        Some(Arc::clone(&mm_control_sink)),
                     )?
                 }
             };
@@ -766,11 +865,21 @@ impl AppState {
         // handles — so generated liquidity is journaled and replayable, never a
         // direct book mutation. The sink's forwarder task is detached (its lifetime
         // is the `AppState`'s, like the actors').
-        let market_maker = Arc::new(MarketMakerEngine::new(
-            ActorCommandSink::new(handles.clone()),
-            lineage_id.clone(),
-            Quoter::default(),
-        ));
+        let market_maker = Arc::new(
+            MarketMakerEngine::new(
+                ActorCommandSink::new(handles.clone()),
+                lineage_id.clone(),
+                Quoter::default(),
+            )
+            // The run-level seed the persona-jitter sub-stream derives from (#047), so
+            // persona jitter is reproducible for a fixed seed and replays identically.
+            .with_run_seed(seed),
+        );
+
+        // Bind the control hub to the engine now that it exists: from here a
+        // sequenced `MarketMakerControl` applies its knobs live. The bind is
+        // synchronous and precedes serving, so no control reaches an unbound hub.
+        mm_control_hub.bind(Arc::clone(&market_maker));
 
         // The price simulator (#016): each walked (or overridden) price step routes
         // through a `VenueStepSink` onto the SAME per-underlying actors as client
@@ -814,6 +923,7 @@ impl AppState {
             correlation_counter: AtomicU64::new(0),
             recording: RecordingController::default(),
             microstructure,
+            expiry_phases: std::sync::Mutex::new(std::collections::HashMap::new()),
         }))
     }
 
@@ -825,17 +935,25 @@ impl AppState {
     /// Routing extracts the underlying from the command (the target symbol, via
     /// the upstream [`SymbolParser`], for order-path and instrument commands; the
     /// `underlying` ticker for a `SimStep`; the `Book` symbol for a scoped mass
-    /// cancel). Venue-global commands that carry no single underlying (`Clock`,
-    /// `MarketMakerControl`, `EvictExpiredOrders`, and hierarchy-wide mass
-    /// cancels) are not routable on this per-underlying submit path — their
-    /// broadcast/lifecycle routing lands with the control-plane issues.
+    /// cancel). **Venue-global** commands that carry no single underlying — a
+    /// `MarketMakerControl`, an `EvictExpiredOrders`, and a hierarchy-wide (non-`Book`)
+    /// `MassCancel` — **fan out** to every hosted underlying's actor, each journaled
+    /// in its own stream (mirroring the [`advance_clock_step`](Self::advance_clock_step)
+    /// coordinator); a `Clock` still enters through that clock coordinator, not this
+    /// raw submit path.
+    ///
+    /// A fan-out returns a **representative** [`Receipt`] (the last committed
+    /// underlying's); a **partial** fan-out (committed on some underlyings, not
+    /// others) is logged (`WARN`) rather than hidden — the venue does not promise
+    /// atomic venue-wide fan-out.
     ///
     /// # Errors
     ///
     /// - [`VenueError::InvalidOrder`] if the command's symbol does not parse, the
     ///   command carries no routable underlying, or the order price falls outside the
     ///   venue-owned price band (#044);
-    /// - [`VenueError::NotFound`] if the underlying is not hosted by this venue;
+    /// - [`VenueError::NotFound`] if the underlying is not hosted by this venue (or a
+    ///   venue-global command is submitted to a venue hosting no underlyings);
     /// - the actor's own typed rejection ([`VenueError::RateLimited`] on a full
     ///   mailbox, [`VenueError::JournalUnavailable`] if the actor has stopped, or
     ///   a sequencing seal) otherwise.
@@ -845,8 +963,238 @@ impl AppState {
         // gateway and never journaled — replay never re-executes a price the live
         // venue refused.
         self.admit_command_price(&command)?;
+        if is_venue_global(&command) {
+            return self.submit_venue_global(command).await;
+        }
         let handle = self.route(&command)?;
         handle.submit(command).await
+    }
+
+    /// Submits a [`VenueCommand::SetInstrumentStatus`] transition onto the
+    /// sequenced order path (#47) — the typed entry point the admin instrument-status
+    /// route builds on. It routes by the target **symbol** to that instrument's
+    /// underlying actor (a status change targets one instrument, not the whole venue),
+    /// so it returns that actor's [`Receipt`].
+    ///
+    /// # Errors
+    ///
+    /// The same typed rejections as [`submit`](Self::submit): an unparseable /
+    /// cross-underlying symbol ([`VenueError::InvalidOrder`]), an unhosted underlying
+    /// ([`VenueError::NotFound`]), or the actor's own sequencing rejection.
+    pub async fn submit_set_instrument_status(
+        &self,
+        symbol: Symbol,
+        status: InstrumentStatus,
+    ) -> Result<Receipt, VenueError> {
+        self.submit(VenueCommand::SetInstrumentStatus { symbol, status })
+            .await
+    }
+
+    /// Drives **scheduled expiry / roll** at venue-clock `now_ms` (#047): enumerates
+    /// every vivified contract, groups by `(underlying, expiration)`, and issues the
+    /// sequenced lifecycle transitions each expiration is **due** for through
+    /// [`submit`](Self::submit) — a scoped `MassCancel` (incl. `GTC`) then
+    /// `SetInstrumentStatus(Settling)` at the operational expiry time, and
+    /// `SetInstrumentStatus(Expired)` at settlement, per `schedule`.
+    ///
+    /// The upstream `ExpiryScheduler` is a **schedule source only**; this driver
+    /// issues every transition as a journaled command so a roll replays identically
+    /// ([05 §10](../docs/05-microstructure-config.md#10-halt-scenarios)). It tracks the
+    /// last phase driven per expiration, so a repeated call only advances **forward**
+    /// (idempotent, never a regressive illegal transition). Groups and symbols are
+    /// iterated in sorted order, so the emitted command stream is deterministic. No
+    /// lock is held across the `submit` `.await`.
+    ///
+    /// The operational phase for an expiration advances (its `expiry_phases` entry is
+    /// written) **only after every required sequenced command for that expiration has
+    /// committed** — the scoped `MassCancel` (incl. `GTC`) then the per-symbol
+    /// `SetInstrumentStatus`. On the **first** rejected command the driver stops issuing
+    /// that expiration's remaining commands and leaves its phase unchanged, so a later
+    /// roll retries it; an instrument is **never** recorded `Settling` / `Expired` while
+    /// a `MassCancel` or status transition did not commit and resting orders may remain
+    /// live. Each expiration is independent — one expiration's rejection never blocks
+    /// another's advance.
+    ///
+    /// `now_ms` is the **venue clock** instant (a venue service, never `SystemTime`).
+    ///
+    /// # Errors
+    ///
+    /// [`ExpiryRollError::Partial`] when at least one expiration's required sequenced
+    /// command was rejected: the error carries the [`ExpiryRollReport`] of the
+    /// expirations that *did* fully commit and the typed [`ExpiryRollFailure`] list
+    /// naming each expiration left un-advanced (with the phase it failed to reach), so
+    /// the caller retries rather than treating a falsely-advanced instrument as settled.
+    pub async fn run_expiry_roll(
+        &self,
+        schedule: &ExpirySchedule,
+        now_ms: i64,
+    ) -> Result<ExpiryRollReport, ExpiryRollError> {
+        // Group vivified contracts by (underlying, expiration-identity-ms) in sorted
+        // order for a deterministic issue sequence.
+        let mut groups: BTreeMap<(String, i64), (ExpirationDate, Vec<Symbol>)> = BTreeMap::new();
+        for raw in self.symbol_index.symbols() {
+            let Ok(parsed) = SymbolParser::parse(&raw) else {
+                continue;
+            };
+            let expiration = *parsed.expiration();
+            let key_ms = match &expiration {
+                ExpirationDate::DateTime(dt) => dt.timestamp_millis(),
+                // A relative `Days` expiry drives no calendar roll (it breaks replay)
+                // and is skipped here, never constructed or propagated.
+                ExpirationDate::Days(_) => continue, // days-expiry-allow: defensive read-arm
+            };
+            let Ok(symbol) = Symbol::parse(&raw) else {
+                continue;
+            };
+            let entry = groups
+                .entry((parsed.underlying().to_string(), key_ms))
+                .or_insert_with(|| (expiration, Vec::new()));
+            entry.1.push(symbol);
+        }
+
+        let mut report = ExpiryRollReport::default();
+        let mut failures: Vec<ExpiryRollFailure> = Vec::new();
+        for ((underlying, key_ms), (expiration, mut symbols)) in groups {
+            let Some(target) = schedule.phase_at(&expiration, now_ms) else {
+                continue;
+            };
+            symbols.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            let last = {
+                let map = self
+                    .expiry_phases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                map.get(&(underlying.clone(), key_ms))
+                    .copied()
+                    .unwrap_or(ExpiryPhase::PreExpiry)
+            };
+            if target <= last {
+                continue;
+            }
+            let commands = schedule.transition_commands(&expiration, &symbols, last, target);
+            // Issue every required command; the operational phase advances ONLY once
+            // all of them commit. On the FIRST rejection we stop issuing this
+            // expiration's remaining commands and leave its phase at `last`, so a later
+            // roll retries it — never marking it `Settling` / `Expired` while a
+            // `MassCancel` or a `SetInstrumentStatus` did not commit (rule 2 / #47).
+            let mut committed = 0usize;
+            let mut rejection: Option<VenueError> = None;
+            for command in commands {
+                match self.submit(command).await {
+                    Ok(_) => committed = committed.checked_add(1).unwrap_or(committed),
+                    Err(error) => {
+                        tracing::warn!(
+                            underlying = %underlying,
+                            attempted_phase = ?target,
+                            error = %error,
+                            "expiry-roll command rejected — phase not advanced, will retry"
+                        );
+                        rejection = Some(error);
+                        break;
+                    }
+                }
+            }
+            report.commands_issued = report
+                .commands_issued
+                .checked_add(committed)
+                .unwrap_or(report.commands_issued);
+            if let Some(error) = rejection {
+                // A required command did not commit: DO NOT advance the phase. The
+                // expiration stays at `last` and this roll is reported partial.
+                failures.push(ExpiryRollFailure {
+                    underlying,
+                    expiration_ms: key_ms,
+                    attempted_phase: target,
+                    reason: error.redacted_message(),
+                });
+                continue;
+            }
+            // Every required command committed — it is now safe to advance the phase.
+            self.expiry_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((underlying, key_ms), target);
+            match target {
+                ExpiryPhase::Settling => {
+                    report.settling = report.settling.checked_add(1).unwrap_or(report.settling);
+                }
+                ExpiryPhase::Expired => {
+                    report.expired = report.expired.checked_add(1).unwrap_or(report.expired);
+                }
+                ExpiryPhase::PreExpiry => {}
+            }
+        }
+        if failures.is_empty() {
+            Ok(report)
+        } else {
+            Err(ExpiryRollError::Partial { report, failures })
+        }
+    }
+
+    /// Evicts every resting order whose intraday `Day` / `Gtd` time-in-force has
+    /// expired at venue-clock `now_ms` (#047) — a single journaled, venue-global
+    /// [`EvictExpiredOrders`](VenueCommand::EvictExpiredOrders) fanned to every hosted
+    /// underlying, so the sweep replays from its journaled `now_ms`.
+    ///
+    /// # Errors
+    ///
+    /// The same typed rejections as [`submit`](Self::submit) for a venue-global fan.
+    pub async fn evict_expired_orders(&self, now_ms: u64) -> Result<Receipt, VenueError> {
+        self.submit(VenueCommand::EvictExpiredOrders {
+            now_ms: EventTimestamp::new(now_ms),
+        })
+        .await
+    }
+
+    /// Fans a **venue-global** command (a `MarketMakerControl`, an
+    /// `EvictExpiredOrders`, or a hierarchy-wide non-`Book` `MassCancel`) to every
+    /// hosted underlying's actor, in the deterministic **sorted** order, each
+    /// journaled in its own stream. Returns the last committed [`Receipt`]; a partial
+    /// fan-out is logged under a shared [`CorrelationId`], never hidden. No borrow of
+    /// `self` is held across an `.await` — each handle is cloned out first.
+    async fn submit_venue_global(&self, command: VenueCommand) -> Result<Receipt, VenueError> {
+        let correlation_id = self.next_correlation_id();
+        let tickers: Vec<String> = self.underlyings().into_iter().map(str::to_string).collect();
+        if tickers.is_empty() {
+            return Err(VenueError::NotFound(
+                "no hosted underlyings for a venue-global command".to_string(),
+            ));
+        }
+        let mut committed: Option<Receipt> = None;
+        let mut first_error: Option<VenueError> = None;
+        let mut ok_count = 0usize;
+        for ticker in &tickers {
+            let result = match self.handle_for(ticker) {
+                Ok(handle) => handle.submit(command.clone()).await,
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(receipt) => {
+                    ok_count += 1;
+                    committed = Some(receipt);
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if ok_count != 0 && ok_count != tickers.len() {
+            tracing::warn!(
+                correlation_id = %correlation_id,
+                committed = ok_count,
+                total = tickers.len(),
+                "venue-global command fan-out was partial across underlyings"
+            );
+        }
+        match (committed, first_error) {
+            (Some(receipt), _) => Ok(receipt),
+            (None, Some(error)) => Err(error),
+            // Non-empty `tickers` with no Ok and no Err is unreachable; return a
+            // typed rejection rather than fabricate a receipt.
+            (None, None) => Err(VenueError::JournalUnavailable),
+        }
     }
 
     /// Admits a price-bearing order command against the venue-owned price band
@@ -1524,7 +1872,7 @@ impl std::fmt::Debug for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::{Cents, Hash32, STPMode, Side, Symbol, TimeInForce};
+    use crate::exchange::{Cents, Hash32, MassCancelType, STPMode, Side, Symbol, TimeInForce};
     use crate::models::{AccountId, OrderType, VenueOrderId};
 
     fn config(underlyings: &[&str]) -> AppStateConfig {
@@ -1662,7 +2010,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_submit_venue_global_command_is_not_routable() {
+    async fn test_submit_clock_command_is_not_routable_by_raw_submit() {
+        // A raw `Clock` submit is still refused (a stepped advance enters through the
+        // clock coordinator, not this path) — the venue-global fan-out (#47) does not
+        // capture `Clock`.
         let state = new_state(config(&["BTC"]));
         match state
             .submit(VenueCommand::Clock {
@@ -1673,6 +2024,204 @@ mod tests {
             Err(VenueError::InvalidOrder(detail)) => assert!(detail.contains("routable")),
             other => panic!("expected an unroutable InvalidOrder, got {other:?}"),
         }
+    }
+
+    // ---- venue-global fan-out routing (#47) ------------------------------
+
+    #[tokio::test]
+    async fn test_market_maker_control_fans_out_and_is_journaled_by_every_underlying() {
+        let state = new_state(config(&["BTC", "ETH"]));
+        // A venue-global MarketMakerControl fans to every actor and journals in each
+        // stream (there is no live sink wired in phase 1 — the seam is dispatched but
+        // no persona knob is applied).
+        let receipt = match state
+            .submit(VenueCommand::MarketMakerControl {
+                spread_multiplier: Some(1.5),
+                size_scalar: None,
+                directional_skew: None,
+                enabled: Some(false),
+            })
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => panic!("MarketMakerControl fan-out failed: {e}"),
+        };
+        assert_eq!(receipt.underlying_sequence.get(), 0);
+        for ticker in ["BTC", "ETH"] {
+            let snap = match state.journal_snapshot(ticker).await {
+                Ok(s) => s,
+                Err(e) => panic!("{ticker} snapshot failed: {e}"),
+            };
+            assert_eq!(
+                snap.last_sequence.map(|s| s.get()),
+                Some(0),
+                "{ticker} journaled the control command"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hierarchy_mass_cancel_fans_out_to_every_underlying() {
+        let state = new_state(config(&["BTC", "ETH"]));
+        match state
+            .submit(VenueCommand::MassCancel {
+                scope: MassCancelScope::Underlying,
+                cancel_type: MassCancelType::All,
+                account: AccountId::new("admin"),
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => panic!("hierarchy MassCancel fan-out failed: {e}"),
+        }
+        for ticker in ["BTC", "ETH"] {
+            let snap = match state.journal_snapshot(ticker).await {
+                Ok(s) => s,
+                Err(e) => panic!("{ticker} snapshot failed: {e}"),
+            };
+            assert_eq!(snap.last_sequence.map(|s| s.get()), Some(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_book_scoped_mass_cancel_routes_to_one_underlying() {
+        // A `Book`-scoped mass cancel names one instrument and routes per-underlying:
+        // only the owning actor journals it.
+        let state = new_state(config(&["BTC", "ETH"]));
+        match state
+            .submit(VenueCommand::MassCancel {
+                scope: MassCancelScope::Book(sym("BTC-20240329-50000-C")),
+                cancel_type: MassCancelType::All,
+                account: AccountId::new("admin"),
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => panic!("book-scoped MassCancel failed: {e}"),
+        }
+        let btc = state.journal_snapshot("BTC").await.expect("BTC snapshot");
+        let eth = state.journal_snapshot("ETH").await.expect("ETH snapshot");
+        assert_eq!(
+            btc.last_sequence.map(|s| s.get()),
+            Some(0),
+            "BTC journaled it"
+        );
+        assert_eq!(eth.last_sequence, None, "ETH was not touched");
+    }
+
+    #[tokio::test]
+    async fn test_submit_set_instrument_status_routes_by_symbol() {
+        let state = new_state(config(&["BTC"]));
+        let receipt = match state
+            .submit_set_instrument_status(sym("BTC-20240329-50000-C"), InstrumentStatus::Halted)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => panic!("submit_set_instrument_status failed: {e}"),
+        };
+        assert_eq!(receipt.underlying_sequence.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_venue_global_command_on_empty_venue_is_not_found() {
+        let state = new_state(config(&[]));
+        match state
+            .submit(VenueCommand::MarketMakerControl {
+                spread_multiplier: Some(1.0),
+                size_scalar: None,
+                directional_skew: None,
+                enabled: None,
+            })
+            .await
+        {
+            Err(VenueError::NotFound(detail)) => assert!(detail.contains("no hosted underlyings")),
+            other => panic!("expected NotFound on an empty venue, got {other:?}"),
+        }
+    }
+
+    // ---- scheduled expiry roll gates the phase advance on every commit (#47) ----
+
+    #[tokio::test]
+    async fn test_expiry_roll_does_not_advance_phase_when_a_required_command_is_rejected() {
+        use option_chain_orderbook::SymbolRef;
+
+        // The venue hosts BTC, but the shared symbol index is seeded with a leaf under
+        // an UNHOSTED underlying ("ZZZ"). Its per-symbol `SetInstrumentStatus` routes to
+        // a non-existent actor and is rejected (`NotFound`), so the required sequenced
+        // command set for that expiration never fully commits.
+        let state = new_state(config(&["BTC"]));
+        let raw = "ZZZ-20250102-50000-C";
+        let parsed = SymbolParser::parse(raw).expect("valid unhosted-underlying symbol");
+        let sym_ref = SymbolRef::new(
+            parsed.underlying(),
+            *parsed.expiration(),
+            parsed.strike(),
+            parsed.option_style(),
+        );
+        // `register` returns `true` only on a duplicate overwrite; this is a fresh
+        // insert, so it returns `false`.
+        assert!(
+            !state.symbol_index().register(raw, sym_ref),
+            "seed the unhosted leaf into the shared index as a new entry"
+        );
+        assert!(
+            state.symbol_index().contains(raw),
+            "the leaf is now indexed"
+        );
+
+        let schedule = ExpirySchedule::default();
+        let expiration = *parsed.expiration();
+        let (_expiry, settle) = schedule
+            .operational_instants(&expiration)
+            .expect("DateTime expiry");
+        let key_ms = match &expiration {
+            ExpirationDate::DateTime(dt) => dt.timestamp_millis(),
+            // days-expiry-allow: defensive read-arm; the fixture symbol is a DateTime expiry.
+            ExpirationDate::Days(_) => panic!("fixture is a DateTime expiry"),
+        };
+
+        // Drive the roll past settlement: the target phase is `Expired`, but the
+        // per-symbol status transition is rejected, so the phase MUST NOT advance —
+        // the driver returns a typed partial result instead.
+        let failures = match state.run_expiry_roll(&schedule, settle).await {
+            Err(ExpiryRollError::Partial { failures, .. }) => failures,
+            Ok(report) => panic!(
+                "a rejected required command must yield a typed partial result, got Ok({report:?})"
+            ),
+        };
+        let failure = failures
+            .iter()
+            .find(|f| f.underlying == "ZZZ")
+            .expect("the partial result names the un-advanced ZZZ expiration");
+        assert_eq!(failure.expiration_ms, key_ms);
+        assert_eq!(
+            failure.attempted_phase,
+            ExpiryPhase::Expired,
+            "it names the phase it failed to reach"
+        );
+
+        // The phase was NOT recorded — the instrument is not falsely marked Expired
+        // while its resting orders may remain live; it stays at the implicit PreExpiry.
+        {
+            let map = state
+                .expiry_phases
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                map.get(&("ZZZ".to_string(), key_ms)).is_none(),
+                "a rejected roll must leave the expiry phase un-advanced so it is retried"
+            );
+        }
+
+        // Re-running the roll at the same instant RETRIES it (still partial), rather
+        // than silently treating the expiration as settled.
+        assert!(
+            matches!(
+                state.run_expiry_roll(&schedule, settle).await,
+                Err(ExpiryRollError::Partial { .. })
+            ),
+            "the un-advanced expiration is retried on the next roll, not skipped as done"
+        );
     }
 
     // ---- fan-out writes the store AppState exposes -----------------------

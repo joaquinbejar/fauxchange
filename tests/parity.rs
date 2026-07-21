@@ -21,8 +21,8 @@
 //!    recovers by a fresh snapshot, never a resend.
 //! 4. **Control parity (REST ≡ WS)** — a WS control action and its REST
 //!    equivalent build the *same* `MarketMakerControl` and surface the *same*
-//!    honest not-routable outcome (not a fabricated success — the command is not
-//!    yet routable, #015).
+//!    sequenced outcome (the venue-global control fans out to every underlying's
+//!    actor and is journaled, #47).
 //! 5. **REST order-entry base** — place / partial-fill / cancel-replace over the
 //!    live REST surface against identically-seeded fresh venues, compared under
 //!    the documented normalization rule; the base the v0.4 FIX arm extends.
@@ -438,6 +438,76 @@ fn test_ws_client_action_set_parses_and_order_entry_is_rejected() {
             other => panic!("order-entry frame {frame} must be rejected, got {other:?}"),
         }
     }
+}
+
+/// The sequenced `MarketMakerControl` a WS control action / a REST parameters or
+/// kill-switch request builds — the SINGLE control-plane command both surfaces route,
+/// so a control cannot diverge across REST and WS by construction (#047).
+fn control_command(
+    spread_multiplier: Option<f64>,
+    size_scalar: Option<f64>,
+    directional_skew: Option<f64>,
+    enabled: Option<bool>,
+) -> VenueCommand {
+    VenueCommand::MarketMakerControl {
+        spread_multiplier,
+        size_scalar,
+        directional_skew,
+        enabled,
+    }
+}
+
+#[tokio::test]
+async fn test_control_parity_rest_and_ws_apply_the_same_knob() {
+    // Control parity (REST ≡ WS): the WS `set_spread` / `set_size` / `set_skew` /
+    // `kill` / `enable` actions and the REST `POST /controls/{parameters,kill-switch}`
+    // build the SAME sequenced `MarketMakerControl`, so applying it on two identical
+    // venues yields identical engine state — the control plane has one command, no
+    // per-surface divergence.
+    let rest_venue = venue(AMPLE_RATE_LIMIT);
+    let ws_venue = venue(AMPLE_RATE_LIMIT);
+
+    // The five control actions, each as the (spread, size, skew, enabled) knobs the
+    // two surfaces derive identically.
+    let actions = [
+        // REST /controls/parameters == WS set_spread / set_size / set_skew batch.
+        (Some(2.5), Some(0.4), Some(-0.3), None),
+        // WS set_spread.
+        (Some(1.5), None, None, None),
+        // WS kill == REST /controls/kill-switch {enabled:false}.
+        (None, None, None, Some(false)),
+        // WS enable == REST /controls/enable {enabled:true}.
+        (None, None, None, Some(true)),
+    ];
+
+    for (spread, size, skew, enabled) in actions {
+        rest_venue
+            .submit(control_command(spread, size, skew, enabled))
+            .await
+            .expect("REST-surface control fans out and applies");
+        ws_venue
+            .submit(control_command(spread, size, skew, enabled))
+            .await
+            .expect("WS-surface control fans out and applies");
+    }
+
+    // Both engines end in the identical persona-substrate config — REST and WS parity.
+    assert_eq!(
+        rest_venue.market_maker().get_config(),
+        ws_venue.market_maker().get_config(),
+        "REST and WS controls apply the identical sequenced knob"
+    );
+    // The final kill/enable/spread landed (enable was last → enabled).
+    let config = rest_venue.market_maker().get_config();
+    assert!(config.enabled, "the final enable control took effect");
+    assert_eq!(
+        config.spread_multiplier, 1.5,
+        "the spread control took effect"
+    );
+    assert_eq!(
+        config.directional_skew, -0.3,
+        "the skew control took effect"
+    );
 }
 
 // ============================================================================
@@ -925,16 +995,15 @@ fn test_fix_market_data_gap_recovers_by_fresh_w_not_resend() {
 }
 
 // ============================================================================
-// 4. Control parity (REST ≡ WS) — same command, same honest not-routable outcome
+// 4. Control parity (REST ≡ WS) — same command, same sequenced fan-out outcome
 // ============================================================================
 
 #[tokio::test]
 async fn test_control_parity_rest_and_ws_build_same_command_and_surface_same_outcome() {
     // The REST kill-switch and the WS `kill` action both build the IDENTICAL
-    // `MarketMakerControl { enabled: Some(false) }` command. It is not yet
-    // routable on the per-underlying submit path (#015), so BOTH surfaces surface
-    // the SAME honest not-routable error — parity of behaviour, not a fabricated
-    // success.
+    // `MarketMakerControl { enabled: Some(false) }` command. It is venue-global and
+    // now **routes** — fanned to every underlying's actor and journaled (#47) — so
+    // BOTH surfaces report the sequenced success, parity of behaviour.
     let state = venue(AMPLE_RATE_LIMIT);
     let admin = token(&state, "admin-1");
 
@@ -951,10 +1020,11 @@ async fn test_control_parity_rest_and_ws_build_same_command_and_surface_same_out
     .await;
     assert_eq!(
         rest_status,
-        StatusCode::BAD_REQUEST,
-        "REST kill-switch surfaces the honest not-routable error, not a fabricated 200"
+        StatusCode::OK,
+        "REST kill-switch routes the venue-global control and reports success"
     );
-    assert_eq!(rest_body["code"], "invalid_order");
+    assert_eq!(rest_body["success"], serde_json::json!(true));
+    assert_eq!(rest_body["master_enabled"], serde_json::json!(false));
 
     // The command both surfaces construct (WS `control()` builds the same value).
     let command = VenueCommand::MarketMakerControl {
@@ -963,21 +1033,12 @@ async fn test_control_parity_rest_and_ws_build_same_command_and_surface_same_out
         directional_skew: None,
         enabled: Some(false),
     };
-    // Submitting it — the exact command the WS `kill` action routes — yields the
-    // SAME typed not-routable error.
+    // Submitting it — the exact command the WS `kill` action routes — now fans out
+    // to the venue's underlyings and commits a receipt.
     match state.submit(command).await {
-        Err(VenueError::InvalidOrder(_)) => {}
-        other => panic!("MarketMakerControl must be not-routable (InvalidOrder), got {other:?}"),
+        Ok(_receipt) => {}
+        other => panic!("MarketMakerControl must now route (a committed receipt), got {other:?}"),
     }
-    // …and its WS rendering is the non-terminal InvalidOrder envelope the WS
-    // control path returns (its close-vs-continue behaviour is unit-tested in
-    // `src/gateway/ws/mod.rs`).
-    let ws_error = VenueError::InvalidOrder("x".to_string()).ws_error(None);
-    assert_eq!(ws_error.code, WsErrorCode::InvalidOrder);
-    assert!(
-        !ws_error.terminal,
-        "a control command error keeps the socket open"
-    );
 }
 
 #[tokio::test]

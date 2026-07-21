@@ -1,0 +1,13 @@
+{
+  "data": {
+    "ask_price": 5100,
+    "ask_size": 2,
+    "bid_price": 4900,
+    "bid_size": 3,
+    "expiration": "20351231",
+    "strike": 50000,
+    "style": "call",
+    "symbol": "BTC-20351231-50000-C"
+  },
+  "type": "quote"
+}

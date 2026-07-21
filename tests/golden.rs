@@ -1153,3 +1153,50 @@ fn test_golden_venue_persisted_journal_row() {
         Err(e) => panic!("payload must reparse to a JournalRecord: {e}"),
     }
 }
+
+// ============================================================================
+// #047 — WS quote / fill shape under a market-maker persona
+// ============================================================================
+
+/// A persona-driven quote renders on the WS `quote` channel in the SAME wire shape
+/// as any other quote — a wide, skewed persona (wider spread, asymmetric sizes) does
+/// not change the schema, only the values. Money stays integer cents.
+#[test]
+fn test_golden_ws_persona_quote_shape() {
+    let quote = WsMessage::Quote {
+        symbol: sym("BTC-20351231-50000-C"),
+        expiration: "20351231".to_string(),
+        strike: 50_000,
+        style: OptionStyle::Call,
+        // A `wide_skewed` persona: a wide spread, sizes trimmed asymmetrically.
+        bid_price: Some(Cents::new(4_900)),
+        ask_price: Some(Cents::new(5_100)),
+        bid_size: 3,
+        ask_size: 2,
+    };
+    assert_golden("ws/persona_quote.json", &quote);
+    let value = serde_json::to_value(&quote).expect("serialise persona quote");
+    assert_no_float_money(&value, &["bid_price", "ask_price"]);
+}
+
+/// A persona maker's fill renders on the public, anonymised WS `fill` channel with
+/// the four cross-surface join keys and its captured `edge`, money as integer cents.
+#[test]
+fn test_golden_ws_persona_fill_shape() {
+    let fill = WsMessage::Fill {
+        execution_id: ExecutionId::new("run-1:BTC:7:0"),
+        underlying_sequence: SequenceNumber::new(7),
+        venue_ts: EventTimestamp::new(1_700_000_000_000),
+        liquidity: LiquidityFlag::Maker,
+        symbol: "BTC".to_string(),
+        instrument: sym("BTC-20351231-50000-C"),
+        side: Side::Sell,
+        quantity: 2,
+        price: Cents::new(5_100),
+        // The persona maker sold above its quote-time theo → positive captured edge.
+        edge: SignedCents::new(75),
+    };
+    assert_golden("ws/persona_fill.json", &fill);
+    let value = serde_json::to_value(&fill).expect("serialise persona fill");
+    assert_no_float_money(&value, &["price", "edge"]);
+}

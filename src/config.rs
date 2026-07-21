@@ -71,8 +71,8 @@ use crate::exchange::{
     SymbolParser, validate_venue_expiry,
 };
 use crate::market_maker::{
-    DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, SIZE_SCALAR_MAX, SIZE_SCALAR_MIN,
-    SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN,
+    DEFAULT_BASE_SIZE, DEFAULT_BASE_SPREAD_BPS, DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN,
+    PersonaConfig, SIZE_SCALAR_MAX, SIZE_SCALAR_MIN, SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN,
 };
 use crate::microstructure::{
     ContractSpecsConfig, FileMicrostructure, MicrostructureConfig, MicrostructureConfigError,
@@ -2325,12 +2325,34 @@ pub const DEFAULT_SEED_VOLATILITY: f64 = 0.20;
 /// so the seeding phase's apply cannot be rejected at range-check time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SeedPersona {
+    /// The construction-time base spread in **basis points** (the half-width the
+    /// `spread_multiplier` scales); defaults to [`DEFAULT_BASE_SPREAD_BPS`].
+    pub base_spread_bps: u64,
+    /// The construction-time base quote size in **contracts** (the size the maker
+    /// rests before the `size_scalar` trims it); defaults to [`DEFAULT_BASE_SIZE`].
+    pub base_size: u64,
     /// The spread multiplier (clamped to `[0.1, 10.0]`).
     pub spread_multiplier: f64,
     /// The size scalar (clamped to `[0.0, 1.0]`).
     pub size_scalar: f64,
     /// The directional skew (clamped to `[-1.0, 1.0]`).
     pub directional_skew: f64,
+}
+
+impl SeedPersona {
+    /// The runtime [`PersonaConfig`] the market maker quotes with — the same
+    /// load-validated knobs, so this conversion never fails.
+    #[must_use]
+    #[inline]
+    pub fn to_persona_config(self) -> PersonaConfig {
+        PersonaConfig {
+            base_spread_bps: self.base_spread_bps,
+            base_size: self.base_size,
+            spread_multiplier: self.spread_multiplier,
+            size_scalar: self.size_scalar,
+            directional_skew: self.directional_skew,
+        }
+    }
 }
 
 /// One seeded underlying: its opening price in **cents**, its resolved canonical
@@ -2416,12 +2438,14 @@ impl SeedManifest {
         self.default_persona.as_deref()
     }
 
-    /// The persona whose knobs the seeding phase applies to the market maker.
+    /// The resolved **default** persona — the one every instrument that names no
+    /// explicit persona is bound to.
     ///
-    /// The engine holds **one global** persona config (per-underlying persona
-    /// *knobs* are a documented seam limitation — the engine differentiates only
-    /// by per-symbol enable/disable), so the seeding phase applies this single
-    /// default persona to the whole engine.
+    /// #047 lifted the former one-global-persona limitation: the seeding phase binds
+    /// each contract to its resolved [`PersonaConfig`] **per instrument** (so `tight`
+    /// vs `wide_skewed` differ per contract), and the engine's global config stays the
+    /// neutral overlay. This returns the default persona for introspection; it is
+    /// **not** applied to the global config (that would double-shape a quote).
     #[must_use]
     pub fn effective_persona(&self) -> Option<SeedPersona> {
         self.default_persona
@@ -2537,6 +2561,12 @@ struct FileMarketMaker {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FilePersona {
+    /// The base spread in **basis points** (default [`DEFAULT_BASE_SPREAD_BPS`]).
+    #[serde(default)]
+    base_spread_bps: Option<u64>,
+    /// The base quote size in **contracts** (default [`DEFAULT_BASE_SIZE`]).
+    #[serde(default)]
+    base_size: Option<u64>,
     /// The spread multiplier (default `1.0`; clamped to `[0.1, 10.0]`).
     #[serde(default)]
     spread_multiplier: Option<f64>,
@@ -2633,7 +2663,17 @@ fn resolve_persona(name: &str, file_persona: &FilePersona) -> Result<SeedPersona
         DIRECTIONAL_SKEW_MIN,
         DIRECTIONAL_SKEW_MAX,
     )?;
+    let base_size = file_persona.base_size.unwrap_or(DEFAULT_BASE_SIZE);
+    if base_size == 0 {
+        return Err(ConfigError::SeedInvalidPersona {
+            reason: format!("persona '{name}' base_size must be positive"),
+        });
+    }
     Ok(SeedPersona {
+        base_spread_bps: file_persona
+            .base_spread_bps
+            .unwrap_or(DEFAULT_BASE_SPREAD_BPS),
+        base_size,
         spread_multiplier: spread,
         size_scalar: size,
         directional_skew: skew,

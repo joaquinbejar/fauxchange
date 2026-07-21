@@ -1,0 +1,15 @@
+{
+  "data": {
+    "edge": 75,
+    "execution_id": "run-1:BTC:7:0",
+    "instrument": "BTC-20351231-50000-C",
+    "liquidity": "maker",
+    "price": 5100,
+    "quantity": 2,
+    "side": "sell",
+    "symbol": "BTC",
+    "underlying_sequence": 7,
+    "venue_ts": 1700000000000
+  },
+  "type": "fill"
+}

@@ -60,7 +60,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::auth::{AccountProvision, AccountRegistry, AccountStore, AuthError};
-use crate::config::{DEFAULT_SEED_VOLATILITY, SeedManifest, SeedPersona};
+use crate::config::{DEFAULT_SEED_VOLATILITY, SeedManifest};
 use crate::simulation::{AssetConfig, SimError, WalkTypeConfig};
 use crate::state::AppState;
 
@@ -252,11 +252,13 @@ pub async fn apply_seed_phase(
 ) -> Result<SeedReport, SeedError> {
     let market_maker = state.market_maker();
 
-    // 1. Persona: apply the effective (default) persona knobs globally. No prices
-    //    are set yet, so the engine's internal requote-all is a no-op here.
-    if let Some(persona) = manifest.effective_persona() {
-        apply_persona(state, &persona)?;
-    }
+    // 1. Personas are applied **per instrument** (step 3), not globally: each
+    //    contract is bound to its resolved [`PersonaConfig`], and the engine's global
+    //    config stays the **neutral overlay** (`1.0`/`1.0`/`0.0`) so a persona shapes
+    //    quotes exactly once (#047). Applying the default persona to the global config
+    //    *as well* would double-shape it (`persona.knob * config.knob`), so the seed
+    //    phase deliberately leaves the global config untouched — runtime WS/REST
+    //    controls remain the only writer of the global overlay.
 
     // 2. Accounts: idempotent provisioning into the #012 registry.
     let (accounts_provisioned, accounts_unchanged) =
@@ -264,6 +266,9 @@ pub async fn apply_seed_phase(
 
     // 3. Instruments: idempotent-conflict check + persona registration. Register
     //    the whole chain before any price so the first requote quotes it in full.
+    //    An instrument bound to a defined persona (#047) registers with that
+    //    persona's base spread / size + knobs and its seeded per-`(persona, symbol)`
+    //    jitter; an unbound instrument follows the engine's global config.
     for set in manifest.instruments() {
         if let Some(existing) = market_maker.get_price(&set.underlying)
             && existing != set.opening_price.get()
@@ -274,8 +279,19 @@ pub async fn apply_seed_phase(
                 requested: set.opening_price.get(),
             });
         }
+        let persona = set.persona.as_ref().and_then(|name| {
+            manifest
+                .personas()
+                .get(name)
+                .map(|persona| (name.clone(), persona.to_persona_config()))
+        });
         for symbol in &set.contracts {
-            market_maker.register_instrument(symbol);
+            match &persona {
+                Some((name, config)) => {
+                    market_maker.register_instrument_with_persona(symbol, None, name, *config);
+                }
+                None => market_maker.register_instrument(symbol),
+            }
         }
     }
 
@@ -315,24 +331,6 @@ pub async fn apply_seed_phase(
     };
     tracing::info!(seed = %report.summary(), "bounded seeding phase applied");
     Ok(report)
-}
-
-/// Applies one persona's clamped knobs to the market-maker engine.
-///
-/// The engine holds one **global** persona config, so this is the single default
-/// persona (per-underlying persona *knobs* are a documented seam limitation).
-fn apply_persona(state: &Arc<AppState>, persona: &SeedPersona) -> Result<(), SeedError> {
-    let market_maker = state.market_maker();
-    market_maker
-        .set_spread_multiplier(persona.spread_multiplier)
-        .map_err(|reason| SeedError::Persona { reason })?;
-    market_maker
-        .set_size_scalar(persona.size_scalar)
-        .map_err(|reason| SeedError::Persona { reason })?;
-    market_maker
-        .set_directional_skew(persona.directional_skew)
-        .map_err(|reason| SeedError::Persona { reason })?;
-    Ok(())
 }
 
 /// A bounded wait for the async requote forwarders to vivify every seeded contract
