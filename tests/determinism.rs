@@ -150,6 +150,36 @@ fn add(
     }
 }
 
+/// A limit add carrying a `client_order_id` — the account-scoped idempotency key
+/// an idempotent resend reuses (#099).
+#[allow(clippy::too_many_arguments)]
+fn add_keyed(
+    lineage: &LineageId,
+    sequence: u64,
+    raw_symbol: &str,
+    account: &str,
+    owner_byte: u8,
+    side: Side,
+    price: u64,
+    quantity: u64,
+    tif: TimeInForce,
+    client_order_id: &str,
+) -> VenueCommand {
+    VenueCommand::AddOrder {
+        symbol: sym(raw_symbol),
+        order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(sequence), 0),
+        account: AccountId::new(account),
+        owner: Hash32([owner_byte; 32]),
+        client_order_id: Some(ClientOrderId::new(client_order_id)),
+        side,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(price)),
+        quantity,
+        time_in_force: tif,
+        stp_mode: STPMode::None,
+    }
+}
+
 fn market(
     lineage: &LineageId,
     sequence: u64,
@@ -582,6 +612,78 @@ fn test_recorded_session_replays_to_identical_events_and_top_of_book() {
     );
 
     // The oracle: a fresh-registry replay reconstructs identical events + witness.
+    assert_replay_equals(&recording, &replay(&recording));
+}
+
+#[test]
+fn test_idempotent_resend_replays_the_stored_terminal_outcome() {
+    // #099: the executor dedups an idempotent resend (same account + ClOrdID) and
+    // journals the STORED terminal outcome as the resend event's outcome. Replaying
+    // the journal re-executes every command into a fresh registry, so the dedup
+    // fires identically and REPRODUCES that stored outcome — the resend stays a
+    // deterministic function of the journal (no wall-clock, no RNG, no second fill).
+    let lineage = LineageId::new("resend-run");
+    let commands = vec![
+        // seq0: resting maker sell 2.
+        add(
+            &lineage,
+            0,
+            CALL,
+            "maker",
+            0x11,
+            Side::Sell,
+            50_000,
+            2,
+            TimeInForce::Gtc,
+        ),
+        // seq1: the original crossing taker buy 3, KEYED — fills 2, rests 1.
+        add_keyed(
+            &lineage,
+            1,
+            CALL,
+            "taker",
+            0x22,
+            Side::Buy,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+            "dup",
+        ),
+        // seq2: the resend — same account + ClOrdID, a FRESH order id (the grammar id
+        // for seq 2). The executor dedups: no second order, no second fill.
+        add_keyed(
+            &lineage,
+            2,
+            CALL,
+            "taker",
+            0x22,
+            Side::Buy,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+            "dup",
+        ),
+    ];
+    let recording = record(&commands, &lineage, &[sym(CALL)]);
+
+    // The original add crossed into a real fill (non-vacuous).
+    assert!(
+        matches!(
+            &recording.events[1].outcome,
+            VenueOutcome::Added { fills, resting_quantity: 1, .. } if fills.len() == 2
+        ),
+        "the original keyed add fills 2 and rests 1, got {:?}",
+        recording.events[1].outcome
+    );
+    // The resend event carries the STORED terminal — byte-identical to the original
+    // add's captured outcome, NOT a recomputed second fill.
+    assert_eq!(
+        recording.events[2].outcome, recording.events[1].outcome,
+        "the resend event replays the stored terminal outcome (no second fill)"
+    );
+
+    // The oracle: a fresh-registry replay reconstructs the identical event stream —
+    // including the resend's stored outcome and its untouched top-of-book witness.
     assert_replay_equals(&recording, &replay(&recording));
 }
 

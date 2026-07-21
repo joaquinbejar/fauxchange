@@ -372,6 +372,39 @@ pub enum VenueOutcome {
     },
 }
 
+impl VenueOutcome {
+    /// The just-submitted aggressor's own **taker** fill legs as `(price,
+    /// quantity)` pairs in capture order — the immediate execution of *this*
+    /// add, projected directly from the captured terminal outcome.
+    ///
+    /// A gateway renders an order-entry response's fills from this, **never** a
+    /// store read-back keyed on the freshly-minted order id. On an idempotent
+    /// resend the executor returns the **stored** terminal outcome — the original
+    /// order's fills, carrying the canonical order and execution ids — so this
+    /// surfaces the true original terminal report, not an empty fresh read-back
+    /// keyed on the resend's fresh order id and sequence (#099). It reads the
+    /// already-captured [`VenueOutcome`], so it recomputes nothing and adds no
+    /// wall-clock or RNG: it stays a deterministic function of the journal, and
+    /// the fills it returns are exactly those [`StoreFanOut`](crate::exchange::StoreFanOut)
+    /// folded into the executions store from this same event.
+    ///
+    /// Only the **taker** legs (the aggressor's own executions) are returned; the
+    /// paired maker legs belong to the resting counterparties. Empty for a
+    /// non-filling outcome (a pure rest, a reject, a cancel, or a control).
+    #[must_use]
+    pub fn taker_fill_legs(&self) -> Vec<(Cents, u64)> {
+        let fills: &[Fill] = match self {
+            Self::Added { fills, .. } | Self::Market { fills, .. } => fills,
+            _ => &[],
+        };
+        fills
+            .iter()
+            .filter(|fill| fill.liquidity == LiquidityFlag::Taker)
+            .map(|fill| (fill.price, fill.quantity))
+            .collect()
+    }
+}
+
 // ============================================================================
 // VenueCommand — the venue's own instruction set
 // ============================================================================

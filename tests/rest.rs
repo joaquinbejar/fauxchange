@@ -165,6 +165,17 @@ fn limit_body(side: &str, price: u64, qty: u64) -> Value {
     serde_json::json!({ "side": side, "price": price, "quantity": qty })
 }
 
+/// A limit-order body carrying the `client_order_id` idempotency key an
+/// idempotent resend reuses (#099).
+fn keyed_limit_body(side: &str, price: u64, qty: u64, client_order_id: &str) -> Value {
+    serde_json::json!({
+        "side": side,
+        "price": price,
+        "quantity": qty,
+        "client_order_id": client_order_id,
+    })
+}
+
 // ---- /health is exempt ----------------------------------------------------
 
 #[tokio::test]
@@ -322,11 +333,84 @@ async fn test_crossing_order_reports_fills_from_the_sequenced_path() {
     )
     .await;
     assert_eq!(taker_status, StatusCode::OK);
-    // The taker's fills are read back from the shared executions store.
+    // The taker's fills are projected from the receipt's captured outcome.
     assert_eq!(body["status"], "filled");
     assert_eq!(body["filled_quantity"], 5);
     assert_eq!(body["remaining_quantity"], 0);
     assert_eq!(body["sequence"], 1);
+}
+
+#[tokio::test]
+async fn test_idempotent_resend_renders_the_stored_terminal_report_not_a_fresh_readback() {
+    // #099: an idempotent resend (same account + `client_order_id`) must render the
+    // STORED terminal report — the ORIGINAL fills, projected from the receipt's
+    // captured outcome — NOT an empty fresh store read-back keyed on the resend's
+    // freshly-minted order id (which would falsely report `accepted` / 0 filled).
+    let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
+    let maker = token(&state, "trader-1");
+    let taker = token(&state, "trader-2");
+    let uri = format!("{CONTRACT}/orders");
+
+    // Maker rests a sell 5; the taker crosses it fully, KEYED with a ClOrdID.
+    let (maker_status, _) = send(
+        &state,
+        build_request(
+            "POST",
+            &uri,
+            Some(&maker),
+            Some(limit_body("sell", 50_000, 5)),
+        ),
+    )
+    .await;
+    assert_eq!(maker_status, StatusCode::OK);
+
+    let (taker_status, first) = send(
+        &state,
+        build_request(
+            "POST",
+            &uri,
+            Some(&taker),
+            Some(keyed_limit_body("buy", 50_000, 5, "dup")),
+        ),
+    )
+    .await;
+    assert_eq!(taker_status, StatusCode::OK);
+    assert_eq!(first["status"], "filled");
+    assert_eq!(first["filled_quantity"], 5);
+    assert_eq!(
+        state.executions().len(),
+        2,
+        "one crossing match records two execution legs"
+    );
+
+    // Resend the byte-identical taker (same ClOrdID, the standard retry after a
+    // dropped ack). The executor dedups: no second order, no phantom fill — and the
+    // response renders the ORIGINAL terminal report, never a fresh accepted/0 read-back.
+    let (resend_status, resend) = send(
+        &state,
+        build_request(
+            "POST",
+            &uri,
+            Some(&taker),
+            Some(keyed_limit_body("buy", 50_000, 5, "dup")),
+        ),
+    )
+    .await;
+    assert_eq!(resend_status, StatusCode::OK);
+    assert_eq!(
+        resend["status"], "filled",
+        "the resend renders the STORED filled terminal, not a fresh `accepted`"
+    );
+    assert_eq!(
+        resend["filled_quantity"], 5,
+        "the resend shows the ORIGINAL filled 5, not a read-back 0 (#099)"
+    );
+    assert_eq!(resend["remaining_quantity"], 0);
+    assert_eq!(
+        state.executions().len(),
+        2,
+        "the resend opened no second order (no phantom fill in the store)"
+    );
 }
 
 // ---- POST /prices is Admin-gated and a journaled SimStep ------------------
