@@ -235,6 +235,40 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "macros",
     "migrate",
 ] }
+# The FIX 4.4 gateway's primitive layer (#036, the first v0.4 dependency
+# additions). `fauxchange` builds the acceptor on IronFix primitives
+# ([ADR-0002](docs/adr/0002-fix-4-4-gateway-on-ironfix.md)); #036 is the typed
+# message vocabulary and consumes exactly three of the eleven IronFix crates —
+# the framing, the type vocabulary, and the version constant — NOT the (partial
+# / skeleton) transport / session / engine crates, which land with the acceptor
+# (#037) and session layer (#038). All three are published on crates.io at
+# `0.3.0` (verified `cargo add <crate>@0.3 --dry-run` resolves against the
+# crates.io sparse index; `deny.toml [sources]` allows ONLY that registry — no
+# git / path dep). MIT, maintained by the joaquinbejar/IronFix project.
+#   - ironfix-core: the `MsgType` / `CompId` / `SeqNum` / `Timestamp` vocabulary
+#     and the `RawMessage` / `FieldRef` zero-copy decode view the typed structs
+#     read fields from. Audit note: pulls `num-derive` NEW into the tree (a
+#     compile-time derive helper; its `proc-macro2` / `quote` / `syn` deps are
+#     ALREADY resolved via `serde_derive`), and adds a dependency EDGE to
+#     `rust_decimal` (already present via `optionstratlib`) and `chrono` (already
+#     present) — no new crate version for those. `fauxchange`'s FIX price seam
+#     does NOT use `rust_decimal`: the decimal `Price` exists only as a string at
+#     the FIX edge and is parsed to integer `Cents` with checked integer
+#     arithmetic (repo Override O-1, ADR-0003).
+#   - ironfix-tagvalue: the zero-copy `Decoder` / `Encoder` + checksum framing
+#     the hand-written encode/decode runs over (`ironfix-derive` is `todo!()`, so
+#     the typed structs are hand-written — the design, not a workaround). Deps
+#     (`bytes` / `smallvec` / `memchr` / `itoa`) are ALL already in the tree.
+#   - ironfix-dictionary: consumed ONLY for `Version::Fix44.begin_string()`, the
+#     pinned `BeginString (8) = FIX.4.4` constant (dialect §1). Audit note: pulls
+#     `quick-xml` NEW into the tree (its QuickFIX-XML loader, which `fauxchange`
+#     does not call — the dialect lives in `docs/specs/fix-dialect.md`, not an XML
+#     file); `quick-xml`'s only dep is `memchr`, already present. `quick-xml` is
+#     MIT and `num-derive` is MIT OR Apache-2.0 — both already on the `deny.toml`
+#     license allow-list; `cargo audit` / `cargo deny` gate the whole tree.
+ironfix-core = "0.3"
+ironfix-tagvalue = "0.3"
+ironfix-dictionary = "0.3"
 
 [dev-dependencies]
 proptest = "1"

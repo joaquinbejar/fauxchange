@@ -11,6 +11,59 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The FIX 4.4 typed message vocabulary and the pinned `fauxchange.fix44.v1`
+  dialect — the first v0.4 (FIX gateway) work** (#36) in the new
+  `src/gateway/fix/` module tree, `tests/golden/fix/`, `tests/golden_fix.rs`,
+  `tests/property.rs`, and `Cargo.toml`
+  ([036](milestones/v0.4-fix-gateway/036-fix-typed-messages-dialect.md),
+  [fix-dialect.md](docs/specs/fix-dialect.md),
+  [ADR-0002](docs/adr/0002-fix-4-4-gateway-on-ironfix.md),
+  [ADR-0003](docs/adr/0003-money-as-integer-cents.md),
+  [ADR-0009](docs/adr/0009-lossless-venue-envelope-outcomes.md)). This is the
+  **vocabulary layer only** — hand-written typed structs with encode/decode over
+  IronFix primitives; it compiles standalone with tests and is not yet wired into
+  a live gateway (the TCP acceptor is #37, the session FSM #38, order-path routing
+  #39, market-data wiring #40). **The first new dependencies since v0.2**:
+  `ironfix-core`, `ironfix-tagvalue`, and `ironfix-dictionary` `0.3` (verified
+  published on crates.io; `cargo audit` + `cargo deny` stay green), consumed for
+  the `MsgType`/`CompId`/`SeqNum`/`Timestamp` vocabulary, the zero-copy
+  `Decoder`/`Encoder` + checksum framing, and the `Version::Fix44` begin-string
+  pin — **not** the transport/session/engine crates (those land with #37/#38).
+  **The typed messages**: session admin (`Logon A`, `Logout 5`, `Heartbeat 0`,
+  `TestRequest 1`, `ResendRequest 2`, `SequenceReset 4`, `Reject 3`); order entry
+  (`NewOrderSingle D`, `OrderCancelRequest F`, `OrderCancelReplaceRequest G`,
+  `OrderMassCancelRequest q`, `OrderStatusRequest H`, `ExecutionReport 8`,
+  `OrderCancelReject 9`, `OrderMassCancelReport r`); market data (`V`/`W`/`X`/`Y`)
+  — each on the standard header/trailer with a golden fixture (tags `9`/`10`
+  asserted). **The checked decimal-`Price` ↔ integer-`Cents` seam**
+  (`src/gateway/fix/price.rs`): exact-or-reject on the `CENTS_SCALE`=2 currency
+  scale **and** the instrument tick, parsed with checked **integer** arithmetic —
+  no `f64` anywhere, the decimal exists only as a string at the FIX edge, and
+  `44=500.05` ↔ `50005` cents round-trips losslessly (the economic-parity golden
+  asserts REST/FIX agree on cents). Requiredness (`R`/`C`/`O`) and closed-set
+  enums (`Side`, `OrdType`, `TimeInForce`, `ExecType`/`OrdStatus`,
+  `MassCancelRequestType`, `MDEntryType`, `SubscriptionRequestType`,
+  `MDUpdateAction`) are enforced exhaustively — a missing `R` tag, a
+  mis-conditioned `C` tag, or an unknown enum value is a **typed reject, never a
+  silent default**; repeating groups (`NoMDEntryTypes`, `NoRelatedSym`,
+  `NoMDEntries`, and the **ordered** `NoAffectedOrders`, ADR-0009) enforce
+  delimiter/count rules; and every inbound-byte path returns a typed
+  `FixDecodeError` — **no `.unwrap()` on caller bytes**. Composite ids ride
+  `OrderID (37)`/`ExecID (17)` and the `underlying_sequence` rides
+  `SecondaryExecID (527)`; an unsupported application `MsgType` is classified
+  toward `BusinessMessageReject (j)` (the routing is #39). The `Logon`
+  `Password (554)` is held in a `Debug`-redacted `SecretField` so it never reaches
+  a log. Property tests cover encode∘decode round-trip identity and the
+  never-lossy `Price` ↔ `Cents` seam over the input space. **Decode-layer
+  hardening** (`src/gateway/fix/limits.rs`): the venue's own `decode()` validates
+  `BodyLength (9)` against the actual frame length **before** the ironfix codec —
+  closing a reachable worker panic from ironfix-tagvalue 0.3.0's unchecked
+  `body_start + body_length` on a hostile oversized `BodyLength` (a PoC regression
+  test asserts a typed reject, no panic; an upstream IronFix fix is requested
+  separately) — and adds a per-message field ceiling, a per-group entry ceiling, a
+  duplicate-scalar-tag rejection (no silent first-wins, `SessionRejectReason=13`),
+  and bounded truncation of every stored untrusted field value so no future
+  `Text (58)` renderer can echo an unbounded payload.
 - **The persistent-mode order-path budget and the WS fan-out N-sweep
   flatness re-verification — the v0.3 performance gate** (#35) in the new
   `benches/hp5_durable_append.rs`, `benches/hp2_ws_fanout.rs`, `Cargo.toml`,

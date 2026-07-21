@@ -44,6 +44,16 @@ use fauxchange::exchange::{
 use fauxchange::exchange::{
     Hash32, OptionStyle, STPMode, Side as SeamSide, TimeInForce as SeamTif,
 };
+use fauxchange::gateway::fix::enums::{
+    MdEntryType, OrdType as FixOrdType, OrderSide, TimeInForce as FixTif,
+};
+use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
+use fauxchange::gateway::fix::marketdata::{MarketDataSnapshotFullRefresh, SnapshotEntry};
+use fauxchange::gateway::fix::order::NewOrderSingle;
+use fauxchange::gateway::fix::price::{
+    PriceScale, parse_decimal_to_cents, render_cents_to_decimal,
+};
+use fauxchange::gateway::fix::{DecodedMessage, decode};
 use fauxchange::market_maker::{QuoteInput, Quoter};
 use fauxchange::simulation::{JournalStream, replay_streams};
 use fauxchange::subscription::OrderbookSubscriptionManager;
@@ -51,6 +61,7 @@ use fauxchange::{
     AccountId, ClientOrderId, ExecutionId, LiquidityFlag, Order, OrderStatus, OrderType,
     Permission, Side, TimeInForce, VenueError, VenueOrderId, WsMessage,
 };
+use ironfix_core::types::{CompId, SeqNum};
 use proptest::prelude::*;
 use proptest::test_runner::TestCaseError;
 
@@ -1052,6 +1063,178 @@ proptest! {
                     )));
                 }
             },
+        }
+    }
+}
+
+// ============================================================================
+// FIX 4.4 vocabulary (#036): the checked Price seam is never lossy and every
+// typed message survives an encode∘decode round trip over its input space.
+// ============================================================================
+
+/// A canonical symbol drawn from a fixed valid set (always parseable).
+fn fix_symbol() -> impl Strategy<Value = Symbol> {
+    prop::sample::select(vec![
+        "BTC-20240329-50000-C",
+        "BTC-20240329-50000-P",
+        "ETH-20251222-3000-C",
+        "AAPL-20240119-190-P",
+    ])
+    .prop_map(|raw| Symbol::parse(raw).expect("fixture symbol parses"))
+}
+
+/// A valid `CompID` over an uppercase alphabet within the 32-byte limit.
+fn fix_comp_id() -> impl Strategy<Value = CompId> {
+    "[A-Z]{1,8}".prop_map(|raw| CompId::new(&raw).expect("comp id within limit"))
+}
+
+/// A standard header with an arbitrary comp-id pair and sequence number and a
+/// fixed, well-formed sending time.
+fn fix_header() -> impl Strategy<Value = StandardHeader> {
+    (fix_comp_id(), fix_comp_id(), any::<u64>()).prop_map(|(sender, target, seq)| {
+        StandardHeader::new(
+            sender,
+            target,
+            SeqNum::new(seq),
+            UtcTimestamp::parse(52, "20240329-12:00:00.000").expect("sending time"),
+        )
+    })
+}
+
+/// A client order id over a colon-friendly alphabet (composite ids use `:`).
+fn fix_clordid() -> impl Strategy<Value = ClientOrderId> {
+    "[A-Za-z0-9:_-]{1,16}".prop_map(ClientOrderId::new)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1024, ..ProptestConfig::default() })]
+
+    /// The seam renders any `Cents` value to a decimal and parses it back to the
+    /// identical cents — no float drift, exact both ways.
+    #[test]
+    fn fix_price_seam_cents_never_lossy(raw in any::<u64>()) {
+        let cents = Cents::new(raw);
+        let decimal = render_cents_to_decimal(cents);
+        // Exactly two fractional digits (the venue cents scale), one dot.
+        prop_assert_eq!(decimal.matches('.').count(), 1);
+        let fractional = decimal.split('.').nth(1).unwrap_or("");
+        prop_assert_eq!(fractional.len(), 2);
+        let back = parse_decimal_to_cents(&decimal)
+            .map_err(|e| TestCaseError::fail(format!("parse {decimal} failed: {e:?}")))?;
+        prop_assert_eq!(back, cents);
+    }
+
+    /// An on-tick price (a whole multiple of the tick) always survives the full
+    /// tick-keyed seam, and an off-tick price is always rejected.
+    #[test]
+    fn fix_price_scale_admits_on_tick_and_rejects_off_tick(
+        tick in 2u64..=1000,
+        multiple in 0u64..=1_000_000,
+        offset in 1u64..1000,
+    ) {
+        let scale = PriceScale::new(tick)
+            .map_err(|e| TestCaseError::fail(format!("scale build failed: {e:?}")))?;
+        let on_tick = Cents::new(tick.saturating_mul(multiple));
+        let decimal = render_cents_to_decimal(on_tick);
+        let parsed = scale.decimal_to_cents(&decimal)
+            .map_err(|e| TestCaseError::fail(format!("on-tick {decimal} rejected: {e:?}")))?;
+        prop_assert_eq!(parsed, on_tick);
+
+        // An offset strictly between 0 and the tick is off-tick and rejected.
+        let off = offset % tick;
+        if off != 0 {
+            let off_cents = Cents::new(on_tick.get().saturating_add(off));
+            let off_decimal = render_cents_to_decimal(off_cents);
+            prop_assert!(scale.decimal_to_cents(&off_decimal).is_err());
+        }
+    }
+
+    /// A `NewOrderSingle (D)` survives an encode∘decode round trip over the full
+    /// space of side / type / TIF / price / account / symbol combinations, with
+    /// the conditional Price/ExpireTime requiredness satisfied by construction.
+    #[test]
+    fn fix_new_order_single_encode_decode_round_trip(
+        header in fix_header(),
+        cl_ord_id in fix_clordid(),
+        account in proptest::option::of("[a-z0-9-]{1,12}"),
+        symbol in fix_symbol(),
+        side in prop::sample::select(vec![OrderSide::Buy, OrderSide::Sell]),
+        limit in any::<bool>(),
+        price_cents in any::<u32>(),
+        order_qty in 1u64..=1_000_000,
+        tif_index in 0usize..5,
+    ) {
+        let (ord_type, price) = if limit {
+            (FixOrdType::Limit, Some(Cents::new(u64::from(price_cents))))
+        } else {
+            (FixOrdType::Market, None)
+        };
+        let (time_in_force, expire_time) = match tif_index {
+            0 => (FixTif::Day, None),
+            1 => (FixTif::Gtc, None),
+            2 => (FixTif::Ioc, None),
+            3 => (FixTif::Fok, None),
+            _ => (
+                FixTif::Gtd,
+                Some(UtcTimestamp::parse(126, "20240329-23:59:59.000").expect("expire time")),
+            ),
+        };
+        let order = NewOrderSingle {
+            header,
+            cl_ord_id,
+            account: account.map(AccountId::new),
+            symbol,
+            side,
+            transact_time: UtcTimestamp::parse(60, "20240329-12:00:00.000").expect("transact time"),
+            ord_type,
+            price,
+            order_qty,
+            time_in_force,
+            expire_time,
+        };
+        let bytes = DecodedMessage::NewOrderSingle(order.clone()).encode();
+        match decode(&bytes) {
+            Ok(DecodedMessage::NewOrderSingle(back)) => prop_assert_eq!(back, order),
+            other => return Err(TestCaseError::fail(format!("expected NewOrderSingle, got {other:?}"))),
+        }
+    }
+
+    /// A `MarketDataSnapshotFullRefresh (W)` with an arbitrary number of book
+    /// entries survives an encode∘decode round trip, preserving entry order and
+    /// per-level cents exactly.
+    #[test]
+    fn fix_market_data_snapshot_encode_decode_round_trip(
+        header in fix_header(),
+        rpt_seq in any::<u64>(),
+        symbol in fix_symbol(),
+        entries in prop::collection::vec(
+            (
+                prop::sample::select(vec![MdEntryType::Bid, MdEntryType::Offer, MdEntryType::Trade]),
+                any::<u32>(),
+                any::<u32>(),
+            ),
+            0..8,
+        ),
+    ) {
+        let entries: Vec<SnapshotEntry> = entries
+            .into_iter()
+            .map(|(entry_type, price, size)| SnapshotEntry {
+                entry_type,
+                price: Cents::new(u64::from(price)),
+                size: u64::from(size),
+            })
+            .collect();
+        let snapshot = MarketDataSnapshotFullRefresh {
+            header,
+            md_req_id: "MDR-1".to_string(),
+            symbol,
+            rpt_seq: SequenceNumber::new(rpt_seq),
+            entries,
+        };
+        let bytes = DecodedMessage::MarketDataSnapshotFullRefresh(snapshot.clone()).encode();
+        match decode(&bytes) {
+            Ok(DecodedMessage::MarketDataSnapshotFullRefresh(back)) => prop_assert_eq!(back, snapshot),
+            other => return Err(TestCaseError::fail(format!("expected snapshot, got {other:?}"))),
         }
     }
 }
