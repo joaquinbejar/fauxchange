@@ -71,12 +71,10 @@ pub mod state;
 
 // Re-exported at the crate root: `error` and `models` are the shared
 // boundary types every gateway and downstream crate depends on directly.
-// `#[allow(unused_imports)]`: both modules are still empty stubs (their
-// first public items land in #002+) — drop the attribute once either
-// module exports something.
-#[allow(unused_imports)]
+// `error` now exports the `VenueError` boundary and its HTTP / FIX / WS
+// renderings (#003), so its glob is live.
 pub use error::*;
-#[allow(unused_imports)]
+// `models` currently exposes `Permission` ahead of the full DTO surface (#004).
 pub use models::*;
 
 #[cfg(test)]
