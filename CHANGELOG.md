@@ -11,6 +11,42 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **FIX market data as a thin projection of the WS subscription manager** (#40) —
+  `MarketDataRequest (V)` maps onto the **same**
+  `OrderbookSubscriptionManager` (#14) the WS surface reads, so
+  `MarketDataSnapshotFullRefresh (W)` renders the identical book snapshot as
+  `orderbook_snapshot` and `MarketDataIncrementalRefresh (X)` the identical
+  resulting-quantity deltas as `orderbook_delta`, both carrying the same
+  per-instrument `instrument_sequence` as `RptSeq (83)` — **observation parity by
+  construction** (the WS market-data gap contract IS the FIX one,
+  [03 §5.4 / §7](docs/03-protocol-surfaces.md#54-market-data)). The new
+  `src/gateway/fix/md_projection.rs` is a pure `WsMessage → W`/`X` projection
+  (bids → `MDEntryType 0`, asks → `1`; `MDEntrySize (271) = 0` = level removed via
+  `MDUpdateAction (279) Delete`, else `Change`), and `VenueFixSession` gains the
+  market-data router: a `V` subscribes its symbols, emits a `W` baseline per
+  symbol immediately, and streams `X` deltas drained from the shared broadcast
+  onto the same bounded outbound mailbox (on inbound activity and on the session
+  cadence tick). A per-symbol baseline filter (mirroring the WS surface) drops any
+  delta at or below the delivered `W`'s sequence, so `RptSeq (83)` strictly
+  increases across the `W → X` boundary and the FIX and WS streams are identical
+  by construction. Recovery keeps the two FIX sequence namespaces **distinct**: an
+  `instrument_sequence` gap (a lagged broadcast) recovers by a fresh `W` per
+  subscription — never `ResendRequest (2)`, which repairs only session
+  `MsgSeqNum`. Market-maker requotes do not emit `X` (reflected in the next
+  snapshot, inherited from the manager). An unsupported request is a
+  `MarketDataRequestReject (Y)` with `MDReqRejReason (281)`, never a bare
+  `Reject (3)`: a Trade-tape-only request → `8` (the trade-tape/quote projection
+  over FIX MD is deferred; the book is the `instrument_sequence`-carrying
+  surface), a duplicate `MDReqID` → `1`, the per-session subscription ceiling →
+  `2`, and a session lacking `Read` → `3`. `V` requires `Read`, gated on the same
+  permission model as REST/WS; `prices`/`fills` are not served over FIX MD.
+  `MDEntryPx (270)` crosses the wire decimal through the #36 checked `Price`
+  seam, cents internally. Adds `md_projection` unit tests, the same-book
+  RptSeq≡`instrument_sequence` observation-parity property, the MM-requote and
+  gap-recovery-by-fresh-`W` properties, and the end-to-end `V`→`W`→`X` / `Y`
+  reject conformance suite
+  ([040](milestones/v0.4-fix-gateway/040-fix-market-data.md),
+  [specs/fix-dialect.md §2.3](docs/specs/fix-dialect.md#23-market-data-subscription-surfaces-03-54)).
 - **FIX order entry mapped onto the sequenced order path with context-sensitive
   rejects** (#39) — the order-submitting messages `NewOrderSingle (D)` /
   `OrderCancelRequest (F)` / `OrderCancelReplaceRequest (G)` translate to the

@@ -47,6 +47,7 @@ use fauxchange::exchange::{
     VenueEvent, VenueOutcome,
 };
 use fauxchange::exchange::{ExecutionFilter, ExecutionsStore};
+use fauxchange::gateway::fix::md_projection::{self, RequestedSides};
 use fauxchange::gateway::ws::{ClientAction, FrameOutcome, parse_frame};
 use fauxchange::models::{
     AccountId, LiquidityFlag, OrderType, Permission, ReplayReportResponse, VenueOrderId, WsMessage,
@@ -737,6 +738,189 @@ fn test_market_data_gap_recovers_by_fresh_snapshot_not_resend() {
         }
         other => panic!("expected a fresh snapshot, got {other:?}"),
     }
+}
+
+// ============================================================================
+// 3b. FIX market-data observation parity (#040) — W/X are the WS twin by construction
+// ============================================================================
+
+const BOTH_SIDES: RequestedSides = RequestedSides {
+    bids: true,
+    asks: true,
+};
+
+/// A resting add by the venue-reserved market-maker account — a requote that must
+/// NOT emit an `orderbook_delta` (and therefore no FIX `X`).
+fn mm_resting_add(
+    sequence: u64,
+    order_id: &str,
+    side: SeamSide,
+    price: u64,
+    qty: u64,
+) -> VenueEvent {
+    let command = VenueCommand::AddOrder {
+        symbol: sym(),
+        order_id: VenueOrderId::new(order_id),
+        account: AccountId::new(fauxchange::exchange::MARKET_MAKER_ACCOUNT),
+        owner: fauxchange::exchange::MARKET_MAKER_OWNER,
+        client_order_id: None,
+        side,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(price)),
+        quantity: qty,
+        time_in_force: TimeInForce::Gtc,
+        stp_mode: STPMode::None,
+    };
+    VenueEvent::new(
+        SequenceNumber::new(sequence),
+        EventTimestamp::new(1_700_000_000_000),
+        command,
+        VenueOutcome::Added {
+            fills: vec![],
+            resting_quantity: qty,
+            stp_cancelled: vec![],
+        },
+    )
+}
+
+#[test]
+fn test_fix_market_data_w_and_x_agree_with_ws_on_sequence_and_quantity() {
+    // The same-book agreement property: the FIX `W`/`X` are a pure projection of the
+    // exact `WsMessage` the manager produced, so `RptSeq (83)` equals the WS
+    // `instrument_sequence` and the resulting quantities match — observation parity
+    // by construction, no parallel market-data path to drift.
+    use fauxchange::subscription::OrderbookSubscriptionManager;
+
+    let manager = OrderbookSubscriptionManager::with_capacity(64);
+    let mut rx = manager.subscribe();
+
+    // Two user-driven rests at the same ask level: resulting totals 8 then 12.
+    manager.on_committed_event(&resting_add(1, "r1", SeamSide::Sell, 50_100, 8));
+    manager.on_committed_event(&resting_add(2, "r2", SeamSide::Sell, 50_100, 4));
+
+    let mut projected = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        if let Some((rpt_seq, entries)) =
+            md_projection::incremental_projection(&message, BOTH_SIDES)
+        {
+            let WsMessage::OrderbookDelta {
+                sequence, changes, ..
+            } = &message
+            else {
+                unreachable!("incremental_projection only returns Some for a delta")
+            };
+            // RptSeq (83) == the WS instrument_sequence for the SAME message.
+            assert_eq!(rpt_seq, *sequence, "RptSeq(83) == WS instrument_sequence");
+            // The X entry's MDEntrySize == the WS change's resulting quantity.
+            assert_eq!(
+                entries[0].size, changes[0].quantity,
+                "MDEntrySize == WS resulting quantity"
+            );
+            projected.push(rpt_seq);
+        }
+    }
+    assert_eq!(
+        projected.len(),
+        2,
+        "two user-driven rests → two X-eligible deltas"
+    );
+    assert!(
+        projected[1] > projected[0],
+        "RptSeq is strictly increasing per instrument"
+    );
+
+    // The FIX `W` snapshot projects the same book at the same sequence.
+    let snapshot = manager.orderbook_snapshot(&sym(), None);
+    let (w_seq, w_entries) =
+        md_projection::snapshot_projection(&snapshot, BOTH_SIDES).expect("a W projection");
+    let WsMessage::OrderbookSnapshot {
+        sequence: ws_seq,
+        asks,
+        ..
+    } = &snapshot
+    else {
+        unreachable!("orderbook_snapshot returns a snapshot")
+    };
+    assert_eq!(
+        w_seq, *ws_seq,
+        "W RptSeq == WS snapshot instrument_sequence"
+    );
+    assert_eq!(w_entries.len(), asks.len(), "one W entry per ask level");
+    assert_eq!(w_entries[0].size, 12, "the folded resulting total is 12");
+}
+
+#[test]
+fn test_fix_market_data_mm_requote_never_produces_an_incremental() {
+    // A market-maker requote does not emit an `orderbook_delta`, so the FIX
+    // projection produces NO `X` (inherited from the manager); the requote is
+    // instead reflected in the next fresh `W` snapshot.
+    use fauxchange::subscription::OrderbookSubscriptionManager;
+
+    let manager = OrderbookSubscriptionManager::with_capacity(64);
+    let mut rx = manager.subscribe();
+    manager.on_committed_event(&mm_resting_add(1, "mm1", SeamSide::Sell, 50_100, 5));
+
+    let mut incrementals = 0usize;
+    while let Ok(message) = rx.try_recv() {
+        if md_projection::incremental_projection(&message, BOTH_SIDES).is_some() {
+            incrementals += 1;
+        }
+    }
+    assert_eq!(incrementals, 0, "an MM requote never streams an X");
+
+    // The requote IS present in the next fresh W snapshot.
+    let snapshot = manager.orderbook_snapshot(&sym(), None);
+    let (_, w_entries) =
+        md_projection::snapshot_projection(&snapshot, BOTH_SIDES).expect("a W projection");
+    assert_eq!(w_entries.len(), 1, "the requote appears in the snapshot");
+    assert_eq!(w_entries[0].size, 5);
+}
+
+#[test]
+fn test_fix_market_data_gap_recovers_by_fresh_w_not_resend() {
+    // A market-data `RptSeq` gap (a lagged broadcast) recovers by a FRESH `W`
+    // snapshot at the re-baselined `instrument_sequence` — NOT a `ResendRequest (2)`
+    // of the dropped deltas. The two sequence namespaces stay distinct: session
+    // `MsgSeqNum` resend cannot backfill an application market-data stream.
+    use fauxchange::subscription::OrderbookSubscriptionManager;
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let manager = OrderbookSubscriptionManager::with_capacity(2);
+    let mut rx = manager.subscribe();
+    for i in 0..6u64 {
+        manager.on_committed_event(&resting_add(
+            i + 1,
+            &format!("m{i}"),
+            SeamSide::Sell,
+            50_000 + i,
+            1,
+        ));
+    }
+    let mut lagged = false;
+    loop {
+        match rx.try_recv() {
+            Ok(_) => {}
+            Err(TryRecvError::Lagged(_)) => {
+                lagged = true;
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    assert!(lagged, "the RptSeq stream has a gap (the receiver lagged)");
+
+    let snapshot = manager.orderbook_snapshot(&sym(), None);
+    let (w_seq, w_entries) =
+        md_projection::snapshot_projection(&snapshot, BOTH_SIDES).expect("a fresh W");
+    assert_eq!(
+        w_seq, 6,
+        "the fresh W re-baselines at the current instrument_sequence"
+    );
+    assert_eq!(
+        w_entries.len(),
+        6,
+        "every folded ask level is in the fresh W"
+    );
 }
 
 // ============================================================================
