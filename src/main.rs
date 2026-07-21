@@ -45,7 +45,10 @@ use std::sync::Arc;
 use fauxchange::auth::{DevMode, JwtAuth};
 use fauxchange::config::Config;
 use fauxchange::db::{DatabasePool, DbPoolConfig};
-use fauxchange::gateway::fix::{FixAcceptor, FixAcceptorConfig, StubSessionFactory};
+use fauxchange::gateway::fix::{
+    FixAcceptor, FixAcceptorConfig, FixSessionStore, InMemoryFixSessionStore, SessionConfig,
+    VenueFixSessionFactory,
+};
 use fauxchange::gateway::rest;
 use fauxchange::seed;
 use fauxchange::state::{AppState, AppStateConfig, AuthConfig};
@@ -179,24 +182,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Weak`-backed task also self-terminates when the last `Arc<AppState>` drops.
     let clock_driver = fauxchange::state::spawn_clock_cadence_driver(&state);
 
-    // The FIX 4.4 gateway (#037): spawn the acceptor ONLY when `[fix].enabled`, so
-    // a released image never opens a raw-TCP port answering the #037 stub by
-    // default. The acceptor reaches auth / rate-limit / the sequencer through
-    // `Arc<AppState>` (the `StubSessionFactory` seam the #038 session FSM replaces);
-    // the gateway depends on `AppState`, never the reverse. Its bounded connection
-    // cap, per-session mailbox, and max-frame-length caps are the validated `[fix]`
-    // DoS controls. A `watch` shutdown signal drains the in-flight sessions when the
-    // REST server returns (process shutdown).
+    // The FIX 4.4 gateway (#038): spawn the acceptor ONLY when `[fix].enabled`, so
+    // a released image never opens a raw-TCP port by default. The acceptor reaches
+    // auth / rate-limit / the account registry / the venue clock through
+    // `Arc<AppState>` (the `VenueFixSessionFactory` seam that replaced the #037
+    // stub); the gateway depends on `AppState`, never the reverse. Its bounded
+    // connection cap, per-session mailbox, and max-frame-length caps are the
+    // validated `[fix]` DoS controls, and the durable account-keyed session store
+    // resumes MsgSeqNum numbering across reconnects. A `watch` shutdown signal
+    // drains the in-flight sessions when the REST server returns (process shutdown).
     let fix_shutdown = if fix_config.enabled {
         let acceptor = FixAcceptor::bind(FixAcceptorConfig::from_config(&fix_config)).await?;
         let addr = acceptor.local_addr();
-        let factory = Arc::new(StubSessionFactory::new(Arc::clone(&state)));
+        // The account-keyed session store: in-memory by default (a future PG
+        // backend slots in behind the same `FixSessionStore` swap seam, exactly as
+        // the durable venue journal does, when `DATABASE_URL` is set).
+        let session_store: Arc<dyn FixSessionStore> = Arc::new(InMemoryFixSessionStore::new());
+        let factory = Arc::new(VenueFixSessionFactory::new(
+            Arc::clone(&state),
+            session_store,
+            SessionConfig::from_config(&fix_config),
+        ));
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(acceptor.serve(factory, shutdown_rx));
-        tracing::info!(
-            %addr,
-            "FIX 4.4 gateway enabled (stub dispatch; the session FSM is #038)"
-        );
+        tracing::info!(%addr, "FIX 4.4 gateway enabled (session FSM + logon auth)");
         Some(shutdown_tx)
     } else {
         tracing::info!("FIX 4.4 gateway disabled ([fix] enabled = false)");
