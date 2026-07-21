@@ -8,14 +8,17 @@
 //!
 //! [`FixSessionStore`] is the **swap seam**, the same shape #029 used for the
 //! per-underlying [`VenueJournal`](crate::exchange::VenueJournal): a synchronous
-//! trait the acceptor calls, with the [`InMemoryFixSessionStore`] as the **only
-//! backend wired today**. A PostgreSQL backend for process-restart persistence
-//! will drop in behind the identical contract (in-memory when `DATABASE_URL` is
-//! unset, PG when set), tracked as [#95](https://github.com/joaquinbejar/fauxchange/issues/95);
-//! this crate persists session state only across a *reconnect* (a new connection,
-//! same process), not a process restart. It is **separate** from
-//! the per-underlying `VenueEvent` journal: a session-sequence reset is a
-//! transport-level fact, not a book mutation ([ADR-0010 §5](../../../docs/adr/0010-fix-session-account-binding.md)).
+//! trait the acceptor calls, with two backends behind the identical contract —
+//! [`InMemoryFixSessionStore`] when `DATABASE_URL` is unset and, since
+//! [#95](https://github.com/joaquinbejar/fauxchange/issues/95),
+//! [`PgFixSessionStore`](super::PgFixSessionStore) (`src/gateway/fix/pg_store.rs`)
+//! when it is set, selected at boot by
+//! [`select_fix_session_store`](super::select_fix_session_store). The in-memory
+//! backend persists session state only across a *reconnect* (a new connection,
+//! same process); the PG backend adds **process-restart** durability. It is
+//! **separate** from the per-underlying `VenueEvent` journal: a session-sequence
+//! reset is a transport-level fact, not a book mutation
+//! ([ADR-0010 §5](../../../docs/adr/0010-fix-session-account-binding.md)).
 //!
 //! It mirrors IronFix's `MessageStore` contract (`store` / `get_range` / the
 //! next-sender/next-target counters / `reset`; `ironfix-store` ships only the
