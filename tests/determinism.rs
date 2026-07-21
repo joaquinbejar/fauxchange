@@ -49,7 +49,7 @@ use fauxchange::exchange::{
     InMemoryVenueJournal, JournalCommand, JournalError, JournalHeader, JournalRecord, LineageId,
     MarkPriceBook, MatchingExecutor, NoopFanOut, PositionsStore, RecordKind, STPMode,
     SequenceNumber, Side, StoreFanOut, Symbol, SymbolError, SymbolParser, TimeInForce, TopOfBook,
-    UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
+    UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, recover,
     validate_venue_expiry,
 };
 use fauxchange::{AccountId, OrderType, VenueError};
@@ -356,71 +356,13 @@ fn assert_replay_equals(recording: &Recording, replay: &Replay) {
 // ============================================================================
 // Recovery-as-re-execution (the integrity oracle)
 // ============================================================================
-
-/// Why a recovery run halted rather than resumed — the two fail-stop conditions of
-/// [ADR-0006 §3](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md).
-#[derive(Debug)]
-enum RecoveryHalt {
-    /// The journal's envelope schema is newer than the binary understands —
-    /// recovery refuses to start rather than mis-parse.
-    SchemaTooNew { found: String },
-    /// A stored `VenueEvent` diverged from its re-execution — the fixed
-    /// `JournalError::Corruption { underlying, sequence }` naming the exact
-    /// `(underlying, N)`.
-    Corruption(JournalError),
-}
-
-/// Recovery-as-re-execution: walk each underlying's stream in `N` order into a
-/// **fresh** registry, re-executing every `VenueCommand` and using the stored
-/// `VenueEvent` as the **integrity oracle** — not an apply source.
-///
-/// - a command with its paired event at `N` → re-execute, then assert the
-///   re-derived event **equals** the stored one; a mismatch **halts** with
-///   [`RecoveryHalt::Corruption`];
-/// - a command with **no** paired event at `N` (a crash between write-ahead and
-///   event append) → re-execute to **derive** the event (no stored event to
-///   compare against);
-/// - a journal whose header schema is newer than the binary → refuse to start
-///   with [`RecoveryHalt::SchemaTooNew`].
-fn recover<J: VenueJournal>(
-    journal: &J,
-    underlying: &str,
-) -> Result<Vec<VenueEvent>, RecoveryHalt> {
-    // Refuse a forward-incompatible journal BEFORE replaying anything.
-    let header = journal.header();
-    if !header.is_current_schema() {
-        return Err(RecoveryHalt::SchemaTooNew {
-            found: header.schema_version.clone(),
-        });
-    }
-    let lineage = header.lineage_id.clone();
-    let records = read_all(journal);
-    let mut executor = MatchingExecutor::new(underlying);
-    let mut recovered = Vec::new();
-
-    for jc in command_records_from(&records) {
-        let outcome = executor.execute(ExecutionContext {
-            underlying,
-            lineage_id: &lineage,
-            sequence: jc.sequence,
-            venue_ts: jc.venue_ts,
-            command: &jc.command,
-        });
-        let derived = VenueEvent::new(jc.sequence, jc.venue_ts, jc.command.clone(), outcome);
-        // The stored event (when present) is the integrity oracle, not an apply
-        // source: a mismatch halts, never a silent divergent resume.
-        if let Some(stored) = stored_event_at(&records, jc.sequence)
-            && stored != &derived
-        {
-            return Err(RecoveryHalt::Corruption(JournalError::Corruption {
-                underlying: underlying.to_string(),
-                sequence: jc.sequence,
-            }));
-        }
-        recovered.push(derived);
-    }
-    Ok(recovered)
-}
+//
+// The recovery reducer is now PRODUCTION code — `fauxchange::exchange::recover`
+// ([`src/exchange/recovery.rs`], #029) — returning the typed `JournalError`
+// (`Corruption` and the newer-than-binary `SchemaTooNew`), replacing the v0.1
+// test-local `RecoveryHalt` halt with the real production error the ADR obligated
+// #029 to introduce. The fixtures below build the journals it walks; the
+// assertions live in section 3.
 
 // ============================================================================
 // Journal helpers
@@ -456,13 +398,6 @@ fn command_records_from(records: &[JournalRecord]) -> Vec<&JournalCommand> {
         .collect();
     commands.sort_by_key(|command| command.sequence);
     commands
-}
-
-fn stored_event_at(records: &[JournalRecord], sequence: SequenceNumber) -> Option<&VenueEvent> {
-    records.iter().find_map(|record| match record {
-        JournalRecord::Event(event) if event.underlying_sequence == sequence => Some(event),
-        _ => None,
-    })
 }
 
 /// Rebuilds a recording's journal, replacing the stored EVENT at `target` with a
@@ -700,7 +635,7 @@ fn test_actor_journal_and_harness_record_agree() {
 
     // And recovery over the actor's own journal reconstructs those events.
     match recover(actor.journal(), UNDERLYING) {
-        Ok(recovered) => assert_eq!(recovered, actor_events),
+        Ok(recovered) => assert_eq!(recovered.events, actor_events),
         Err(e) => panic!("recovery over a clean actor journal failed: {e:?}"),
     }
 }
@@ -881,7 +816,7 @@ fn test_recovery_reexecutes_clean_journal_to_events_equal_to_stored() {
     let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
     match recover(&recording.journal, UNDERLYING) {
         Ok(recovered) => assert_eq!(
-            recovered, recording.events,
+            recovered.events, recording.events,
             "recovery re-executes a clean journal to events equal to the stored ones"
         ),
         Err(e) => panic!("recovery of a clean journal must not halt: {e:?}"),
@@ -899,10 +834,10 @@ fn test_recovery_halts_on_corrupted_stored_event_with_exact_underlying_and_seque
     let corrupted = corrupt_event_at(&recording, target);
 
     match recover(&corrupted, UNDERLYING) {
-        Err(RecoveryHalt::Corruption(JournalError::Corruption {
+        Err(JournalError::Corruption {
             underlying,
             sequence,
-        })) => {
+        }) => {
             assert_eq!(
                 underlying, UNDERLYING,
                 "the halt names the exact underlying"
@@ -923,7 +858,7 @@ fn test_recovery_derives_event_for_tail_command_with_no_paired_event() {
     let journal = drop_tail_event(&recording);
     match recover(&journal, UNDERLYING) {
         Ok(recovered) => assert_eq!(
-            recovered, recording.events,
+            recovered.events, recording.events,
             "a tail command with no paired event re-executes to derive the identical event"
         ),
         Err(e) => panic!("recovery of a tail-command-only journal must not halt: {e:?}"),
@@ -937,7 +872,7 @@ fn test_recovery_refuses_a_newer_than_binary_schema() {
     let newer = with_newer_schema(&recording);
 
     match recover(&newer, UNDERLYING) {
-        Err(RecoveryHalt::SchemaTooNew { found }) => assert_eq!(found, "venue.v2"),
+        Err(JournalError::SchemaTooNew { found }) => assert_eq!(found, "venue.v2"),
         other => panic!("expected a SchemaTooNew refusal, got {other:?}"),
     }
 }
@@ -998,7 +933,7 @@ fn test_pre_execution_append_failure_reuses_sequence_and_replay_is_gapless() {
     let clean = record(&[committed], &lineage, &[sym(CALL)]);
     match recover(actor.journal(), UNDERLYING) {
         Ok(recovered) => assert_eq!(
-            recovered, clean.events,
+            recovered.events, clean.events,
             "a pre-exec append failure reused N with no gap; replay reconstructs identically"
         ),
         Err(e) => panic!("recovery after a pre-exec fault must not halt: {e:?}"),
@@ -1060,10 +995,11 @@ fn test_post_mutation_append_failure_seals_and_restart_reexecutes_to_identical_e
         Err(e) => panic!("recovery after a post-mutation seal must not halt: {e:?}"),
     };
     assert_eq!(
-        recovered, clean.events,
+        recovered.events, clean.events,
         "the post-mutation seal leaves a tail command; restart re-executes to the identical event"
     );
     let event = recovered
+        .events
         .iter()
         .find(|event| event.underlying_sequence == SequenceNumber::new(1))
         .expect("a derived event at the tail sequence");
@@ -1133,7 +1069,7 @@ fn test_ioc_order_that_fills_and_errs_is_journaled_with_fills_and_replays() {
     // Replay and recovery reconstruct the identical lossless event.
     assert_replay_equals(&recording, &replay(&recording));
     match recover(&recording.journal, UNDERLYING) {
-        Ok(recovered) => assert_eq!(recovered, recording.events),
+        Ok(recovered) => assert_eq!(recovered.events, recording.events),
         Err(e) => panic!("recovery of the IOC-error journal must not halt: {e:?}"),
     }
 }
@@ -1183,7 +1119,7 @@ fn test_partial_replace_replays_identically() {
     assert_replay_equals(&recording, &replay(&recording));
     match recover(&recording.journal, UNDERLYING) {
         Ok(recovered) => assert_eq!(
-            recovered, recording.events,
+            recovered.events, recording.events,
             "a partial replace replays identically"
         ),
         Err(e) => panic!("recovery of the partial-replace journal must not halt: {e:?}"),

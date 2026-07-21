@@ -73,7 +73,7 @@ use crate::auth::{
     AccountProvision, AccountRegistry, AccountStore, Argon2Hasher, AuthError, AuthService,
     BootstrapGate, DEFAULT_RATE_LIMIT_PER_WINDOW, JwtAuth, RateLimiter, RevocationOracle,
 };
-use crate::db::DatabasePool;
+use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
     ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, InMemoryExecutionsStore,
@@ -116,6 +116,24 @@ pub const DEFAULT_LINEAGE_TOKEN: &str = "fauxchange";
 /// while cheap: each tick is a single atomic store **off** the sequenced path — no
 /// journal append, no book mutation. The live value becomes venue config (#046).
 pub const DEFAULT_CLOCK_CADENCE: Duration = Duration::from_millis(250);
+
+/// A failure assembling an [`AppState`] — the two fallible boot steps: building
+/// auth ([`AuthError`]) and opening the durable journal store when `DATABASE_URL` is
+/// set ([`DbError`]). Both carry only non-secret detail (the `DbError` `Display` is
+/// a redacted operation label; the `DATABASE_URL` is never logged or surfaced).
+#[derive(Debug, thiserror::Error)]
+pub enum AppStateError {
+    /// Auth could not be built (dev fixtures failed to parse, a provisioned password
+    /// could not be hashed, or two accounts collided on an id / FIX username).
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    /// The durable journal store could not be opened for an underlying (a header
+    /// row could not be ensured or read back, the **persisted header disagreed**
+    /// with this run's lineage/schema, or the venue was assembled outside a tokio
+    /// runtime). Only reachable when `DATABASE_URL` is set.
+    #[error(transparent)]
+    Db(#[from] DbError),
+}
 
 // ============================================================================
 // Construction parameters
@@ -367,7 +385,7 @@ impl AppStateConfig {
 ///
 /// ```rust,no_run
 /// use fauxchange::state::{AppState, AppStateConfig};
-/// # fn main() -> Result<(), fauxchange::auth::AuthError> {
+/// # fn main() -> Result<(), fauxchange::state::AppStateError> {
 /// // Must be called within a `tokio` runtime — it spawns one actor per underlying.
 /// // Auth defaults to the embedded dev key pair when the config carries none.
 /// let state = AppState::new(AppStateConfig::new(["BTC", "ETH"]))?;
@@ -529,11 +547,13 @@ impl AppState {
     ///
     /// # Errors
     ///
-    /// [`AuthError`] if auth cannot be built: the embedded dev fixtures fail to
-    /// parse ([`AuthError::KeyLoad`]), a provisioned password cannot be hashed
-    /// ([`AuthError::PasswordHash`]), or two accounts collide on an id or FIX
-    /// username ([`AuthError::Provisioning`]).
-    pub fn new(config: AppStateConfig) -> Result<Arc<Self>, AuthError> {
+    /// [`AppStateError::Auth`] if auth cannot be built: the embedded dev fixtures
+    /// fail to parse ([`AuthError::KeyLoad`]), a provisioned password cannot be
+    /// hashed ([`AuthError::PasswordHash`]), or two accounts collide on an id or FIX
+    /// username ([`AuthError::Provisioning`]). [`AppStateError::Db`] if
+    /// `DATABASE_URL` is set but a per-underlying durable journal store cannot be
+    /// opened (its header row cannot be ensured).
+    pub fn new(config: AppStateConfig) -> Result<Arc<Self>, AppStateError> {
         let AppStateConfig {
             underlyings,
             lineage_id,
@@ -606,9 +626,6 @@ impl AppState {
                 continue;
             }
 
-            // Each actor owns its own append-only journal, keyed on the shared
-            // lineage so re-derived ids stay in one namespace.
-            let journal = InMemoryVenueJournal::new(JournalHeader::new(lineage_id.clone()));
             // The fan-out tees the committed event into BOTH the shared stores
             // (`StoreFanOut`, #008) and the WS market-data broadcast (`WsFanOut`,
             // #014) — one post-journal event, two consumers, neither on the
@@ -625,15 +642,40 @@ impl AppState {
             );
             let actor_config =
                 ActorConfig::new(Arc::clone(&ticker), lineage_id.clone(), mailbox_capacity);
+            let header = JournalHeader::new(lineage_id.clone());
 
-            let (handle, join) = spawn_matching_actor_with_registry_and_index(
-                actor_config,
-                journal,
-                fan_out,
-                clock.clone(),
-                Arc::clone(&registry),
-                Arc::clone(&symbol_index),
-            );
+            // Swap the STORE, not the contract: when `DATABASE_URL` is set the actor
+            // writes its append-only journal through the durable `PgVenueJournal`
+            // (#029); otherwise through the in-memory `InMemoryVenueJournal`. Both
+            // implement the SAME `VenueJournal` trait, so the actor's write-ahead
+            // turn discipline is identical. Each stream is keyed on the shared
+            // lineage so re-derived ids stay in one namespace. Boot-time resume of a
+            // non-empty durable journal (re-execution into the running venue) is the
+            // replay driver (#030); a fresh boot persists durably going forward.
+            let (handle, join) = match db.as_ref() {
+                Some(pool) => {
+                    let journal = PgVenueJournal::open(pool, ticker.as_ref(), header)?;
+                    spawn_matching_actor_with_registry_and_index(
+                        actor_config,
+                        journal,
+                        fan_out,
+                        clock.clone(),
+                        Arc::clone(&registry),
+                        Arc::clone(&symbol_index),
+                    )
+                }
+                None => {
+                    let journal = InMemoryVenueJournal::new(header);
+                    spawn_matching_actor_with_registry_and_index(
+                        actor_config,
+                        journal,
+                        fan_out,
+                        clock.clone(),
+                        Arc::clone(&registry),
+                        Arc::clone(&symbol_index),
+                    )
+                }
+            };
             // Detach: the actor's shutdown is its mailbox closing when this handle
             // drops with `AppState`; the mailbox drains its backlog first.
             drop(join);

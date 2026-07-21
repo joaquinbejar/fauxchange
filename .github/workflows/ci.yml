@@ -246,6 +246,12 @@ jobs:
       # same file already ran in the `test` job. Migrations apply cleanly against
       # `postgres:18-alpine` inside the test (via `connect_and_migrate`).
       - run: cargo test --test db --all-features -- --ignored
+      # The durable venue-journal integration tests (#029) are `#[ignore]`d for
+      # the same reason — they spin their OWN ephemeral `postgres:18-alpine`
+      # via `testcontainers`, apply the journal migration, and exercise the
+      # durable append / recovery-by-re-execution / sequence-continuity paths.
+      # The DB-less clock/cadence tests in the same file already ran in `test`.
+      - run: cargo test --test integration --all-features -- --ignored
 
   # --- Supply-chain gate (docs/08-threat-model.md §8) -----------------------
   # Both jobs install the REAL cargo-audit / cargo-deny binaries (pinned

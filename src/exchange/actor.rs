@@ -480,9 +480,15 @@ where
                     WriteAhead::Reuse
                 }
             }
+            // Any confirmed-not-committed / integrity failure reuses `N` (nothing
+            // executed, book untouched). `SchemaTooNew` / `Backend` / `Corruption`
+            // are never returned on the durable append path, but the match stays
+            // exhaustive and conservative — an unexpected failure never advances.
             Err(JournalError::AppendFailed(_))
             | Err(JournalError::Conflict { .. })
-            | Err(JournalError::Corruption { .. }) => WriteAhead::Reuse,
+            | Err(JournalError::Corruption { .. })
+            | Err(JournalError::SchemaTooNew { .. })
+            | Err(JournalError::Backend { .. }) => WriteAhead::Reuse,
         }
     }
 }
