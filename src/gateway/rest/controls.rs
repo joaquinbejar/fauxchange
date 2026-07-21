@@ -239,7 +239,7 @@ pub async fn toggle_instrument(
     // resume-an-`Expired`) is a journaled `Rejected` the registry produced, surfaced
     // as a typed `409` (`InstrumentHalted`) rather than a false `success:true`.
     match &receipt.outcome {
-        Some(VenueOutcome::Rejected { reason }) => {
+        Some(VenueOutcome::Rejected { reason, .. }) => {
             Err(VenueError::InstrumentHalted(reason.clone()))
         }
         _ => Ok(Json(InstrumentToggleResponse {

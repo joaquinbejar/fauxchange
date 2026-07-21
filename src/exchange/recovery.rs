@@ -307,7 +307,7 @@ fn stored_event_at(records: &[JournalRecord], sequence: SequenceNumber) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::envelope::{VenueCommand, VenueOutcome};
+    use crate::exchange::envelope::{RejectKind, VenueCommand, VenueOutcome};
     use crate::exchange::event::EventTimestamp;
     use crate::exchange::identity::{JournalHeader, VENUE_ENVELOPE_SCHEMA};
     use crate::exchange::journal::{InMemoryVenueJournal, VenueJournal};
@@ -430,9 +430,7 @@ mod tests {
                 SequenceNumber::new(0),
                 TS,
                 command,
-                VenueOutcome::Rejected {
-                    reason: "corrupted-by-test".to_string(),
-                },
+                VenueOutcome::rejected(RejectKind::Internal, "corrupted-by-test"),
             )))
             .expect("append corrupted event");
 

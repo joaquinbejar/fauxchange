@@ -17,9 +17,9 @@ use fauxchange::exchange::FanOut;
 use fauxchange::exchange::{
     AddOutcome, CancelReason, CancelledLeg, Cents, EventTimestamp, ExecutionsStore,
     Fill as VenueFill, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore, JournalRecord,
-    LineageId, MarkPriceBook, PositionsStore, SequenceNumber, Side as SeamSide, SignedCents,
-    SnapshotRestored, StoreFanOut, Symbol, TimeInForce as SeamTif, VenueCommand, VenueEvent,
-    VenueOutcome,
+    LineageId, MarkPriceBook, PositionsStore, RejectKind, SequenceNumber, Side as SeamSide,
+    SignedCents, SnapshotRestored, StoreFanOut, Symbol, TimeInForce as SeamTif, VenueCommand,
+    VenueEvent, VenueOutcome,
 };
 use fauxchange::{
     AccountId, BookSide, BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, ClientOrderId,
@@ -1067,9 +1067,10 @@ fn test_golden_venue_replace_partial_event() {
     };
     let outcome = VenueOutcome::Replace {
         cancelled: true,
-        add: AddOutcome::Rejected {
-            reason: "order was not fillable and did not rest".to_string(),
-        },
+        add: AddOutcome::rejected(
+            RejectKind::NotFillable,
+            "order was not fillable and did not rest",
+        ),
     };
     let event = VenueEvent::new(
         seq,

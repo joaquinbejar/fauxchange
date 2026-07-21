@@ -32,7 +32,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::exchange::{MoneyError, SymbolError};
+use crate::exchange::{MoneyError, RejectKind, SymbolError};
 use crate::models::Permission;
 use crate::simulation::ReplayError;
 
@@ -49,6 +49,19 @@ pub const WS_ERROR_SCHEMA: &str = "ws-error.v1";
 /// The redacted client-facing message for an internal failure. Never carries
 /// internal state, a cause chain, or a secret.
 pub const REDACTED_INTERNAL_MESSAGE: &str = "internal error";
+
+/// The uniform, client-safe message a cancel/replace reject surfaces on REST when
+/// the referenced order cannot be cancelled — collapsing not-found / not-owner /
+/// already-gone into ONE indistinguishable reply so the reject is never a
+/// cross-account existence/ownership enumeration oracle (BOLA/IDOR, #132/#118).
+///
+/// `VenueOrderId`s are minted deterministically, so a distinct not-owner vs
+/// not-found reply would let an authenticated caller enumerate which ids hold a
+/// live resting order owned by another account. The true [`RejectKind`] (especially
+/// [`RejectKind::NotOwner`]) stays internal — the gateway journals + traces it as a
+/// detective control, never on the wire. The FIX surface uses its own `Text (58)`
+/// idiom for the same mask.
+pub const CANCEL_REJECT_MASKED_REASON: &str = "order not found or not cancellable";
 
 /// Retry-after hint for a throttled request, in milliseconds — the venue's
 /// sliding rate-limit window ([03 §6.1](../docs/03-protocol-surfaces.md)).
@@ -270,6 +283,52 @@ impl VenueError {
             schema: REST_ERROR_SCHEMA.to_string(),
             code: self.machine_code().to_string(),
             message: self.redacted_message(),
+        }
+    }
+
+    /// The CLIENT-FACING error for a cancel/replace whose sequenced outcome was a
+    /// captured [`VenueOutcome::Rejected`](crate::exchange::VenueOutcome::Rejected),
+    /// keyed on the TYPED [`RejectKind`] — never a string-match of the human reason
+    /// (#132).
+    ///
+    /// The authorization-sensitive existence kinds ([`RejectKind::NotOwner`] /
+    /// [`RejectKind::NotFound`] / [`RejectKind::NotResting`]) collapse to ONE
+    /// indistinguishable not-found reject carrying `masked_reason`, so an
+    /// authenticated caller cannot tell a live order owned by another account from a
+    /// nonexistent id (the BOLA/IDOR mask). `masked_reason` is the surface's own
+    /// client-safe text (REST uses [`CANCEL_REJECT_MASKED_REASON`]; FIX uses its
+    /// `Text (58)` idiom) — never the internal `reason`.
+    ///
+    /// The remaining kinds are not reachable as a *top-level* cancel/replace reject
+    /// from a well-formed gateway request (the gateway validates the symbol before
+    /// submit and never gates a cancel on instrument status), so they render
+    /// defensively as their natural error and [`RejectKind::Internal`]'s cause is
+    /// redacted.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fauxchange::VenueError;
+    /// use fauxchange::exchange::RejectKind;
+    /// // not-owner and not-found are byte-identical at the client boundary.
+    /// let owner = VenueError::masked_cancel_reject(RejectKind::NotOwner, "unknown order");
+    /// let found = VenueError::masked_cancel_reject(RejectKind::NotFound, "unknown order");
+    /// assert_eq!(owner.http_status(), found.http_status());
+    /// assert_eq!(owner.redacted_message(), found.redacted_message());
+    /// ```
+    #[must_use]
+    pub fn masked_cancel_reject(kind: RejectKind, masked_reason: &str) -> VenueError {
+        match kind {
+            RejectKind::NotFound | RejectKind::NotOwner | RejectKind::NotResting => {
+                VenueError::NotFound(masked_reason.to_string())
+            }
+            RejectKind::InstrumentNotActive => {
+                VenueError::InstrumentHalted(masked_reason.to_string())
+            }
+            RejectKind::InvalidOrder | RejectKind::NotFillable => {
+                VenueError::InvalidOrder(masked_reason.to_string())
+            }
+            RejectKind::Internal => VenueError::JournalUnavailable,
         }
     }
 
@@ -988,6 +1047,58 @@ mod tests {
         assert_eq!(reject.kind.msg_type(), "9");
         assert_eq!(reject.kind.reason_field_tag(), 102);
         assert_eq!(reject.reason, FixRejectReason::Authorization);
+    }
+
+    // ---- masked cancel/replace reject (BOLA/IDOR mask, #132) ---------------
+
+    /// The three authorization-sensitive existence kinds render **byte-identically**
+    /// to the client across HTTP, the REST envelope, the FIX reject, and the WS
+    /// envelope — so a not-owner reject is indistinguishable from a not-found one.
+    #[test]
+    fn test_masked_cancel_reject_existence_kinds_are_byte_identical() {
+        let masked_reason = CANCEL_REJECT_MASKED_REASON;
+        let rejects: Vec<VenueError> = [
+            RejectKind::NotOwner,
+            RejectKind::NotFound,
+            RejectKind::NotResting,
+        ]
+        .into_iter()
+        .map(|kind| VenueError::masked_cancel_reject(kind, masked_reason))
+        .collect();
+        // Every rendering is identical to the not-found baseline.
+        let baseline = &rejects[0];
+        for reject in &rejects {
+            assert_eq!(reject.http_status(), baseline.http_status());
+            assert_eq!(reject.machine_code(), baseline.machine_code());
+            assert_eq!(reject.redacted_message(), baseline.redacted_message());
+            assert_eq!(reject.error_envelope(), baseline.error_envelope());
+            assert_eq!(
+                reject.fix_reject(FixRejectContext::CancelReplace),
+                baseline.fix_reject(FixRejectContext::CancelReplace)
+            );
+            assert_eq!(reject.ws_error(None), baseline.ws_error(None));
+        }
+        // The baseline is a not-found: FIX CxlRejReason category is NotFound (→ 102=1).
+        assert_eq!(baseline.http_status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            baseline.fix_reject(FixRejectContext::CancelReplace).reason,
+            FixRejectReason::NotFound
+        );
+    }
+
+    /// The mask keys on the TYPED [`RejectKind`], not the human reason string — the
+    /// masked wire text is exactly the supplied masked reason, never the executor's
+    /// internal reason, so refactoring that string cannot change the mask.
+    #[test]
+    fn test_masked_cancel_reject_uses_masked_reason_not_internal_reason() {
+        let masked = VenueError::masked_cancel_reject(RejectKind::NotOwner, "unknown order");
+        match masked {
+            VenueError::NotFound(text) => {
+                assert_eq!(text, "unknown order");
+                assert!(!text.contains("does not own"));
+            }
+            other => panic!("a masked not-owner cancel reject must be a NotFound, got {other:?}"),
+        }
     }
 
     #[test]

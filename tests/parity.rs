@@ -2241,6 +2241,56 @@ async fn test_order_entry_parity_uncancellable_cancel_masks_reason_on_rest_and_f
     }
 }
 
+#[tokio::test]
+async fn test_order_entry_parity_uncancellable_replace_masks_reason_on_fix() {
+    // #132: the masking extends to the REPLACE (`G`) path, not just cancel. A replace
+    // the order path refuses (here an already-gone original) is an observed
+    // `VenueOutcome::Rejected` rendered as a masked `OrderCancelReject (9)` — keyed on
+    // the TYPED RejectKind — with the UNIFORM `Text (58)` + `CxlRejReason (102) = 1`,
+    // never revealing not-found vs not-owner vs already-gone (a cross-account oracle).
+    let harness = cfix::FixParityHarness::start().await;
+    let mut maker = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let mut taker = cfix::FixClient::logon(harness.addr(), cfix::TRADER2).await;
+    // trader-1 rests a sell; trader-2 fully crosses it, so trader-1's order is gone.
+    let _ = maker.place_limit("rmask-maker", "2", 50_000, 2, "1").await;
+    let _ = taker.place_limit("rmask-taker", "1", 50_000, 2, "1").await;
+    // trader-1 REPLACES its now-filled (gone) order → observed Rejected → masked `9`.
+    let reply = maker
+        .replace("rmask-maker", "rmask-rpl", "2", 50_100, 2)
+        .await;
+    assert!(
+        !cfix::any_msg_type(&reply, "3"),
+        "a replace reject is never a session Reject(3)"
+    );
+    let r9 = match cfix::find_msg(&reply, "9") {
+        Some(r9) => r9,
+        None => panic!(
+            "a replace of an uncancellable order must be an OrderCancelReject(9), got {reply:?}"
+        ),
+    };
+    assert_eq!(
+        cfix::field(r9, "434").as_deref(),
+        Some("2"),
+        "CxlRejResponseTo is OrderCancelReplaceRequest (2)"
+    );
+    assert_eq!(
+        cfix::field(r9, "102").as_deref(),
+        Some("1"),
+        "CxlRejReason is the uniform Unknown order (masked), never a per-reason code"
+    );
+    if let Some(text) = cfix::field(r9, "58") {
+        let lowered = text.to_lowercase();
+        assert!(
+            lowered.contains("unknown order"),
+            "the replace reject carries the uniform masked reason, got {text:?}"
+        );
+        assert!(
+            !lowered.contains("does not own") && !lowered.contains("not resting"),
+            "the replace reject must not reveal not-owner / already-gone, got {text:?}"
+        );
+    }
+}
+
 /// An `AddOrder` whose STP-configured book cancels one resting leg — the STP-outcome
 /// shape, parameterised by the aggressor / resting order ids so two per-surface
 /// events can be built that differ only in the stripped ids.

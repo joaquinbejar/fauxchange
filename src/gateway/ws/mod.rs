@@ -782,7 +782,7 @@ impl Connection {
             //     underlyings, not others) is reported rather than hidden — mirroring the
             //     REST control response.
             Ok(receipt) => match &receipt.outcome {
-                Some(VenueOutcome::Rejected { reason }) => {
+                Some(VenueOutcome::Rejected { reason, .. }) => {
                     WsMessage::Error(VenueError::InvalidOrder(reason.clone()).ws_error(request_id))
                 }
                 _ => {

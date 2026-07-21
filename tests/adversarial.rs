@@ -39,8 +39,8 @@ use fauxchange::config::{ConfigError, SeedManifest};
 use fauxchange::exchange::{
     ActorConfig, Cents, EventTimestamp, FixedClock, Hash32, InMemoryVenueJournal, JournalError,
     JournalHeader, JournalRecord, LineageId, MAX_JOURNAL_RECORD_BYTES, MatchingExecutor,
-    NoopFanOut, STPMode, SequenceNumber, Side, TimeInForce, UnderlyingActor, VenueCommand,
-    VenueEvent, VenueJournal, VenueOutcome, decode_journal_record,
+    NoopFanOut, RejectKind, STPMode, SequenceNumber, Side, TimeInForce, UnderlyingActor,
+    VenueCommand, VenueEvent, VenueJournal, VenueOutcome, decode_journal_record,
 };
 use fauxchange::models::AccountId;
 use fauxchange::simulation::{
@@ -408,9 +408,7 @@ fn test_bundle_corpus_tampered_event_halts_with_journal_corruption() {
                     event.underlying_sequence,
                     event.venue_ts,
                     event.command.clone(),
-                    VenueOutcome::Rejected {
-                        reason: "tampered-on-disk".to_string(),
-                    },
+                    VenueOutcome::rejected(RejectKind::Internal, "tampered-on-disk"),
                 );
             }
         }
@@ -507,9 +505,7 @@ fn test_hostile_stream_yields_no_partial_replay_report() {
                 event.underlying_sequence,
                 event.venue_ts,
                 event.command.clone(),
-                VenueOutcome::Rejected {
-                    reason: "tampered".to_string(),
-                },
+                VenueOutcome::rejected(RejectKind::Internal, "tampered"),
             );
         }
     }
