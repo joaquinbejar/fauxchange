@@ -11,6 +11,71 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The FIX 4.4 TCP acceptor — the raw-TCP accept loop, per-connection
+  lifecycle, and DoS controls over IronFix's `FixCodec`** (#37) in the new
+  `src/gateway/fix/acceptor.rs`, the `[fix]` config section
+  (`src/config.rs`), the `main.rs` gateway wiring, and `tests/fix_acceptor.rs`
+  ([037](milestones/v0.4-fix-gateway/037-fix-tcp-acceptor-codec.md),
+  [03 §5 / §5.1](docs/03-protocol-surfaces.md#5-fix-44-gateway-new),
+  [ADR-0002](docs/adr/0002-fix-4-4-gateway-on-ironfix.md),
+  [08 §4 / §5](docs/08-threat-model.md#4-untrusted-input-hardening)). IronFix
+  ships **no** acceptor — `ironfix-transport` has the `FixCodec` framing codec
+  only, no TCP listener — so the accept loop, the per-connection tokio task, and
+  the connection lifecycle are new venue work. **The pipe**: `TcpListener::accept`
+  → one task per connection → the read half is framed by a venue
+  `BoundedFrameDecoder` (around `FixCodec`) and each complete frame decodes into
+  the #036 typed messages at a **dispatch seam** (`FixSession` / `FixSessionFactory`)
+  where the #038 session FSM plugs in; the seam callbacks are **async** (RPITIT
+  `impl Future + Send`, no `async-trait` box) so #038's Argon2id logon verify and
+  registry lookup never block a tokio worker. #037 ships a logging stub reaching
+  the venue through `Arc<AppState>`. Reply frames flow through a **bounded**
+  outbound `mpsc` a dedicated writer task drains. **The DoS controls, wired as
+  security controls from the first commit** ([08 §5](docs/08-threat-model.md#5-denial-of-service-posture)):
+  a venue **connection cap** (the N+1th connection is refused, not queued); a
+  **bounded per-session mailbox** (a full mailbox latches a typed busy and closes
+  the session, never an unbounded queue); a **max-frame-length** cap enforced at
+  the framing boundary; a **read-idle timeout** (`[fix] idle_timeout_secs`,
+  default `30`s) closing a silent connection so a Slowloris of idle sockets cannot
+  pin the connection cap (connection hygiene this issue owns; refined by #038's
+  negotiated heartbeat); and a boot-validated ceiling on the
+  `connection_cap × max_frame_bytes` **product** (`<= 1 GiB` aggregate). **Two
+  `ironfix` unchecked-arithmetic panics are closed venue-side** at the framing
+  boundary (both the framing-layer analogue of #036's `validate_body_length`, both
+  no-panic in debug **and** release): the `BoundedFrameDecoder` pre-checks the
+  declared `BodyLength (9)` against `max_frame_bytes` before `FixCodec`'s unchecked
+  `... + body_length + 7` add, **and** pre-validates a complete frame's
+  `CheckSum (10)` as a **magnitude `<= 255`** (the u8 domain of a real `sum % 256`
+  checksum) before `ironfix-tagvalue`'s `parse_checksum` folds `d0*100 + d1*10 + d2`
+  into a `u8` — that fold overflows for the **whole `256..=999` band**, not just a
+  hundreds digit `>= 3`, so the guard parses the three digits with widening `u16`
+  arithmetic (it cannot itself overflow) and rejects any value `> 255`, boundary-exact
+  (`255` still flows to `FixCodec`'s real sum check, `256` is rejected). No panic on
+  the entire `000..=999` checksum input space. Both guards surface a typed
+  `FrameError` and close the session with no unbounded allocation. (A follow-up
+  contract gap is documented at the `FixSession` seam for #038: the acceptor does not
+  yet bound/cancel an in-flight async `on_message`/`on_decode_error` — harmless with
+  the instant #037 stub, but #038's Argon2id-verifying dispatch must be bounded so a
+  stall cannot hold a slot past the idle timeout.) **Graceful shutdown** over a
+  `watch` signal drains
+  the in-flight sessions with no task leak (a live-session gauge witnesses churn
+  stays flat). `tracing` spans/events carry the peer address and message-**type** /
+  error-**kind** only — **never** a frame payload or a decoded field (a `Logon`
+  `Password (554)` is never logged; asserted by a captured-subscriber test). **The
+  `[fix]` config section** (`enabled` / `connection_cap` / `mailbox_depth` /
+  `max_frame_bytes` / `idle_timeout_secs`, on `deny_unknown_fields`) has its
+  DoS-control ranges **and their aggregate product validated at boot** (a typed
+  `ConfigError::BadFixValue` on an out-of-range or over-aggregate value); the
+  gateway is **disabled by default** (opt-in until the session FSM #038, order
+  routing #039, and market data #040 land) and `main.rs` spawns it only when
+  enabled. **New dependencies** (all published, `cargo audit` + `cargo
+  deny` green): `ironfix-transport` `0.3` (the `FixCodec` framing codec — the one
+  new crate edge; its whole dependency tree was already resolved), and the
+  promotion of the already-in-tree `tokio-util` `0.7` (`codec` feature, the
+  `Decoder` trait) and `bytes` `1` (the framing buffer) from transitive to direct
+  (zero new resolved versions), plus the tokio `io-util` feature for the manual
+  socket read/write loop (no `futures-util` `Framed` dependency). The session FSM,
+  logon auth, sequence store, order routing, and market data build on this seam
+  (#038–#040).
 - **The FIX 4.4 typed message vocabulary and the pinned `fauxchange.fix44.v1`
   dialect — the first v0.4 (FIX gateway) work** (#36) in the new
   `src/gateway/fix/` module tree, `tests/golden/fix/`, `tests/golden_fix.rs`,

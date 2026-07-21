@@ -35,9 +35,20 @@ option-chain-orderbook = { version = "0.7", features = ["sequencer"] }
 # mailbox); #013 runs the live REST server and the periodic rate-limit
 # `sweep_expired` task, so the feature set grows to what serving needs:
 #   - `rt-multi-thread` — the binary's multi-thread runtime (`main.rs`).
-#   - `net`             — `TcpListener` for `axum::serve`.
+#   - `net`             — `TcpListener` for `axum::serve` AND the FIX acceptor's
+#     `TcpListener` / `TcpStream::into_split` (#037).
 #   - `time`            — `tokio::time::interval` driving the bounded
 #     `RateLimiter::sweep_expired` reclaim task (#011 seam obligation).
+#   - `io-util`         — `AsyncReadExt::read_buf` / `AsyncWriteExt::write_all`
+#     for the FIX per-connection task's manual read/write loop over the split
+#     `TcpStream` halves (#037). The acceptor deliberately does NOT wrap the
+#     socket in a `tokio_util::codec::Framed`: it splits the connection into owned
+#     read/write halves and runs a dedicated writer task draining the bounded
+#     outbound mailbox, which fits the per-session lifecycle (bounded backpressure,
+#     graceful/aborted drain) better than a single `Framed` sink/stream. It feeds
+#     `FixCodec` (a `tokio_util::codec::Decoder`) a bounded `BytesMut` directly and
+#     writes pre-framed bytes back. Still a feature flag on the already-present
+#     tokio 1.
 # Still no new crate — these are feature flags on the already-present tokio 1.
 tokio = { version = "1", default-features = false, features = [
     "rt",
@@ -46,6 +57,7 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
     "net",
     "time",
+    "io-util",
 ] }
 # Needed directly only to name `OptionStyle` / `ExpirationDate`: upstream
 # `option-chain-orderbook` v0.7.0 does not re-export them, so they must come
@@ -269,6 +281,38 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 ironfix-core = "0.3"
 ironfix-tagvalue = "0.3"
 ironfix-dictionary = "0.3"
+# The FIX 4.4 acceptor's framing codec (#037). `ironfix-transport::FixCodec` is a
+# `tokio_util::codec::Decoder`/`Encoder` that frames a FIX message on the wire
+# (BeginString / BodyLength / CheckSum), reused as-is
+# ([03 §5.1](docs/03-protocol-surfaces.md#5-fix-44-gateway-new), [ADR-0002](docs/adr/0002-fix-4-4-gateway-on-ironfix.md));
+# IronFix ships NO TCP acceptor, so the accept loop, the per-connection task, and
+# the connection lifecycle are new venue work over this codec. Published on
+# crates.io at `0.3.0` (verified `cargo add ironfix-transport@0.3 --dry-run`
+# resolves against the crates.io sparse index; `deny.toml [sources]` allows ONLY
+# that registry — no git / path dep). Audit note: `ironfix-transport` 0.3.0's own
+# dependencies — `ironfix-core`, `ironfix-tagvalue`, `thiserror`, `tokio`,
+# `tokio-util`, `bytes`, `memchr`, `tracing` — are ALL already resolved in the
+# tree (verified against `Cargo.lock`), so it adds only the one new crate edge,
+# no new transitive crate version. `fauxchange` consumes only its `codec` module
+# (`FixCodec` / `CodecError`); the (skeleton) `ironfix-session` / `ironfix-store`
+# crates land with #038. MIT, maintained by the joaquinbejar/IronFix project.
+ironfix-transport = "0.3"
+# `tokio_util::codec::Decoder` — the trait `FixCodec` (above) implements and the
+# venue's bounded frame decoder (`src/gateway/fix/acceptor.rs`) wraps to pre-check
+# the declared `BodyLength (9)` before delegating (#037). Only the `codec` feature
+# is enabled (the `Decoder`/`Encoder` traits + the `BytesMut` framing buffer). Audit
+# note: `tokio-util` 0.7.18 is ALREADY resolved in the tree (via `sqlx`), so naming
+# it as a direct dependency at `0.7` adds NO new crate version — the same
+# "already in the tree, adds no new version" precedent as `serde_json` / `tower`.
+# MIT, maintained by the tokio project; `cargo audit` / `cargo deny` gate it.
+tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
+# `bytes::BytesMut` — the growable byte buffer the `tokio_util::codec::Decoder`
+# signature takes (`decode(&mut BytesMut)`) and the FIX acceptor's per-connection
+# read buffer (#037). Audit note: `bytes` 1.x is ALREADY resolved in the tree
+# (via `tokio` / `axum` / `sqlx` / `ironfix-tagvalue`), so naming it directly at
+# `1` adds NO new crate version. MIT, maintained by the tokio project; `cargo
+# audit` / `cargo deny` gate it.
+bytes = "1"
 
 [dev-dependencies]
 proptest = "1"

@@ -85,6 +85,64 @@ use optionstratlib::ExpirationDate;
 pub const DEFAULT_HTTP_ADDR: &str = "0.0.0.0:8080";
 /// Default FIX 4.4 bind address (`FAUXCHANGE_FIX_ADDR`).
 pub const DEFAULT_FIX_ADDR: &str = "0.0.0.0:9878";
+/// Default FIX gateway enablement (`[fix] enabled`) — **disabled** until the
+/// session FSM (#038), order routing (#039), and market data (#040) land, so a
+/// released image does not open a raw-TCP port answering only the #037 stub. The
+/// operator opts in explicitly; the acceptor spawns only when this is `true`
+/// ([06 §5](../docs/06-deployment.md#5-ports-and-endpoints)).
+pub const DEFAULT_FIX_ENABLED: bool = false;
+/// Default FIX venue connection cap (`[fix] connection_cap`) — the maximum number
+/// of concurrent FIX sessions; the N+1th connection is refused, not queued. A
+/// **DoS control** ([08 §5](../docs/08-threat-model.md#5-denial-of-service-posture)),
+/// not a fairness knob.
+pub const DEFAULT_FIX_CONNECTION_CAP: usize = 256;
+/// Default FIX per-session outbound mailbox depth (`[fix] mailbox_depth`) — the
+/// bounded `mpsc` between the session and its socket writer; past the bound a full
+/// mailbox surfaces a typed busy and closes the session, never an unbounded queue
+/// (a **DoS control**, [08 §5](../docs/08-threat-model.md#5-denial-of-service-posture)).
+pub const DEFAULT_FIX_MAILBOX_DEPTH: usize = 256;
+/// Default FIX maximum on-the-wire frame size in **bytes** (`[fix]
+/// max_frame_bytes`) — the byte cap enforced at the framing boundary; an oversize
+/// frame is rejected with no unbounded allocation and no panic (a **DoS control**,
+/// [08 §4](../docs/08-threat-model.md#4-untrusted-input-hardening)). `256` KiB is
+/// generous for a conformant order / market-data message while replacing the
+/// codec's 1 MiB default.
+pub const DEFAULT_FIX_MAX_FRAME_BYTES: usize = 256 * 1024;
+
+/// The inclusive maximum for `[fix] connection_cap` / `[fix] mailbox_depth` — a
+/// coarse sanity ceiling so a config typo (a nonsensical `10_000_000_000` cap)
+/// fails fast at boot rather than reserving an absurd semaphore/channel.
+pub const FIX_MAX_CONNECTION_CAP: usize = 65_536;
+/// The inclusive maximum for `[fix] mailbox_depth`.
+pub const FIX_MAX_MAILBOX_DEPTH: usize = 65_536;
+/// The inclusive minimum for `[fix] max_frame_bytes` — below this a legitimate FIX
+/// frame (a logon plus header/trailer) would not fit, so a smaller value is a
+/// misconfiguration.
+pub const FIX_MIN_MAX_FRAME_BYTES: usize = 512;
+/// The inclusive maximum for `[fix] max_frame_bytes` (`16` MiB) — a coarse ceiling
+/// bounding the per-connection read buffer.
+pub const FIX_MAX_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default FIX read-idle timeout in **seconds** (`[fix] idle_timeout_secs`) — a
+/// connection that sends no bytes for this long is closed, releasing its cap slot.
+/// A **connection-hygiene DoS control** ([08 §5](../docs/08-threat-model.md#5-denial-of-service-posture)):
+/// without it a Slowloris of silent sockets pins the connection cap. This is the
+/// pre-#038 bound; the negotiated FIX heartbeat (`HeartBtInt`) refines it in #038.
+pub const DEFAULT_FIX_IDLE_TIMEOUT_SECS: u64 = 30;
+/// The inclusive minimum for `[fix] idle_timeout_secs` — at least `1` second (a
+/// `0` timeout would close every connection instantly).
+pub const FIX_MIN_IDLE_TIMEOUT_SECS: u64 = 1;
+/// The inclusive maximum for `[fix] idle_timeout_secs` (`86_400` = 24h) — a coarse
+/// ceiling so a typo cannot disable the hygiene bound outright.
+pub const FIX_MAX_IDLE_TIMEOUT_SECS: u64 = 86_400;
+
+/// The inclusive ceiling on the **product** `connection_cap × max_frame_bytes`
+/// (`1` GiB) — the worst-case aggregate per-connection read-buffer reservation
+/// across all live sessions. Each knob is range-checked independently, but nothing
+/// else bounds their product; a typed [`ConfigError::BadFixValue`] at boot refuses
+/// a combination whose worst case would reserve an absurd amount of memory (a
+/// **DoS control**, [08 §5](../docs/08-threat-model.md#5-denial-of-service-posture)).
+pub const FIX_MAX_AGGREGATE_FRAME_BYTES: usize = 1024 * 1024 * 1024;
 /// Default run-level seed (`FAUXCHANGE_SEED`) — a deterministic `0`.
 pub const DEFAULT_SEED: u64 = 0;
 /// Default clock mode (`FAUXCHANGE_CLOCK`).
@@ -394,6 +452,22 @@ pub enum ConfigError {
         /// The offending value.
         value: String,
     },
+    /// A `[fix]` knob (`enabled` / `connection_cap` / `mailbox_depth` /
+    /// `max_frame_bytes`) did not parse, or fell outside its validated range. The
+    /// FIX DoS bounds are **security controls** validated at boot, so an
+    /// out-of-range value fails the process fast rather than reserving an absurd
+    /// resource ([08 §5](../docs/08-threat-model.md#5-denial-of-service-posture)).
+    /// Names the field, value, and the expectation.
+    #[error("invalid fix value '{value}' for {field}: {reason}")]
+    BadFixValue {
+        /// The config field (`enabled` / `connection_cap` / `mailbox_depth` /
+        /// `max_frame_bytes`).
+        field: &'static str,
+        /// The offending value.
+        value: String,
+        /// What the field expected (a type or a range).
+        reason: String,
+    },
     /// An `[expiry_lifecycle]` operational time (`expiry_time` / `settlement_time`)
     /// did not parse as an `HH:MM:SS` time-of-day in `00:00:00..=23:59:59`.
     #[error(
@@ -519,14 +593,39 @@ pub struct ServerConfig {
     pub http_addr: SocketAddr,
 }
 
-/// The `[fix]` section: the FIX 4.4 bind address.
+/// The `[fix]` section: the FIX 4.4 gateway toggle, bind address, and its bounded
+/// DoS-control knobs (connection cap, per-session mailbox depth, max frame size).
+///
+/// The acceptor spawns only when [`enabled`](Self::enabled); the caps are
+/// **security controls** validated at boot, not fairness knobs
+/// ([08 §5](../docs/08-threat-model.md#5-denial-of-service-posture)).
 ///
 /// `#[non_exhaustive]` for forward-compatible field additions (see [`ServerConfig`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FixConfig {
+    /// Whether the FIX 4.4 acceptor is spawned (`[fix] enabled`). Disabled by
+    /// default until the session FSM / order routing / market data land
+    /// (#038–#040).
+    pub enabled: bool,
     /// The FIX 4.4 bind address (`FAUXCHANGE_FIX_ADDR`).
     pub fix_addr: SocketAddr,
+    /// The venue connection cap (`[fix] connection_cap`) — concurrent FIX sessions
+    /// past this are refused, not queued.
+    pub connection_cap: usize,
+    /// The per-session outbound mailbox depth (`[fix] mailbox_depth`) — the bounded
+    /// `mpsc` to the socket writer; a full mailbox surfaces a typed busy and closes
+    /// the session.
+    pub mailbox_depth: usize,
+    /// The maximum on-the-wire frame size in **bytes** (`[fix] max_frame_bytes`) —
+    /// an oversize frame is rejected at the framing boundary with no unbounded
+    /// allocation and no panic.
+    pub max_frame_bytes: usize,
+    /// The read-idle timeout in **seconds** (`[fix] idle_timeout_secs`) — a
+    /// connection sending no bytes for this long is closed, releasing its cap slot
+    /// (connection hygiene against a silent-socket Slowloris; refined by the #038
+    /// negotiated heartbeat).
+    pub idle_timeout_secs: u64,
 }
 
 /// The `[persistence]` section: the optional durable backend toggle.
@@ -901,7 +1000,9 @@ impl Config {
             None => "<unset>".to_string(),
         };
         format!(
-            "server.http_addr={http} fix.fix_addr={fix} \
+            "server.http_addr={http} fix.enabled={fix_enabled} fix.fix_addr={fix} \
+             fix.connection_cap={fix_cap} fix.mailbox_depth={fix_mbx} \
+             fix.max_frame_bytes={fix_frame} fix.idle_timeout_secs={fix_idle} \
              persistence.backend={backend} persistence.database_url={database_url} \
              persistence.pool_max_connections={pool} persistence.slow_acquire_ms={slow} \
              clock.mode={clock} \
@@ -910,7 +1011,12 @@ impl Config {
              determinism.seed={seed} \
              auth.bootstrap_secret={bootstrap_secret} logging.format={log}",
             http = self.server.http_addr,
+            fix_enabled = self.fix.enabled,
             fix = self.fix.fix_addr,
+            fix_cap = self.fix.connection_cap,
+            fix_mbx = self.fix.mailbox_depth,
+            fix_frame = self.fix.max_frame_bytes,
+            fix_idle = self.fix.idle_timeout_secs,
             backend = self.persistence.backend().as_str(),
             pool = self.persistence.pool_max_connections,
             slow = self.persistence.slow_acquire_ms,
@@ -939,6 +1045,11 @@ impl Config {
 struct RawConfig {
     http_addr: Option<String>,
     fix_addr: Option<String>,
+    fix_enabled: Option<String>,
+    fix_connection_cap: Option<String>,
+    fix_mailbox_depth: Option<String>,
+    fix_max_frame_bytes: Option<String>,
+    fix_idle_timeout_secs: Option<String>,
     database_url: Option<String>,
     db_pool_max_connections: Option<String>,
     db_slow_acquire_ms: Option<String>,
@@ -959,6 +1070,11 @@ impl RawConfig {
         Self {
             http_addr: Some(DEFAULT_HTTP_ADDR.to_string()),
             fix_addr: Some(DEFAULT_FIX_ADDR.to_string()),
+            fix_enabled: Some(DEFAULT_FIX_ENABLED.to_string()),
+            fix_connection_cap: Some(DEFAULT_FIX_CONNECTION_CAP.to_string()),
+            fix_mailbox_depth: Some(DEFAULT_FIX_MAILBOX_DEPTH.to_string()),
+            fix_max_frame_bytes: Some(DEFAULT_FIX_MAX_FRAME_BYTES.to_string()),
+            fix_idle_timeout_secs: Some(DEFAULT_FIX_IDLE_TIMEOUT_SECS.to_string()),
             database_url: None,
             db_pool_max_connections: Some(DEFAULT_DB_POOL_MAX_CONNECTIONS.to_string()),
             db_slow_acquire_ms: Some(DEFAULT_DB_SLOW_ACQUIRE_MS.to_string()),
@@ -981,6 +1097,21 @@ impl RawConfig {
         }
         if other.fix_addr.is_some() {
             self.fix_addr = other.fix_addr;
+        }
+        if other.fix_enabled.is_some() {
+            self.fix_enabled = other.fix_enabled;
+        }
+        if other.fix_connection_cap.is_some() {
+            self.fix_connection_cap = other.fix_connection_cap;
+        }
+        if other.fix_mailbox_depth.is_some() {
+            self.fix_mailbox_depth = other.fix_mailbox_depth;
+        }
+        if other.fix_max_frame_bytes.is_some() {
+            self.fix_max_frame_bytes = other.fix_max_frame_bytes;
+        }
+        if other.fix_idle_timeout_secs.is_some() {
+            self.fix_idle_timeout_secs = other.fix_idle_timeout_secs;
         }
         if other.database_url.is_some() {
             self.database_url = other.database_url;
@@ -1023,6 +1154,53 @@ impl RawConfig {
     fn validate(self) -> Result<Config, ConfigError> {
         let http_addr = parse_addr("http_addr", self.http_addr)?;
         let fix_addr = parse_addr("fix_addr", self.fix_addr)?;
+        let fix_enabled = parse_fix_bool("enabled", self.fix_enabled, DEFAULT_FIX_ENABLED)?;
+        let fix_connection_cap = parse_fix_usize(
+            "connection_cap",
+            self.fix_connection_cap,
+            DEFAULT_FIX_CONNECTION_CAP,
+            1,
+            FIX_MAX_CONNECTION_CAP,
+        )?;
+        let fix_mailbox_depth = parse_fix_usize(
+            "mailbox_depth",
+            self.fix_mailbox_depth,
+            DEFAULT_FIX_MAILBOX_DEPTH,
+            1,
+            FIX_MAX_MAILBOX_DEPTH,
+        )?;
+        let fix_max_frame_bytes = parse_fix_usize(
+            "max_frame_bytes",
+            self.fix_max_frame_bytes,
+            DEFAULT_FIX_MAX_FRAME_BYTES,
+            FIX_MIN_MAX_FRAME_BYTES,
+            FIX_MAX_MAX_FRAME_BYTES,
+        )?;
+        let fix_idle_timeout_secs = parse_fix_u64(
+            "idle_timeout_secs",
+            self.fix_idle_timeout_secs,
+            DEFAULT_FIX_IDLE_TIMEOUT_SECS,
+            FIX_MIN_IDLE_TIMEOUT_SECS,
+            FIX_MAX_IDLE_TIMEOUT_SECS,
+        )?;
+        // Bound the PRODUCT `connection_cap × max_frame_bytes` (each knob is
+        // range-checked alone; nothing else caps their worst-case aggregate
+        // per-connection read-buffer reservation). A typed error refuses an absurd
+        // combination at boot rather than reserving it. `checked_mul` treats an
+        // overflow as over-ceiling.
+        let over_aggregate = match fix_connection_cap.checked_mul(fix_max_frame_bytes) {
+            Some(product) => product > FIX_MAX_AGGREGATE_FRAME_BYTES,
+            None => true,
+        };
+        if over_aggregate {
+            return Err(ConfigError::BadFixValue {
+                field: "connection_cap",
+                value: format!("{fix_connection_cap} × {fix_max_frame_bytes} max_frame_bytes"),
+                reason: format!(
+                    "connection_cap × max_frame_bytes exceeds the {FIX_MAX_AGGREGATE_FRAME_BYTES}-byte aggregate ceiling"
+                ),
+            });
+        }
         let mode = parse_clock(self.clock)?;
         let clock_multiplier = parse_clock_u32(
             "multiplier",
@@ -1049,7 +1227,14 @@ impl RawConfig {
         )?;
         Ok(Config {
             server: ServerConfig { http_addr },
-            fix: FixConfig { fix_addr },
+            fix: FixConfig {
+                enabled: fix_enabled,
+                fix_addr,
+                connection_cap: fix_connection_cap,
+                mailbox_depth: fix_mailbox_depth,
+                max_frame_bytes: fix_max_frame_bytes,
+                idle_timeout_secs: fix_idle_timeout_secs,
+            },
             persistence: PersistenceConfig {
                 database_url: self.database_url.map(Secret::new),
                 pool_max_connections,
@@ -1214,6 +1399,13 @@ fn raw_from_env<F: Fn(&str) -> Option<String>>(get: F) -> RawConfig {
     RawConfig {
         http_addr: pick("FAUXCHANGE_HTTP_ADDR"),
         fix_addr: pick("FAUXCHANGE_FIX_ADDR"),
+        // The FIX gateway toggle + DoS-control knobs are file-only `[fix]` knobs
+        // (no env/CLI override), so the env layer never supplies them.
+        fix_enabled: None,
+        fix_connection_cap: None,
+        fix_mailbox_depth: None,
+        fix_max_frame_bytes: None,
+        fix_idle_timeout_secs: None,
         database_url: pick("DATABASE_URL"),
         db_pool_max_connections: pick("FAUXCHANGE_DB_MAX_CONNECTIONS"),
         db_slow_acquire_ms: pick("FAUXCHANGE_DB_SLOW_ACQUIRE_MS"),
@@ -1389,6 +1581,86 @@ fn parse_clock_u64(
     }
 }
 
+/// Parses a `[fix]` boolean knob (`enabled`), accepting `true` / `false` (the
+/// TOML boolean rendering), failing with [`ConfigError::BadFixValue`] on anything
+/// else.
+fn parse_fix_bool(
+    field: &'static str,
+    value: Option<String>,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ConfigError::BadFixValue {
+            field,
+            value,
+            reason: "expected a boolean (true / false)".to_string(),
+        }),
+    }
+}
+
+/// Parses a `[fix]` `usize` DoS-control knob and **range-checks** it against
+/// `[min, max]` inclusive, failing with [`ConfigError::BadFixValue`] on a
+/// non-integer or an out-of-range value. The bounds are validated at boot so a
+/// nonsensical cap/depth/frame-size fails the process fast rather than reserving
+/// an absurd resource (a **security control**, not a fairness knob).
+fn parse_fix_usize(
+    field: &'static str,
+    value: Option<String>,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, ConfigError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| ConfigError::BadFixValue {
+            field,
+            value: value.clone(),
+            reason: "expected a non-negative integer".to_string(),
+        })?;
+    if parsed < min || parsed > max {
+        return Err(ConfigError::BadFixValue {
+            field,
+            value,
+            reason: format!("expected an integer in {min}..={max}"),
+        });
+    }
+    Ok(parsed)
+}
+
+/// Parses a `[fix]` `u64` knob (`idle_timeout_secs`) and **range-checks** it
+/// against `[min, max]` inclusive, failing with [`ConfigError::BadFixValue`] on a
+/// non-integer or an out-of-range value.
+fn parse_fix_u64(
+    field: &'static str,
+    value: Option<String>,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Result<u64, ConfigError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    let parsed = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ConfigError::BadFixValue {
+            field,
+            value: value.clone(),
+            reason: "expected a non-negative integer".to_string(),
+        })?;
+    if parsed < min || parsed > max {
+        return Err(ConfigError::BadFixValue {
+            field,
+            value,
+            reason: format!("expected an integer in {min}..={max}"),
+        });
+    }
+    Ok(parsed)
+}
+
 /// Parses and validates the `[expiry_lifecycle]` operational times into an
 /// [`ExpiryLifecycleConfig`], enforcing the identity-vs-operational rule
 /// ([01 §5](../docs/01-domain-model.md#5-instruments-and-the-symbol-grammar)):
@@ -1532,6 +1804,30 @@ impl FileConfig {
             .as_ref()
             .and_then(|section| section.slow_acquire_ms)
             .map(|value| value.to_string());
+        // Bind the fix section once so its address and all four DoS-control knobs
+        // read the same optional table (a moved-out field cannot be read twice).
+        let fix = self.fix;
+        let fix_addr = fix.as_ref().and_then(|section| section.fix_addr.clone());
+        let fix_enabled = fix
+            .as_ref()
+            .and_then(|section| section.enabled)
+            .map(|value| value.to_string());
+        let fix_connection_cap = fix
+            .as_ref()
+            .and_then(|section| section.connection_cap)
+            .map(|value| value.to_string());
+        let fix_mailbox_depth = fix
+            .as_ref()
+            .and_then(|section| section.mailbox_depth)
+            .map(|value| value.to_string());
+        let fix_max_frame_bytes = fix
+            .as_ref()
+            .and_then(|section| section.max_frame_bytes)
+            .map(|value| value.to_string());
+        let fix_idle_timeout_secs = fix
+            .as_ref()
+            .and_then(|section| section.idle_timeout_secs)
+            .map(|value| value.to_string());
         // Bind the clock section once so its mode and both mode knobs read the same
         // optional table (a moved-out field cannot be read twice).
         let clock = self.clock;
@@ -1554,7 +1850,12 @@ impl FileConfig {
             .and_then(|section| section.settlement_time.clone());
         RawConfig {
             http_addr: self.server.and_then(|section| section.http_addr),
-            fix_addr: self.fix.and_then(|section| section.fix_addr),
+            fix_addr,
+            fix_enabled,
+            fix_connection_cap,
+            fix_mailbox_depth,
+            fix_max_frame_bytes,
+            fix_idle_timeout_secs,
             database_url,
             db_pool_max_connections,
             db_slow_acquire_ms,
@@ -1605,12 +1906,24 @@ struct FileServer {
     http_addr: Option<String>,
 }
 
-/// `[fix]` — an unrecognised inner key aborts startup.
+/// `[fix]` — an unrecognised inner key aborts startup. `enabled` /
+/// `connection_cap` / `mailbox_depth` / `max_frame_bytes` are file-only knobs (no
+/// env/CLI override); `fix_addr` also carries `FAUXCHANGE_FIX_ADDR` / `--fix-addr`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileFix {
     #[serde(default)]
     fix_addr: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    connection_cap: Option<usize>,
+    #[serde(default)]
+    mailbox_depth: Option<usize>,
+    #[serde(default)]
+    max_frame_bytes: Option<usize>,
+    #[serde(default)]
+    idle_timeout_secs: Option<u64>,
 }
 
 /// `[persistence]` — an unrecognised inner key aborts startup. Not `Debug`
@@ -2655,6 +2968,187 @@ read_per_window = 6000
             Err(other) => panic!("expected an unknown-key rejection, got {other}"),
             Ok(_) => panic!("expected an unknown-key rejection, got a parsed config"),
         }
+    }
+
+    // ---- #037: [fix] gateway toggle + DoS-control knobs --------------------
+
+    #[test]
+    fn test_config_fix_defaults_are_bounded_and_disabled() -> Result<(), ConfigError> {
+        // No `[fix]` section: the gateway is disabled by default with the bounded
+        // DoS-control defaults.
+        let config = Config::load_from(std::iter::empty::<String>(), |_| None)?;
+        assert!(
+            !config.fix.enabled,
+            "the FIX gateway is opt-in (default off)"
+        );
+        assert_eq!(config.fix.fix_addr.port(), 9878);
+        assert_eq!(config.fix.connection_cap, DEFAULT_FIX_CONNECTION_CAP);
+        assert_eq!(config.fix.mailbox_depth, DEFAULT_FIX_MAILBOX_DEPTH);
+        assert_eq!(config.fix.max_frame_bytes, DEFAULT_FIX_MAX_FRAME_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_section_overrides_all_knobs() -> Result<(), ConfigError> {
+        let file = raw_from_toml_str(
+            "[fix]\nenabled = true\nfix_addr = \"127.0.0.1:19878\"\n\
+             connection_cap = 8\nmailbox_depth = 16\nmax_frame_bytes = 4096\n",
+        )?;
+        let config = Config::assemble(file, raw_from_env(|_| None), RawConfig::default())?;
+        assert!(config.fix.enabled);
+        assert_eq!(config.fix.fix_addr.to_string(), "127.0.0.1:19878");
+        assert_eq!(config.fix.connection_cap, 8);
+        assert_eq!(config.fix.mailbox_depth, 16);
+        assert_eq!(config.fix.max_frame_bytes, 4096);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_zero_connection_cap_is_out_of_range() -> Result<(), ConfigError> {
+        // A `0` cap is below the `1` minimum — a validated-range rejection, not a
+        // silent clamp.
+        let file = raw_from_toml_str("[fix]\nconnection_cap = 0\n")?;
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::BadFixValue { field, .. }) => assert_eq!(field, "connection_cap"),
+            other => panic!("expected BadFixValue(connection_cap), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_connection_cap_over_ceiling_is_rejected() -> Result<(), ConfigError> {
+        let file = raw_from_toml_str(&format!(
+            "[fix]\nconnection_cap = {}\n",
+            FIX_MAX_CONNECTION_CAP + 1
+        ))?;
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::BadFixValue { field, reason, .. }) => {
+                assert_eq!(field, "connection_cap");
+                assert!(reason.contains(&FIX_MAX_CONNECTION_CAP.to_string()));
+            }
+            other => panic!("expected BadFixValue(connection_cap), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_max_frame_bytes_below_floor_is_rejected() -> Result<(), ConfigError> {
+        // A frame cap below the floor would not fit a legitimate FIX frame.
+        let file = raw_from_toml_str(&format!(
+            "[fix]\nmax_frame_bytes = {}\n",
+            FIX_MIN_MAX_FRAME_BYTES - 1
+        ))?;
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::BadFixValue { field, .. }) => assert_eq!(field, "max_frame_bytes"),
+            other => panic!("expected BadFixValue(max_frame_bytes), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_max_frame_bytes_over_ceiling_is_rejected() -> Result<(), ConfigError> {
+        let file = raw_from_toml_str(&format!(
+            "[fix]\nmax_frame_bytes = {}\n",
+            FIX_MAX_MAX_FRAME_BYTES + 1
+        ))?;
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::BadFixValue { field, .. }) => assert_eq!(field, "max_frame_bytes"),
+            other => panic!("expected BadFixValue(max_frame_bytes), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_unknown_key_names_the_key() {
+        // `deny_unknown_fields` holds on the extended `[fix]` section.
+        match raw_from_toml_str("[fix]\nenabled = true\nmax_frames = 10\n") {
+            Err(ConfigError::UnknownKey { key }) => assert!(key.contains("max_frames")),
+            Err(other) => panic!("expected an unknown-key rejection, got {other}"),
+            Ok(_) => panic!("expected an unknown-key rejection, got a parsed config"),
+        }
+    }
+
+    #[test]
+    fn test_config_fix_addr_env_overrides_file() -> Result<(), ConfigError> {
+        // `fix_addr` still honours the env layer (later wins), while the file-only
+        // knobs are carried from the `[fix]` file section.
+        let file = raw_from_toml_str("[fix]\nfix_addr = \"127.0.0.1:1111\"\nconnection_cap = 4\n")?;
+        let env = raw_from_env(|key| {
+            (key == "FAUXCHANGE_FIX_ADDR").then(|| "127.0.0.1:2222".to_string())
+        });
+        let config = Config::assemble(file, env, RawConfig::default())?;
+        assert_eq!(config.fix.fix_addr.to_string(), "127.0.0.1:2222");
+        assert_eq!(config.fix.connection_cap, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_render_effective_never_omits_fix_knobs() -> Result<(), ConfigError> {
+        let config = Config::load_from(std::iter::empty::<String>(), |_| None)?;
+        let rendered = config.render_effective();
+        assert!(rendered.contains("fix.enabled=false"));
+        assert!(rendered.contains("fix.connection_cap="));
+        assert!(rendered.contains("fix.mailbox_depth="));
+        assert!(rendered.contains("fix.max_frame_bytes="));
+        assert!(rendered.contains("fix.idle_timeout_secs="));
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_idle_timeout_default_and_override() -> Result<(), ConfigError> {
+        let default = Config::load_from(std::iter::empty::<String>(), |_| None)?;
+        assert_eq!(default.fix.idle_timeout_secs, DEFAULT_FIX_IDLE_TIMEOUT_SECS);
+        let file = raw_from_toml_str("[fix]\nidle_timeout_secs = 5\n")?;
+        let config = Config::assemble(file, raw_from_env(|_| None), RawConfig::default())?;
+        assert_eq!(config.fix.idle_timeout_secs, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_zero_idle_timeout_is_out_of_range() -> Result<(), ConfigError> {
+        // A `0` timeout is below the `1`s minimum — rejected, not silently clamped
+        // (a `0`s idle timeout would close every connection instantly).
+        let file = raw_from_toml_str("[fix]\nidle_timeout_secs = 0\n")?;
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::BadFixValue { field, .. }) => assert_eq!(field, "idle_timeout_secs"),
+            other => panic!("expected BadFixValue(idle_timeout_secs), got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_cap_times_frame_product_ceiling_is_enforced() -> Result<(), ConfigError> {
+        // Each knob is in range individually, but their PRODUCT exceeds the
+        // aggregate ceiling — refused at boot with a typed error (a DoS control, not
+        // a silent accept).
+        let cap = FIX_MAX_CONNECTION_CAP; // 65_536, in range
+        let frame = FIX_MAX_MAX_FRAME_BYTES; // 16 MiB, in range
+        assert!(
+            cap * frame > FIX_MAX_AGGREGATE_FRAME_BYTES,
+            "the fixture must exceed the aggregate ceiling"
+        );
+        let file = raw_from_toml_str(&format!(
+            "[fix]\nconnection_cap = {cap}\nmax_frame_bytes = {frame}\n"
+        ))?;
+        match Config::assemble(file, raw_from_env(|_| None), RawConfig::default()) {
+            Err(ConfigError::BadFixValue { reason, .. }) => {
+                assert!(reason.contains("aggregate ceiling"), "reason: {reason}");
+            }
+            other => panic!("expected an aggregate-ceiling BadFixValue, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_config_fix_cap_times_frame_product_within_ceiling_is_accepted()
+    -> Result<(), ConfigError> {
+        // A generous-but-bounded combination (256 conns × 256 KiB = 64 MiB) is well
+        // under the ceiling and accepted.
+        let file = raw_from_toml_str("[fix]\nconnection_cap = 256\nmax_frame_bytes = 262144\n")?;
+        let config = Config::assemble(file, raw_from_env(|_| None), RawConfig::default())?;
+        assert_eq!(config.fix.connection_cap, 256);
+        assert_eq!(config.fix.max_frame_bytes, 262_144);
+        Ok(())
     }
 
     // ---- #032: [expiry_lifecycle] operational times ------------------------
