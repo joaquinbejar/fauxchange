@@ -12,8 +12,10 @@
 
 # ---------------------------------------------------------------------------
 # graph — which target platforms the dependency graph is evaluated against.
-# `fauxchange` ships as a Linux binary/container (CI runner + the Alpine
-# runtime image, docs/06-deployment.md) and is developed on macOS. Restricting
+# `fauxchange` ships as a Linux binary/container (CI runner + the
+# debian-slim / distroless glibc runtime image, docs/06-deployment.md §12 —
+# deliberately NOT alpine/musl; see docker/Dockerfile) and is developed on
+# macOS. Restricting
 # to the targets we actually build for prunes platform-conditional deps we
 # never compile (e.g. `r-efi` / UEFI-only crates pulled in by `getrandom`'s
 # cfg-gated deps, which carry LGPL-2.1-or-later and would otherwise force a
@@ -23,7 +25,7 @@
 [graph]
 targets = [
     "x86_64-unknown-linux-gnu",   # GitHub Actions runner (ubuntu-24.04)
-    "x86_64-unknown-linux-musl",  # docker/Dockerfile runtime (alpine)
+    "x86_64-unknown-linux-musl",  # reserved for a future musl cross-build; the shipped runtime is glibc/debian (docker/Dockerfile)
     "aarch64-apple-darwin",       # developer laptops (Apple Silicon)
     "x86_64-apple-darwin",        # developer laptops (Intel)
 ]
