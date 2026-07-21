@@ -1,0 +1,15 @@
+{
+  "data": {
+    "report": {
+      "executions": 2,
+      "per_underlying": [
+        {
+          "event_count": 3,
+          "last_sequence": 2,
+          "underlying": "BTC"
+        }
+      ]
+    }
+  },
+  "type": "replay_complete"
+}

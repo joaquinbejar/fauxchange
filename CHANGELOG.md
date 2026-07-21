@@ -11,6 +11,51 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The replay driver — reproduce identical events, fills, and top-of-book from
+  the durable journal** (#30) in the new `src/simulation/replay.rs`
+  (`replay_streams` / `replay_bundle`, `ScenarioBundle` / `JournalStream`,
+  `ReplayReport`, `ReplayError`, `RecordingController`) with the record/replay
+  control plane in `src/gateway/rest/replay.rs` + the WS `record` / `replay_bundle`
+  actions ([030](milestones/v0.3-replay/030-replay-driver.md),
+  [04 §4](docs/04-market-data-and-replay.md#4-historical-replay),
+  [ADR-0004](docs/adr/0004-deterministic-replay-with-seeded-clock.md),
+  [ADR-0006](docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
+  Replay and recovery share **one algorithm — re-execution**: the driver reuses
+  the #29 `exchange::recover` core **verbatim** (never a second "apply the stored
+  event" path), re-executing every `VenueCommand` in `underlying_sequence` order
+  into a **fresh** `InstrumentRegistry` per underlying with the stored `VenueEvent`
+  as the integrity oracle — a mismatch halts with `JournalCorruption { underlying,
+  sequence }`, a newer-than-binary envelope schema is refused. Oracle equality is
+  stated over **symbols + `underlying_sequence`** (never process-global registry
+  ids); mark prices and unrealised P&L are recomputed **live** and excluded. Two
+  input formats: the **native journal** and a portable **scenario bundle** (journal
+  streams + the `RunManifest`, now extended with `instrument_seed`, a microstructure
+  fingerprint, and the **pinned crate/dependency versions** — real compile-time
+  values, all `#[serde(default)]` so an older manifest stays backward-readable);
+  `replay_bundle` verifies the bundle schema + the manifest's pinned versions
+  against the running binary first (a typed `VersionMismatch`), and a bundle
+  without a manifest / a malformed bundle is a typed decode error, never a panic.
+  Reproduction is **journal-driven, not seed-regenerated**: the live requote engine
+  is muted (the offline driver never invokes it, so journaled market-maker
+  `AddOrder`s replay with no cascade), and journaled non-order inputs
+  (`EvictExpiredOrders { now_ms }`, `SetInstrumentStatus`, `Clock` / `SimStep`
+  values) are applied **from the command**, never a replay clock. The **executions
+  store** and **positions fold** are reconstructed from the same replayed events
+  through the live post-journal `StoreFanOut`. The record/replay controls are
+  `Admin`-gated with REST ≡ WS **control parity** (both surfaces flip the same
+  `RecordingController` / run the same offline replay), and there is **no** FIX
+  control surface. Scope is honestly **single-epoch**: a journal crossing a
+  snapshot-restore boundary **fails stop** at the first post-restore command
+  (the restore boundary is outside the determinism oracle), and reconstructing a
+  restored cut plus **boot-time resume** of a non-empty durable journal into a live
+  venue are tracked in #85. Exercised across unit, property
+  (`journal_driver_replay_reconstructs_book`), the flagship `tests/determinism.rs`
+  (same journal → same fills; exclusions tested as exclusions; multi-underlying
+  partial control fan-out reproduced per underlying; replay-stable `DateTime`
+  expiries; the restore-boundary fail-stop), `tests/parity.rs` (control + observation
+  parity), and a `testcontainers` `postgres:18-alpine` integration test (record into
+  a durable venue → export the bundle → replay offline → reconstructed executions +
+  positions fold match the live goldens).
 - **Durable persistence for the venue envelope journal — swap the store, keep
   the contract** (#29) in the new `src/db/journal.rs` (`PgVenueJournal`) and
   `src/exchange/recovery.rs` (`recover` / `Recovered`, the production recovery

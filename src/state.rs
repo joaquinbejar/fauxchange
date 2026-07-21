@@ -84,7 +84,8 @@ use crate::exchange::{
 use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
 use crate::models::AccountId;
 use crate::simulation::{
-    AssetConfig, ClockMode, CorrelationId, PriceSimulator, RunManifest, SimClock, SimulationConfig,
+    AssetConfig, ClockMode, CorrelationId, JournalStream, PriceSimulator, RecordingController,
+    ReplayError, ReplayReport, RunManifest, ScenarioBundle, SimClock, SimulationConfig,
     VenueClockConfig, VenueStepSink,
 };
 // The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
@@ -472,6 +473,11 @@ pub struct AppState {
     /// per-underlying commands one advance produced and detect a partial fan-out
     /// ([02 §4.1](../docs/02-matching-architecture.md#41-venue-wide-commands-marketmakercontrol--clock--simstep)).
     correlation_counter: AtomicU64,
+    /// The venue recording flag (#030) — the record/replay control plane's
+    /// scenario-capture window. The durable journal is always on; this marks
+    /// whether a capture window is active for bundle export. Both the REST and WS
+    /// record controls flip this **same** flag (control parity).
+    recording: RecordingController,
 }
 
 /// The result of a venue-control clock advance fanned across the underlyings —
@@ -650,8 +656,13 @@ impl AppState {
             // implement the SAME `VenueJournal` trait, so the actor's write-ahead
             // turn discipline is identical. Each stream is keyed on the shared
             // lineage so re-derived ids stay in one namespace. Boot-time resume of a
-            // non-empty durable journal (re-execution into the running venue) is the
-            // replay driver (#030); a fresh boot persists durably going forward.
+            // non-empty durable journal is NOT yet wired: this actor starts at
+            // `SequenceNumber::START`, so a restart against a non-empty durable
+            // journal fails **loud** on the `(underlying, N, kind)` unique key
+            // (a Conflict, never a silent overwrite). The boot-recovery wiring
+            // (`ActorConfig::start_sequence` + a recover-per-underlying in
+            // `AppState::new`) is tracked in #85; the #030 replay driver replays a
+            // journal/bundle **offline** into a fresh registry, not into this venue.
             let (handle, join) = match db.as_ref() {
                 Some(pool) => {
                     let journal = PgVenueJournal::open(pool, ticker.as_ref(), header)?;
@@ -733,6 +744,7 @@ impl AppState {
             clock,
             manifest,
             correlation_counter: AtomicU64::new(0),
+            recording: RecordingController::default(),
         }))
     }
 
@@ -797,11 +809,14 @@ impl AppState {
     /// **Concurrency caveat.** This is **not** internally serialized against
     /// concurrent callers: it advances the shared clock and then awaits each
     /// actor's fan-out. Today only sequential drivers (tests) call it, so the clock
-    /// is stable across a single advance. When #030 wires the REST/WS clock-control
-    /// surface, concurrent advances MUST be serialized (or at-most-one-in-flight
-    /// enforced) so a racing advance cannot bump the shared clock between an actor
-    /// journaling a `Clock { now_ms }` and stamping its `venue_ts` — that
-    /// serialization is #030's responsibility, not enforced here.
+    /// is stable across a single advance. A future **live** REST/WS clock-control
+    /// surface that drives this concurrently MUST serialize advances (or enforce
+    /// at-most-one-in-flight) so a racing advance cannot bump the shared clock
+    /// between an actor journaling a `Clock { now_ms }` and stamping its
+    /// `venue_ts` — that serialization is that surface's responsibility, not
+    /// enforced here. (#030 shipped the record/replay controls, which replay
+    /// **offline** and never drive a live clock advance, so no such surface is
+    /// wired today.)
     pub async fn advance_clock_step(&self) -> ClockAdvance {
         let now_ms = self.clock.step();
         self.fan_clock(now_ms).await
@@ -810,9 +825,10 @@ impl AppState {
     /// Advances the shared venue clock **monotonically** to `target_ms` (a no-op if
     /// at or below the current instant) and fans the resulting `Clock` command to
     /// every underlying actor — the explicit-instant sibling of
-    /// [`advance_clock_step`](Self::advance_clock_step) the replay driver (#030)
-    /// drives to a recorded instant. The same **concurrency caveat** applies:
-    /// concurrent advances are not serialized here; #030 must enforce that.
+    /// [`advance_clock_step`](Self::advance_clock_step), for driving the venue clock
+    /// to a chosen instant. The same **concurrency caveat** applies: concurrent
+    /// advances are not serialized here; a future live clock-control surface must
+    /// enforce that.
     pub async fn advance_clock_to(&self, target_ms: u64) -> ClockAdvance {
         let now_ms = self.clock.advance_to(target_ms);
         self.fan_clock(now_ms).await
@@ -1000,12 +1016,83 @@ impl AppState {
         &self.clock
     }
 
-    /// The run manifest (#028) — the recorded `seed` + `clock_mode` fixing this
-    /// run's determinism.
+    /// The run manifest (#028/#030) — the recorded `seed` + `clock_mode` +
+    /// `instrument_seed` + microstructure fingerprint + pinned crate/dependency
+    /// versions fixing this run's determinism.
     #[must_use]
     #[inline]
     pub fn manifest(&self) -> &RunManifest {
         &self.manifest
+    }
+
+    // ---- record / replay control plane (#030) ----------------------------
+
+    /// Whether the venue's scenario-capture window is active (#030). The durable
+    /// journal is always on; this is the operator-facing record on/off flag.
+    #[must_use]
+    #[inline]
+    pub fn is_recording(&self) -> bool {
+        self.recording.is_recording()
+    }
+
+    /// Flips the venue's scenario-capture window, returning the **previous** state.
+    /// Both the REST record route and the WS `record` action call this **same**
+    /// method (control parity). Admin gating is enforced at each gateway, not here.
+    pub fn set_recording(&self, on: bool) -> bool {
+        let previous = self.recording.set_recording(on);
+        if previous != on {
+            tracing::info!(recording = on, "venue scenario-capture window toggled");
+        }
+        previous
+    }
+
+    /// Exports the current venue's journal as a portable [`ScenarioBundle`] — the
+    /// per-underlying journal streams (from each actor's read-only journal
+    /// snapshot, in deterministic **sorted** order) plus the run [`RunManifest`], so
+    /// a recorded scenario is self-describing and replayable on any machine (#030).
+    ///
+    /// The stream headers are rebuilt from the run lineage + current envelope schema
+    /// (the one header every actor shares), so no extra per-actor read is needed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the per-underlying [`ActorHandle::snapshot`] rejection
+    /// ([`VenueError::RateLimited`] / [`VenueError::JournalUnavailable`]).
+    pub async fn export_bundle(&self) -> Result<ScenarioBundle, VenueError> {
+        let header = JournalHeader::new(self.lineage_id.clone());
+        let mut streams = Vec::with_capacity(self.underlyings.len());
+        // Deterministic sorted underlying order — the portable bundle is stable.
+        for ticker in self.underlyings() {
+            let snapshot = self.journal_snapshot(ticker).await?;
+            streams.push(JournalStream::new(ticker, header.clone(), snapshot.records));
+        }
+        Ok(ScenarioBundle::new(self.manifest.clone(), streams))
+    }
+
+    /// Replays a recorded scenario [`ScenarioBundle`] **offline** into a fresh
+    /// registry per underlying, reconstructing identical events, fills, and
+    /// top-of-book plus the executions store and positions fold (#030). It does
+    /// **not** mutate this live venue — replay is a fresh re-execution, and the
+    /// live requote engine is never invoked (the driver is structurally mute).
+    ///
+    /// The CPU-bound re-execution runs on a blocking thread so a large bundle never
+    /// stalls an async worker (replay is not a client-latency hot path).
+    ///
+    /// # Errors
+    ///
+    /// The driver's typed [`ReplayError`] — a version mismatch, a corrupted /
+    /// schema-refused / malformed journal, or a durable-read backend failure.
+    pub async fn replay_bundle(
+        &self,
+        bundle: &ScenarioBundle,
+    ) -> Result<ReplayReport, ReplayError> {
+        let bundle = bundle.clone();
+        match tokio::task::spawn_blocking(move || crate::simulation::replay_bundle(&bundle)).await {
+            Ok(result) => result,
+            Err(_join) => Err(ReplayError::Backend {
+                operation: "replay task join",
+            }),
+        }
     }
 
     /// The venue account registry (the [`AccountStore`] backend) — resolution by

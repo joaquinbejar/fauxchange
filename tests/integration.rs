@@ -24,10 +24,10 @@ use tokio::sync::broadcast;
 use fauxchange::OrderType;
 use fauxchange::db::{DatabasePool, DbError, DbPoolConfig, PgVenueJournal};
 use fauxchange::exchange::{
-    ActorConfig, FixedClock, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore, JournalError,
-    JournalHeader, JournalRecord, LineageId, MarkPriceBook, MatchingExecutor, RecordKind,
-    SequenceNumber, Side, StoreFanOut, Symbol, TimeInForce, TopOfBook, UnderlyingActor,
-    VenueJournal, recover,
+    ActorConfig, ExecutionsStore, FixedClock, Hash32, InMemoryExecutionsStore,
+    InMemoryPositionsStore, JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook,
+    MatchingExecutor, PositionsStore, RecordKind, SequenceNumber, Side, StoreFanOut, Symbol,
+    TimeInForce, TopOfBook, UnderlyingActor, VenueJournal, recover,
 };
 
 const UNDERLYING: &str = "BTC";
@@ -539,6 +539,130 @@ async fn test_open_refuses_foreign_schema_over_existing_stream() {
             );
         }
         other => panic!("expected a HeaderMismatch on a schema disagreement, got {other:?}"),
+    }
+
+    drop(container);
+}
+
+// ============================================================================
+// Replay driver end-to-end (#030) — testcontainers postgres:18-alpine
+// ============================================================================
+
+/// A limit add onto the `AppState` BTC book, minting the venue order id from the id
+/// grammar at its sequence.
+fn app_add(
+    lineage: &LineageId,
+    sequence: u64,
+    account: &str,
+    owner: u8,
+    side: Side,
+    price: u64,
+    quantity: u64,
+) -> VenueCommand {
+    VenueCommand::AddOrder {
+        symbol: journal_sym(),
+        order_id: lineage.venue_order_id(JOURNAL_UNDERLYING, SequenceNumber::new(sequence), 0),
+        account: AccountId::new(account),
+        owner: Hash32([owner; 32]),
+        client_order_id: None,
+        side,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(price)),
+        quantity,
+        time_in_force: TimeInForce::Gtc,
+        stp_mode: fauxchange::exchange::STPMode::None,
+    }
+}
+
+/// Record a scenario into a **durable** venue (the sequenced order path REST enters,
+/// journaled through Postgres), export the durable journal as a portable scenario
+/// bundle, replay the bundle into a **fresh** registry offline, and assert the
+/// reconstructed executions store + positions fold match the live venue's — the
+/// persistent-path oracle end to end (#030).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_record_over_durable_venue_then_replay_bundle_matches_goldens() {
+    use fauxchange::exchange::ExecutionFilter;
+
+    let (container, db) = start_pg().await;
+
+    // A durable venue hosting BTC — every committed command is journaled to Postgres.
+    let state = AppState::new(
+        AppStateConfig::new([JOURNAL_UNDERLYING])
+            .with_lineage(LineageId::new("run-1"))
+            .with_db(Some(db)),
+    )
+    .expect("durable AppState builds");
+    let lineage = LineageId::new("run-1");
+
+    // Record a crossing scenario onto the sequenced path (the same path REST enters):
+    // a resting maker sell (3) and a bid (2), then a marketable buy (1) crosses.
+    for command in [
+        app_add(&lineage, 0, "maker", 0x11, Side::Sell, 50_000, 3),
+        app_add(&lineage, 1, "bidder", 0x33, Side::Buy, 49_900, 2),
+        app_add(&lineage, 2, "taker", 0x22, Side::Buy, 50_000, 1),
+    ] {
+        state.submit(command).await.expect("durable submit commits");
+    }
+
+    // Export the DURABLE journal as a portable bundle (its version set is pinned).
+    let bundle = state
+        .export_bundle()
+        .await
+        .expect("export the recorded scenario");
+    assert!(bundle.is_current_schema());
+    assert!(bundle.manifest.versions.matches_current());
+
+    // Replay the bundle OFFLINE into a fresh registry (no durable venue involved).
+    let report = state
+        .replay_bundle(&bundle)
+        .await
+        .expect("replay the bundle");
+
+    // The reconstructed top-of-book matches the recorded end state (2 of the ask
+    // left after 1 crossed; the bid rests at 49_900).
+    let replay = report.underlying(JOURNAL_UNDERLYING).expect("BTC replay");
+    assert_eq!(
+        replay.top_of_book(&journal_sym()),
+        TopOfBook {
+            best_bid: Some(Cents::new(49_900)),
+            best_ask: Some(Cents::new(50_000)),
+            bid_depth: 2,
+            ask_depth: 2,
+        },
+        "the replayed bundle reconstructs identical book state"
+    );
+
+    // The reconstructed executions store + positions fold match the LIVE goldens.
+    for account in ["maker", "taker"] {
+        let account = AccountId::new(account);
+        let golden = state
+            .executions()
+            .list(&account, &ExecutionFilter::default())
+            .expect("live executions list");
+        let reconstructed = report
+            .executions
+            .list(&account, &ExecutionFilter::default())
+            .expect("reconstructed executions list");
+        assert!(!golden.is_empty(), "{account:?} has a recorded fill leg");
+        assert_eq!(
+            reconstructed, golden,
+            "the reconstructed executions store matches the live golden for {account:?}"
+        );
+
+        // Positions fold (mark-free — the journaled fold, not the live mark).
+        let golden_pos = state
+            .positions()
+            .get(&account, &journal_sym(), None)
+            .expect("live positions get");
+        let reconstructed_pos = report
+            .positions
+            .get(&account, &journal_sym(), None)
+            .expect("reconstructed positions get");
+        assert_eq!(
+            reconstructed_pos, golden_pos,
+            "the reconstructed positions fold matches the live golden for {account:?}"
+        );
     }
 
     drop(container);

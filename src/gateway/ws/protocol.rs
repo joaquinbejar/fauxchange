@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::error::{WS_ERROR_SCHEMA, WsError, WsErrorCategory, WsErrorCode};
 use crate::models::SubscriptionChannel;
+use crate::simulation::ScenarioBundle;
 
 /// A `subscribe` / `unsubscribe` action payload: a channel, a symbol, and an
 /// optional orderbook `depth`.
@@ -58,6 +59,23 @@ pub struct ValueParam {
     pub value: f64,
 }
 
+/// A `record` control action payload (#030): flip the scenario-capture window.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct RecordParam {
+    /// `true` opens the capture window, `false` closes it.
+    pub enabled: bool,
+}
+
+/// A `replay_bundle` control action payload (#030): the self-describing scenario
+/// bundle to replay **offline** into a fresh registry. Bounded by the inbound WS
+/// frame-size cap ([`MAX_WS_FRAME_BYTES`](super::MAX_WS_FRAME_BYTES)); an oversize
+/// bundle is rejected by the transport before it reaches this parser.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReplayBundleParam {
+    /// The scenario bundle (journal streams + run manifest).
+    pub bundle: ScenarioBundle,
+}
+
 /// A client → server action, internally tagged by `action`
 /// (`#[serde(tag = "action", rename_all = "snake_case")]`).
 ///
@@ -86,6 +104,11 @@ pub enum ClientAction {
     Kill,
     /// Enable market-maker quoting (control; `Admin`).
     Enable,
+    /// Flip the scenario-capture window on or off (control; `Admin`, #030).
+    Record(RecordParam),
+    /// Replay a recorded scenario bundle offline into a fresh registry (control;
+    /// `Admin`, #030).
+    ReplayBundle(ReplayBundleParam),
 }
 
 /// The outcome of parsing one client text frame.
@@ -399,6 +422,42 @@ mod tests {
             parse_frame(frame),
             FrameOutcome::Action(ClientAction::Subscribe(_), _)
         ));
+    }
+
+    #[test]
+    fn test_parse_record_action_carries_enabled() {
+        match parse_frame(r#"{"action":"record","enabled":false}"#) {
+            FrameOutcome::Action(ClientAction::Record(p), _) => assert!(!p.enabled),
+            other => panic!("expected a Record action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_replay_bundle_action_carries_bundle() {
+        let frame = r#"{"action":"replay_bundle","request_id":"r-1","bundle":{"schema":"scenario-bundle.v1","manifest":{"seed":0,"clock_mode":"realtime"},"streams":[]}}"#;
+        match parse_frame(frame) {
+            FrameOutcome::Action(ClientAction::ReplayBundle(p), rid) => {
+                assert!(p.bundle.is_current_schema());
+                assert!(p.bundle.streams.is_empty());
+                assert_eq!(rid.as_deref(), Some("r-1"));
+            }
+            other => panic!("expected a ReplayBundle action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_replay_bundle_without_manifest_is_a_decode_error() {
+        // The bundle's `manifest` is required; a bundle-shaped frame missing it is a
+        // non-terminal decode error, never a panic.
+        let frame =
+            r#"{"action":"replay_bundle","bundle":{"schema":"scenario-bundle.v1","streams":[]}}"#;
+        match parse_frame(frame) {
+            FrameOutcome::Reject(error) => {
+                assert_eq!(error.code, WsErrorCode::BadRequest);
+                assert!(!error.terminal);
+            }
+            other => panic!("a manifest-less replay bundle must be rejected, got {other:?}"),
+        }
     }
 
     #[test]

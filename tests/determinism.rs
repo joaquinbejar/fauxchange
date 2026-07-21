@@ -45,12 +45,15 @@ use std::sync::Arc;
 
 use fauxchange::exchange::{
     ActorConfig, AddOutcome, Cents, CommandExecutor, EventTimestamp, ExecutionContext,
-    ExpirationDate, FanOut, FixedClock, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore,
-    InMemoryVenueJournal, JournalCommand, JournalError, JournalHeader, JournalRecord, LineageId,
-    MarkPriceBook, MatchingExecutor, NoopFanOut, PositionsStore, RecordKind, STPMode,
-    SequenceNumber, Side, StoreFanOut, Symbol, SymbolError, SymbolParser, TimeInForce, TopOfBook,
-    UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, recover,
-    validate_venue_expiry,
+    ExecutionsStore, ExpirationDate, FanOut, FixedClock, Hash32, InMemoryExecutionsStore,
+    InMemoryPositionsStore, InMemoryVenueJournal, JournalCommand, JournalError, JournalHeader,
+    JournalRecord, LineageId, MarkPriceBook, MatchingExecutor, NoopFanOut, PositionsStore,
+    RecordKind, STPMode, SequenceNumber, Side, StoreFanOut, Symbol, SymbolError, SymbolParser,
+    TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal,
+    VenueOutcome, recover, validate_venue_expiry,
+};
+use fauxchange::simulation::{
+    ClockMode, JournalStream, RunManifest, ScenarioBundle, replay_bundle, replay_streams,
 };
 use fauxchange::{AccountId, OrderType, VenueError};
 
@@ -1449,4 +1452,243 @@ fn collect_keys(value: &serde_json::Value, keys: &mut BTreeSet<String>) {
         }
         _ => {}
     }
+}
+
+// ============================================================================
+// #030: the production replay DRIVER (persistent-path oracle)
+// ============================================================================
+//
+// These exercise `fauxchange::simulation::{replay_streams, replay_bundle}` — the
+// #030 driver that reuses the ONE re-execution core (`recover`) over the native
+// journal + the portable scenario bundle. Sections 1–6 above prove the harness /
+// recovery reducer; these prove the driver on top of it reconstructs identical
+// events, fills, top-of-book, and the executions/positions fold, per underlying.
+
+/// A [`JournalStream`] from a recording's journal — the driver's native input.
+fn driver_stream(recording: &Recording) -> JournalStream {
+    JournalStream::new(
+        recording.underlying.clone(),
+        recording.journal.header().clone(),
+        read_all(&recording.journal),
+    )
+}
+
+/// Drives a command stream through the real single-writer actor for `underlying`
+/// and returns its [`JournalStream`] — the same journal the live venue writes.
+fn actor_stream(underlying: &str, lineage: &LineageId, commands: &[VenueCommand]) -> JournalStream {
+    let header = JournalHeader::new(lineage.clone());
+    let mut actor = UnderlyingActor::new(
+        ActorConfig::new(underlying, lineage.clone(), 64),
+        InMemoryVenueJournal::new(header.clone()),
+        MatchingExecutor::new(underlying),
+        NoopFanOut,
+        CLOCK,
+    );
+    for command in commands {
+        if let Err(e) = actor.handle(command.clone()) {
+            panic!("actor turn must commit: {e}");
+        }
+    }
+    JournalStream::new(underlying, header, read_all(actor.journal()))
+}
+
+#[test]
+fn test_replay_driver_reproduces_events_fills_and_top_of_book() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    let stream = driver_stream(&recording);
+
+    let report = match replay_streams(std::slice::from_ref(&stream)) {
+        Ok(report) => report,
+        Err(e) => panic!("driver replay must not halt on a clean journal: {e}"),
+    };
+    let replay = report.underlying(UNDERLYING).expect("BTC replay present");
+
+    // Ordered VenueEvent-stream equality per underlying — the oracle, over the
+    // production driver path.
+    assert_eq!(
+        replay.events, recording.events,
+        "the driver re-derives the identical ordered event stream"
+    );
+    // The top-of-book witness after replay matches the recorded end state.
+    let recorded_top = recording.tops.last().expect("a recorded top row");
+    let witnessed: Vec<_> = recording
+        .witnesses
+        .iter()
+        .map(|w| replay.top_of_book(w))
+        .collect();
+    assert_eq!(
+        &witnessed, recorded_top,
+        "reconstructed top-of-book matches"
+    );
+}
+
+#[test]
+fn test_replay_driver_reconstructs_executions_and_positions_fold() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    let stream = driver_stream(&recording);
+
+    // Reconstruct through the driver...
+    let report = replay_streams(&[stream]).expect("driver replay");
+
+    // ...and independently fold the recorded events (the golden), then compare the
+    // reconstructed executions + positions to it — a deterministic function of the
+    // journal.
+    let golden_positions = fold_positions(&recording.events);
+
+    // Executions: the recording's fill legs equal the driver-reconstructed count.
+    let recorded_legs: usize = recording
+        .events
+        .iter()
+        .map(|event| match &event.outcome {
+            VenueOutcome::Added { fills, .. } | VenueOutcome::Market { fills, .. } => fills.len(),
+            _ => 0,
+        })
+        .sum();
+    assert!(recorded_legs > 0, "the fixture crosses into fills");
+    assert_eq!(
+        report.executions.len(),
+        recorded_legs,
+        "the reconstructed executions store has exactly the journaled fill legs"
+    );
+
+    // Positions: the taker's reconstructed fold equals the golden fold (mark-free).
+    let taker = AccountId::new("t1");
+    let symbol = sym(CALL);
+    let reconstructed = report
+        .positions
+        .get(&taker, &symbol, None)
+        .expect("positions get")
+        .expect("a reconstructed taker position");
+    let golden = golden_positions
+        .get(&taker, &symbol, None)
+        .expect("positions get")
+        .expect("a golden taker position");
+    assert_eq!(
+        reconstructed.net_quantity, golden.net_quantity,
+        "the reconstructed positions fold matches the recorded fold"
+    );
+    assert_eq!(reconstructed.realized_pnl, golden.realized_pnl);
+}
+
+#[test]
+fn test_replay_driver_mark_prices_are_recomputed_and_excluded_from_the_oracle() {
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    let stream = driver_stream(&recording);
+    let report = replay_streams(&[stream]).expect("driver replay");
+
+    // The reconstructed positions fold is mark-INDEPENDENT (journaled), but the
+    // unrealised P&L is recomputed live from the non-journaled mark — asserting two
+    // different marks change only the unrealised half proves marks are excluded.
+    let taker = AccountId::new("t1");
+    let symbol = sym(CALL);
+    let at_entry = report
+        .positions
+        .get(&taker, &symbol, Some(Cents::new(50_000)))
+        .expect("get")
+        .expect("position");
+    let at_higher = report
+        .positions
+        .get(&taker, &symbol, Some(Cents::new(70_000)))
+        .expect("get")
+        .expect("position");
+    assert_eq!(
+        at_entry.net_quantity, at_higher.net_quantity,
+        "the journaled fold is mark-independent"
+    );
+    assert_ne!(
+        at_entry.unrealized_pnl, at_higher.unrealized_pnl,
+        "the live-recomputed mark is excluded from the reconstructed oracle"
+    );
+}
+
+#[test]
+fn test_multi_underlying_partial_fan_out_reproduced_per_underlying() {
+    // A venue-wide `Clock` advance fans to the underlyings, but ETH's actor did NOT
+    // journal it (a PARTIAL fan-out — e.g. a full mailbox / sealed underlying). Each
+    // underlying's journal is the ONLY source: replaying both reproduces BTC WITH
+    // the Clock and ETH WITHOUT it, per underlying — no venue-wide total order is
+    // claimed, and the partial is reproduced exactly from each stream.
+    let lineage = LineageId::new("run-multi");
+    let clock_now = EventTimestamp::new(1_800_000_000_000);
+
+    let btc = actor_stream(
+        "BTC",
+        &lineage,
+        &[
+            add(
+                &lineage,
+                0,
+                CALL,
+                "mm",
+                0x11,
+                Side::Sell,
+                50_000,
+                3,
+                TimeInForce::Gtc,
+            ),
+            VenueCommand::Clock { now_ms: clock_now },
+        ],
+    );
+    // ETH's stream is over a DIFFERENT contract and did NOT get the Clock.
+    let eth = actor_stream(
+        "ETH",
+        &lineage,
+        &[add(
+            &lineage,
+            0,
+            "ETH-20240329-3000-C",
+            "mm",
+            0x11,
+            Side::Sell,
+            3_000,
+            2,
+            TimeInForce::Gtc,
+        )],
+    );
+
+    let report = replay_streams(&[btc, eth]).expect("multi-underlying driver replay");
+
+    let btc_replay = report.underlying("BTC").expect("BTC replay");
+    let eth_replay = report.underlying("ETH").expect("ETH replay");
+
+    // BTC reproduces its Clock advance from its own journal; ETH reproduces none.
+    let btc_has_clock = btc_replay.events.iter().any(
+        |event| matches!(&event.command, VenueCommand::Clock { now_ms } if *now_ms == clock_now),
+    );
+    let eth_has_clock = eth_replay
+        .events
+        .iter()
+        .any(|event| matches!(&event.command, VenueCommand::Clock { .. }));
+    assert!(btc_has_clock, "BTC reproduces the Clock it journaled");
+    assert!(
+        !eth_has_clock,
+        "ETH reproduces no Clock — the partial fan-out is faithful to each journal"
+    );
+    // Each underlying's own book is reconstructed independently.
+    assert_eq!(btc_replay.last_sequence, Some(SequenceNumber::new(1)));
+    assert_eq!(eth_replay.last_sequence, Some(SequenceNumber::new(0)));
+}
+
+#[test]
+fn test_replay_driver_datetime_expiry_is_replay_stable_via_bundle() {
+    // A scenario bundle over an absolute `DateTime`-expiry contract replays
+    // identically through the portable bundle path (schema + versions verified),
+    // proving replay-stable expiries end to end.
+    let lineage = LineageId::new("run-1");
+    let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
+    let stream = driver_stream(&recording);
+    let bundle = ScenarioBundle::new(RunManifest::new(0, ClockMode::Realtime), vec![stream]);
+
+    let report = match replay_bundle(&bundle) {
+        Ok(report) => report,
+        Err(e) => panic!("a current-version bundle over a DateTime expiry must replay: {e}"),
+    };
+    let replay = report.underlying(UNDERLYING).expect("BTC replay");
+    assert_eq!(
+        replay.events, recording.events,
+        "the DateTime-expiry session replays identically through the bundle path"
+    );
 }

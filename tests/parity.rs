@@ -46,8 +46,11 @@ use fauxchange::exchange::{
     STPMode, SequenceNumber, Side as SeamSide, SignedCents, Symbol, TimeInForce, VenueCommand,
     VenueEvent, VenueOutcome,
 };
+use fauxchange::exchange::{ExecutionFilter, ExecutionsStore};
 use fauxchange::gateway::ws::{ClientAction, FrameOutcome, parse_frame};
-use fauxchange::models::{AccountId, LiquidityFlag, OrderType, VenueOrderId, WsMessage};
+use fauxchange::models::{
+    AccountId, LiquidityFlag, OrderType, Permission, ReplayReportResponse, VenueOrderId, WsMessage,
+};
 use fauxchange::{VenueError, WsErrorCode};
 
 // ============================================================================
@@ -158,6 +161,9 @@ fn rest_route_inventory() -> Vec<(String, Vec<&'static str>)> {
         ("/api/v1/controls/parameters", vec!["post"]),
         ("/api/v1/controls/instruments", vec!["get"]),
         ("/api/v1/controls/instrument/{symbol}/toggle", vec!["post"]),
+        ("/api/v1/replay/record", vec!["get", "post"]),
+        ("/api/v1/replay/export", vec!["get"]),
+        ("/api/v1/replay/bundle", vec!["post"]),
         ("/api/v1/prices", vec!["get", "post"]),
         ("/api/v1/prices/{symbol}", vec!["get"]),
         ("/api/v1/underlyings", vec!["get"]),
@@ -379,6 +385,8 @@ fn test_every_documented_ws_message_round_trips_to_its_golden() {
         "batch_subscribed",
         "batch_unsubscribed",
         "subscriptions",
+        "recording_state",
+        "replay_complete",
         "error",
     ];
     for wanted in documented {
@@ -1109,4 +1117,219 @@ fn test_normalize_strips_stp_cancelled_order_id_but_keeps_owner_and_reason() {
         "2222222222222222222222222222222222222222222222222222222222222222"
     );
     assert_eq!(stp["reason"], "SelfTradePrevention");
+}
+
+// ============================================================================
+// 7. Record / replay control parity (REST ≡ WS) + observation parity (#030)
+// ============================================================================
+
+/// A limit add command targeting the parity fixture `CALL` contract.
+fn add_cmd(
+    seq: u64,
+    account: &str,
+    owner: u8,
+    side: SeamSide,
+    price: u64,
+    qty: u64,
+) -> VenueCommand {
+    let lineage = LineageId::new("fauxchange");
+    VenueCommand::AddOrder {
+        symbol: sym(),
+        order_id: lineage.venue_order_id("BTC", SequenceNumber::new(seq), 0),
+        account: AccountId::new(account),
+        owner: Hash32([owner; 32]),
+        client_order_id: None,
+        side,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(price)),
+        quantity: qty,
+        time_in_force: TimeInForce::Gtc,
+        stp_mode: STPMode::None,
+    }
+}
+
+/// Seeds a crossing session (maker sell + crossing taker buy) onto the sequenced
+/// path so the venue's journal + executions store carry one fill.
+async fn seed_crossing(state: &std::sync::Arc<fauxchange::state::AppState>) {
+    for command in [
+        add_cmd(0, "maker", 0x11, SeamSide::Sell, 50_000, 2),
+        add_cmd(1, "taker", 0x22, SeamSide::Buy, 50_000, 2),
+    ] {
+        state.submit(command).await.expect("submit must commit");
+    }
+}
+
+#[tokio::test]
+async fn test_control_parity_record_on_off_rest_and_ws_same_effect() {
+    // The REST record route and the WS `record` action flip the SAME venue flag —
+    // control parity by construction (both call `AppState::set_recording`).
+    let state = venue(AMPLE_RATE_LIMIT);
+    let admin = token(&state, "admin-1");
+    assert!(state.is_recording(), "the venue records by default");
+
+    // REST: POST /replay/record { enabled: false } flips the flag off.
+    let (status, body) = send(
+        &state,
+        build_request(
+            "POST",
+            "/api/v1/replay/record",
+            Some(&admin),
+            Some(serde_json::json!({ "enabled": false })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["recording"], serde_json::json!(false));
+    assert!(
+        !state.is_recording(),
+        "REST flipped the shared recording flag"
+    );
+
+    // The WS `record` action parses to the same intent…
+    match parse_frame(r#"{"action":"record","enabled":true}"#) {
+        FrameOutcome::Action(ClientAction::Record(p), _) => assert!(p.enabled),
+        other => panic!("expected a Record action, got {other:?}"),
+    }
+    // …and flips the SAME `AppState::set_recording` the WS handler calls — same
+    // effect on the shared flag, from either surface.
+    state.set_recording(true);
+    assert!(
+        state.is_recording(),
+        "the WS-invoked method flips the same flag"
+    );
+}
+
+#[tokio::test]
+async fn test_control_parity_record_permission_gate_is_identical_on_rest_and_ws() {
+    // Admin-gated on both surfaces: a Trade token is forbidden on the REST record
+    // route, exactly as the WS record path forbids a non-Admin caller.
+    let state = venue(AMPLE_RATE_LIMIT);
+    let trader = token(&state, "trader-1");
+    let (status, body) = send(
+        &state,
+        build_request(
+            "POST",
+            "/api/v1/replay/record",
+            Some(&trader),
+            Some(serde_json::json!({ "enabled": false })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "forbidden");
+    // The WS rendering of the same Forbidden(Admin) is a non-terminal envelope.
+    let ws_error = VenueError::Forbidden(Permission::Admin).ws_error(None);
+    assert_eq!(ws_error.code, WsErrorCode::Forbidden);
+    assert!(!ws_error.terminal);
+}
+
+#[tokio::test]
+async fn test_control_parity_replay_bundle_rest_and_ws_same_report() {
+    // The REST replay-bundle route and the WS `replay_bundle` action run the SAME
+    // offline replay (`AppState::replay_bundle`) and surface the SAME reconstructed
+    // report — control parity.
+    let state = venue(AMPLE_RATE_LIMIT);
+    let admin = token(&state, "admin-1");
+    seed_crossing(&state).await;
+    let bundle = state
+        .export_bundle()
+        .await
+        .expect("export the recorded scenario");
+
+    // REST replays the bundle and returns the reconstructed summary.
+    let (status, body) = send(
+        &state,
+        build_request(
+            "POST",
+            "/api/v1/replay/bundle",
+            Some(&admin),
+            Some(serde_json::to_value(&bundle).expect("serialize bundle")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "REST replay of a valid bundle succeeds"
+    );
+    let rest_report: ReplayReportResponse =
+        serde_json::from_value(body).expect("REST body is a ReplayReportResponse");
+
+    // The WS-invoked path (`AppState::replay_bundle`) yields the identical report.
+    let ws_report = state
+        .replay_bundle(&bundle)
+        .await
+        .expect("offline replay succeeds")
+        .to_response();
+    assert_eq!(
+        rest_report, ws_report,
+        "REST and WS surface the identical reconstructed replay report"
+    );
+    assert_eq!(
+        rest_report.executions, 2,
+        "the crossing's two legs are reconstructed"
+    );
+}
+
+#[tokio::test]
+async fn test_control_parity_replay_bundle_version_mismatch_is_rejected_on_both() {
+    // A bundle whose manifest pins a wrong version is a typed reject on REST (400),
+    // and `AppState::replay_bundle` (the WS-invoked path) rejects it identically.
+    let state = venue(AMPLE_RATE_LIMIT);
+    let admin = token(&state, "admin-1");
+    seed_crossing(&state).await;
+    let mut bundle = state.export_bundle().await.expect("export bundle");
+    bundle.manifest.versions.fauxchange = "0.0.0-mismatch".to_string();
+
+    let (status, body) = send(
+        &state,
+        build_request(
+            "POST",
+            "/api/v1/replay/bundle",
+            Some(&admin),
+            Some(serde_json::to_value(&bundle).expect("serialize bundle")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a version mismatch is a typed 400"
+    );
+    assert_eq!(body["code"], "invalid_order");
+
+    match state.replay_bundle(&bundle).await {
+        Err(fauxchange::simulation::ReplayError::VersionMismatch { kind, .. }) => {
+            assert_eq!(kind, "fauxchange");
+        }
+        other => panic!("the WS-invoked path must reject the same mismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_observation_parity_replayed_fill_matches_recorded_execution() {
+    // A recorded fill and its REPLAYED reconstruction render IDENTICALLY on the
+    // REST observation surface — the reconstructed `ExecutionRecord`s equal the live
+    // ones the REST `/executions` read returns.
+    let state = venue(AMPLE_RATE_LIMIT);
+    seed_crossing(&state).await;
+    let bundle = state.export_bundle().await.expect("export bundle");
+    let report = state.replay_bundle(&bundle).await.expect("replay bundle");
+
+    for account in ["maker", "taker"] {
+        let account = AccountId::new(account);
+        let live = state
+            .executions()
+            .list(&account, &ExecutionFilter::default())
+            .expect("live executions list");
+        let replayed = report
+            .executions
+            .list(&account, &ExecutionFilter::default())
+            .expect("replayed executions list");
+        assert!(!live.is_empty(), "the account has a recorded fill leg");
+        assert_eq!(
+            replayed, live,
+            "the replayed fill renders identically to the recorded one on the observation surface"
+        );
+    }
 }

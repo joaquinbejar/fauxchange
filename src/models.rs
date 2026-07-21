@@ -1947,6 +1947,60 @@ pub struct ActiveSubscription {
     pub depth: Option<usize>,
 }
 
+// ============================================================================
+// Record / replay control plane (#030)
+// ============================================================================
+
+/// The request body of the record-control route — flip the venue's scenario
+/// capture window on or off ([04 §4](../docs/04-market-data-and-replay.md#4-historical-replay)).
+///
+/// A **Sequenced-class venue control** requiring [`Permission::Admin`], mirrored by
+/// the WS `record` action for control parity. Rejects unknown fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecordControlRequest {
+    /// `true` opens the scenario-capture window, `false` closes it. The durable
+    /// write-ahead journal is unaffected (it is always on).
+    pub enabled: bool,
+}
+
+/// The venue recording state — the response of the record-control route and its
+/// `GET` status read, and the payload of the WS `recording_state` ack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RecordingStateResponse {
+    /// Whether a scenario-capture window is currently active.
+    pub recording: bool,
+}
+
+/// One underlying's replay summary — the event count re-derived and the
+/// `underlying_sequence` the replay ended at (#030). Registry ids are excluded
+/// from the oracle, so this reports the journaled sequence, never a registry id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct UnderlyingReplaySummary {
+    /// The underlying ticker.
+    pub underlying: String,
+    /// The number of re-derived ordered events for this underlying.
+    pub event_count: u64,
+    /// The highest `underlying_sequence` present, or `null` for an empty stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_sequence: Option<u64>,
+}
+
+/// The reconstructed summary of a replayed scenario bundle — the response of the
+/// replay-bundle route and the payload of the WS `replay_complete` ack (#030).
+///
+/// A wire-safe projection of the driver's reconstructed report: per-underlying
+/// event counts + ending sequences, and the reconstructed executions-leg count.
+/// The full reconstructed books / stores are not serialised here (mark prices are
+/// recomputed live and excluded from the oracle).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReplayReportResponse {
+    /// The per-underlying replay summaries, in deterministic underlying order.
+    pub per_underlying: Vec<UnderlyingReplaySummary>,
+    /// The total reconstructed executions-leg count across all underlyings.
+    pub executions: u64,
+}
+
 /// A server → client WebSocket message ([03 §4](../docs/03-protocol-surfaces.md)).
 ///
 /// Internally-adjacently tagged (`#[serde(tag = "type", content = "data")]`):
@@ -2139,6 +2193,22 @@ pub enum WsMessage {
     SubscriptionList {
         /// The active subscriptions.
         active: Vec<ActiveSubscription>,
+    },
+    /// The venue recording state after a `record` control action (#030) — the WS
+    /// ack for the record on/off control, mirroring the REST
+    /// [`RecordingStateResponse`] for control parity.
+    #[serde(rename = "recording_state")]
+    RecordingState {
+        /// Whether a scenario-capture window is now active.
+        recording: bool,
+    },
+    /// The reconstructed summary of a `replay_bundle` control action (#030) — the
+    /// WS ack carrying the same [`ReplayReportResponse`] the REST replay route
+    /// returns, for control parity.
+    #[serde(rename = "replay_complete")]
+    ReplayComplete {
+        /// The per-underlying replay summary + reconstructed executions count.
+        report: ReplayReportResponse,
     },
     /// A typed error envelope ([03 §4.2](../docs/03-protocol-surfaces.md)) — the
     /// versioned [`WsError`] from the shared error boundary (#003), reused
