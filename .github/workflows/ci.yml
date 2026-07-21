@@ -35,12 +35,24 @@
 # (docs/08 §8): a new advisory or a policy violation fails BEFORE any image
 # is built.
 #
+# The `fuzz` job (added in v0.4 #042, docs/08-threat-model.md §6) runs a SHORT
+# bounded `cargo-fuzz` pass over the FIX tag-value decode path
+# (`fuzz/fuzz_targets/fix_decode.rs`), seeded by the committed adversarial
+# corpus (`fuzz/corpus/fix_decode/`) — the same two-stage pipeline the acceptor
+# drives on every inbound TCP read. `fuzz/` is a DELIBERATELY separate Cargo
+# workspace (its own `Cargo.lock`, no `[workspace]` table links it to the root
+# crate — verified via `cargo metadata`); this job is the only place its
+# toolchain/dependencies touch CI, and it never affects the `RUST_TOOLCHAIN` /
+# `RUST_MSRV` pin or the `cargo-audit`/`cargo-deny` gates above (both resolve
+# the root manifest only). A crash or ASan finding fails the job; the corpus is
+# never regenerated in CI (`UPDATE_CORPUS` is a local-only maintenance action,
+# see `tests/fix_adversarial.rs`).
+#
 # Explicitly OUT of this workflow (see
 # milestones/v0.1-backend-core/019-ci-audit-deny-lint.md "Scope"):
-# the `fuzz` job (FIX gateway lands v0.4) and the `bench-regression` gate
-# (armed before v1.0). The `docker-smoke` cold-bring-up + one-order-round-trip
-# e2e stage (v0.2 #027) is wired below, dedicated and DOCKER=1-gated — not on
-# every unit-test job.
+# the `bench-regression` gate (armed before v1.0). The `docker-smoke`
+# cold-bring-up + one-order-round-trip e2e stage (v0.2 #027) is wired below,
+# dedicated and DOCKER=1-gated — not on every unit-test job.
 #
 # `make workflow-<job-id>` (see Makefile) runs any job here locally via
 # `act` — job ids below are the stable contract those targets rely on.
@@ -86,6 +98,14 @@ env:
   # and re-verify `cargo audit` / `cargo deny check` locally before bumping.
   CARGO_AUDIT_VERSION: "0.22.1"
   CARGO_DENY_VERSION: "0.19.2"
+  # `cargo-fuzz` version verified locally (`cargo +nightly fuzz build/run
+  # fix_decode`, #042). Bump deliberately, re-verifying the local build first.
+  CARGO_FUZZ_VERSION: "0.13.2"
+  # The nightly toolchain `cargo-fuzz` needs (libFuzzer sanitizer-coverage
+  # instrumentation is nightly-only) — used ONLY by the `fuzz` job below, never
+  # `rust-toolchain.toml` or RUST_TOOLCHAIN/RUST_MSRV above. Bump deliberately,
+  # re-verifying `cargo +nightly fuzz run fix_decode` locally first.
+  FUZZ_NIGHTLY: "nightly-2026-07-15"
   # Quiet logs on test runs, mirroring `make test` (Makefile).
   LOGLEVEL: WARN
 
@@ -221,6 +241,40 @@ jobs:
         with:
           shared-key: parity
       - run: cargo test --test parity --all-features
+
+  # --- FIX parser fuzz target (v0.4 security gate, #042, docs/08 §6) --------
+  # A SHORT bounded `cargo-fuzz` run over the FIX tag-value decode path, seeded
+  # by the committed adversarial corpus (see the top-of-file note above for the
+  # separate-workspace / toolchain-isolation rationale). Builds the target
+  # first (a build failure is a distinct, earlier signal from a runtime
+  # finding), then runs it for a fixed wall-clock budget over
+  # `fuzz/corpus/fix_decode/` — not a soak. `-max_len` matches the harness's
+  # own frame cap (`MAX_FRAME_BYTES` in `fuzz/fuzz_targets/fix_decode.rs`) so
+  # the budget is spent on realistically-sized frames.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.FUZZ_NIGHTLY }}
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz
+      # `cargo-fuzz` itself is a normal stable-Rust CLI (it shells out to
+      # `cargo +nightly` for the instrumented build); `cargo install --locked`
+      # is its own documented install path and does not depend on a third-party
+      # tool registry shipping a prebuilt binary for it. `Swatinem/rust-cache`
+      # above caches `~/.cargo/registry`, so repeat runs reuse cargo-fuzz's own
+      # already-resolved dependency downloads.
+      - run: cargo install cargo-fuzz --locked --version ${{ env.CARGO_FUZZ_VERSION }}
+      - run: cargo +${{ env.FUZZ_NIGHTLY }} fuzz build fix_decode
+      - run: |
+          cargo +${{ env.FUZZ_NIGHTLY }} fuzz run fix_decode fuzz/corpus/fix_decode \
+            -- -max_total_time=120 -max_len=262144
 
   # --- Optional PostgreSQL persistence (docs/06 §6, #023) -------------------
   # Runs the durable persistence layer's migrations + DB integration test

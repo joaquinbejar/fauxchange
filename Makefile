@@ -33,7 +33,7 @@ help: ## List the common targets
 	@echo ""
 	@echo "  workflow-<job-id>  Run a .github/workflows/ci.yml job locally via act"
 	@echo "                     (fmt, clippy, test, build-release, doctests, msrv,"
-	@echo "                     golden, determinism, parity, migrations, cargo-audit,"
+	@echo "                     golden, determinism, parity, fuzz, migrations, cargo-audit,"
 	@echo "                     cargo-deny, image-build, docker-smoke)"
 
 # --- Build / run -------------------------------------------------------
@@ -134,7 +134,7 @@ publish: ## Publish fauxchange to crates.io (CARGO_REGISTRY_TOKEN); CONFIRM with
 # `make workflow-<job-id>` runs the matching job from
 # .github/workflows/ci.yml locally via `act` (https://github.com/nektos/act).
 # Job ids are the stable contract: fmt, clippy, test, build-release,
-# doctests, msrv, golden, determinism, parity, cargo-audit, cargo-deny.
+# doctests, msrv, golden, determinism, parity, fuzz, cargo-audit, cargo-deny.
 # Example: `make workflow-clippy`, `make workflow-cargo-deny`.
 workflow-%:
 	act push -j $* --workflows .github/workflows/ci.yml

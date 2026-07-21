@@ -199,6 +199,16 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedMessage, FixDecodeError> {
     // disagrees with the real frame is malformed).
     validate_body_length(bytes)?;
 
+    // Guard CheckSum(10) BEFORE the ironfix codec too: `ironfix-tagvalue` 0.3.0's
+    // `parse_checksum` folds the three checksum digits `d0*100 + d1*10 + d2` into a
+    // `u8`, which overflows (panics in debug, wraps in release) on any value > 255.
+    // `Decoder::decode` folds the FIRST `CheckSum (10)` field it reaches — wherever
+    // tag 10 occurs, not only the trailing field — so a duplicate / mid-body `10=`
+    // reaches that fold and crashes, bypassing the framing-layer precheck (which
+    // inspects only the positionally-trailing checksum). This scans every tag-10
+    // occurrence and rejects an out-of-domain value first.
+    reject_malformed_checksum(bytes)?;
+
     let raw = Decoder::new(bytes).decode()?;
 
     let begin_string = raw.begin_string();
@@ -438,6 +448,70 @@ fn validate_body_length(bytes: &[u8]) -> Result<(), FixDecodeError> {
     Ok(())
 }
 
+/// Guards `CheckSum (10)` before the `ironfix-tagvalue` codec — the belt for its
+/// `parse_checksum` fold (`d0*100 + d1*10 + d2` into a `u8`), which overflows
+/// (panicking in a debug build, wrapping in release) on any three-digit value
+/// `> 255`.
+///
+/// [`ironfix_tagvalue::Decoder::decode`] folds the value of the **first**
+/// `CheckSum (10)` field it reaches — wherever tag 10 occurs, not only the
+/// trailing field — so a duplicate or mid-body `10=` reaches `parse_checksum` and
+/// crashes, bypassing the framing-layer [`BoundedFrameDecoder`] precheck (which
+/// inspects only the positionally-trailing checksum at `total_length - 4`). This
+/// guard scans **every** `SOH`-delimited field by the same NUMERIC tag fold as
+/// [`split_field`] (so `010=` is caught too) and rejects any `CheckSum (10)`
+/// whose value is exactly three ASCII digits with a magnitude `> 255` — the exact
+/// input space that overflows the `u8` fold — applied to all occurrences rather
+/// than the trailing one alone.
+///
+/// Like [`validate_body_length`] it is deliberately permissive: a fold-safe
+/// checksum (three digits `<= 255`, the real `sum % 256` domain) still flows to
+/// the codec's actual sum check, and any tag-10 value that is not exactly three
+/// digits is deferred to `ironfix` — its `parse_checksum` returns `None` for a
+/// wrong length / a non-digit, so no overflow. The guard's own digit fold widens
+/// to `u16`, so it cannot itself overflow.
+///
+/// # Errors
+///
+/// [`FixDecodeError::MalformedChecksum`] for a `CheckSum (10)` field whose
+/// three-digit value exceeds `255`.
+fn reject_malformed_checksum(bytes: &[u8]) -> Result<(), FixDecodeError> {
+    /// SOH field delimiter.
+    const SOH: u8 = 0x01;
+    /// The `CheckSum (10)` tag, folded numerically.
+    const CHECKSUM_TAG: u64 = 10;
+    /// The largest value the `u8` checksum fold represents without overflow — the
+    /// domain of a conformant `sum % 256`.
+    const MAX_CHECKSUM: u16 = 255;
+
+    for field in bytes.split(|&b| b == SOH) {
+        let Some((tag, value)) = split_field(field) else {
+            continue;
+        };
+        if tag != CHECKSUM_TAG {
+            continue;
+        }
+        // Only an exactly-three-ASCII-digit value reaches `parse_checksum`'s u8
+        // fold; a different length or a non-digit makes it return `None` (no
+        // overflow), so defer that to the codec.
+        let &[d0, d1, d2] = value else {
+            continue;
+        };
+        if !(d0.is_ascii_digit() && d1.is_ascii_digit() && d2.is_ascii_digit()) {
+            continue;
+        }
+        // Widen to `u16` so the guard's own fold cannot overflow (max `999`).
+        let magnitude =
+            u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0');
+        if magnitude > MAX_CHECKSUM {
+            return Err(FixDecodeError::MalformedChecksum {
+                reason: "checksum value exceeds 255",
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,6 +679,93 @@ mod tests {
         })
         .encode();
         assert!(decode(&bytes).is_ok());
+    }
+
+    #[test]
+    fn test_decode_rejects_mid_body_checksum_injection_without_panic() {
+        // Fuzzer crash (P1): a MarketDataRequest carrying an injected mid-body
+        // `10=624` BEFORE the real trailing checksum. `ironfix_tagvalue::Decoder`
+        // folds the FIRST tag-10 it reaches (`624`) through `parse_checksum`'s u8
+        // fold — `6*100` overflows u8 (panics in a debug build, wraps in release).
+        // The framing-layer precheck inspects only the positionally-trailing
+        // checksum, so this bypasses it and reaches `decode`; the pre-codec guard
+        // rejects it first with a typed error (no panic). Built through
+        // `frame_with_body` so the BodyLength(9) and the trailing CheckSum(10) are
+        // both valid — ONLY the injected mid-body tag-10 can fire the guard.
+        let body = b"35=V\x0149=CLIENT\x0156=VENUE\x0134=1\x0152=20240329-12:00:00.000\x01262=MDR-1\x01263=1\x01264=0\x01267=1\x01269=0\x0110=624\x0155=BTC-20240329-50000-C\x01";
+        let frame = frame_with_body(body);
+        match decode(&frame) {
+            Err(err @ FixDecodeError::MalformedChecksum { .. }) => {
+                assert!(matches!(
+                    err.reject_route(),
+                    FixRejectRoute::SessionReject {
+                        reason: SessionRejectReason::IncorrectDataFormat,
+                        ref_tag: Some(10),
+                    }
+                ));
+            }
+            other => panic!("expected MalformedChecksum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_rejects_trailing_checksum_over_255_without_panic() {
+        // The positionally-trailing overflow vector, closed at the decode layer too
+        // (defence-in-depth for a direct `decode` caller that does not run the
+        // framing-layer precheck): a correctly-length-declared frame whose trailing
+        // CheckSum(10) is `624` (> 255) overflows `parse_checksum`'s u8 fold. The
+        // guard rejects it before the codec runs.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"8=FIX.4.4\x01");
+        frame.extend_from_slice(format!("9={}\x01", HEARTBEAT_BODY.len()).as_bytes());
+        frame.extend_from_slice(HEARTBEAT_BODY);
+        frame.extend_from_slice(b"10=624\x01"); // trailing checksum > 255
+        match decode(&frame) {
+            Err(FixDecodeError::MalformedChecksum { .. }) => {}
+            other => panic!("expected MalformedChecksum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_accepts_single_trailing_checksum_in_domain() {
+        // The parallel positive case: a well-formed frame with exactly one trailing
+        // checksum in `000..=255` passes the checksum guard and decodes to its
+        // typed struct (the guard must not false-reject a conformant frame).
+        let bytes = frame_with_body(HEARTBEAT_BODY);
+        match decode(&bytes) {
+            Ok(DecodedMessage::Heartbeat(_)) => {}
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reject_malformed_checksum_is_exhaustively_magnitude_bounded_mid_body() {
+        // Exhaustive over the full 3-digit input space `000..=999` in the MID-BODY
+        // position (the position `ironfix` folds first, bypassing the trailing-only
+        // framing precheck). Every value `> 255` overflows `parse_checksum`'s u8
+        // fold and MUST be rejected as `MalformedChecksum`; every value `<= 255` is
+        // fold-safe (the real `sum % 256` domain) and must NOT be rejected — the
+        // valid trailing checksum `frame_with_body` appends stays decodable. The
+        // guard is tested directly (its own fold widens to u16, so no panic across
+        // the space). Mirrors the framing-layer sweep in `acceptor.rs`.
+        for value in 0u16..=999 {
+            let body = format!(
+                "35=V\x0149=CLIENT\x0156=VENUE\x0134=1\x0152=20240329-12:00:00.000\x0110={value:03}\x0155=BTC-20240329-50000-C\x01"
+            );
+            let frame = frame_with_body(body.as_bytes());
+            let outcome = reject_malformed_checksum(&frame);
+            if value > 255 {
+                assert!(
+                    matches!(outcome, Err(FixDecodeError::MalformedChecksum { .. })),
+                    "mid-body `10={value:03}` (> 255) must be rejected, got {outcome:?}"
+                );
+            } else {
+                assert!(
+                    outcome.is_ok(),
+                    "mid-body `10={value:03}` (<= 255) must not be rejected, got {outcome:?}"
+                );
+            }
+        }
     }
 
     #[test]

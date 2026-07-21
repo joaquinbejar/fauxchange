@@ -90,9 +90,20 @@ impl Harness {
     }
 
     async fn start_with(accounts: Vec<AccountProvision>, rate_limit: u32) -> Self {
+        Self::start_full(accounts, rate_limit, "boot-secret").await
+    }
+
+    /// Like [`Self::start_with`], but with a caller-chosen bootstrap secret — so a
+    /// captured-log test can plant a distinctive marker and assert its absence
+    /// (#042).
+    async fn start_full(
+        accounts: Vec<AccountProvision>,
+        rate_limit: u32,
+        bootstrap_secret: &str,
+    ) -> Self {
         let auth = AuthConfig::dev()
             .expect("dev auth")
-            .with_bootstrap_secret("boot-secret")
+            .with_bootstrap_secret(bootstrap_secret)
             .with_rate_limit(rate_limit)
             .with_accounts(accounts);
         let state = AppState::new(
@@ -305,6 +316,44 @@ async fn recv_frames(stream: &mut TcpStream, timeout: Duration) -> Vec<Vec<u8>> 
         }
     }
     split_frames(&buf)
+}
+
+/// Like [`recv_frames`], but keeps accumulating frames across reads until one
+/// satisfies `wanted` or `timeout` elapses, returning everything received.
+///
+/// A single [`recv_frames`] returns on the first complete frame. When a logical
+/// response arrives as several frames written with a gap — e.g. a `New (150=0)`
+/// ack followed by a `Trade (150=F)` fill — a lone call can return only the ack
+/// and race the fill. Under a CPU-loaded test binary (the Argon2id-heavy #42
+/// suite adds contention) that gap widens and the fill lands after the first
+/// call returns. This waits for the awaited frame instead; only the receive
+/// window is widened — the assertions on the returned frames are unchanged.
+async fn recv_frames_until(
+    stream: &mut TcpStream,
+    timeout: Duration,
+    wanted: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut all = Vec::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let batch = recv_frames(stream, deadline - now).await;
+        let matched = batch.iter().any(|frame| wanted(frame));
+        let empty = batch.is_empty();
+        all.extend(batch);
+        if matched {
+            break;
+        }
+        // A window that elapsed with no new frame at all is a genuine timeout,
+        // not a mid-write gap — stop rather than spin to the deadline.
+        if empty {
+            break;
+        }
+    }
+    all
 }
 
 /// The value of scalar `tag` in a FIX frame (`SOH`-delimited `tag=value`).
@@ -573,7 +622,10 @@ async fn test_crossing_order_reports_trade_with_join_keys_and_commission() {
         ))
         .await
         .expect("taker");
-    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let reply = recv_frames_until(&mut client, Duration::from_secs(10), |f| {
+        msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("F")
+    })
+    .await;
     let trade = reply
         .iter()
         .find(|f| msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("F"))
@@ -1012,7 +1064,10 @@ async fn test_idempotent_resend_after_fill_re_renders_real_state_and_keeps_corre
         ))
         .await
         .expect("taker");
-    let first = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let first = recv_frames_until(&mut client, Duration::from_secs(10), |f| {
+        msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("F")
+    })
+    .await;
     assert!(
         first
             .iter()
@@ -1037,7 +1092,10 @@ async fn test_idempotent_resend_after_fill_re_renders_real_state_and_keeps_corre
         ))
         .await
         .expect("resend");
-    let resend = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let resend = recv_frames_until(&mut client, Duration::from_secs(10), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
     let report = resend
         .iter()
         .find(|f| msg_type(f).as_deref() == Some("8"))
@@ -1072,7 +1130,10 @@ async fn test_idempotent_resend_after_fill_re_renders_real_state_and_keeps_corre
         .write_all(&cancel_frame(TRADER_SENDER, VENUE, 5, "dup", "cxl-dup"))
         .await
         .expect("cancel");
-    let cancel_reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let cancel_reply = recv_frames_until(&mut client, Duration::from_secs(10), |f| {
+        msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("4")
+    })
+    .await;
     assert!(
         cancel_reply
             .iter()
@@ -1635,5 +1696,149 @@ async fn test_reconnect_with_reset_seq_num_flag_at_seq_one_is_admitted() {
         field(ack, "141").as_deref(),
         Some("Y"),
         "the ack echoes ResetSeqNumFlag"
+    );
+}
+
+/// #042: extends the logon-only capture test above with a **full** logon +
+/// order flow (resting order, crossing fill, unknown-order cancel reject,
+/// unsupported-message business reject — every reply type that can carry a
+/// `Text (58)`), and widens the forbidden-secret set beyond the password to
+/// the bootstrap secret, the Argon2id PHC marker, and the JWT dev signing key
+/// fragment — asserted absent from BOTH the captured `tracing` output AND
+/// every outbound `Text (58)` field across the whole flow. A `DATABASE_URL`
+/// forward guard (the FIX gateway itself never touches `DATABASE_URL` today;
+/// its redaction is proven generically by `tests/security.rs`'s boot-config
+/// test) is included so a future change wiring DB logging into this same
+/// tracing scope would be caught here too.
+#[tokio::test]
+async fn test_no_credential_appears_in_a_captured_log_or_text58_over_a_full_order_flow() {
+    const BOOTSTRAP_MARKER: &str = "BOOTSTRAP-SECRET-marker-DoNotLog-042";
+    const DB_PASSWORD_MARKER: &str = "DBPASS-marker-DoNotLog-042";
+    // A fragment unique to the embedded dev **private** key (`JwtAuth::dev`,
+    // src/auth.rs) — the same marker `tests/security.rs` uses.
+    const DEV_SIGNING_KEY_FRAGMENT: &str = "VNh0Vk8l7tR9inRKTQaO";
+
+    let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer({
+            let buffer = Arc::clone(&buffer);
+            move || CaptureBuffer(Arc::clone(&buffer))
+        })
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let accounts = vec![
+        AccountProvision::new(
+            AccountId::new("trader-1"),
+            Hash32([2; 32]),
+            vec![Permission::Trade],
+        )
+        .with_fix_login(TRADER_USER, TRADER_PW)
+        .with_comp_ids(CompIdBinding {
+            sender_comp_id: TRADER_SENDER.to_string(),
+            target_comp_id: VENUE.to_string(),
+        }),
+    ];
+    let harness = Harness::start_full(accounts, u32::MAX, BOOTSTRAP_MARKER).await;
+
+    // A forward-guard boot-config log line naming a DATABASE_URL-shaped
+    // secret: proves a future change that logged it from within this same
+    // tracing scope would be caught (mirrors tests/security.rs's boot-config
+    // redaction test).
+    let database_url = format!("postgres://venue:{DB_PASSWORD_MARKER}@db:5432/fauxchange");
+    tracing::info!(
+        database_url = "<redacted>",
+        "fix gateway effective config at boot"
+    );
+    assert!(database_url.contains(DB_PASSWORD_MARKER));
+
+    let mut client = logon_trader(harness.addr).await;
+    let mut all_frames: Vec<Vec<u8>> = Vec::new();
+
+    // A resting maker, a crossing taker (a real Trade fill).
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "maker-042",
+            "2",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("maker");
+    all_frames.extend(recv_frames(&mut client, Duration::from_secs(3)).await);
+    client
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            "taker-042",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("taker");
+    all_frames.extend(recv_frames(&mut client, Duration::from_secs(3)).await);
+
+    // An unknown-order cancel — a Text-bearing OrderCancelReject(9).
+    client
+        .write_all(&cancel_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            "never-placed-042",
+            "cxl-042",
+        ))
+        .await
+        .expect("cancel");
+    all_frames.extend(recv_frames(&mut client, Duration::from_secs(3)).await);
+
+    // An unsupported application message — a Text-bearing BusinessMessageReject(j).
+    client
+        .write_all(&unsupported_app_frame(TRADER_SENDER, VENUE, 5))
+        .await
+        .expect("unsupported");
+    all_frames.extend(recv_frames(&mut client, Duration::from_secs(3)).await);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Every Text(58) value seen across the whole flow, plus the captured log.
+    let mut haystack = String::from_utf8_lossy(&buffer.lock().expect("lock")).to_string();
+    for frame in &all_frames {
+        if let Some(text) = field(frame, "58") {
+            haystack.push('\n');
+            haystack.push_str(&text);
+        }
+    }
+
+    let forbidden: &[(&str, &str)] = &[
+        ("FIX plaintext password", TRADER_PW),
+        ("bootstrap secret", BOOTSTRAP_MARKER),
+        ("Argon2id PHC marker", "$argon2id$"),
+        ("JWT signing key fragment", DEV_SIGNING_KEY_FRAGMENT),
+        ("DATABASE_URL password marker", DB_PASSWORD_MARKER),
+    ];
+    for (label, needle) in forbidden {
+        assert!(
+            !haystack.contains(needle),
+            "SECURITY: {label} leaked into a captured log or a FIX Text(58) field \
+             over a full logon+order flow"
+        );
+    }
+
+    // Positive proof the flow actually reached the Text-bearing reply types this
+    // test means to cover.
+    assert!(
+        any_msg_type(&all_frames, "9"),
+        "expected an OrderCancelReject(9) in the flow, got {all_frames:?}"
+    );
+    assert!(
+        any_msg_type(&all_frames, "j"),
+        "expected a BusinessMessageReject(j) in the flow, got {all_frames:?}"
     );
 }

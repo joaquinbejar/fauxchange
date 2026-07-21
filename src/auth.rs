@@ -273,6 +273,15 @@ pub enum AuthError {
     /// enumerate accounts pre-authentication.
     #[error("no such account")]
     UnknownAccount,
+    /// Bootstrap minting selected a **revoked** account. Revocation is permanent
+    /// until an explicit re-enable ([ADR-0007 §3](../docs/adr/0007-fix-credentials-and-account-model.md)),
+    /// so a fresh token is refused rather than minted at the bumped epoch (which
+    /// would trivially pass its own freshness check and silently bypass the
+    /// revocation). Mirrors the FIX-logon rule (a bumped epoch cannot log in).
+    /// Returned **only after** the bootstrap secret has cleared, so it cannot be
+    /// used to enumerate accounts pre-authentication.
+    #[error("account revoked")]
+    AccountRevoked,
     /// The requested token lifetime (`issued_at + ttl`) overflowed `u64` seconds —
     /// an invalid, unmintable lifetime (never reached for real clocks / TTLs).
     #[error("invalid token lifetime")]
@@ -1503,6 +1512,9 @@ impl AccountRegistry {
     ///   secret gate rejects (checked first, before any account lookup);
     /// - [`AuthError::UnknownAccount`] if the (authorised) request names an account
     ///   the registry does not hold;
+    /// - [`AuthError::AccountRevoked`] if the (authorised, resolved) account has been
+    ///   revoked (a non-zero epoch) — revocation is permanent, so a fresh token is
+    ///   refused rather than minted at the bumped epoch;
     /// - [`AuthError::TokenLifetime`] if `issued_at_secs + ttl_secs` overflows;
     /// - [`AuthError::Signing`] if signing fails.
     pub fn mint_for_account(
@@ -1519,6 +1531,16 @@ impl AccountRegistry {
         gate.authorize(presented_secret)?;
 
         let resolved = self.account(account).ok_or(AuthError::UnknownAccount)?;
+        // Revocation is permanent (ADR-0007 §3): a revoked account (a non-zero
+        // epoch) MUST NOT be re-issued a token. Minting at the bumped epoch would
+        // carry a `revocation_epoch` equal to the account's current epoch, so the
+        // token would trivially pass `admit`'s freshness check and silently bypass
+        // the revocation. Refuse here — mirroring the FIX-logon rule (`fsm.rs`:
+        // `revocation_epoch > 0` cannot log in). Checked AFTER the bootstrap gate
+        // and account resolution, so it is not a pre-auth enumeration oracle.
+        if resolved.revocation_epoch > 0 {
+            return Err(AuthError::AccountRevoked);
+        }
         let exp = issued_at_secs
             .checked_add(ttl_secs)
             .ok_or(AuthError::TokenLifetime)?;
@@ -3014,10 +3036,72 @@ mod tests {
     }
 
     #[test]
-    fn test_mint_for_account_carries_current_revocation_epoch() {
+    fn test_mint_for_account_revoked_account_is_refused() {
+        // Previously this asserted the bug: mint-after-revoke SUCCEEDED, carrying
+        // the account's bumped epoch — a token that trivially passed its own
+        // freshness check and silently bypassed the revocation. Revocation is
+        // permanent (ADR-0007 §3), so minting for a revoked account MUST now be
+        // refused with `AuthError::AccountRevoked`, mirroring the FIX-logon rule.
         let registry = provisioned_registry();
         let jwt = dev_auth();
         assert_eq!(registry.revoke(&AccountId::new("trader")), Some(1));
+        match registry.mint_for_account(
+            &jwt,
+            &bootstrap(),
+            &AccountId::new("trader"),
+            "operator-secret",
+            now_secs(),
+            3_600,
+        ) {
+            Err(AuthError::AccountRevoked) => {}
+            other => panic!("minting for a revoked account must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mint_for_account_never_revoked_account_still_mints() {
+        // The normal path is unchanged: a never-revoked account (epoch 0) mints
+        // exactly as before, and the token admits.
+        let registry = Arc::new(provisioned_registry());
+        let clock = TestClock::new(1_000);
+        let jwt = dev_auth();
+        let iat = now_secs();
+        let token = match registry.mint_for_account(
+            &jwt,
+            &bootstrap(),
+            &AccountId::new("trader"),
+            "operator-secret",
+            iat,
+            3_600,
+        ) {
+            Ok(token) => token,
+            Err(error) => panic!("a never-revoked account must mint: {error}"),
+        };
+        let claims = match jwt.verify_token(&token) {
+            Ok(claims) => claims,
+            Err(error) => panic!("the minted token must verify: {error}"),
+        };
+        assert_eq!(claims.revocation_epoch, 0);
+        let service = AuthService::new(
+            jwt,
+            RateLimiter::new(clock, 100),
+            Arc::clone(&registry) as Arc<dyn RevocationOracle>,
+        );
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        match service.admit("/api/v1/orders", Some(&token), peer, Permission::Trade) {
+            Admission::Admitted { .. } => {}
+            other => panic!("a never-revoked token must be admitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mint_for_account_revoked_then_pre_revocation_token_is_refused_by_admit() {
+        // The read-path invariant this guard complements: a token minted BEFORE a
+        // revoke is refused by `admit` afterwards (asserted here so the mint-path
+        // guard and the admit-path check together close the revocation bypass).
+        let registry = Arc::new(provisioned_registry());
+        let clock = TestClock::new(1_000);
+        let jwt = dev_auth();
         let token = match registry.mint_for_account(
             &jwt,
             &bootstrap(),
@@ -3027,14 +3111,31 @@ mod tests {
             3_600,
         ) {
             Ok(token) => token,
-            Err(error) => panic!("resolved mint must succeed: {error}"),
+            Err(error) => panic!("the pre-revocation mint must succeed: {error}"),
         };
-        let claims = match jwt.verify_token(&token) {
-            Ok(claims) => claims,
-            Err(error) => panic!("the minted token must verify: {error}"),
-        };
-        // The token carries the account's CURRENT epoch, so it is not stale.
-        assert_eq!(claims.revocation_epoch, 1);
+        let service = AuthService::new(
+            jwt,
+            RateLimiter::new(clock, 100),
+            Arc::clone(&registry) as Arc<dyn RevocationOracle>,
+        );
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(registry.revoke(&AccountId::new("trader")), Some(1));
+        match service.admit("/api/v1/orders", Some(&token), peer, Permission::Trade) {
+            Admission::Rejected { error, .. } => assert!(matches!(error, VenueError::Unauthorized)),
+            other => panic!("a pre-revocation token must be refused post-revoke, got {other:?}"),
+        }
+        // And a fresh mint for the now-revoked account is also refused.
+        match registry.mint_for_account(
+            service.jwt(),
+            &bootstrap(),
+            &AccountId::new("trader"),
+            "operator-secret",
+            now_secs(),
+            3_600,
+        ) {
+            Err(AuthError::AccountRevoked) => {}
+            other => panic!("re-minting for the revoked account must be refused, got {other:?}"),
+        }
     }
 
     #[test]
