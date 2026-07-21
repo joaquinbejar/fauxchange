@@ -46,8 +46,8 @@ use fauxchange::auth::{DevMode, JwtAuth};
 use fauxchange::config::Config;
 use fauxchange::db::{DatabasePool, DbPoolConfig};
 use fauxchange::gateway::fix::{
-    FixAcceptor, FixAcceptorConfig, FixSessionStore, InMemoryFixSessionStore, SessionConfig,
-    VenueFixSessionFactory,
+    FixAcceptor, FixAcceptorConfig, FixSessionStore, SessionConfig, VenueFixSessionFactory,
+    select_fix_session_store,
 };
 use fauxchange::gateway::rest;
 use fauxchange::seed;
@@ -218,10 +218,12 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let fix_shutdown = if fix_config.enabled {
         let acceptor = FixAcceptor::bind(FixAcceptorConfig::from_config(&fix_config)).await?;
         let addr = acceptor.local_addr();
-        // The account-keyed session store: in-memory by default (a future PG
-        // backend slots in behind the same `FixSessionStore` swap seam, exactly as
-        // the durable venue journal does, when `DATABASE_URL` is set).
-        let session_store: Arc<dyn FixSessionStore> = Arc::new(InMemoryFixSessionStore::new());
+        // The account-keyed session store (#095): the durable PostgreSQL backend
+        // when `DATABASE_URL` is set (session counters + resend log + reset audit
+        // survive a PROCESS RESTART), the in-memory backend otherwise — behind the
+        // same `FixSessionStore` swap seam, exactly as the durable venue journal
+        // (#029) selects `PgVenueJournal` vs `InMemoryVenueJournal`.
+        let session_store: Arc<dyn FixSessionStore> = select_fix_session_store(state.db())?;
         let factory = Arc::new(VenueFixSessionFactory::new(
             Arc::clone(&state),
             session_store,

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO fix_session_resets (\n                account_id, sender_comp_id, target_comp_id, at_ms, trigger,\n                old_next_sender_seq, old_next_target_seq, new_next_sender_seq, new_next_target_seq\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "38180040debaae6b385f5cbfff42230cdf897aa7c79bcbdd5810a6cc575f7864"
+}

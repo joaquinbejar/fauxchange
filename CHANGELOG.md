@@ -57,6 +57,31 @@ The full versioning and release-process policy lives in the design docs
     given the same post-restart commands. A `testcontainers` restart test
     (`tests/recovery.rs`, `#[ignore]`-gated) drives boot → trade → kill →
     re-boot against the same Postgres and resumes at the continued sequence.
+- **PostgreSQL-durable FIX session store — process-restart persistence** (#95).
+  A `PgFixSessionStore` implements the existing `FixSessionStore` trait
+  (unchanged); `main.rs` now selects it via `select_fix_session_store(db)` when
+  `DATABASE_URL` is set and the in-memory backend otherwise (parity with #29's
+  `PgVenueJournal`). So each `(account_id, sender_comp_id, target_comp_id)`
+  session's sequence counters, outbound-frame resend log, and `SequenceReset`
+  audit now survive a **process restart**, not just a same-process reconnect.
+  - Migration `20260716120600_fix_sessions.sql`: three tables keyed on
+    `(account_id, sender_comp_id, target_comp_id)` — `fix_session_counters`
+    (`>= 1` CHECKed sender/target seqs, doubling as the key registry for the
+    `MAX_SESSION_KEYS` bound), `fix_session_outbound` (append-not-dedup resend
+    log, byte-exact `frame BYTEA`, oldest-first eviction), `fix_session_resets`
+    (bounded reset-audit ring, injected venue-clock `at_ms`, never wall-clock).
+  - Parameterized `sqlx::query!` / `query_scalar!` only; the `.sqlx/` offline
+    artifacts are committed so a `SQLX_OFFLINE=true` build is green. Typed
+    `SessionStoreError::Backend` static labels — `DATABASE_URL` / credentials /
+    frame payloads are never logged. `checked` (`try_from`) on every
+    seq/ms `u64`↔`i64` conversion. The durable backend lives in the gateway
+    (`src/gateway/fix/pg_store.rs`) depending inward on `crate::db`, keeping the
+    transport→persistence direction (a transport trait's backend, not a domain
+    store).
+  - `testcontainers` tests (`tests/db.rs`, `#[ignore]`-gated): counters +
+    resend log + reset audit survive a simulated process exit (drop store +
+    pool, reopen a fresh pool against the same DB, resume numbering); plus an
+    in-memory/PG behavioral-parity test over one fixed trait-call scenario.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;

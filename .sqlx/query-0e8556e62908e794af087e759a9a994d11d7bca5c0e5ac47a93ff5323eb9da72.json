@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM fix_session_outbound\n            WHERE id IN (\n                SELECT id FROM (\n                    SELECT\n                        id,\n                        row_number() OVER (ORDER BY id DESC) AS rn,\n                        sum(octet_length(frame)) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING)\n                            AS cum_bytes\n                    FROM fix_session_outbound\n                    WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3\n                ) ranked\n                WHERE ranked.rn > $4 OR ranked.cum_bytes > $5\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0e8556e62908e794af087e759a9a994d11d7bca5c0e5ac47a93ff5323eb9da72"
+}

@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT next_sender_seq, next_target_seq\n            FROM fix_session_counters\n            WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next_sender_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "fix_session_counters",
+            "name": "next_sender_seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "next_target_seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "fix_session_counters",
+            "name": "next_target_seq"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "98c1f2c2d305038effabaad62e3292e0c26292a17f220e0ac8b9ea236262071c"
+}

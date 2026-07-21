@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT seq, frame\n            FROM fix_session_outbound\n            WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3\n              AND seq >= $4\n              AND ($5::bigint = 0 OR seq <= $5::bigint)\n            ORDER BY seq ASC, id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "fix_session_outbound",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "frame",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "fix_session_outbound",
+            "name": "frame"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "152a24248b491faa02a0d01795fa384d328c3dadd36b2a654e42218da31a734d"
+}

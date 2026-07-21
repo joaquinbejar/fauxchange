@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO fix_session_counters\n                (account_id, sender_comp_id, target_comp_id, next_sender_seq, next_target_seq)\n            SELECT $1, $2, $3, $4, $5\n            WHERE (\n                EXISTS (\n                    SELECT 1 FROM fix_session_counters\n                    WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3\n                )\n                OR (SELECT count(*) FROM fix_session_counters) < $6\n            )\n            ON CONFLICT (account_id, sender_comp_id, target_comp_id) DO UPDATE SET\n                next_sender_seq = EXCLUDED.next_sender_seq,\n                next_target_seq = EXCLUDED.next_target_seq,\n                updated_at = now()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1b61bbf6f79a2492875da3fa52981c9d57babed9e3081996f84966086343f6de"
+}
