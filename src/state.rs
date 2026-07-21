@@ -36,23 +36,28 @@
 //! actor's [`StoreFanOut`] at spawn and retained here; both sides point at the
 //! one store ([02 §6](../docs/02-matching-architecture.md)).
 //!
-//! ## Auth (real, from #012) and the remaining placeholders (#014–#016)
+//! ## Auth + subscriptions (real) and the remaining placeholders (#015–#016)
 //!
 //! The auth service is **real** as of #012: [`AppState`] owns the
 //! [`AccountRegistry`] and an [`AuthService`] pinned to the concrete venue
 //! [`FixedClock`] (built from [`JwtAuth`] + [`RateLimiter`] + the registry as the
-//! [`RevocationOracle`]). The subscription-manager, market-maker, and simulator
-//! services are still **placeholders** so the wiring compiles and its shape is
-//! fixed; each real implementation slots into its field without reshaping
-//! `AppState`:
+//! [`RevocationOracle`]). The WebSocket subscription manager is **real** as of
+//! #014: `AppState` owns the [`crate::subscription::OrderbookSubscriptionManager`]
+//! service (a sibling of [`crate::auth`] / [`crate::ohlc`], **not** a gateway) and
+//! tees a [`WsFanOut`] alongside each actor's
+//! [`StoreFanOut`] via the exchange-owned [`TeeFanOut`], so the **same** committed
+//! [`VenueEvent`](crate::exchange::VenueEvent) feeds the stores and the WS
+//! broadcast post-journal. The market-maker and simulator services are still
+//! **placeholders** so the wiring compiles and its shape is fixed; each real
+//! implementation slots into its field without reshaping `AppState`:
 //!
-//! | Field           | Type / placeholder          | Filled by |
-//! |-----------------|-----------------------------|-----------|
-//! | `auth`          | [`AuthService`] (real)       | #011/#012 |
-//! | `accounts`      | [`AccountRegistry`] (real)   | #012      |
-//! | `subscriptions` | [`SubscriptionsPlaceholder`]| #014      |
-//! | `market_maker`  | [`MarketMakerPlaceholder`]  | #015      |
-//! | `simulator`     | [`SimulatorPlaceholder`]    | #016      |
+//! | Field           | Type / placeholder                | Filled by |
+//! |-----------------|-----------------------------------|-----------|
+//! | `auth`          | [`AuthService`] (real)             | #011/#012 |
+//! | `accounts`      | [`AccountRegistry`] (real)         | #012      |
+//! | `subscriptions` | [`crate::subscription::OrderbookSubscriptionManager`] (real) | #014 |
+//! | `market_maker`  | [`MarketMakerPlaceholder`]        | #015      |
+//! | `simulator`     | [`SimulatorPlaceholder`]          | #016      |
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,10 +72,18 @@ use crate::error::VenueError;
 use crate::exchange::{
     ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, FixedClock, InMemoryExecutionsStore,
     InMemoryPositionsStore, InMemoryVenueJournal, JournalHeader, JournalSnapshot, LineageId,
-    MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, VenueCommand,
+    MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, TeeFanOut, VenueCommand,
     spawn_matching_actor_with_registry_and_index,
 };
 use crate::models::AccountId;
+// The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
+// sibling of `crate::auth` / `crate::ohlc`), NOT a gateway. `AppState` owns the
+// manager and tees a `WsFanOut` alongside `StoreFanOut` (via the exchange-owned
+// `TeeFanOut`) into every actor's fan-out. The service imports only the DTOs +
+// the exchange core, never `crate::state` or `crate::gateway`, so the layered
+// flow (transport → application → domain / services) holds — this is the same
+// kind of wiring reference `AppState` already makes to `StoreFanOut`.
+use crate::subscription::{OrderbookSubscriptionManager, WsFanOut};
 
 /// The default bounded mailbox capacity for each per-underlying actor — a DoS
 /// control, never unbounded ([08 §5](../docs/08-threat-model.md)). The real
@@ -91,11 +104,6 @@ pub const DEFAULT_LINEAGE_TOKEN: &str = "fauxchange";
 // ============================================================================
 // Service placeholders — stable field types for #014–#016
 // ============================================================================
-
-/// Placeholder for the WebSocket subscription manager (per-symbol monotonic
-/// sequence, broadcast fan-out) — filled by **#014**.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct SubscriptionsPlaceholder;
 
 /// Placeholder for the market-maker engine handle — filled by **#015**.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -327,8 +335,10 @@ pub struct AppState {
     /// The operator gate on token issuance (`AUTH_BOOTSTRAP_SECRET`), consulted by
     /// the registry-resolved mint ([`AppState::mint_token`]).
     bootstrap_gate: BootstrapGate,
-    /// The WebSocket subscription manager (placeholder until #014).
-    subscriptions: SubscriptionsPlaceholder,
+    /// The WebSocket market-data subscription manager (#014) — the shared
+    /// broadcast + per-instrument `instrument_sequence` service every `/ws`
+    /// connection reads, fed post-journal by each actor's [`WsFanOut`].
+    subscriptions: Arc<OrderbookSubscriptionManager>,
     /// The market-maker engine handle (placeholder until #015).
     market_maker: MarketMakerPlaceholder,
     /// The price simulator handle (placeholder until #016).
@@ -417,6 +427,11 @@ impl AppState {
         let positions = Arc::new(InMemoryPositionsStore::new());
         let marks = Arc::new(MarkPriceBook::new());
 
+        // The WebSocket market-data service: one shared bounded broadcast + the
+        // per-instrument sequence/aggregate, fed by a `WsFanOut` teed alongside
+        // each actor's `StoreFanOut` (both consume the SAME post-journal event).
+        let subscriptions = Arc::new(OrderbookSubscriptionManager::new());
+
         let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::with_capacity(underlyings.len());
         for underlying in underlyings {
             let ticker: Arc<str> = Arc::from(underlying);
@@ -431,12 +446,19 @@ impl AppState {
             // Each actor owns its own append-only journal, keyed on the shared
             // lineage so re-derived ids stay in one namespace.
             let journal = InMemoryVenueJournal::new(JournalHeader::new(lineage_id.clone()));
-            // The fan-out clones the shared store `Arc`s: the actor writes into
-            // the very instances `AppState` exposes for reads.
-            let fan_out = StoreFanOut::new(
-                Arc::clone(&executions),
-                Arc::clone(&positions),
-                Arc::clone(&marks),
+            // The fan-out tees the committed event into BOTH the shared stores
+            // (`StoreFanOut`, #008) and the WS market-data broadcast (`WsFanOut`,
+            // #014) — one post-journal event, two consumers, neither on the
+            // order-path critical section. The store fan-out clones the shared
+            // store `Arc`s (the actor writes into the very instances `AppState`
+            // exposes for reads); the WS fan-out clones the shared manager `Arc`.
+            let fan_out = TeeFanOut::new(
+                StoreFanOut::new(
+                    Arc::clone(&executions),
+                    Arc::clone(&positions),
+                    Arc::clone(&marks),
+                ),
+                WsFanOut::new(Arc::clone(&subscriptions)),
             );
             let actor_config =
                 ActorConfig::new(Arc::clone(&ticker), lineage_id.clone(), mailbox_capacity);
@@ -472,7 +494,7 @@ impl AppState {
             accounts: account_registry,
             auth: auth_service,
             bootstrap_gate,
-            subscriptions: SubscriptionsPlaceholder,
+            subscriptions,
             market_maker: MarketMakerPlaceholder,
             simulator: SimulatorPlaceholder,
         }))
@@ -683,10 +705,13 @@ impl AppState {
         )
     }
 
-    /// The WebSocket subscription manager (placeholder until #014).
+    /// The WebSocket market-data subscription manager (#014) — the shared
+    /// broadcast + per-instrument `instrument_sequence` service the `/ws`
+    /// connections read (snapshot on subscribe, filtered forwarding of the
+    /// bounded broadcast).
     #[must_use]
     #[inline]
-    pub fn subscriptions(&self) -> &SubscriptionsPlaceholder {
+    pub fn subscriptions(&self) -> &Arc<OrderbookSubscriptionManager> {
         &self.subscriptions
     }
 

@@ -186,7 +186,13 @@ pub enum Side {
 
 /// The side of a book price level in an orderbook delta. Wire casing is
 /// **lowercase** (`"bid"` / `"ask"`) — distinct from an order [`Side`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+///
+/// `Ord` (declaration order, `Bid` < `Ask`) is derived so the WS subscription
+/// manager can key its touched-level set deterministically (#014); it does not
+/// affect the wire form.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
+)]
 #[repr(u8)]
 #[serde(rename_all = "lowercase")]
 pub enum BookSide {

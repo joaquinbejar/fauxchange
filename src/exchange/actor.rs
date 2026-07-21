@@ -178,6 +178,43 @@ impl FanOut for NoopFanOut {
     fn emit(&mut self, _event: &VenueEvent) {}
 }
 
+/// A **tee** [`FanOut`]: emits one committed event to two consumers in order.
+///
+/// A pure generic combinator over the [`FanOut`] seam with no store / WS / DTO
+/// knowledge — it lives here beside the trait so the application layer can compose
+/// any two fan-out consumers without either owning the other. [`crate::state::AppState`]
+/// uses it to compose the #008 [`StoreFanOut`]
+/// (`first`, so the authoritative stores update first) with the #014
+/// `WsFanOut` (`second`) — the **same** post-journal event feeds both, and neither
+/// consumer's work is on the actor's critical path beyond its own synchronous
+/// enqueue.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TeeFanOut<A, B> {
+    first: A,
+    second: B,
+}
+
+impl<A, B> TeeFanOut<A, B> {
+    /// Composes two fan-out consumers; `first` is emitted to before `second`.
+    #[must_use]
+    #[inline]
+    pub fn new(first: A, second: B) -> Self {
+        Self { first, second }
+    }
+}
+
+impl<A, B> FanOut for TeeFanOut<A, B>
+where
+    A: FanOut,
+    B: FanOut,
+{
+    #[inline]
+    fn emit(&mut self, event: &VenueEvent) {
+        self.first.emit(event);
+        self.second.emit(event);
+    }
+}
+
 // ============================================================================
 // Receipt + seal
 // ============================================================================

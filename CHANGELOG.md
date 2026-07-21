@@ -11,6 +11,72 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The WebSocket surface — the `WsMessage` protocol, channel producers, and the
+  subscription manager** (#14) in `src/gateway/ws/` + the new `src/subscription.rs`
+  service module ([03 §4, §4.1, §4.2](docs/03-protocol-surfaces.md),
+  [01 §9.1](docs/01-domain-model.md)). `GET /ws` upgrades to the tagged
+  `WsMessage` protocol behind an authenticated handshake: the bearer JWT is read
+  from the `Authorization` header **or** a `?token=` / `?access_token=` query
+  parameter (a browser WebSocket cannot set headers) and admitted through the
+  venue's one `AuthService::admit` (baseline `Read`) — a missing/invalid token or
+  an exhausted rate-limit budget **refuses the upgrade** (`401`/`429`), the socket
+  never opens. The `OrderbookSubscriptionManager` (replacing the #010
+  subscriptions placeholder in `AppState`) keeps a per-instrument monotonic
+  `instrument_sequence` — the market-data namespace, **separate** from the
+  journaled `underlying_sequence`, gap-repaired only by a fresh snapshot, never a
+  resend — plus an event-sourced L2 aggregate over a **bounded**
+  `tokio::broadcast` fan-out. **Every advertised channel has a real
+  producer/filter/sequence policy**: `orderbook` (committed book mutation →
+  snapshot then strictly-increasing resulting-quantity deltas), `trades` (one
+  public print per match), `fills` (one **anonymised** print per committed fill
+  leg — the four join keys only, **never** `account`/`fee`; account-scoped detail
+  stays REST/FIX), and `prices` (the committed `SimStep` override); `quotes` is
+  honest-pending on the `Quoter` (#015). **Only user-driven book mutations emit
+  `orderbook_delta`** — a control-plane event never does. **Layering**: the
+  manager + `WsFanOut` are a `crate::subscription` **service** (a sibling of
+  `crate::auth`/`crate::ohlc`, **not** a gateway), so `AppState` owns them without
+  importing `crate::gateway`; the generic `TeeFanOut` fan-out combinator lives in
+  `crate::exchange` beside the `FanOut` trait. **Critical fan-out wiring**: a
+  `WsFanOut` (a #006 `FanOut` impl) is composed with #008's `StoreFanOut` via the
+  exchange-owned `TeeFanOut`, so `AppState` feeds the **same** post-journal
+  `VenueEvent` to both the stores and the WS broadcast; the broadcast enqueue is
+  O(1) and non-blocking, off the actor's critical path (a laggard drops and
+  re-snapshots, never stalling the order path). **Client → server actions**
+  (`subscribe`/`unsubscribe`/`batch_*`/`list_subscriptions`) manage per-connection
+  subscription state capped at `MAX_SUBSCRIPTIONS_PER_CONNECTION` (256, a DoS
+  control); the market-maker control actions (`set_spread`/`set_size`/`set_skew`/
+  `kill`/`enable`) are rate-limited **then** `Admin`-gated (admission-first) and
+  routed as sequenced `MarketMakerControl` commands (control parity, REST ≡ WS).
+  **WS carries no order entry** — any place/cancel/replace-shaped frame is
+  rejected with the typed (non-terminal) `WsError` envelope; an auth/terminal
+  error closes the socket, a command error keeps it open. **DoS bounds**
+  (docs/08 §5): a venue-wide concurrent-connection cap (`MAX_WS_CONNECTIONS` = 1024,
+  a semaphore permit per socket → `503` at the ceiling, released on close), an
+  idle/liveness reaper (a heartbeat protocol ping each 30 s; a connection with no
+  inbound traffic for `MAX_IDLE_TICKS` = 4 ticks is closed), an up-front
+  `MAX_BATCH_SIZE` (64) cap on `batch_*` before the array is iterated, and a
+  64 KiB inbound frame/message cap (replacing axum's 16 MiB/64 MiB defaults).
+  **Live-session re-validation**: each heartbeat tick re-checks the socket's
+  session via `AuthService::revalidate_session` — a token revoked or expired since
+  the handshake closes the socket with the terminal `Unauthorized` error (the
+  handshake admits only once). Enables the axum `ws` feature (pulls
+  `tokio-tungstenite` + `tungstenite` + `data-encoding` + `futures-sink` NEW;
+  `sha1`/`base64` were already in the tree — only a new dep edge) and promotes
+  `serde_json` to a direct dependency for client-frame parsing (already in the
+  tree — no new crate); `BookSide` gains a derived `Ord` for the manager's
+  touched-level set (additive, no wire change). **`MarketMakerControl` routing
+  seam**: `AppState::submit` does not yet route the venue-global
+  `MarketMakerControl` (a #010 deviation), so the control actions surface the
+  honest not-routable error rather than fabricate a success — the same seam #013's
+  REST controls hit. Tests: unit (subscribe→snapshot→delta ordering, anonymised
+  fill shape, requote-no-delta, sub-cap enforcement, order-entry-frame rejection,
+  control forbidden/rate-limit-first/not-routable non-terminal, connection-cap
+  ceiling, batch-cap rejection, session revalidation revoke/expire/unknown);
+  property (`ws_instrument_sequence_monotonic_per_symbol`); integration
+  (`tests/ws.rs`) — the real `GET /ws` handshake over a bound server
+  (`401`/`101`/query-param `101`/`429`), subscribe→sequenced-deltas-never-backward,
+  laggard re-snapshot, live-session revalidation closes a revoked socket, and the
+  typed error envelope close-vs-continue semantics.
 - **The REST gateway — the ~50-route Backend surface on Axum 0.8 with utoipa
   OpenAPI + Swagger UI** (#13) in `src/gateway/rest/`
   ([03 §3, §10](docs/03-protocol-surfaces.md),
