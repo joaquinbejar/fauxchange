@@ -776,6 +776,7 @@ dependencies = [
 name = "fauxchange-fuzz"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "bytes",
  "fauxchange",
  "libfuzzer-sys",

@@ -1,0 +1,1 @@
+{"Command":{"sequence":0,"venue_ts":1700000000000,"command":{"CancelOrder":{"symbol":"BTC-20240329-50000-C","order_id":"o-1","account":"acct-1"}},"injected":"evil"}}

@@ -8,24 +8,36 @@ material (JWT signing keys, Argon2id password hashes, `AUTH_BOOTSTRAP_SECRET`),
 and processes untrusted protocol input on open ports. Its security posture is
 treated as that of any internal service.
 
-> **Status (v0.0.1):** name-reservation placeholder — no implementation code
-> exists yet. This policy is in force from the first implementation commit.
-> The engineering threat model behind it is
-> [`docs/08-threat-model.md`](docs/08-threat-model.md); the owner decision that
-> made security a first-class priority is
+> **Status:** this policy has been in force since the first implementation
+> commit. The version-support table below states the policy that governs
+> from the `v1.0.0` release onward (the `v1.0` stability milestone —
+> [ROADMAP.md §v1.0 stability commitment](docs/ROADMAP.md#v10--stability-commitment));
+> before `v1.0.0`, only the latest published `0.x` minor carries any
+> security-fix commitment, and no `0.x` release carries a long-term-support
+> guarantee ([SEMVER.md](docs/SEMVER.md)). The engineering threat model
+> behind this policy is [`docs/08-threat-model.md`](docs/08-threat-model.md);
+> the owner decision that made security a first-class priority is
 > [ADR-0008](docs/adr/0008-production-grade-performance-and-security.md).
 
 ## Supported versions
 
+From `v1.0.0` onward, `fauxchange` follows [SEMVER.md](docs/SEMVER.md):
+breaking changes land only in a major bump, so a security fix backports
+cleanly onto the current major line.
+
 | Version | Supported |
 |---------|-----------|
-| `0.0.x` | Pre-release placeholder — no security support; do not deploy |
-| latest `0.x` (once code lands) | Security fixes on the latest published minor |
-| `< latest 0.x` | Not supported — upgrade to the latest minor |
+| latest published `1.x` minor | Security fixes |
+| `< latest 1.x` minor (still `1.x`) | Not supported — upgrade to the latest `1.x` minor |
+| `0.x` (pre-`v1.0.0`) | Not supported — pre-stability; upgrade to `1.x` |
 
-During `0.x`, only the **latest published minor** receives security fixes. A
-long-term-support policy is defined at the `1.0` stability cut
-([SEMVER.md](docs/SEMVER.md), [ROADMAP.md](docs/ROADMAP.md)).
+Only the **latest published minor** of the current major line receives
+security fixes — there is no parallel-maintained older minor. A pre-`1.0`
+(`0.x`) release carries no security-fix guarantee; report a vulnerability
+against a `0.x` release through the same channel below and it is triaged
+against the latest `1.x` (or, before `v1.0.0` ships, the latest `0.x`)
+minor. When `fauxchange` ships a `2.0`, this table is revised the same way
+the `1.x` row was.
 
 ## Reporting a vulnerability
 

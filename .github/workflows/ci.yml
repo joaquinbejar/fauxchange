@@ -48,6 +48,15 @@
 # never regenerated in CI (`UPDATE_CORPUS` is a local-only maintenance action,
 # see `tests/fix_adversarial.rs`).
 #
+# #052 (the v1.0 security gate) extends the SAME job with three more SHORT
+# bounded passes — REST JSON body decode (`rest_json_decode`), WS client-frame
+# decode (`ws_frame_decode`), and the journal-record / scenario-bundle
+# deserialiser (`journal_bundle_decode`, folding in the #034 adversarial
+# corpus as seeds) — so `cargo fuzz` now covers FIX + REST + WS + journal, per
+# [TESTING.md §11](../../docs/TESTING.md#11-ci-matrix) ("REST/WS/journal by
+# v1.0"). FIX stays the primary target (unchanged budget); the three new
+# targets are secondary and run after it in the same job.
+#
 # Explicitly OUT of this workflow (see
 # milestones/v0.1-backend-core/019-ci-audit-deny-lint.md "Scope"):
 # the `bench-regression` gate (armed before v1.0). The `docker-smoke`
@@ -242,15 +251,21 @@ jobs:
           shared-key: parity
       - run: cargo test --test parity --all-features
 
-  # --- FIX parser fuzz target (v0.4 security gate, #042, docs/08 §6) --------
-  # A SHORT bounded `cargo-fuzz` run over the FIX tag-value decode path, seeded
-  # by the committed adversarial corpus (see the top-of-file note above for the
-  # separate-workspace / toolchain-isolation rationale). Builds the target
-  # first (a build failure is a distinct, earlier signal from a runtime
-  # finding), then runs it for a fixed wall-clock budget over
-  # `fuzz/corpus/fix_decode/` — not a soak. `-max_len` matches the harness's
-  # own frame cap (`MAX_FRAME_BYTES` in `fuzz/fuzz_targets/fix_decode.rs`) so
-  # the budget is spent on realistically-sized frames.
+  # --- Parser fuzz targets (docs/08 §6; FIX v0.4 #042, REST/WS/journal ------
+  # --- v1.0 #052) -------------------------------------------------------------
+  # SHORT bounded `cargo-fuzz` runs, each seeded by its committed adversarial
+  # corpus (see the top-of-file note above for the separate-workspace /
+  # toolchain-isolation rationale). Each target is built first (a build
+  # failure is a distinct, earlier signal from a runtime finding), then run
+  # for a fixed wall-clock budget over its own `fuzz/corpus/<target>/` — not a
+  # soak. `-max_len` is chosen per target: FIX and WS mirror their harness's
+  # own hard frame cap exactly (`MAX_FRAME_BYTES` / `MAX_WS_FRAME_BYTES`, so
+  # every fuzzed byte is spent on a realistically-sized frame); REST mirrors
+  # the router's `MAX_REQUEST_BODY_BYTES` ceiling; the journal/bundle target's
+  # own internal ceilings (`MAX_JOURNAL_RECORD_BYTES` = 2 MiB,
+  # `MAX_BUNDLE_BYTES` = 64 MiB) are already proven by the committed
+  # `tests/adversarial.rs` unit tests, so its `-max_len` is a SMALLER,
+  # coverage-focused bound (interesting shape mutations, not ceiling volume).
   fuzz:
     name: fuzz
     runs-on: ubuntu-24.04
@@ -271,10 +286,25 @@ jobs:
       # above caches `~/.cargo/registry`, so repeat runs reuse cargo-fuzz's own
       # already-resolved dependency downloads.
       - run: cargo install cargo-fuzz --locked --version ${{ env.CARGO_FUZZ_VERSION }}
+      # Primary target (#042) — the FIX tag-value decode path.
       - run: cargo +${{ env.FUZZ_NIGHTLY }} fuzz build fix_decode
       - run: |
           cargo +${{ env.FUZZ_NIGHTLY }} fuzz run fix_decode fuzz/corpus/fix_decode \
             -- -max_total_time=120 -max_len=262144
+      # Secondary targets (#052) — REST JSON body, WS client frame, and the
+      # journal-record / scenario-bundle deserialiser.
+      - run: cargo +${{ env.FUZZ_NIGHTLY }} fuzz build rest_json_decode
+      - run: |
+          cargo +${{ env.FUZZ_NIGHTLY }} fuzz run rest_json_decode fuzz/corpus/rest_json_decode \
+            -- -max_total_time=60 -max_len=1048576
+      - run: cargo +${{ env.FUZZ_NIGHTLY }} fuzz build ws_frame_decode
+      - run: |
+          cargo +${{ env.FUZZ_NIGHTLY }} fuzz run ws_frame_decode fuzz/corpus/ws_frame_decode \
+            -- -max_total_time=60 -max_len=65536
+      - run: cargo +${{ env.FUZZ_NIGHTLY }} fuzz build journal_bundle_decode
+      - run: |
+          cargo +${{ env.FUZZ_NIGHTLY }} fuzz run journal_bundle_decode fuzz/corpus/journal_bundle_decode \
+            -- -max_total_time=60 -max_len=1048576
 
   # --- Optional PostgreSQL persistence (docs/06 §6, #023) -------------------
   # Runs the durable persistence layer's migrations + DB integration test

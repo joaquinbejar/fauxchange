@@ -19,14 +19,17 @@
 #
 # Dependency audit note (rules/global_rules.md "adding a dependency"):
 # `libfuzzer-sys` 0.4 (MIT/Apache-2.0, maintained by the rust-fuzz project) is
-# the standard `cargo-fuzz` libFuzzer harness macro; it is the ONLY new
-# dependency here (no `arbitrary` — the FIX tag-value decode path already takes
-# raw `&[u8]`, so no structured-input derive is needed). `fauxchange` itself is
+# the standard `cargo-fuzz` libFuzzer harness macro. `fauxchange` itself is
 # pulled in via a `path` dependency (this crate always builds against the exact
 # working-tree source, never a published version). Neither dependency reaches
 # the shipped `fauxchange` binary or crate — this whole crate is fuzz-only
 # tooling, excluded from `[package] include` and from `cargo package`/`cargo
 # publish` by living outside the parent crate's manifest entirely.
+#
+# #052 (the v1.0 REST/WS/journal fuzz-set extension) adds ONE more direct
+# dependency, `axum` — audited below; no `arbitrary` is needed anywhere in this
+# crate (every target drives raw `&[u8]` / UTF-8 `&str` straight into a REAL
+# production decode function, never a structured-input derive).
 [package]
 name = "fauxchange-fuzz"
 version = "0.0.0"
@@ -40,9 +43,20 @@ cargo-fuzz = true
 # The `#[no_main]` libFuzzer entrypoint macro (`fuzz_target!`).
 libfuzzer-sys = "0.4"
 # `BytesMut` — the exact buffer type `BoundedFrameDecoder` (the acceptor's own
-# framing layer, src/gateway/fix/acceptor.rs) reads from, so the harness feeds
-# it the identical buffer shape the real TCP read loop uses.
+# framing layer, src/gateway/fix/acceptor.rs) reads from, so the `fix_decode`
+# harness feeds it the identical buffer shape the real TCP read loop uses.
 bytes = "1"
+# `axum::Json::<T>::from_bytes` (#052, `rest_json_decode`) — the EXACT function
+# axum's own `Json<T>: FromRequest` impl calls after buffering a request body
+# (`axum-0.8.9/src/json.rs`), so the REST target drives the real decode path
+# rather than a `serde_json::from_slice` reimplementation. `default-features =
+# false, features = ["json"]` pulls in only `serde_json` +
+# `serde_path_to_error` (`json = ["dep:serde_json", "dep:serde_path_to_error"]`
+# in axum's own `Cargo.toml`) — no router/server/tokio machinery. Pinned to the
+# SAME `"0.8"` requirement the root `fauxchange` manifest already resolves (a
+# path dependency away), so this adds a dependency EDGE, not a new version to
+# the tree. MIT, maintained by the tokio project.
+axum = { version = "0.8", default-features = false, features = ["json"] }
 
 [dependencies.fauxchange]
 path = ".."
@@ -50,6 +64,27 @@ path = ".."
 [[bin]]
 name = "fix_decode"
 path = "fuzz_targets/fix_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rest_json_decode"
+path = "fuzz_targets/rest_json_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws_frame_decode"
+path = "fuzz_targets/ws_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_bundle_decode"
+path = "fuzz_targets/journal_bundle_decode.rs"
 test = false
 doc = false
 bench = false
