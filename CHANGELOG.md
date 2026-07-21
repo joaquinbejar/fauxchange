@@ -11,6 +11,43 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The v0.1 protocol-parity suite** (#18) in `tests/parity.rs` +
+  `tests/conformance/`
+  ([018](milestones/v0.1-backend-core/018-parity-fixtures-rest-ws.md),
+  [03 §7](docs/03-protocol-surfaces.md),
+  [TESTING.md §6–§7](docs/TESTING.md)). The milestone's primary acceptance test —
+  the contract that the surface an order arrives on does not change what the
+  venue does — scoped to the surfaces present at v0.1 (REST + WS; FIX joins at
+  v0.4). **Reachability:** every documented Backend REST route is served with its
+  OpenAPI shape (a `(path, methods)` inventory checked against the live
+  `/api-docs/openapi.json`, plus a representative live-router sweep), and every
+  documented WS message round-trips to its #004 golden. **Observation parity
+  (REST ≡ WS):** one committed fill renders identically as a REST
+  `ExecutionRecord` and a WS `fill` on the four join keys
+  (`execution_id`/`liquidity`/`underlying_sequence`/`venue_ts`) plus
+  price/quantity/side — both projections of the same committed event — while the
+  WS `fill` omits `account`/`fee` (the public anonymised print) and the REST
+  record carries them (the authoritative account-scoped log). **Market-data
+  parity:** `orderbook_delta` carries a strictly-increasing per-instrument
+  `instrument_sequence` and resulting-quantity semantics (the change quantity is
+  the level's new total), and a laggard gap recovers by a fresh snapshot, never a
+  resend. **Control parity (REST ≡ WS):** the REST kill-switch/enable and the WS
+  `kill`/`enable` actions build the identical `MarketMakerControl` command and
+  surface the identical honest not-routable outcome (`InvalidOrder` on both, not
+  a fabricated success — the command is not yet routable, #015), and the Admin
+  permission gate is identical across surfaces. **REST order-entry base:** place /
+  partial-fill / cancel-replace driven over the live REST surface against
+  identically-seeded fresh venues, compared under the documented **normalization
+  rule** — protocol-only fields (transport `venue_ts`, and the per-surface
+  order-id / `ClOrdID` mapping placeholders `order_id`/`new_order_id`/
+  `client_order_id`) are normalized away, while `underlying_sequence`,
+  `execution_id`, fills, and resting-book state are compared **verbatim**;
+  unit-tested for which fields are stripped vs kept (including the STP
+  `stp_cancelled` outcome shape). The normalization helper, the per-surface
+  fresh-venue topology, and the cross-surface join-key projection live in a
+  reusable `tests/conformance/` module so the v0.4 FIX order-entry arm (#41) and
+  the v1.0 packaged conformance harness (#51) **extend** the suite rather than
+  rewrite it.
 - **The flagship determinism harness** (#17) in `tests/determinism.rs`
   ([017](milestones/v0.1-backend-core/017-determinism-test-harness.md),
   [02 §5–§6](docs/02-matching-architecture.md),
