@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 
 use fauxchange::exchange::{
     Cents, CommandExecutor, EventTimestamp, ExecutionContext, Hash32, InstrumentStatus,
-    JournalRecord, LineageId, MassCancelScope, MassCancelType, MatchingExecutor, STPMode,
-    SequenceNumber, Side, Symbol, TimeInForce, TopOfBook, VenueCommand, VenueOutcome,
-    is_market_maker_account, is_market_maker_command, market_maker_account,
+    JournalRecord, LineageId, MARKET_MAKER_OWNER, MassCancelScope, MassCancelType,
+    MatchingExecutor, STPMode, SequenceNumber, Side, Symbol, TimeInForce, TopOfBook, VenueCommand,
+    VenueOutcome, is_market_maker_account, is_market_maker_command, market_maker_account,
 };
 use fauxchange::market_maker::{CommandSink, MarketMakerEngine, PersonaConfig, Quoter};
 use fauxchange::models::{AccountId, OrderType, VenueOrderId};
@@ -663,6 +663,142 @@ async fn test_sequenced_market_maker_control_applies_the_knob_via_appstate() {
         engine.registered_count(UNDERLYING),
         1,
         "sessions not dropped"
+    );
+}
+
+/// An `AddOrder` submitted through the real `AppState` order path — used to rest
+/// maker + client liquidity before a sequenced kill.
+fn state_add(
+    order_id: &str,
+    account: AccountId,
+    owner: Hash32,
+    side: Side,
+    price: u64,
+    quantity: u64,
+) -> VenueCommand {
+    VenueCommand::AddOrder {
+        symbol: sym(CALL),
+        order_id: VenueOrderId::new(order_id),
+        account,
+        owner,
+        client_order_id: None,
+        side,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(price)),
+        quantity,
+        time_in_force: TimeInForce::Gtc,
+        stp_mode: STPMode::None,
+    }
+}
+
+#[tokio::test]
+async fn test_sequenced_kill_and_follow_on_mass_cancel_replay_identically() {
+    // #117 determinism: a sequenced kill journals the control AND a SEPARATE
+    // owner-scoped MassCancel. Exporting the journal and replaying it offline (the
+    // sink-less recovery driver) reproduces BOTH — and the same cancellation of the
+    // maker's standing quote — proving the follow-on is a replay-stable journaled
+    // command, not a live side effect that would vanish on replay.
+    let state = AppState::new(AppStateConfig::new([UNDERLYING])).expect("AppState");
+
+    // A resting maker ask (owner = MARKET_MAKER_OWNER) and a resting client bid that
+    // must survive the owner-scoped sweep. They do not cross (40_000 < 50_000).
+    state
+        .submit(state_add(
+            "mm-ask",
+            market_maker_account(),
+            MARKET_MAKER_OWNER,
+            Side::Sell,
+            50_000,
+            2,
+        ))
+        .await
+        .expect("maker quote rests");
+    state
+        .submit(state_add(
+            "cli-bid",
+            AccountId::new("alice"),
+            Hash32([0x11; 32]),
+            Side::Buy,
+            40_000,
+            3,
+        ))
+        .await
+        .expect("client order rests");
+
+    // The sequenced kill: the control commits, then a follow-on MassCancel is enqueued
+    // as its own journaled command.
+    state
+        .submit(VenueCommand::MarketMakerControl {
+            spread_multiplier: None,
+            size_scalar: None,
+            directional_skew: None,
+            enabled: Some(false),
+        })
+        .await
+        .expect("kill fans out and is accepted");
+
+    // Export the venue journal and replay it offline into a fresh registry — `Ok`
+    // proves every re-derived event equalled the stored one (the integrity oracle).
+    let bundle = state
+        .export_bundle()
+        .await
+        .expect("export the journal bundle");
+    let report = state
+        .replay_bundle(&bundle)
+        .await
+        .expect("replay the journal");
+    let replay = report.underlying(UNDERLYING).expect("BTC replay");
+
+    // The kill control replays to ControlApplied WITHOUT a live engine.
+    let control_replayed = replay.events.iter().any(|event| {
+        matches!(
+            &event.command,
+            VenueCommand::MarketMakerControl {
+                enabled: Some(false),
+                ..
+            }
+        ) && event.outcome == VenueOutcome::ControlApplied
+    });
+    assert!(control_replayed, "the kill control replays identically");
+
+    // The follow-on MassCancel replays and re-cancels exactly the maker's own quote.
+    let sweep = replay
+        .events
+        .iter()
+        .find_map(|event| match (&event.command, &event.outcome) {
+            (
+                VenueCommand::MassCancel { cancel_type, .. },
+                VenueOutcome::MassCancelled { affected },
+            ) => Some((cancel_type.clone(), affected.clone())),
+            _ => None,
+        });
+    let (cancel_type, affected) = sweep.expect("the follow-on MassCancel replays from the journal");
+    assert_eq!(
+        cancel_type,
+        MassCancelType::ByUser(MARKET_MAKER_OWNER),
+        "the replayed sweep is owner-scoped to the market maker"
+    );
+    assert_eq!(
+        affected.len(),
+        1,
+        "the replayed sweep re-cancels the one maker quote"
+    );
+    assert!(
+        affected.iter().all(|leg| leg.owner == MARKET_MAKER_OWNER),
+        "only MARKET_MAKER_OWNER legs are cancelled on replay — the client survives"
+    );
+
+    // The reconstructed book proves the maker quote no longer rests; the client bid
+    // survives — the cancellation is reproduced from the journal, not re-derived live.
+    let top = replay.top_of_book(&sym(CALL));
+    assert_eq!(
+        top.best_ask, None,
+        "the maker ask was cancelled — it no longer rests on the replayed book"
+    );
+    assert_eq!(
+        top.best_bid,
+        Some(Cents::new(40_000)),
+        "the client bid is untouched by the owner-scoped sweep"
     );
 }
 
