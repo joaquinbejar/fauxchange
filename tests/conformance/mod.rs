@@ -39,6 +39,11 @@
 
 #![allow(dead_code)]
 
+/// The FIX order-entry parity arm (#041): the live-acceptor harness, the FIX test
+/// client, [`fix::drive_fix_orders`], and the FIX fill projection — the seam this
+/// module's doc reserved, added without changing the normalization rule above.
+pub mod fix;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};

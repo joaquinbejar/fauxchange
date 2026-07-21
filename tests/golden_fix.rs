@@ -471,3 +471,277 @@ fn test_economic_parity_rest_and_fix_agree_on_cents_and_sequence() {
     };
     assert_eq!(report.secondary_exec_id, SequenceNumber::new(7));
 }
+
+/// Encodes an ordered message script to one `|`-delimited frame per line, asserting
+/// tags `9`/`10` are present and each frame round-trips, then compares (or, under
+/// `UPDATE_GOLDEN=1`, regenerates) the captured golden.
+fn assert_golden_script(name: &str, messages: &[DecodedMessage]) {
+    let mut lines: Vec<String> = Vec::with_capacity(messages.len());
+    for message in messages {
+        let bytes = message.encode();
+        let text = match String::from_utf8(bytes.clone()) {
+            Ok(t) => t,
+            Err(e) => panic!("encoded script frame is not utf-8: {e}"),
+        };
+        let display = text.replace('\u{1}', "|");
+        assert!(
+            display.starts_with("8=FIX.4.4|9="),
+            "tag 9 (BodyLength) must be present: {display}"
+        );
+        assert!(
+            display.contains("|10="),
+            "tag 10 (CheckSum) must be present: {display}"
+        );
+        assert!(
+            display.ends_with('|'),
+            "each script frame must terminate with SOH: {display}"
+        );
+        match decode(&bytes) {
+            Ok(back) => assert_eq!(&back, message, "decode(script frame) mismatch"),
+            Err(e) => panic!("decode failed for a script frame: {e:?}"),
+        }
+        lines.push(display);
+    }
+    let joined = lines.join("\n");
+
+    let path = format!("{}/tests/golden/fix/{}", env!("CARGO_MANIFEST_DIR"), name);
+    if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        let mut out = joined.clone();
+        out.push('\n');
+        if let Err(e) = std::fs::write(&path, out) {
+            panic!("failed to write golden {path}: {e}");
+        }
+    } else {
+        let expected = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) => panic!("failed to read golden {path}: {e}"),
+        };
+        assert_eq!(
+            joined,
+            expected.trim_end_matches('\n'),
+            "golden script mismatch for {name}"
+        );
+    }
+}
+
+/// A `New`/`Replaced`/`Canceled`/`Rejected` `ExecutionReport (8)` for the script.
+#[allow(clippy::too_many_arguments)]
+fn script_report(
+    seq: u64,
+    exec_type: ExecType,
+    ord_status: OrdStatus,
+    side: OrderSide,
+    leaves: u64,
+    cum: u64,
+    price: Option<Cents>,
+    underlying_sequence: u64,
+    ord_rej_reason: Option<u16>,
+    text: Option<&str>,
+) -> ExecutionReport {
+    ExecutionReport {
+        header: venue_header(seq),
+        order_id: VenueOrderId::new("run-1:BTC:1:0"),
+        exec_id: ExecutionId::new(format!("run-1:BTC:1:{seq}")),
+        exec_type,
+        ord_status,
+        symbol: sym(),
+        side,
+        leaves_qty: leaves,
+        cum_qty: cum,
+        last_qty: None,
+        last_px: None,
+        price,
+        secondary_exec_id: SequenceNumber::new(underlying_sequence),
+        commission: None,
+        comm_type: None,
+        last_liquidity_ind: None,
+        ord_rej_reason,
+        text: text.map(str::to_string),
+    }
+}
+
+/// The **captured conformance script** (#041): the canonical ordered frame set the
+/// FIX conformance test exercises — session admin (`A`/`0`/`1`/`2`/`4`/`5`), order
+/// entry (`D`/`G`/`F` → `8`) and its rejects (`8 Rejected`/`9`), and market data
+/// (`V` → `W`/`X`) and its rejects (`Y`/`3`/`j`) — one diff-readable golden with `|`
+/// for SOH and tags `9`/`10` asserted per frame. Live behaviour (reason tags,
+/// redaction) is asserted in `tests/parity.rs`; this pins the wire shapes.
+#[test]
+fn test_golden_conformance_script() {
+    let script = vec![
+        // --- Session admin: logon + heartbeat cadence ---
+        DecodedMessage::Logon(Logon {
+            header: client_header(1),
+            heart_bt_int: 30,
+            username: "trader-1".to_string(),
+            password: SecretField::new("REDACTED-TEST-CREDENTIAL"),
+            reset_seq_num_flag: None,
+        }),
+        DecodedMessage::TestRequest(TestRequest {
+            header: venue_header(1),
+            test_req_id: "PING-CONF".to_string(),
+        }),
+        DecodedMessage::Heartbeat(Heartbeat {
+            header: client_header(2),
+            test_req_id: Some("PING-CONF".to_string()),
+        }),
+        // --- Order entry: D → 8 New, G → 8 Replaced, F → 8 Canceled ---
+        DecodedMessage::NewOrderSingle(NewOrderSingle {
+            header: client_header(3),
+            cl_ord_id: ClientOrderId::new("conf-rest"),
+            account: None,
+            symbol: sym(),
+            side: OrderSide::Sell,
+            transact_time: ts(SENDING_TIME),
+            ord_type: OrdType::Limit,
+            price: Some(Cents::new(50_000)),
+            order_qty: 5,
+            time_in_force: TimeInForce::Gtc,
+            expire_time: None,
+        }),
+        DecodedMessage::ExecutionReport(script_report(
+            2,
+            ExecType::New,
+            OrdStatus::New,
+            OrderSide::Sell,
+            5,
+            0,
+            Some(Cents::new(50_000)),
+            1,
+            None,
+            None,
+        )),
+        DecodedMessage::OrderCancelReplaceRequest(OrderCancelReplaceRequest {
+            header: client_header(4),
+            orig_cl_ord_id: ClientOrderId::new("conf-rest"),
+            cl_ord_id: ClientOrderId::new("conf-repl"),
+            symbol: sym(),
+            side: OrderSide::Sell,
+            ord_type: OrdType::Limit,
+            price: Some(Cents::new(50_500)),
+            order_qty: 5,
+        }),
+        DecodedMessage::ExecutionReport(script_report(
+            3,
+            ExecType::Replaced,
+            OrdStatus::Replaced,
+            OrderSide::Sell,
+            5,
+            0,
+            Some(Cents::new(50_500)),
+            2,
+            None,
+            None,
+        )),
+        DecodedMessage::OrderCancelRequest(OrderCancelRequest {
+            header: client_header(5),
+            orig_cl_ord_id: ClientOrderId::new("conf-repl"),
+            cl_ord_id: ClientOrderId::new("conf-cxl"),
+            symbol: sym(),
+            side: OrderSide::Sell,
+        }),
+        DecodedMessage::ExecutionReport(script_report(
+            4,
+            ExecType::Canceled,
+            OrdStatus::Canceled,
+            OrderSide::Sell,
+            0,
+            0,
+            None,
+            3,
+            None,
+            None,
+        )),
+        // --- Market data: V → W then X ---
+        DecodedMessage::MarketDataRequest(MarketDataRequest {
+            header: client_header(6),
+            md_req_id: "MDR-CONF".to_string(),
+            subscription_request_type: SubscriptionRequestType::SnapshotPlusUpdates,
+            market_depth: 0,
+            entry_types: vec![MdEntryType::Bid, MdEntryType::Offer],
+            symbols: vec![sym()],
+        }),
+        DecodedMessage::MarketDataSnapshotFullRefresh(MarketDataSnapshotFullRefresh {
+            header: venue_header(5),
+            md_req_id: "MDR-CONF".to_string(),
+            symbol: sym(),
+            rpt_seq: SequenceNumber::new(1),
+            entries: vec![SnapshotEntry {
+                entry_type: MdEntryType::Offer,
+                price: Cents::new(50_500),
+                size: 5,
+            }],
+        }),
+        DecodedMessage::MarketDataIncrementalRefresh(MarketDataIncrementalRefresh {
+            header: venue_header(6),
+            md_req_id: "MDR-CONF".to_string(),
+            rpt_seq: SequenceNumber::new(2),
+            entries: vec![IncrementalEntry {
+                update_action: MdUpdateAction::Change,
+                entry_type: MdEntryType::Offer,
+                symbol: sym(),
+                price: Cents::new(50_500),
+                size: 8,
+            }],
+        }),
+        // --- Session admin: resend / sequence reset / logout ---
+        DecodedMessage::ResendRequest(ResendRequest {
+            header: client_header(7),
+            begin_seq_no: SeqNum::new(3),
+            end_seq_no: SeqNum::new(0),
+        }),
+        DecodedMessage::SequenceReset(SequenceReset {
+            header: venue_header(7),
+            new_seq_no: SeqNum::new(8),
+            gap_fill_flag: Some(true),
+        }),
+        DecodedMessage::Logout(Logout {
+            header: venue_header(8),
+            text: Some("session ended".to_string()),
+        }),
+        // --- Every context-sensitive reject row (03 §8) ---
+        DecodedMessage::Reject(Reject {
+            header: venue_header(9),
+            ref_seq_num: SeqNum::new(3),
+            session_reject_reason: Some(SessionRejectReason::RequiredTagMissing),
+            ref_tag_id: Some(54),
+            text: Some("required tag missing".to_string()),
+        }),
+        DecodedMessage::ExecutionReport(script_report(
+            10,
+            ExecType::Rejected,
+            OrdStatus::Rejected,
+            OrderSide::Sell,
+            0,
+            0,
+            None,
+            0,
+            Some(6),
+            Some("client_order_id reused with a different order"),
+        )),
+        DecodedMessage::OrderCancelReject(OrderCancelReject {
+            header: venue_header(11),
+            order_id: VenueOrderId::new("run-1:BTC:0:0"),
+            cl_ord_id: ClientOrderId::new("conf-cxl-unknown"),
+            orig_cl_ord_id: ClientOrderId::new("never-placed"),
+            ord_status: OrdStatus::Rejected,
+            cxl_rej_response_to: CxlRejResponseTo::OrderCancelRequest,
+            cxl_rej_reason: 1,
+            text: Some("unknown order".to_string()),
+        }),
+        DecodedMessage::MarketDataRequestReject(MarketDataRequestReject {
+            header: venue_header(12),
+            md_req_id: "MDR-TRADE".to_string(),
+            md_req_rej_reason: 8,
+            text: Some("only Bid/Offer market data is served over FIX".to_string()),
+        }),
+        DecodedMessage::BusinessMessageReject(BusinessMessageReject {
+            header: venue_header(13),
+            ref_seq_num: SequenceNumber::new(2),
+            ref_msg_type: "R".to_string(),
+            business_reject_reason: 3,
+            text: Some("unsupported message type".to_string()),
+        }),
+    ];
+    assert_golden_script("conformance_script.txt", &script);
+}
