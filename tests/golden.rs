@@ -16,9 +16,10 @@
 use fauxchange::exchange::FanOut;
 use fauxchange::exchange::{
     AddOutcome, CancelReason, CancelledLeg, Cents, EventTimestamp, ExecutionsStore,
-    Fill as VenueFill, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore, LineageId,
-    MarkPriceBook, PositionsStore, SequenceNumber, Side as SeamSide, SignedCents, StoreFanOut,
-    Symbol, TimeInForce as SeamTif, VenueCommand, VenueEvent, VenueOutcome,
+    Fill as VenueFill, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore, JournalRecord,
+    LineageId, MarkPriceBook, PositionsStore, SequenceNumber, Side as SeamSide, SignedCents,
+    SnapshotRestored, StoreFanOut, Symbol, TimeInForce as SeamTif, VenueCommand, VenueEvent,
+    VenueOutcome,
 };
 use fauxchange::{
     AccountId, BookSide, BulkOrderResponse, BulkOrderResultItem, BulkOrderStatus, ClientOrderId,
@@ -26,7 +27,8 @@ use fauxchange::{
     FillPrint, InstrumentLifecycle, InstrumentView, LimitOrderStatus, LiquidityFlag,
     MarketOrderStatus, OhlcBar, OptionStyle, Order, OrderStatus, OrderType, Permission,
     PlaceLimitOrderRequest, PlaceLimitOrderResponse, PlaceMarketOrderResponse, Position,
-    PriceLevelChange, PriceLevelData, QuoteResponse, Side, SubscriptionChannel, SubscriptionResult,
+    PriceLevelChange, PriceLevelData, QuoteResponse, RestoreSnapshotResponse, Side,
+    SnapshotSummary, SnapshotsListResponse, SubscriptionChannel, SubscriptionResult,
     SystemControlResponse, TimeInForce, TokenResponse, VenueError, VenueOrderId, WsMessage,
 };
 use serde::Serialize;
@@ -504,6 +506,44 @@ fn test_golden_rest_create_snapshot() {
         timestamp: EventTimestamp::new(1_700_000_000_000),
     };
     assert_golden("rest/create_snapshot.json", &resp);
+}
+
+#[test]
+fn test_golden_rest_snapshot_summary() {
+    let summary = SnapshotSummary {
+        snapshot_id: "snap-1".to_string(),
+        orderbook_count: 12,
+        total_orders: 340,
+        created_at: EventTimestamp::new(1_700_000_000_000),
+    };
+    assert_golden("rest/snapshot_summary.json", &summary);
+}
+
+#[test]
+fn test_golden_rest_snapshots_list() {
+    let list = SnapshotsListResponse {
+        snapshots: vec![SnapshotSummary {
+            snapshot_id: "snap-1".to_string(),
+            orderbook_count: 12,
+            total_orders: 340,
+            created_at: EventTimestamp::new(1_700_000_000_000),
+        }],
+        total: 1,
+    };
+    assert_golden("rest/snapshots_list.json", &list);
+}
+
+#[test]
+fn test_golden_rest_restore_snapshot() {
+    let resp = RestoreSnapshotResponse {
+        success: true,
+        snapshot_id: "snap-1".to_string(),
+        orderbooks_restored: 12,
+        orders_restored: 340,
+        orderbooks_failed: 0,
+        timestamp: EventTimestamp::new(1_700_000_000_000),
+    };
+    assert_golden("rest/restore_snapshot.json", &resp);
 }
 
 #[test]
@@ -1015,4 +1055,30 @@ fn test_golden_venue_replace_partial_event() {
         serde_json::json!(true)
     );
     assert!(golden["outcome"]["Replace"]["add"]["Rejected"].is_object());
+}
+
+#[test]
+fn test_golden_venue_snapshot_restored_epoch() {
+    // The `venue.v1` wire addition of #009: the `SnapshotRestored` epoch marker
+    // record a restore writes as the first record of a fresh journal epoch. Pins
+    // the `JournalRecord::Epoch` variant tag, the mandatory `schema` tag, the
+    // continued `underlying_sequence` (never reset), the epoch counter, and the
+    // lineage carried forward — so a field rename or casing drift is a hard decode
+    // error.
+    let record = JournalRecord::epoch(SnapshotRestored::new(
+        SequenceNumber::new(42),
+        EventTimestamp::new(1_700_000_000_000),
+        "snap-1",
+        1,
+        LineageId::new("run-1"),
+    ));
+    assert_golden("venue/snapshot_restored_epoch.json", &record);
+    let golden = load_golden("venue/snapshot_restored_epoch.json");
+    assert_eq!(golden["Epoch"]["schema"], serde_json::json!("venue.v1"));
+    assert_eq!(
+        golden["Epoch"]["underlying_sequence"],
+        serde_json::json!(42)
+    );
+    assert_eq!(golden["Epoch"]["epoch"], serde_json::json!(1));
+    assert_eq!(golden["Epoch"]["lineage_id"], serde_json::json!("run-1"));
 }

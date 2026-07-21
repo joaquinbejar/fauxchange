@@ -1,0 +1,10 @@
+{
+  "Epoch": {
+    "epoch": 1,
+    "lineage_id": "run-1",
+    "schema": "venue.v1",
+    "snapshot_id": "snap-1",
+    "underlying_sequence": 42,
+    "venue_ts": 1700000000000
+  }
+}

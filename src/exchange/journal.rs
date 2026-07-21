@@ -49,9 +49,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::exchange::envelope::{VenueCommand, VenueEvent};
 use crate::exchange::event::{EventTimestamp, SequenceNumber};
-use crate::exchange::identity::JournalHeader;
+use crate::exchange::identity::{JournalHeader, LineageId, VENUE_ENVELOPE_SCHEMA};
 
-/// Which of the two paired records at a sequence `N` this is
+/// Which of the records at a sequence `N` this is
 /// ([02 §6](../../../docs/02-matching-architecture.md)). Part of the
 /// `(underlying, N, kind)` uniqueness key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -64,6 +64,78 @@ pub enum RecordKind {
     /// The paired [`VenueEvent`], appended **after** the outcome is captured
     /// (step 4).
     Event,
+    /// A [`SnapshotRestored`] epoch marker — the **first** record of a fresh
+    /// journal epoch after a snapshot restore
+    /// ([02 §9](../../../docs/02-matching-architecture.md)). Unlike a
+    /// command/event pair it is **not** re-executable: recovery treats it as an
+    /// epoch boundary and does not replay prior epochs past the restored cut.
+    Epoch,
+}
+
+/// The `SnapshotRestored { snapshot_id, epoch, lineage_id }` epoch marker — the
+/// first record of a fresh journal epoch opened by a snapshot **restore**
+/// ([02 §9](../../../docs/02-matching-architecture.md#9-snapshots-and-restore),
+/// [01 §6.1](../../../docs/01-domain-model.md#61-order-identity-and-cross-protocol-idempotency)).
+///
+/// A restore captures *state*, not the *sequence of decisions*, so it is an
+/// explicit **replay exclusion**: rather than inject a book the journal never
+/// produced, it starts a new epoch over the restored consistent cut. The marker
+/// carries the run's [`LineageId`] forward so restored ids keep minting in the
+/// **same** namespace (the lineage is never regenerated on restore), and it
+/// records the `underlying_sequence` it opens at — the sequence **continues**
+/// from the last journaled value, it does **not** reset. It is a `venue.v1` wire
+/// addition and carries the mandatory [`schema`](Self::schema) tag with the same
+/// `deny_unknown_fields` discipline as [`VenueEvent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct SnapshotRestored {
+    /// The mandatory schema tag — always [`VENUE_ENVELOPE_SCHEMA`]
+    /// (`"venue.v1"`); a missing `schema` is a hard decode error.
+    pub schema: String,
+    /// The per-underlying sequence this marker opens the new epoch at — the
+    /// **continued** sequence, never reset to `0`.
+    pub underlying_sequence: SequenceNumber,
+    /// The venue-clock timestamp the restore was stamped with, in **ms**.
+    pub venue_ts: EventTimestamp,
+    /// The identifier of the restored snapshot.
+    pub snapshot_id: String,
+    /// The monotonically increasing epoch number this restore opens (a fresh
+    /// venue is epoch `0`; the first restore opens epoch `1`).
+    pub epoch: u64,
+    /// The run lineage carried forward so id derivation continues in the same
+    /// namespace ([01 §6.1](../../../docs/01-domain-model.md)).
+    pub lineage_id: LineageId,
+}
+
+impl SnapshotRestored {
+    /// Builds a `venue.v1` epoch marker, stamping the mandatory
+    /// [`schema`](Self::schema) tag.
+    #[must_use]
+    #[inline]
+    pub fn new(
+        underlying_sequence: SequenceNumber,
+        venue_ts: EventTimestamp,
+        snapshot_id: impl Into<String>,
+        epoch: u64,
+        lineage_id: LineageId,
+    ) -> Self {
+        Self {
+            schema: VENUE_ENVELOPE_SCHEMA.to_string(),
+            underlying_sequence,
+            venue_ts,
+            snapshot_id: snapshot_id.into(),
+            epoch,
+            lineage_id,
+        }
+    }
+
+    /// Returns `true` iff this marker's `schema` tag is the one the running
+    /// binary understands ([`VENUE_ENVELOPE_SCHEMA`]).
+    #[must_use]
+    #[inline]
+    pub fn is_current_schema(&self) -> bool {
+        self.schema == VENUE_ENVELOPE_SCHEMA
+    }
 }
 
 /// The write-ahead [`RecordKind::Command`] record — the [`VenueCommand`] envelope
@@ -99,6 +171,8 @@ pub enum JournalRecord {
     Command(JournalCommand),
     /// The paired event record (step 4).
     Event(VenueEvent),
+    /// The [`SnapshotRestored`] epoch marker opening a fresh epoch (§9).
+    Epoch(SnapshotRestored),
 }
 
 impl JournalRecord {
@@ -124,6 +198,13 @@ impl JournalRecord {
         Self::Event(event)
     }
 
+    /// Builds a [`RecordKind::Epoch`] marker record.
+    #[must_use]
+    #[inline]
+    pub fn epoch(marker: SnapshotRestored) -> Self {
+        Self::Epoch(marker)
+    }
+
     /// The per-underlying sequence `N` this record belongs to.
     #[must_use]
     #[inline]
@@ -131,16 +212,19 @@ impl JournalRecord {
         match self {
             Self::Command(command) => command.sequence,
             Self::Event(event) => event.underlying_sequence,
+            Self::Epoch(marker) => marker.underlying_sequence,
         }
     }
 
-    /// Whether this is the command or the event half of the pair at its sequence.
+    /// Whether this is the command, the paired event, or the epoch marker at its
+    /// sequence.
     #[must_use]
     #[inline]
     pub fn kind(&self) -> RecordKind {
         match self {
             Self::Command(_) => RecordKind::Command,
             Self::Event(_) => RecordKind::Event,
+            Self::Epoch(_) => RecordKind::Epoch,
         }
     }
 }
@@ -475,5 +559,65 @@ mod tests {
         };
         assert!(err.to_string().contains("BTC"));
         assert!(err.to_string().contains('9'));
+    }
+
+    // ---- epoch marker (#009) ---------------------------------------------
+
+    fn snapshot_restored(seq: u64, epoch: u64) -> SnapshotRestored {
+        SnapshotRestored::new(
+            SequenceNumber::new(seq),
+            EventTimestamp::new(1_700_000_000_000),
+            "snap-1",
+            epoch,
+            LineageId::new("run-1"),
+        )
+    }
+
+    #[test]
+    fn test_epoch_marker_exposes_its_sequence_and_kind() {
+        let marker = snapshot_restored(9, 1);
+        assert!(marker.is_current_schema());
+        let record = JournalRecord::epoch(marker);
+        assert_eq!(record.sequence(), SequenceNumber::new(9));
+        assert_eq!(record.kind(), RecordKind::Epoch);
+    }
+
+    #[test]
+    fn test_epoch_marker_appends_and_reads_back_as_the_first_epoch_record() {
+        let mut journal = InMemoryVenueJournal::new(header());
+        // A pre-restore command/event pair at sequence 5.
+        assert!(journal.append(command_record(5)).is_ok());
+        assert!(journal.append(event_record(5)).is_ok());
+        // The epoch marker opens at the CONTINUED sequence 6 (not reset to 0).
+        assert!(
+            journal
+                .append(JournalRecord::epoch(snapshot_restored(6, 1)))
+                .is_ok()
+        );
+        assert_eq!(journal.last_sequence(), Some(SequenceNumber::new(6)));
+        assert!(journal.contains(SequenceNumber::new(6), RecordKind::Epoch));
+    }
+
+    #[test]
+    fn test_epoch_marker_roundtrips_through_serde() {
+        let record = JournalRecord::epoch(snapshot_restored(6, 2));
+        let json = match serde_json::to_string(&record) {
+            Ok(s) => s,
+            Err(e) => panic!("serialize failed: {e}"),
+        };
+        match serde_json::from_str::<JournalRecord>(&json) {
+            Ok(back) => assert_eq!(back, record),
+            Err(e) => panic!("deserialize failed: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_epoch_marker_missing_schema_is_a_decode_error() {
+        // The schema tag is mandatory on the marker, like the event envelope.
+        let json = r#"{"underlying_sequence":6,"venue_ts":1,"snapshot_id":"snap-1","epoch":1,"lineage_id":"run-1"}"#;
+        match serde_json::from_str::<SnapshotRestored>(json) {
+            Err(_) => {}
+            Ok(parsed) => panic!("expected a missing-schema decode error, parsed {parsed:?}"),
+        }
     }
 }

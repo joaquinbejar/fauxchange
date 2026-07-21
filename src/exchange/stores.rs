@@ -59,6 +59,7 @@ use crate::exchange::actor::FanOut;
 use crate::exchange::boundary::{Side as SeamSide, SymbolParser};
 use crate::exchange::envelope::{AddOutcome, Fill, VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::money::{Cents, SignedCents};
+use crate::exchange::snapshot::{ExecutionCapture, PositionCapture};
 use crate::exchange::symbol::Symbol;
 use crate::models::{AccountId, ExecutionId, ExecutionRecord, LiquidityFlag, Position, Side};
 
@@ -296,6 +297,55 @@ impl InMemoryExecutionsStore {
     #[inline]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Captures every recorded leg (with its insertion surrogate) for a snapshot
+    /// cut (#009), sorted by `ord` so the cut is deterministic regardless of map
+    /// iteration order.
+    #[must_use]
+    pub fn capture(&self) -> Vec<ExecutionCapture> {
+        let mut captures: Vec<ExecutionCapture> = self
+            .records
+            .iter()
+            .map(|entry| ExecutionCapture {
+                ord: entry.ord,
+                record: entry.record.clone(),
+            })
+            .collect();
+        captures.sort_by_key(|capture| capture.ord);
+        captures
+    }
+
+    /// Replaces the store's contents from a snapshot cut, in place, under actor
+    /// quiescence (the in-memory analogue of the durable "one transaction" swap,
+    /// #023). `next_ord` continues past the restored maximum so post-restore legs
+    /// sort after the cut.
+    pub fn restore(&self, captures: Vec<ExecutionCapture>) {
+        self.records.clear();
+        let mut max_ord: u64 = 0;
+        for capture in captures {
+            max_ord = max_ord.max(capture.ord);
+            let key = ExecKey {
+                execution_id: capture.record.execution_id.clone(),
+                liquidity: capture.record.liquidity,
+            };
+            self.records.insert(
+                key,
+                StoredExecution {
+                    ord: capture.ord,
+                    record: capture.record,
+                },
+            );
+        }
+        // The surrogate is an internal ordering index, not a venue sequence / id /
+        // money value, so it advances past the restored maximum; `2^64` legs is
+        // unreachable, and `checked_add` keeps the crate free of `saturating_*`.
+        let next = if self.records.is_empty() {
+            0
+        } else {
+            max_ord.checked_add(1).unwrap_or(max_ord)
+        };
+        self.next_ord.store(next, Ordering::Relaxed);
     }
 }
 
@@ -551,6 +601,32 @@ impl PositionState {
         Ok(())
     }
 
+    /// Captures the exact fold accumulators for a snapshot cut (#009) — the
+    /// integer-cents state, never the derived mark / unrealised projection.
+    fn to_capture(&self, account: &AccountId, symbol: &Symbol) -> PositionCapture {
+        PositionCapture {
+            account: account.clone(),
+            symbol: symbol.clone(),
+            underlying: self.underlying.clone(),
+            net_quantity: self.net_quantity,
+            basis: self.basis,
+            cash_ex_fee: self.cash_ex_fee,
+            fees: self.fees,
+        }
+    }
+
+    /// Rebuilds a fold state from a captured cut — the restore side of
+    /// [`to_capture`](Self::to_capture).
+    fn from_capture(capture: &PositionCapture) -> Self {
+        Self {
+            underlying: capture.underlying.clone(),
+            net_quantity: capture.net_quantity,
+            basis: capture.basis,
+            cash_ex_fee: capture.cash_ex_fee,
+            fees: capture.fees,
+        }
+    }
+
     /// Projects the fold into a DTO [`Position`] marked at `mark`.
     fn project(
         &self,
@@ -623,6 +699,40 @@ impl InMemoryPositionsStore {
     #[inline]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Captures every `(account, symbol)` fold's exact accumulators for a
+    /// snapshot cut (#009), sorted by `(account, symbol)` so the cut is
+    /// deterministic regardless of map iteration order.
+    #[must_use]
+    pub fn capture(&self) -> Vec<PositionCapture> {
+        let mut captures: Vec<PositionCapture> = self
+            .positions
+            .iter()
+            .map(|entry| {
+                let (account, symbol) = entry.key();
+                entry.value().to_capture(account, symbol)
+            })
+            .collect();
+        captures.sort_by(|a, b| {
+            a.account
+                .as_str()
+                .cmp(b.account.as_str())
+                .then_with(|| a.symbol.as_str().cmp(b.symbol.as_str()))
+        });
+        captures
+    }
+
+    /// Replaces the fold contents from a snapshot cut, in place, under actor
+    /// quiescence (the in-memory analogue of the durable "one transaction" swap,
+    /// #023).
+    pub fn restore(&self, captures: Vec<PositionCapture>) {
+        self.positions.clear();
+        for capture in captures {
+            let key = (capture.account.clone(), capture.symbol.clone());
+            self.positions
+                .insert(key, PositionState::from_capture(&capture));
+        }
     }
 }
 
@@ -704,6 +814,22 @@ where
             positions,
             marks,
         }
+    }
+
+    /// The shared executions store handle — the snapshot cut reads/replaces it
+    /// through here (#009).
+    #[must_use]
+    #[inline]
+    pub fn executions(&self) -> &Arc<E> {
+        &self.executions
+    }
+
+    /// The shared positions store handle — the snapshot cut reads/replaces it
+    /// through here (#009).
+    #[must_use]
+    #[inline]
+    pub fn positions(&self) -> &Arc<P> {
+        &self.positions
     }
 }
 
@@ -1237,6 +1363,92 @@ mod tests {
                 .get(&AccountId::new("acct-1"), &sym(), None)
                 .expect("get")
                 .is_none()
+        );
+    }
+
+    // ---- snapshot capture / restore (#009) -------------------------------
+
+    #[test]
+    fn test_executions_capture_and_restore_round_trip() {
+        let mut fan = StoreFanOut::new(
+            Arc::new(InMemoryExecutionsStore::new()),
+            Arc::new(InMemoryPositionsStore::new()),
+            Arc::new(MarkPriceBook::new()),
+        );
+        fan.emit(&added_event(1, 50_000, 2));
+        fan.emit(&added_event(2, 50_100, 1));
+        let captured = fan.executions().capture();
+        assert_eq!(captured.len(), 4, "two matches record four legs");
+
+        let restored = InMemoryExecutionsStore::new();
+        restored.restore(captured);
+        // The taker's list is identical (same legs, same journal order) on the
+        // restored store.
+        let taker = AccountId::new("taker");
+        let original = fan
+            .executions()
+            .list(&taker, &ExecutionFilter::default())
+            .expect("list");
+        let after = restored
+            .list(&taker, &ExecutionFilter::default())
+            .expect("list");
+        assert_eq!(original, after);
+    }
+
+    #[test]
+    fn test_positions_capture_and_restore_round_trip() {
+        let store = InMemoryPositionsStore::new();
+        let account = AccountId::new("acct-1");
+        let symbol = sym();
+        store
+            .apply(&leg(&account, &symbol, SeamSide::Sell, 8, 50_000, 0))
+            .expect("apply");
+        store
+            .apply(&leg(&account, &symbol, SeamSide::Buy, 3, 49_600, 0))
+            .expect("apply");
+        let mark = Some(Cents::new(50_500));
+        let before = store
+            .get(&account, &symbol, mark)
+            .expect("get")
+            .expect("a position");
+
+        let captured = store.capture();
+        assert_eq!(captured.len(), 1);
+        let restored = InMemoryPositionsStore::new();
+        restored.restore(captured);
+        let after = restored
+            .get(&account, &symbol, mark)
+            .expect("get")
+            .expect("a position");
+        // The exact accumulators round-trip, so the marked projection is identical.
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn test_store_restore_replaces_prior_contents() {
+        // A store restore is a wholesale replace, not a merge: prior contents are
+        // dropped so post-restore reads are the cut, exactly.
+        let store = InMemoryExecutionsStore::new();
+        let mut fan = StoreFanOut::new(
+            Arc::new(InMemoryExecutionsStore::new()),
+            Arc::new(InMemoryPositionsStore::new()),
+            Arc::new(MarkPriceBook::new()),
+        );
+        fan.emit(&added_event(1, 50_000, 2));
+        let cut = fan.executions().capture();
+
+        // A different store with unrelated content is fully replaced by the cut.
+        let mut other = StoreFanOut::new(
+            Arc::new(store),
+            Arc::new(InMemoryPositionsStore::new()),
+            Arc::new(MarkPriceBook::new()),
+        );
+        other.emit(&added_event(9, 40_000, 5));
+        other.executions().restore(cut);
+        assert_eq!(
+            other.executions().len(),
+            2,
+            "only the cut's two legs remain"
         );
     }
 }

@@ -51,8 +51,13 @@ use tokio::task::JoinHandle;
 use crate::error::VenueError;
 use crate::exchange::envelope::{VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::event::{EventTimestamp, SequenceNumber};
+use crate::exchange::executor::MatchingExecutor;
 use crate::exchange::identity::LineageId;
-use crate::exchange::journal::{JournalError, JournalRecord, RecordKind, VenueJournal};
+use crate::exchange::journal::{
+    JournalError, JournalRecord, RecordKind, SnapshotRestored, VenueJournal,
+};
+use crate::exchange::snapshot::{SnapshotError, SnapshotMetadata, VenueSnapshot};
+use crate::exchange::stores::{InMemoryExecutionsStore, InMemoryPositionsStore, StoreFanOut};
 
 // ============================================================================
 // Clock seam — the venue time service (never `SystemTime`)
@@ -289,6 +294,9 @@ pub struct UnderlyingActor<J, E, F, C> {
     /// (the upstream `OptionChainSequencer::assign()` is `pub(crate)`, so the
     /// venue owns this).
     next_sequence: SequenceNumber,
+    /// The current journal epoch — a fresh venue is `0`; each snapshot restore
+    /// opens the next epoch (#009, [02 §9](../../../docs/02-matching-architecture.md)).
+    epoch: u64,
     /// `Some` once sealed — every further command is rejected.
     sealed: Option<SealReason>,
 }
@@ -311,6 +319,7 @@ where
             fan_out,
             clock,
             next_sequence: config.start_sequence,
+            epoch: 0,
             sealed: None,
         }
     }
@@ -438,6 +447,179 @@ where
             | Err(JournalError::Conflict { .. })
             | Err(JournalError::Corruption { .. }) => WriteAhead::Reuse,
         }
+    }
+}
+
+// ============================================================================
+// Snapshot capture / restore (#009) — the consistent-cut entry points
+// ============================================================================
+
+/// Snapshot **capture** and **restore** for the default order-path wiring — the
+/// real [`MatchingExecutor`] over the in-memory [`StoreFanOut`]. These are the
+/// entry points the admin snapshot routes (#013) and the replay driver (#030)
+/// build on; they run **synchronously under the single writer**, so a
+/// directly-owned actor — or a quiesced spawned one — drives them without racing
+/// a turn (the mailbox plumbing for the spawned path lands with #013).
+impl<J, C>
+    UnderlyingActor<
+        J,
+        MatchingExecutor,
+        StoreFanOut<InMemoryExecutionsStore, InMemoryPositionsStore>,
+        C,
+    >
+where
+    J: VenueJournal,
+    C: VenueClock,
+{
+    /// The current journal epoch (a fresh venue is `0`; each restore opens the
+    /// next).
+    #[must_use]
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Captures a **consistent cut** of the four derived stores plus
+    /// config/version metadata, keyed by `snapshot_id`
+    /// ([02 §9](../../../docs/02-matching-architecture.md)).
+    ///
+    /// A pure read of the leaf books (current resting quantities), the executions
+    /// log, the positions fold, and the idempotency map — non-journaled analytics
+    /// (mark price, unrealised P&L, Greeks, registry ids) are **excluded** and
+    /// recompute live after a restore.
+    #[must_use]
+    pub fn capture(
+        &self,
+        snapshot_id: impl Into<String>,
+        config_fingerprint: impl Into<String>,
+    ) -> VenueSnapshot {
+        let metadata = SnapshotMetadata::new(
+            snapshot_id,
+            self.clock.now_ms(),
+            self.lineage_id.clone(),
+            config_fingerprint,
+        );
+        VenueSnapshot {
+            metadata,
+            executor: self.executor.capture_state(),
+            executions: self.fan_out.executions().capture(),
+            positions: self.fan_out.positions().capture(),
+        }
+    }
+
+    /// Restores a snapshot over a consistent cut, **all-or-nothing**, opening a
+    /// fresh journal epoch (§9).
+    ///
+    /// 1. Validate the snapshot's config/version metadata against the running
+    ///    venue — a mismatch is refused with **no** mutation.
+    /// 2. **Prepare** the book rebuild (fallible, non-mutating) and append the
+    ///    [`SnapshotRestored`] marker at the **continued** `underlying_sequence`
+    ///    (fallible). Both fallible steps run **before** any store is swapped, so
+    ///    a fault here rolls back all four stores.
+    /// 3. **Commit** the swap of all four stores (books, executions, positions,
+    ///    idempotency map) infallibly under quiescence, then continue the
+    ///    `underlying_sequence` from past the marker (it does **not** reset).
+    ///
+    /// The marker carries the run [`LineageId`] forward so restored ids keep
+    /// minting in the same namespace. Reproducibility holds *forward from* the
+    /// new epoch; the restore boundary is **outside** the determinism oracle.
+    ///
+    /// # Errors
+    ///
+    /// - [`SnapshotError::MetadataMismatch`] if the snapshot does not match the
+    ///   running venue;
+    /// - [`SnapshotError::RebuildFailed`] if the captured book cannot be rebuilt
+    ///   (rolls back — nothing swapped);
+    /// - [`SnapshotError::JournalUnavailable`] if the epoch marker cannot be
+    ///   journaled (rolls back), or the underlying is sealed on the journal;
+    /// - [`SnapshotError::SequenceExhausted`] if the underlying is sealed on
+    ///   exhaustion, the epoch counter cannot advance, or the
+    ///   `underlying_sequence` cannot continue past the epoch marker — the last
+    ///   is refused **before** any live state is mutated (nothing swapped).
+    pub fn restore(
+        &mut self,
+        snapshot: &VenueSnapshot,
+        config_fingerprint: &str,
+    ) -> Result<Receipt, SnapshotError> {
+        // Step 1: metadata validation — no mutation on a mismatch.
+        snapshot
+            .metadata
+            .validate_against(&self.lineage_id, config_fingerprint)?;
+
+        if let Some(reason) = self.sealed {
+            return Err(match reason {
+                SealReason::SequenceExhausted => SnapshotError::SequenceExhausted,
+                SealReason::JournalUnavailable => SnapshotError::JournalUnavailable,
+            });
+        }
+
+        let sequence = self.next_sequence; // continues — never reset to 0
+        let venue_ts = self.clock.now_ms();
+        let new_epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or(SnapshotError::SequenceExhausted)?;
+
+        // Pre-mutation sequence-capacity gate (#009 all-or-nothing): the epoch
+        // marker consumes `sequence`, and the fresh epoch must be able to continue
+        // PAST it. Prove that capacity now — while everything is still on the
+        // detached/prepared side — so a restore that would exhaust the
+        // `underlying_sequence` is refused BEFORE any live state (books, stores,
+        // epoch, journal) is touched, leaving the live books exactly as they were.
+        // This mirrors the re-add path's all-or-nothing contract; the genuinely
+        // at-the-limit LIVE command path still seals post-commit (`handle`), but a
+        // RESTORE fails closed rather than sealing after replacing the books.
+        let next_sequence = sequence
+            .checked_next()
+            .ok_or(SnapshotError::SequenceExhausted)?;
+
+        // Step 2a: prepare the detached book image (fallible, non-mutating).
+        let prepared = self.executor.prepare_restore(
+            &snapshot.executor.resting_orders,
+            &snapshot.executor.idempotency,
+            &snapshot.executor.instrument_statuses,
+        )?;
+
+        // Step 2b: append the epoch marker as the first record of the fresh
+        // epoch (fallible). Done before any swap so a failure rolls back cleanly.
+        let marker = SnapshotRestored::new(
+            sequence,
+            venue_ts,
+            snapshot.metadata.snapshot_id.clone(),
+            new_epoch,
+            self.lineage_id.clone(),
+        );
+        if self.journal.append(JournalRecord::epoch(marker)).is_err() {
+            tracing::error!(
+                underlying = %self.underlying,
+                "snapshot restore could not journal the epoch marker; rolling back"
+            );
+            return Err(SnapshotError::JournalUnavailable);
+        }
+
+        // Step 3: commit — swap all four stores infallibly under quiescence, then
+        // continue the `underlying_sequence` past the marker. The capacity was
+        // proven above (`next_sequence`), so this advance cannot exhaust and the
+        // commit cannot leave a half-restored, un-advanceable book.
+        self.executor.commit_restore(prepared);
+        self.fan_out
+            .executions()
+            .restore(snapshot.executions.clone());
+        self.fan_out.positions().restore(snapshot.positions.clone());
+        self.epoch = new_epoch;
+        self.next_sequence = next_sequence;
+
+        tracing::info!(
+            underlying = %self.underlying,
+            snapshot_id = %snapshot.metadata.snapshot_id,
+            epoch = new_epoch,
+            underlying_sequence = sequence.get(),
+            "snapshot restored; opened a fresh journal epoch"
+        );
+        Ok(Receipt {
+            underlying_sequence: sequence,
+            venue_ts,
+        })
     }
 }
 
@@ -604,10 +786,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::boundary::{Hash32, STPMode, Side, TimeInForce};
     use crate::exchange::identity::JournalHeader;
     use crate::exchange::journal::InMemoryVenueJournal;
+    use crate::exchange::money::Cents;
+    use crate::exchange::stores::MarkPriceBook;
     use crate::exchange::symbol::Symbol;
-    use crate::models::{AccountId, VenueOrderId};
+    use crate::models::{AccountId, ClientOrderId, OrderType, VenueOrderId};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // ---- fixtures --------------------------------------------------------
@@ -834,6 +1019,97 @@ mod tests {
             Err(VenueError::SequenceExhausted) => {}
             other => panic!("expected SequenceExhausted, got {other:?}"),
         }
+    }
+
+    // ---- restore refuses pre-mutation on sequence exhaustion (#009) -------
+
+    /// A default-wired actor (real [`MatchingExecutor`] over the in-memory
+    /// [`StoreFanOut`]) seeded at `start_sequence`, so a restore can be driven
+    /// synchronously under the single writer.
+    fn real_actor(
+        start_sequence: SequenceNumber,
+    ) -> UnderlyingActor<
+        InMemoryVenueJournal,
+        MatchingExecutor,
+        StoreFanOut<InMemoryExecutionsStore, InMemoryPositionsStore>,
+        FixedClock,
+    > {
+        let fan = StoreFanOut::new(
+            Arc::new(InMemoryExecutionsStore::new()),
+            Arc::new(InMemoryPositionsStore::new()),
+            Arc::new(MarkPriceBook::new()),
+        );
+        UnderlyingActor::new(
+            config_from(start_sequence),
+            journal(),
+            MatchingExecutor::new("BTC"),
+            fan,
+            CLOCK,
+        )
+    }
+
+    /// A resting limit add on the shared fixture leaf.
+    fn add_order(tag: &str, sequence: u64, side: Side, price: u64, quantity: u64) -> VenueCommand {
+        VenueCommand::AddOrder {
+            symbol: sym("BTC-20240329-50000-C"),
+            order_id: LineageId::new("run-1").venue_order_id(
+                "BTC",
+                SequenceNumber::new(sequence),
+                0,
+            ),
+            account: AccountId::new(tag),
+            owner: Hash32([0xAB; 32]),
+            client_order_id: Some(ClientOrderId::new(format!("cloid-{tag}"))),
+            side,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(price)),
+            quantity,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        }
+    }
+
+    #[test]
+    fn test_restore_that_would_exhaust_sequence_refuses_before_mutating() {
+        // Source venue: a healthy actor with one resting order → the snapshot cut.
+        let mut source = real_actor(SequenceNumber::START);
+        if let Err(e) = source.handle(add_order("m1", 0, Side::Sell, 50_100, 3)) {
+            panic!("source add failed: {e}");
+        }
+        let snapshot = source.capture("snap-1", "fp-1");
+
+        // Target venue: a DISTINCT actor seeded one below the ceiling, given its
+        // OWN resting order in one committed turn — which advances the counter to
+        // exactly u64::MAX WITHOUT sealing (the genuinely-at-the-limit live case).
+        let mut target = real_actor(SequenceNumber::new(u64::MAX - 1));
+        if let Err(e) = target.handle(add_order("b1", u64::MAX - 1, Side::Buy, 49_900, 2)) {
+            panic!("target add failed: {e}");
+        }
+
+        // The target's cut BEFORE the attempted restore. FixedClock ⇒ two captures
+        // are byte-identical iff every store is unchanged.
+        let before = target.capture("probe", "fp-1");
+
+        // A restore whose epoch marker would consume the last assignable sequence
+        // and then be unable to advance MUST be refused BEFORE any live state is
+        // mutated (the all-or-nothing contract) — not sealed after a swap.
+        match target.restore(&snapshot, "fp-1") {
+            Err(SnapshotError::SequenceExhausted) => {}
+            other => panic!("expected SequenceExhausted, got {other:?}"),
+        }
+
+        // Live books untouched: the target still carries its OWN order, not the
+        // source's — the pre-fix post-mutation check would have swapped them first.
+        let after = target.capture("probe", "fp-1");
+        assert_eq!(
+            before, after,
+            "a refused restore must leave top_of_book / capture_state byte-identical"
+        );
+        assert_eq!(
+            target.epoch(),
+            0,
+            "a refused restore must not open a new epoch"
+        );
     }
 
     // ---- pre-execution append failure: reuse N, book untouched -----------
