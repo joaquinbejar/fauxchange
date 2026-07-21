@@ -288,6 +288,19 @@ mod tests {
     }
 
     #[test]
+    fn test_build_symbol_rejects_relative_day_count_expiration() {
+        // #032 DTO boundary: the expiration path segment is an absolute `YYYYMMDD`
+        // date, never a wall-clock-relative day count. A bare `30` cannot become an
+        // `ExpirationDate::Days` here — the symbol grammar refuses it as a typed
+        // `VenueError::InvalidOrder` (HTTP 400), so a relative expiry never reaches
+        // the sequenced path over REST/WS.
+        match build_symbol("BTC", "30", 50_000, OptionStyle::Call) {
+            Err(VenueError::InvalidOrder(_)) => {}
+            other => panic!("expected InvalidOrder for a relative day-count expiry, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_mint_order_id_is_grammar_compatible_and_unique() {
         let lineage = LineageId::new("run-1");
         let a = mint_order_id(&lineage, "BTC");

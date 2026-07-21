@@ -57,7 +57,9 @@ use optionstratlib::chains::utils::adjust_volatility;
 use optionstratlib::prelude::{Decimal, Positive};
 use serde::{Deserialize, Serialize};
 
-use crate::exchange::{Cents, ExpirationDate, OptionStyle, Symbol, SymbolParser};
+use crate::exchange::{
+    Cents, ExpirationDate, OptionStyle, Symbol, SymbolParser, validate_venue_expiry,
+};
 use crate::simulation::simulator::AssetConfig;
 use crate::simulation::walk::{SimError, WalkTypeConfig};
 
@@ -374,6 +376,14 @@ pub fn synthesize_chain(
     let yyyymmdd = expiry_yyyymmdd(base_now_ms, config.days_to_expiration)?;
     let expiration = SymbolParser::parse_yyyymmdd(&yyyymmdd, "").map_err(|error| {
         SimError::ChainSynthesisFailed(format!("expiry {yyyymmdd} unresolvable: {error}"))
+    })?;
+    // Boundary guard (#032): route the synthesised expiry back through the venue
+    // replay-stability invariant so the `ExpirationDate::DateTime`-only guarantee is
+    // explicit and typed, not incidental to `parse_yyyymmdd`. A future change that
+    // emitted a relative `Days` or a non-canonical instant is a typed
+    // `ChainSynthesisFailed`, never a silently non-reproducible session.
+    let expiration = validate_venue_expiry(&expiration).map_err(|error| {
+        SimError::ChainSynthesisFailed(format!("expiry {yyyymmdd} is not replay-stable: {error}"))
     })?;
 
     // The ATM strike snaps the spot onto the strike grid; strikes fan out

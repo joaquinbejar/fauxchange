@@ -11,6 +11,59 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **`ExpirationDate::DateTime` everywhere + a permanent replay-stability guard**
+  (#32) — every *stored / journaled* expiry is an absolute `ExpirationDate::DateTime`
+  (an instant), never a wall-clock-relative `ExpirationDate::Days` (which re-resolves
+  against "now" on replay and maps to a different calendar date), closing a binding
+  determinism invariant ([04 §6](docs/04-market-data-and-replay.md#6-determinism-and-seeding),
+  [02 §5.4](docs/02-matching-architecture.md#5-determinism),
+  [ADR-0004](docs/adr/0004-deterministic-replay-with-seeded-clock.md)). The venue
+  refuses a relative expiry as a **typed rejection** at every construction boundary
+  — `ConfigError` at config / seed-manifest load (`parse_seed_expiry` →
+  `validate_venue_expiry`), `VenueError::InvalidOrder` (HTTP 400) at the REST/WS DTO
+  boundary (the `YYYYMMDD` symbol grammar cannot express a `Days`), and a typed
+  `SimError::ChainSynthesisFailed` at stepped-session synthesis (a new
+  `validate_venue_expiry` guard making the `DateTime`-only guarantee explicit rather
+  than incidental to `parse_yyyymmdd`) — so a relative expiry is never silently
+  re-resolved. A new recursive, non-vacuous grep guard
+  (`test_no_days_relative_expiry_survives_anywhere_in_the_venue`) scans the **whole
+  `src/`** and asserts **no `ExpirationDate::Days` construction survives**, exempting
+  only comment prose and an **explicit, enumerated `days-expiry-allow` allow-list** of
+  the four legitimate uses (each annotated in-place with its upstream evidence): the
+  market-maker pricer's clock-free kernel argument, the price-walk's `Step` x-axis
+  nominal, the engine's defensive read-arm, and the symbol match-to-reject arms.
+  **The pattern (the wording #33's guarantee doc inherits):** the venue's stored /
+  journaled / identity expiry form is *always* `ExpirationDate::DateTime`; at the two
+  clock-free kernel seams the venue converts `DateTime − venue_now` → a `Days`-valued
+  duration (off the #28 venue clock) and the kernel never reads wall-clock — because
+  `Days(_).get_years()` is `days / DAYS_IN_A_YEAR` (pure) whereas
+  `DateTime(_).get_years()` / `get_days()` read `Utc::now()` (verified pinned:
+  `expiration_date` 0.2.1 `convert.rs:26,65,83`; there is no public
+  `get_years_from(base)`, so `Days` is the *only* clock-free vehicle). **Honest note
+  on the acceptance-criterion letter:** the AC says "no `Days` in simulation", but the
+  price walk's nominal MUST stay `Days` — a `DateTime` there would call optionstratlib
+  `Xstep::new` → `get_days()` → `Utc::now()` and *reintroduce* the wall-clock read this
+  issue removes; the **spirit is preserved** (no wall-clock re-resolution anywhere;
+  `Days` survives only as the clock-free duration vehicle at two annotated kernel
+  seams, never as a stored expiry). A new **`[expiry_lifecycle]`** config section adds
+  the **operational** expiry / settlement times-of-day (`OperationalTime`, `HH:MM:SS`
+  UTC, defaults `08:00:00` / `08:30:00`; dependency-free, no `chrono` added), kept
+  **distinct** from the `23:59:59 UTC` symbol-identity instant and validated at load
+  (`settlement >= expiry`, both strictly before `23:59:59`) with typed `ConfigError`s
+  naming the offending combination — an invalid time combination is a startup failure.
+  The section is `deny_unknown_fields` and file-only; it is *validated now* but the
+  lifecycle scheduler that **consumes** these times lands in v0.5 (the milestone's
+  explicit out-of-scope). Options math (pricing, Greeks) continues through
+  `optionstratlib` — never hand-rolled — over the venue-resolved time-to-expiry.
+  Exercised by `tests/determinism.rs` (a `DateTime` fixture replays identically; a
+  `Days`-relative expiry is rejected at load; the venue-wide grep guard),
+  `tests/market_maker.rs`
+  (`test_requote_prices_are_identical_under_a_fixed_venue_clock` — two requotes at the
+  same `venue_now_ms` produce byte-identical limit prices despite wall-clock advance),
+  the DTO-boundary rejection unit tests in `src/error.rs` / `src/gateway/rest/support.rs`,
+  and the `[expiry_lifecycle]` validation tests in `src/config.rs` (defaults valid;
+  settlement-before-expiry / at-identity / malformed / unknown-key rejected)
+  ([032](milestones/v0.3-replay/032-expiration-datetime-everywhere.md)).
 - **Stepped synthetic sessions — the OptionChain-Simulator model absorbed as code,
   not a dependency** (#31) in the new `src/simulation/session.rs` (`SessionConfig`,
   `synthesize_chain`, `SynthesizedChain`), a per-instrument implied-volatility
