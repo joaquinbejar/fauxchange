@@ -39,16 +39,36 @@
 //! so it never re-derives a cascading requote,
 //! [04 §2, §6](../../docs/04-market-data-and-replay.md#6-determinism-and-seeding)).
 //!
+//! ## The clock as a venue service (#028)
+//!
+//! [`SimClock`] is the one venue time source — realtime / accelerated / stepped,
+//! seeded from the run-level seed and recorded in the [`RunManifest`]. It
+//! implements the [`VenueClock`](crate::exchange::VenueClock) seam the
+//! per-underlying actors stamp `venue_ts` from and the price walk stamps its
+//! `SimStep.now_ms` from, so a single seeded clock decides every timestamp and
+//! `now_ms` on the sequenced path is a pure atomic load (never `SystemTime`). A
+//! stepped advance is a `Clock` [`VenueCommand`](crate::exchange::VenueCommand)
+//! fanned to every underlying actor by the venue-control coordinator (owned by
+//! [`AppState`](crate::state::AppState)), so the advance joins the recorded input
+//! stream and replay reproduces it from the journaled value.
+//!
 //! ## Not here yet
 //!
-//! The stepped deterministic sessions + smile curve (v0.3, #030/#031), the replay
-//! driver, and the clock-as-a-service modes (v0.3, #028) land later; this issue is
-//! the price-walk generation and its sequenced-path routing.
+//! The stepped deterministic sessions + smile curve and the replay driver (v0.3,
+//! #030/#031) land later; this module hosts the price-walk generation, its
+//! sequenced-path routing, and the clock service.
 
+pub mod clock;
+pub mod manifest;
 pub mod simulator;
 pub mod sink;
 pub mod walk;
 
+pub use self::clock::{
+    ClockMode, CorrelationId, DEFAULT_ACCEL_MULTIPLIER, DEFAULT_CLOCK_START_MS,
+    DEFAULT_STEP_INTERVAL_MS, SimClock, VenueClockConfig,
+};
+pub use self::manifest::RunManifest;
 pub use self::simulator::{
     AssetConfig, DEFAULT_HORIZON_STEPS, DEFAULT_PRICE_CHANNEL_CAPACITY, DEFAULT_START_MS,
     DEFAULT_STEP_MS, DEFAULT_TICK_INTERVAL, PriceSimulator, PriceUpdate, SimulationConfig,

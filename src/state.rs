@@ -39,9 +39,10 @@
 //! ## Auth + subscriptions (real) and the remaining placeholders (#015–#016)
 //!
 //! The auth service is **real** as of #012: [`AppState`] owns the
-//! [`AccountRegistry`] and an [`AuthService`] pinned to the concrete venue
-//! [`FixedClock`] (built from [`JwtAuth`] + [`RateLimiter`] + the registry as the
-//! [`RevocationOracle`]). The WebSocket subscription manager is **real** as of
+//! [`AccountRegistry`] and an [`AuthService`] pinned to the shared venue
+//! [`SimClock`] (built from [`JwtAuth`] + [`RateLimiter`] + the registry as the
+//! [`RevocationOracle`]) — the same advancing clock the actors stamp `venue_ts`
+//! from, so rate-limit decisions replay deterministically (#028). The WebSocket subscription manager is **real** as of
 //! #014: `AppState` owns the [`crate::subscription::OrderbookSubscriptionManager`]
 //! service (a sibling of [`crate::auth`] / [`crate::ohlc`], **not** a gateway) and
 //! tees a [`WsFanOut`] alongside each actor's
@@ -60,10 +61,13 @@
 //! | `simulator`     | [`crate::simulation::PriceSimulator`] (real) | #016 |
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use option_chain_orderbook::{InstrumentRegistry, SymbolIndex, SymbolParser};
+use tokio::task::JoinHandle;
+use tokio::time::MissedTickBehavior;
 
 use crate::auth::{
     AccountProvision, AccountRegistry, AccountStore, Argon2Hasher, AuthError, AuthService,
@@ -72,14 +76,17 @@ use crate::auth::{
 use crate::db::DatabasePool;
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, FixedClock, InMemoryExecutionsStore,
+    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, InMemoryExecutionsStore,
     InMemoryPositionsStore, InMemoryVenueJournal, JournalHeader, JournalSnapshot, LineageId,
     MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, TeeFanOut, VenueCommand,
     spawn_matching_actor_with_registry_and_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
 use crate::models::AccountId;
-use crate::simulation::{AssetConfig, PriceSimulator, SimulationConfig, VenueStepSink};
+use crate::simulation::{
+    AssetConfig, ClockMode, CorrelationId, PriceSimulator, RunManifest, SimClock, SimulationConfig,
+    VenueClockConfig, VenueStepSink,
+};
 // The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
 // sibling of `crate::auth` / `crate::ohlc`), NOT a gateway. `AppState` owns the
 // manager and tees a `WsFanOut` alongside `StoreFanOut` (via the exchange-owned
@@ -94,16 +101,21 @@ use crate::subscription::{OrderbookSubscriptionManager, WsFanOut};
 /// per-instrument value is venue config (#022); this fixes a bounded default.
 pub const DEFAULT_MAILBOX_CAPACITY: usize = 1_024;
 
-/// The default fixed venue-clock instant, in **milliseconds**. `venue_ts` is not
-/// the journaled total order (the `underlying_sequence` is), so a fixed instant
-/// is deterministic and sufficient until the stepped / seeded clock lands. The
-/// seeded clock service is wired with the simulation clock (#016).
-pub const DEFAULT_VENUE_CLOCK_MS: u64 = 0;
+/// The default run-level seed recorded in the [`RunManifest`] when a caller
+/// supplies none ([04 §6](../docs/04-market-data-and-replay.md#6-determinism-and-seeding)).
+pub const DEFAULT_SEED: u64 = 0;
 
 /// The default run lineage token when none is supplied. Namespaces every
 /// venue-minted id ([01 §6.1](../docs/01-domain-model.md)); the per-run unique
 /// lineage is minted at bootstrap (#022).
 pub const DEFAULT_LINEAGE_TOKEN: &str = "fauxchange";
+
+/// The default wall-clock cadence at which [`spawn_clock_cadence_driver`] advances
+/// the shared venue clock in realtime / accelerated mode. Fine enough that
+/// `venue_ts` stays fresh and the sliding rate-limit window (60 s) rolls smoothly,
+/// while cheap: each tick is a single atomic store **off** the sequenced path — no
+/// journal append, no book mutation. The live value becomes venue config (#046).
+pub const DEFAULT_CLOCK_CADENCE: Duration = Duration::from_millis(250);
 
 // ============================================================================
 // Construction parameters
@@ -220,8 +232,11 @@ pub struct AppStateConfig {
     pub lineage_id: LineageId,
     /// The bounded mailbox capacity for each actor.
     pub mailbox_capacity: usize,
-    /// The fixed venue-clock instant, in **milliseconds**.
-    pub venue_clock_ms: EventTimestamp,
+    /// The venue clock construction parameters (mode + virtual epoch) — the one
+    /// clock the actors, the simulator, and the rate limiter share (#028).
+    pub clock: VenueClockConfig,
+    /// The one run-level seed recorded in the [`RunManifest`].
+    pub seed: u64,
     /// The auth inputs; `None` defaults to [`AuthConfig::dev`] in
     /// [`AppState::new`].
     pub auth: Option<AuthConfig>,
@@ -244,22 +259,37 @@ pub struct AppStateConfig {
 
 impl AppStateConfig {
     /// Builds a config for `underlyings` with the bounded defaults
-    /// ([`DEFAULT_LINEAGE_TOKEN`] / [`DEFAULT_MAILBOX_CAPACITY`] /
-    /// [`DEFAULT_VENUE_CLOCK_MS`]) and **no** explicit auth (local dev auth is
-    /// applied by [`AppState::new`]).
+    /// ([`DEFAULT_LINEAGE_TOKEN`] / [`DEFAULT_MAILBOX_CAPACITY`] / a realtime
+    /// [`VenueClockConfig`] / [`DEFAULT_SEED`]) and **no** explicit auth (local dev
+    /// auth is applied by [`AppState::new`]).
     #[must_use]
     pub fn new(underlyings: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
             underlyings: underlyings.into_iter().map(Into::into).collect(),
             lineage_id: LineageId::new(DEFAULT_LINEAGE_TOKEN),
             mailbox_capacity: DEFAULT_MAILBOX_CAPACITY,
-            venue_clock_ms: EventTimestamp::new(DEFAULT_VENUE_CLOCK_MS),
+            clock: VenueClockConfig::default(),
+            seed: DEFAULT_SEED,
             auth: None,
             assets: Vec::new(),
             simulation: SimulationConfig::default(),
             db: None,
             start_serving: true,
         }
+    }
+
+    /// Sets the venue clock construction parameters (mode + virtual epoch).
+    #[must_use]
+    pub fn with_clock(mut self, clock: VenueClockConfig) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Sets the run-level seed recorded in the [`RunManifest`].
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
     }
 
     /// Sets whether the venue starts already **serving** (#024). Pass `false` to
@@ -373,8 +403,10 @@ pub struct AppState {
     /// to the middleware on the next request.
     accounts: Arc<AccountRegistry>,
     /// The JWT auth service (real as of #012): JWT verification, the rate limiter
-    /// on the venue [`FixedClock`], and the account revocation oracle.
-    auth: AuthService<FixedClock>,
+    /// on the shared venue [`SimClock`], and the account revocation oracle. The
+    /// rate limiter reads the **same** advancing clock the sequenced path stamps
+    /// events from, so its decisions replay deterministically (#028).
+    auth: AuthService<SimClock>,
     /// The operator gate on token issuance (`AUTH_BOOTSTRAP_SECRET`), consulted by
     /// the registry-resolved mint ([`AppState::mint_token`]).
     bootstrap_gate: BootstrapGate,
@@ -408,6 +440,62 @@ pub struct AppState {
     /// seed-time manifest input, [03 §10](../docs/03-protocol-surfaces.md#10-state-changing-operation-classification)).
     /// A monotonic one-way flip — never flipped back.
     serving: AtomicBool,
+    /// The one shared venue clock (#028) — the source the per-underlying actors
+    /// stamp `venue_ts` from, the simulator stamps `SimStep.now_ms` from, and the
+    /// auth rate limiter reads. Advancing it (stepped `Clock` command, or the
+    /// realtime/accelerated cadence driver) happens off the sequenced read.
+    clock: SimClock,
+    /// The run manifest (#028) — the recorded `seed` + `clock_mode` that fix this
+    /// run's determinism, so a replay can assert it reproduces the same run
+    /// ([04 §6](../docs/04-market-data-and-replay.md#6-determinism-and-seeding)).
+    manifest: RunManifest,
+    /// The monotonic counter minting a shared [`CorrelationId`] per venue-control
+    /// fan-out (a stepped `Clock` advance), so an operator can correlate the
+    /// per-underlying commands one advance produced and detect a partial fan-out
+    /// ([02 §4.1](../docs/02-matching-architecture.md#41-venue-wide-commands-marketmakercontrol--clock--simstep)).
+    correlation_counter: AtomicU64,
+}
+
+/// The result of a venue-control clock advance fanned across the underlyings —
+/// the coordinator's in-memory ack ([02 §4.1](../docs/02-matching-architecture.md#41-venue-wide-commands-marketmakercontrol--clock--simstep)).
+///
+/// It reports the venue instant the clock advanced to, the shared
+/// [`CorrelationId`] tagging this fan-out, and the per-underlying accept/commit
+/// (a [`Receipt`] on success, a typed [`VenueError`] otherwise) — so a **partial**
+/// fan-out (committed on some underlyings, not others) is surfaced, never hidden.
+/// Journaling the correlation id durably for post-hoc partial-detection queries
+/// lands with the durable journal (#029); #028's tag is this in-memory ack.
+#[derive(Debug)]
+pub struct ClockAdvance {
+    /// The venue instant the shared clock advanced to (or held at), in **ms**.
+    pub now_ms: EventTimestamp,
+    /// The shared correlation id tagging every per-underlying command this advance
+    /// fanned out.
+    pub correlation_id: CorrelationId,
+    /// Per-underlying accept/commit, keyed by ticker, in the deterministic sorted
+    /// order.
+    pub per_underlying: Vec<(String, Result<Receipt, VenueError>)>,
+}
+
+impl ClockAdvance {
+    /// The number of underlyings that committed the advance (a successful
+    /// [`Receipt`]).
+    #[must_use]
+    pub fn committed_count(&self) -> usize {
+        self.per_underlying
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .count()
+    }
+
+    /// Whether the fan-out was **partial** — at least one underlying committed and
+    /// at least one did not. An all-committed or (degenerate) all-failed fan-out is
+    /// not partial.
+    #[must_use]
+    pub fn is_partial(&self) -> bool {
+        let committed = self.committed_count();
+        committed != 0 && committed != self.per_underlying.len()
+    }
 }
 
 impl AppState {
@@ -429,8 +517,9 @@ impl AppState {
     /// Auth is built **before** any actor is spawned: a `None` [`AppStateConfig::auth`]
     /// defaults to [`AuthConfig::dev`], the registry is provisioned (hashing each
     /// account's password with Argon2id — a one-off bootstrap cost, never a
-    /// request-path cost), and the [`AuthService`] is pinned to the venue
-    /// [`FixedClock`], with the registry (as [`RevocationOracle`]) as its oracle.
+    /// request-path cost), and the [`AuthService`] is pinned to the shared venue
+    /// [`SimClock`] (the same advancing clock the actors stamp `venue_ts` from,
+    /// #028), with the registry (as [`RevocationOracle`]) as its oracle.
     ///
     /// # Panics
     ///
@@ -449,7 +538,8 @@ impl AppState {
             underlyings,
             lineage_id,
             mailbox_capacity,
-            venue_clock_ms,
+            clock: clock_config,
+            seed,
             auth,
             assets,
             simulation,
@@ -457,9 +547,13 @@ impl AppState {
             start_serving,
         } = config;
 
-        // A deterministic fixed clock (`venue_ts` is not the journaled order); the
-        // rate limiter and the sequenced path read this SAME venue clock.
-        let clock = FixedClock::new(venue_clock_ms);
+        // The one shared venue clock (#028): the rate limiter, every actor's
+        // `venue_ts`, and the simulator's `SimStep.now_ms` all read this SAME
+        // advancing clock, so a single seeded clock decides every timestamp and
+        // replay reuses the recorded value. Cloned as a cheap `Arc` handle into
+        // each consumer; advancing happens off the sequenced read.
+        let clock = SimClock::new(clock_config);
+        let manifest = RunManifest::new(seed, clock.mode());
 
         // Build auth FIRST (the only fallible step): a `None` auth defaults to the
         // embedded dev key pair, then provision the registry and assemble the
@@ -481,7 +575,7 @@ impl AppState {
         let revocation: Arc<dyn RevocationOracle> = account_registry.clone();
         let auth_service = AuthService::new(
             jwt,
-            RateLimiter::new(clock, rate_limit_per_window),
+            RateLimiter::new(clock.clone(), rate_limit_per_window),
             revocation,
         );
         let bootstrap_gate = BootstrapGate::new(bootstrap_secret);
@@ -536,7 +630,7 @@ impl AppState {
                 actor_config,
                 journal,
                 fan_out,
-                clock,
+                clock.clone(),
                 Arc::clone(&registry),
                 Arc::clone(&symbol_index),
             );
@@ -567,12 +661,14 @@ impl AppState {
             assets,
             simulation,
             VenueStepSink::new(handles.clone(), Arc::clone(&market_maker)),
+            clock.clone(),
         );
 
         tracing::info!(
             underlyings = handles.len(),
             accounts = account_registry.account_count(),
             durable = db.is_some(),
+            manifest = %manifest.summary(),
             "AppState assembled; one single-writer actor spawned per underlying"
         );
 
@@ -592,6 +688,9 @@ impl AppState {
             simulator,
             db,
             serving: AtomicBool::new(start_serving),
+            clock,
+            manifest,
+            correlation_counter: AtomicU64::new(0),
         }))
     }
 
@@ -632,6 +731,87 @@ impl AppState {
     pub async fn journal_snapshot(&self, underlying: &str) -> Result<JournalSnapshot, VenueError> {
         let handle = self.handle_for(underlying)?;
         handle.snapshot().await
+    }
+
+    /// Advances the shared venue clock by one **stepped** interval and fans the
+    /// resulting `Clock` command to every underlying actor — the venue-control
+    /// coordinator for a stepped clock tick
+    /// ([02 §4.1](../docs/02-matching-architecture.md#41-venue-wide-commands-marketmakercontrol--clock--simstep),
+    /// [04 §5](../docs/04-market-data-and-replay.md#5-clock-control)).
+    ///
+    /// The clock is advanced **first** (so each actor stamps the new instant), then
+    /// a `Clock { now_ms }` is submitted to every actor as a normal per-underlying
+    /// sequenced command carrying that value — so the advance is part of the
+    /// recorded input stream and replay reproduces it from the journaled command,
+    /// never by re-reading the replay clock. The returned [`ClockAdvance`] reports
+    /// per-underlying accept/commit keyed by a shared [`CorrelationId`], surfacing a
+    /// **partial** fan-out rather than hiding it (the venue does not promise atomic
+    /// all-or-nothing fan-out — there is no venue-wide total order).
+    ///
+    /// In realtime / accelerated modes [`SimClock::step`](crate::simulation::SimClock::step)
+    /// is a no-op read, so this fans the current instant without advancing (those
+    /// modes advance via the cadence driver); it is the stepped-mode control path.
+    ///
+    /// **Concurrency caveat.** This is **not** internally serialized against
+    /// concurrent callers: it advances the shared clock and then awaits each
+    /// actor's fan-out. Today only sequential drivers (tests) call it, so the clock
+    /// is stable across a single advance. When #030 wires the REST/WS clock-control
+    /// surface, concurrent advances MUST be serialized (or at-most-one-in-flight
+    /// enforced) so a racing advance cannot bump the shared clock between an actor
+    /// journaling a `Clock { now_ms }` and stamping its `venue_ts` — that
+    /// serialization is #030's responsibility, not enforced here.
+    pub async fn advance_clock_step(&self) -> ClockAdvance {
+        let now_ms = self.clock.step();
+        self.fan_clock(now_ms).await
+    }
+
+    /// Advances the shared venue clock **monotonically** to `target_ms` (a no-op if
+    /// at or below the current instant) and fans the resulting `Clock` command to
+    /// every underlying actor — the explicit-instant sibling of
+    /// [`advance_clock_step`](Self::advance_clock_step) the replay driver (#030)
+    /// drives to a recorded instant. The same **concurrency caveat** applies:
+    /// concurrent advances are not serialized here; #030 must enforce that.
+    pub async fn advance_clock_to(&self, target_ms: u64) -> ClockAdvance {
+        let now_ms = self.clock.advance_to(target_ms);
+        self.fan_clock(now_ms).await
+    }
+
+    /// Fans a `Clock { now_ms }` to every hosted underlying (in the deterministic
+    /// **sorted** order), collecting per-underlying accept/commit under one shared
+    /// correlation id. No borrow of `self` is held across an `.await` — each handle
+    /// is cloned out first.
+    async fn fan_clock(&self, now_ms: EventTimestamp) -> ClockAdvance {
+        let correlation_id = self.next_correlation_id();
+        let command = VenueCommand::Clock { now_ms };
+        let tickers: Vec<String> = self.underlyings().into_iter().map(str::to_string).collect();
+        let mut per_underlying = Vec::with_capacity(tickers.len());
+        for ticker in tickers {
+            let result = match self.handle_for(&ticker) {
+                Ok(handle) => handle.submit(command.clone()).await,
+                Err(error) => Err(error),
+            };
+            per_underlying.push((ticker, result));
+        }
+        let advance = ClockAdvance {
+            now_ms,
+            correlation_id,
+            per_underlying,
+        };
+        if advance.is_partial() {
+            tracing::warn!(
+                correlation_id = %correlation_id,
+                now_ms = now_ms.get(),
+                committed = advance.committed_count(),
+                total = advance.per_underlying.len(),
+                "clock advance fan-out was partial across underlyings"
+            );
+        }
+        advance
+    }
+
+    /// Mints the next shared [`CorrelationId`] for a venue-control fan-out.
+    fn next_correlation_id(&self) -> CorrelationId {
+        CorrelationId::new(self.correlation_counter.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Resolves the actor handle a command routes to, cloning it so no borrow of
@@ -764,8 +944,26 @@ impl AppState {
     /// gateway consults.
     #[must_use]
     #[inline]
-    pub fn auth(&self) -> &AuthService<FixedClock> {
+    pub fn auth(&self) -> &AuthService<SimClock> {
         &self.auth
+    }
+
+    /// The one shared venue clock (#028) — the source every `venue_ts`, the
+    /// simulator's `SimStep.now_ms`, and the rate limiter read. Advance it with
+    /// [`advance_clock_step`](Self::advance_clock_step) /
+    /// [`advance_clock_to`](Self::advance_clock_to).
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> &SimClock {
+        &self.clock
+    }
+
+    /// The run manifest (#028) — the recorded `seed` + `clock_mode` fixing this
+    /// run's determinism.
+    #[must_use]
+    #[inline]
+    pub fn manifest(&self) -> &RunManifest {
+        &self.manifest
     }
 
     /// The venue account registry (the [`AccountStore`] backend) — resolution by
@@ -882,6 +1080,100 @@ impl AppState {
             tracing::info!("venue flipped to serving; runtime hierarchy mutation now refused");
         }
     }
+}
+
+// ============================================================================
+// The clock-cadence driver (#028; self-review fix #112)
+// ============================================================================
+
+/// Spawns the venue **clock-cadence driver** — the owned background task that
+/// advances the shared venue [`SimClock`] on a wall cadence in realtime /
+/// accelerated mode, so `venue_ts` progresses and the sliding rate-limit window
+/// rolls for the whole life of the running service.
+///
+/// Without it the venue clock never advances off the sequenced path: nothing calls
+/// [`SimClock::tick`](crate::simulation::SimClock::tick), so `now_ms` is frozen at
+/// the epoch, `venue_ts` is constant, and the rate-limit windows never roll for the
+/// entire process lifetime (the self-review gap tracked in #112). Stepped mode was
+/// never affected — it advances via explicit `Clock` commands — so only the default
+/// live modes (realtime / accelerated) were broken.
+///
+/// Returns `None` in [`ClockMode::Stepped`]: a stepped clock advances **only** on an
+/// explicit `Clock` [`VenueCommand`] (the #028 control coordinator
+/// [`AppState::advance_clock_step`] / [`AppState::advance_clock_to`], or a replay
+/// driver), never on a wall cadence, so no auto-advancing driver is spawned.
+///
+/// # Determinism
+///
+/// The driver drives **only** the venue clock: each tick is a single
+/// [`SimClock::tick`](crate::simulation::SimClock::tick), a wall read taken **off**
+/// the sequenced path that advances the clock's atomic instant. It mutates no book
+/// and appends no journal record — the journaled `Clock` advances that fan to the
+/// actors stay the #028 control-coordinator path, not a new sequenced path invented
+/// here. Reading the real wall clock in this off-path driver is the intended
+/// realtime time source, not a sequenced-path violation: the sequenced read
+/// [`SimClock::now_ms`](crate::simulation::SimClock::now_ms) stays a pure atomic
+/// load, and a replay reproduces `venue_ts` from the journaled values rather than
+/// re-reading the wall clock.
+///
+/// # Shutdown
+///
+/// The task holds only a [`Weak`] handle to [`AppState`] (mirroring
+/// [`spawn_rate_limit_sweeper`](crate::gateway::rest::spawn_rate_limit_sweeper)), so
+/// when the last strong `Arc<AppState>` drops (server shutdown) the next tick fails
+/// to upgrade and the loop exits cleanly — it never keeps the venue alive. `main.rs`
+/// additionally `abort`s the returned handle once the REST server drains, for prompt
+/// shutdown.
+#[must_use]
+pub fn spawn_clock_cadence_driver(state: &Arc<AppState>) -> Option<JoinHandle<()>> {
+    spawn_clock_cadence_driver_with_cadence(state, DEFAULT_CLOCK_CADENCE)
+}
+
+/// [`spawn_clock_cadence_driver`] with an explicit `cadence` — the seam tests drive
+/// on a short interval so the advance is observable without racing the default
+/// cadence.
+#[must_use]
+pub(crate) fn spawn_clock_cadence_driver_with_cadence(
+    state: &Arc<AppState>,
+    cadence: Duration,
+) -> Option<JoinHandle<()>> {
+    if matches!(state.clock().mode(), ClockMode::Stepped { .. }) {
+        tracing::info!(
+            "clock cadence driver: stepped mode advances only via explicit Clock \
+             commands; not spawning a wall-cadence driver"
+        );
+        return None;
+    }
+
+    let mode = state.clock().mode().as_token();
+    let weak: Weak<AppState> = Arc::downgrade(state);
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(cadence);
+        // Never burst-catch-up after a stall: a delayed tick just resumes the
+        // cadence (the wall-tracking advance is absolute, so a skipped tick is not
+        // lost time — the next tick jumps straight to the true wall instant).
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match weak.upgrade() {
+                // Advance ONLY the venue clock — a wall read off the sequenced path.
+                // `tick` is mode-aware (realtime / accelerated here); the returned
+                // instant is intentionally discarded. No book mutation, no journal.
+                Some(state) => {
+                    let _ = state.clock().tick();
+                }
+                // The last strong `Arc<AppState>` dropped: shut the driver down.
+                None => break,
+            }
+        }
+        tracing::debug!("clock cadence driver stopped");
+    });
+    tracing::info!(
+        cadence_ms = cadence.as_millis(),
+        mode,
+        "clock cadence driver spawned; venue clock advances off the sequenced path"
+    );
+    Some(handle)
 }
 
 impl std::fmt::Debug for AppState {
@@ -1091,5 +1383,147 @@ mod tests {
         assert_eq!(taker.len(), 1);
         assert_eq!(taker[0].price_cents, Cents::new(50_000));
         assert_eq!(taker[0].quantity, 2);
+    }
+
+    // ---- clock coordinator (#028) ----------------------------------------
+
+    /// A stepped-clock config over `underlyings`, starting at `start_ms` and
+    /// advancing by `step_ms` per step.
+    fn stepped_config(underlyings: &[&str], start_ms: u64, step_ms: u64) -> AppStateConfig {
+        config(underlyings).with_clock(VenueClockConfig::stepped(start_ms, step_ms))
+    }
+
+    #[tokio::test]
+    async fn test_advance_clock_step_fans_to_all_underlyings_and_advances_venue_ts() {
+        let state = new_state(stepped_config(&["BTC", "ETH"], 1_000, 500));
+        // The stepped advance moves the shared clock by exactly the interval and
+        // fans a Clock command to EVERY underlying, each committing on its own
+        // sequence 0.
+        let advance = state.advance_clock_step().await;
+        assert_eq!(advance.now_ms, EventTimestamp::new(1_500));
+        assert_eq!(state.clock().now_ms(), EventTimestamp::new(1_500));
+        assert_eq!(advance.committed_count(), 2, "both underlyings committed");
+        assert!(!advance.is_partial(), "a full fan-out is not partial");
+        for (ticker, result) in &advance.per_underlying {
+            match result {
+                Ok(receipt) => assert_eq!(
+                    receipt.underlying_sequence.get(),
+                    0,
+                    "{ticker} sequenced the Clock command at its own seq 0"
+                ),
+                Err(e) => panic!("{ticker} clock fan-out failed: {e}"),
+            }
+        }
+        // A subsequent order is now stamped with the advanced venue instant.
+        let receipt = match state.submit(cancel("BTC-20240329-50000-C")).await {
+            Ok(r) => r,
+            Err(e) => panic!("post-advance submit failed: {e}"),
+        };
+        assert_eq!(
+            receipt.underlying_sequence.get(),
+            1,
+            "after the Clock at seq 0"
+        );
+        assert_eq!(
+            receipt.venue_ts,
+            EventTimestamp::new(1_500),
+            "venue_ts is stamped from the advanced shared clock"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_advance_clock_step_is_a_no_op_advance_in_realtime() {
+        // In realtime mode `step()` is a no-op read: the fan-out still reaches every
+        // underlying (at the current instant), the clock does not jump on a step.
+        let state = new_state(config(&["BTC"]).with_clock(VenueClockConfig::realtime(7_000)));
+        let advance = state.advance_clock_step().await;
+        assert_eq!(advance.now_ms, EventTimestamp::new(7_000));
+        assert_eq!(advance.committed_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_manifest_records_seed_and_clock_mode() {
+        let state = new_state(stepped_config(&["BTC"], 1_000, 500).with_seed(99));
+        assert_eq!(state.manifest().seed, 99);
+        assert_eq!(state.manifest().clock_mode, "stepped");
+    }
+
+    // ---- clock cadence driver (#028; self-review fix #112) ---------------
+
+    /// Polls the shared clock until it advances past `start`, or `budget` elapses,
+    /// returning the observed instant — so the assertion waits on the driver rather
+    /// than racing a fixed sleep.
+    async fn wait_for_advance(state: &Arc<AppState>, start: u64, budget: Duration) -> u64 {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let now = state.clock().now_ms().get();
+            if now > start || tokio::time::Instant::now() >= deadline {
+                return now;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_clock_cadence_driver_advances_the_venue_clock_in_accelerated() {
+        // The bug fixed by #112: in the running service nothing advanced the venue
+        // clock, so `venue_ts` was constant for the process lifetime. The cadence
+        // driver advances it off the sequenced path. A large multiplier makes even a
+        // couple of short cadence ticks of real wall time advance the virtual clock
+        // far past the epoch, so the assertion is robust to timing jitter.
+        let start = 1_000_000_000_000;
+        let state =
+            new_state(config(&["BTC"]).with_clock(VenueClockConfig::accelerated(start, 100_000)));
+        assert_eq!(
+            state.clock().now_ms().get(),
+            start,
+            "starts parked at the epoch"
+        );
+
+        let driver = match spawn_clock_cadence_driver_with_cadence(&state, Duration::from_millis(2))
+        {
+            Some(handle) => handle,
+            None => panic!("realtime/accelerated must spawn a cadence driver"),
+        };
+
+        let advanced = wait_for_advance(&state, start, Duration::from_secs(2)).await;
+        assert!(
+            advanced > start,
+            "the cadence driver advanced the venue clock off the sequenced path \
+             ({advanced} > {start})"
+        );
+
+        // Clean shutdown: aborting the driver stops the loop (it also exits on the
+        // dropped `Weak` when `state` drops at end of scope).
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn test_clock_cadence_driver_is_not_spawned_in_stepped_mode() {
+        // Stepped clocks advance ONLY on an explicit Clock command, never on a wall
+        // cadence: no driver is spawned, and the clock does not auto-advance.
+        let start = 5_000;
+        let state = new_state(stepped_config(&["BTC"], start, 500));
+        assert!(
+            spawn_clock_cadence_driver_with_cadence(&state, Duration::from_millis(2)).is_none(),
+            "stepped mode must spawn no wall-cadence driver"
+        );
+
+        // Give any (erroneously spawned) loop ample time to fire, then confirm the
+        // clock is still parked at the epoch — a stepped clock never auto-advances.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state.clock().now_ms().get(),
+            start,
+            "a stepped clock does not auto-advance without an explicit step"
+        );
+
+        // The explicit #028 control path still advances it by exactly the interval.
+        state.advance_clock_step().await;
+        assert_eq!(
+            state.clock().now_ms().get(),
+            start + 500,
+            "an explicit Clock advance still moves a stepped clock"
+        );
     }
 }

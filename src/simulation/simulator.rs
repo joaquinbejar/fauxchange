@@ -8,11 +8,14 @@
 //!
 //! ## The venue clock, not `SystemTime` (rule 3)
 //!
-//! Each tick advances a **deterministic virtual venue clock** — `now_ms =
-//! start_ms + step_index × step_ms` — and carries that `now_ms` into the
-//! `SimStep`, so replay reuses the exact value. No `SystemTime` is read on any
-//! step. (The full clock-as-a-service modes — realtime / accelerated / stepped —
-//! are v0.3, #028; this is the deterministic virtual clock the sim needs now.)
+//! Each emitted step is stamped `now_ms` from the injected venue
+//! [`SimClock`](crate::simulation::SimClock) — the **one** clock the whole venue
+//! reads (#028) — and carries that value into the `SimStep`, so replay reuses the
+//! exact recorded value. `step_once` **reads** the current venue instant (a pure
+//! atomic load, never `SystemTime`); the clock is **advanced** by the cadence
+//! driver / control coordinator (realtime & accelerated track wall time off the
+//! sequenced path; stepped advances only on an explicit `Clock` command), so the
+//! sim's price cadence runs off the injected clock rather than a private counter.
 //!
 //! ## Journal-driven replay, not seed-regenerated (rule 3/5)
 //!
@@ -32,13 +35,14 @@
 //! `tokio::broadcast`; a laggard drops and re-reads (rule 7).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
 
 use crate::exchange::{Cents, EventTimestamp};
+use crate::simulation::clock::{ClockMode, SimClock};
 use crate::simulation::sink::StepSink;
 use crate::simulation::walk::{SimError, WalkTypeConfig, generate_path};
 
@@ -183,23 +187,25 @@ pub struct PriceSimulator {
     assets: RwLock<HashMap<String, AssetState>>,
     /// The bounded price-update broadcast.
     price_tx: broadcast::Sender<PriceUpdate>,
-    /// The virtual-clock step counter (the next step's index).
-    step_index: AtomicU64,
+    /// The injected venue clock — the **one** source of the `now_ms` every step is
+    /// stamped with, shared with the per-underlying actors' `venue_ts` (#028).
+    clock: SimClock,
     /// The loop's stop flag (set by [`PriceSimulator::stop`]).
     stopped: AtomicBool,
 }
 
 impl PriceSimulator {
-    /// Builds a simulator over `assets` and `config`, routing every step through
-    /// `sink`. Each asset's initial path is pre-generated eagerly; an asset whose
-    /// walk fails to generate starts **dormant** (it serves no price until a
-    /// [`set_price`](Self::set_price) override revives it) rather than aborting
-    /// construction.
+    /// Builds a simulator over `assets` and `config`, stamping every step from the
+    /// injected venue `clock` and routing it through `sink`. Each asset's initial
+    /// path is pre-generated eagerly; an asset whose walk fails to generate starts
+    /// **dormant** (it serves no price until a [`set_price`](Self::set_price)
+    /// override revives it) rather than aborting construction.
     #[must_use]
     pub fn new(
         assets: Vec<AssetConfig>,
         config: SimulationConfig,
         sink: Arc<dyn StepSink>,
+        clock: SimClock,
     ) -> Arc<Self> {
         let (price_tx, _) = broadcast::channel(config.price_channel_capacity.max(1));
         let mut map: HashMap<String, AssetState> = HashMap::with_capacity(assets.len());
@@ -241,9 +247,17 @@ impl PriceSimulator {
             config,
             assets: RwLock::new(map),
             price_tx,
-            step_index: AtomicU64::new(0),
+            clock,
             stopped: AtomicBool::new(false),
         })
+    }
+
+    /// The injected venue clock this simulator stamps its steps from — the shared
+    /// handle the actors also read for `venue_ts`.
+    #[must_use]
+    #[inline]
+    pub fn clock(&self) -> &SimClock {
+        &self.clock
     }
 
     /// Subscribes to the bounded price-update broadcast — one receiver per
@@ -292,17 +306,7 @@ impl PriceSimulator {
     /// - [`SimError::UnknownUnderlying`] if `underlying` is not a configured asset
     ///   (the transport-level `POST /api/v1/prices` override goes through the actor
     ///   on its own path and is not scoped to configured assets).
-    /// - [`SimError::TimelineExhausted`] if the virtual clock has reached the `u64`
-    ///   ceiling (unreachable in practice): the override is not applied and the
-    ///   simulator halts rather than stamp a clamped, non-monotonic instant.
     pub fn set_price(&self, underlying: &str, price: Cents) -> Result<(), SimError> {
-        // Stamp with the current virtual-clock instant FIRST (checked): if the
-        // clock is exhausted, halt without mutating or publishing rather than emit
-        // a clamped, non-monotonic instant (rule 3).
-        let Some(now_ms) = self.now_ms_at(self.step_index.load(Ordering::Relaxed)) else {
-            self.seal_exhausted("virtual clock");
-            return Err(SimError::TimelineExhausted);
-        };
         {
             let mut assets = self.write_assets();
             let state = assets
@@ -311,44 +315,30 @@ impl PriceSimulator {
             state.current = price;
             state.dormant = false;
         }
+        // The venue Clock service (#028) is the instant source now — a pure atomic
+        // read, never `SystemTime`; `emit` journals the step before it publishes.
+        let now_ms = self.clock.now_ms();
         self.emit(now_ms, underlying, price);
         Ok(())
     }
 
-    /// Advances every asset by one step at a fresh virtual-clock instant — the
-    /// interval loop's body, exposed for deterministic stepping.
+    /// Emits one price step for every asset **at the current venue-clock instant**
+    /// — the interval loop's body, exposed for deterministic stepping.
     ///
-    /// Each asset serves its next pre-generated price (regenerating off-lock when
-    /// exhausted, backing off dormant on a walk failure), publishes a
-    /// [`PriceUpdate`], and routes a journaled `SimStep` through the sink. A
-    /// stopped simulator is a no-op. Assets are stepped in a **sorted** order so
-    /// the per-tick sequence does not depend on map iteration (rule 5).
+    /// It **reads** `now_ms` from the injected clock (a pure atomic load, never
+    /// `SystemTime`); advancing the clock is the cadence driver's / control
+    /// coordinator's job, so a caller composes an advance with an emit
+    /// (`clock.step()` / `clock.tick()` then `step_once()`). Each asset serves its
+    /// next pre-generated price (regenerating off-lock when exhausted, backing off
+    /// dormant on a walk failure), publishes a [`PriceUpdate`], and routes a
+    /// journaled `SimStep` through the sink. A stopped simulator is a no-op. Assets
+    /// are stepped in a **sorted** order so the per-tick sequence does not depend on
+    /// map iteration (rule 5).
     pub fn step_once(&self) {
         if self.stopped.load(Ordering::Relaxed) {
             return;
         }
-        // Reserve this step's index with a CHECKED advance: at the `u64` ceiling
-        // the counter would wrap to a repeated index, so we fail closed (halt)
-        // instead. `fetch_update` keeps the reserve-and-advance atomic.
-        let step =
-            match self
-                .step_index
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    current.checked_add(1)
-                }) {
-                Ok(previous) => previous,
-                Err(_) => {
-                    self.seal_exhausted("step counter");
-                    return;
-                }
-            };
-        // Stamp the step with a CHECKED virtual-clock instant: an overflowing clock
-        // would clamp to a repeated/regressed `now_ms`, so we fail closed (halt)
-        // and emit no instant rather than corrupt the deterministic timeline.
-        let Some(now_ms) = self.now_ms_at(step) else {
-            self.seal_exhausted("virtual clock");
-            return;
-        };
+        let now_ms = self.clock.now_ms();
         for underlying in self.underlyings() {
             if let Some(price) = self.next_price(&underlying) {
                 self.emit(now_ms, &underlying, price);
@@ -356,10 +346,37 @@ impl PriceSimulator {
         }
     }
 
-    /// Spawns the interval loop, which calls [`step_once`](Self::step_once) on each
-    /// tick until [`stop`](Self::stop) is called (or the simulator is dropped).
-    /// Must be called within a `tokio` runtime.
+    /// Advances the venue clock by one cadence tick and emits a step at the new
+    /// instant — the composed advance-then-emit the wall-cadence loop runs.
+    ///
+    /// The clock advance ([`SimClock::tick`](crate::simulation::SimClock::tick))
+    /// happens **off** the sequenced read: realtime / accelerated track wall time,
+    /// and stepped is a no-op read (its clock is advanced by the control
+    /// coordinator, so a wall loop does not drive its cadence).
+    pub fn tick_once(&self) {
+        if self.stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        self.clock.tick();
+        self.step_once();
+    }
+
+    /// Spawns the interval loop, which calls [`tick_once`](Self::tick_once) on each
+    /// wall tick (advancing the venue clock and emitting a step) until
+    /// [`stop`](Self::stop) is called (or the simulator is dropped). Must be called
+    /// within a `tokio` runtime.
+    ///
+    /// In [`ClockMode::Stepped`](crate::simulation::ClockMode::Stepped) the venue
+    /// clock is advanced by the control coordinator, not a wall cadence, so the
+    /// spawned loop does not auto-step there — it is a no-op that logs and returns.
     pub fn spawn(self: &Arc<Self>) {
+        if matches!(self.clock.mode(), ClockMode::Stepped { .. }) {
+            tracing::info!(
+                "price simulator: stepped clock mode — cadence is driven by the control \
+                 coordinator, not the wall loop; not spawning"
+            );
+            return;
+        }
         let this = Arc::clone(self);
         let interval = self.config.tick_interval;
         tokio::spawn(async move {
@@ -369,7 +386,7 @@ impl PriceSimulator {
                 if this.stopped.load(Ordering::Relaxed) {
                     break;
                 }
-                this.step_once();
+                this.tick_once();
             }
             tracing::debug!("price simulator loop stopped");
         });
@@ -409,39 +426,6 @@ impl PriceSimulator {
             price,
             now_ms,
         });
-    }
-
-    /// Halts the simulator on virtual-timeline exhaustion — the step counter or the
-    /// virtual clock reached the `u64` ceiling. Sets the stop flag so no further
-    /// step runs (and no wrapped index or clamped, non-monotonic instant is ever
-    /// emitted) and logs the cause once. Unreachable in practice (a `2^64`-step /
-    /// `2^64`-ms horizon); the simulator fails **closed** (rule 3).
-    #[cold]
-    fn seal_exhausted(&self, cause: &str) {
-        if !self.stopped.swap(true, Ordering::Relaxed) {
-            tracing::error!(
-                cause,
-                "virtual timeline exhausted; halting the price simulator"
-            );
-        }
-    }
-
-    /// The venue-clock instant for step `step`, in **milliseconds** — a
-    /// deterministic virtual clock (`start_ms + step × step_ms`), never
-    /// `SystemTime`.
-    ///
-    /// Returns `None` when the instant would overflow `u64` milliseconds. A
-    /// `2^64`-millisecond virtual timeline is unreachable in practice, but the
-    /// arithmetic is **checked** and surfaces exhaustion instead of clamping to
-    /// `u64::MAX`: a clamped clock would repeat or regress `now_ms`, corrupting
-    /// the deterministic timeline. The caller halts the simulator on `None` rather
-    /// than emitting a non-monotonic instant (rule 3 / global `checked_*`).
-    #[must_use]
-    #[inline]
-    fn now_ms_at(&self, step: u64) -> Option<EventTimestamp> {
-        let offset = step.checked_mul(self.config.step_ms)?;
-        let millis = self.config.start_ms.checked_add(offset)?;
-        Some(EventTimestamp::new(millis))
     }
 
     /// Serves `underlying`'s next price, regenerating its path **off-lock** when
@@ -548,7 +532,7 @@ impl std::fmt::Debug for PriceSimulator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PriceSimulator")
             .field("assets", &self.read_assets().len())
-            .field("step_index", &self.step_index.load(Ordering::Relaxed))
+            .field("clock_now_ms", &self.clock.now_ms().get())
             .field("stopped", &self.is_stopped())
             .finish_non_exhaustive()
     }
@@ -635,7 +619,10 @@ mod tests {
 
     fn simulator(assets: Vec<AssetConfig>) -> (Arc<PriceSimulator>, Arc<CollectingStepSink>) {
         let sink = Arc::new(CollectingStepSink::default());
-        let sim = PriceSimulator::new(assets, config(), sink.clone());
+        // A stepped venue clock at the deterministic epoch, advancing by exactly the
+        // walk's step interval — the sim stamps each emission from this shared clock.
+        let clock = SimClock::stepped(DEFAULT_START_MS, DEFAULT_STEP_MS);
+        let sim = PriceSimulator::new(assets, config(), sink.clone(), clock);
         (sim, sink)
     }
 
@@ -687,8 +674,13 @@ mod tests {
     #[test]
     fn test_now_ms_advances_deterministically_per_step() {
         let (sim, sink) = simulator(vec![gbm_asset("BTC", 5_000_000)]);
+        // Emit at the current instant, then advance the stepped venue clock by
+        // exactly its interval — so each emission is stamped `start_ms + n ×
+        // step_ms`, deterministic and monotonic, from the injected clock (never
+        // `SystemTime`).
         for _ in 0..4 {
             sim.step_once();
+            sim.clock().step();
         }
         let stamps: Vec<u64> = sink
             .drain()
@@ -698,7 +690,6 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // start_ms + step × step_ms, deterministic and monotonic — no SystemTime.
         assert_eq!(
             stamps,
             vec![
@@ -813,6 +804,7 @@ mod tests {
                 ..SimulationConfig::default()
             },
             sink,
+            SimClock::stepped(DEFAULT_START_MS, DEFAULT_STEP_MS),
         );
         let mut rx = sim.subscribe();
         for _ in 0..6 {
@@ -842,6 +834,7 @@ mod tests {
             vec![gbm_asset("BTC", 5_000_000)],
             config(),
             Arc::new(DroppingStepSink),
+            SimClock::stepped(DEFAULT_START_MS, DEFAULT_STEP_MS),
         );
         let mut rx = sim.subscribe();
         sim.step_once();
@@ -858,71 +851,5 @@ mod tests {
             matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
             "a dropped override must not publish a PriceUpdate"
         );
-    }
-
-    #[test]
-    fn test_step_clock_is_strictly_monotonic_and_halts_on_exhaustion() {
-        let (sim, sink) = simulator(vec![gbm_asset("BTC", 5_000_000)]);
-        let step_ms = sim.config.step_ms;
-        let start_ms = sim.config.start_ms;
-        // The largest step index whose instant still fits in `u64` ms.
-        let last_ok = (u64::MAX - start_ms) / step_ms;
-
-        // Park the counter two below the ceiling so two representable steps run.
-        sim.step_index.store(last_ok - 1, Ordering::Relaxed);
-        sim.step_once();
-        sim.step_once();
-        assert!(
-            !sim.is_stopped(),
-            "the last two representable steps do not halt the simulator"
-        );
-        let stamps: Vec<u64> = sink
-            .drain()
-            .into_iter()
-            .filter_map(|command| match command {
-                VenueCommand::SimStep { now_ms, .. } => Some(now_ms.get()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            stamps,
-            vec![
-                start_ms + (last_ok - 1) * step_ms,
-                start_ms + last_ok * step_ms
-            ],
-            "each representable step stamps its exact deterministic instant"
-        );
-        assert!(
-            stamps[1] > stamps[0],
-            "the virtual clock is strictly monotonic (never repeated or regressed)"
-        );
-
-        // The next step would overflow the virtual clock. The simulator fails
-        // CLOSED: it halts and emits no further (repeated/regressed) instant rather
-        // than clamping to `u64::MAX`.
-        sim.step_once();
-        assert!(
-            sim.is_stopped(),
-            "an overflowing virtual clock halts the simulator"
-        );
-        assert!(
-            sink.drain().is_empty(),
-            "a halted step emits no instant (no clamp, no regression)"
-        );
-    }
-
-    #[test]
-    fn test_step_counter_halts_at_the_ceiling_rather_than_wrapping() {
-        // Park the counter at `u64::MAX`: the checked advance cannot produce a
-        // fresh index, so the simulator halts instead of wrapping to a repeated
-        // step index.
-        let (sim, sink) = simulator(vec![gbm_asset("BTC", 5_000_000)]);
-        sim.step_index.store(u64::MAX, Ordering::Relaxed);
-        sim.step_once();
-        assert!(
-            sim.is_stopped(),
-            "a step counter at the ceiling halts rather than wrapping"
-        );
-        assert!(sink.drain().is_empty(), "the wrapped step emits nothing");
     }
 }

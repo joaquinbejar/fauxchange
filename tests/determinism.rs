@@ -1233,6 +1233,237 @@ fn test_days_relative_expiry_is_rejected_at_load() {
 }
 
 // ============================================================================
+// #028: the venue clock on the sequenced path
+// ============================================================================
+
+/// A journaled `Clock` advance (and the `now_ms` journaled into an expiry sweep)
+/// replays to the identical `now_ms`-derived effects: the harness `replay`
+/// re-executes the journaled `VenueCommand`s and reuses each journaled `venue_ts`,
+/// **never** re-reading a wall / replay clock, so the carried `now_ms` values
+/// survive the round-trip byte-identically
+/// ([04 §5](../docs/04-market-data-and-replay.md#5-clock-control),
+/// [02 §4.1](../docs/02-matching-architecture.md#41-venue-wide-commands-marketmakercontrol--clock--simstep)).
+///
+/// The interleaved order is `GTC` **on purpose**: `GTC` admission is
+/// time-independent, so its outcome is a genuine function of the journaled input.
+/// `Day` / `GTD` admission is decided by the leaf's default `MonotonicClock`
+/// (wall time), not the injected venue clock — the named upstream leaf-clock gap —
+/// so it is **not** asserted here (that would be a false green); it is documented
+/// by `test_day_gtd_admission_determinism_blocked_by_leaf_clock_gap` below.
+#[test]
+fn test_journaled_clock_advance_replays_to_identical_now_ms() {
+    let lineage = LineageId::new("run-clock");
+    let t1 = EventTimestamp::new(1_800_000_000_000);
+    let t2 = EventTimestamp::new(1_900_000_000_000);
+    let commands = vec![
+        VenueCommand::Clock { now_ms: t1 },
+        add(
+            &lineage,
+            1,
+            CALL,
+            "mm",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+        VenueCommand::Clock { now_ms: t2 },
+        VenueCommand::EvictExpiredOrders { now_ms: t2 },
+    ];
+    let recording = record(&commands, &lineage, &[sym(CALL)]);
+    let replayed = replay(&recording);
+
+    // Ordered VenueEvent-stream equality per underlying — the whole stream,
+    // including the two Clock advances, the time-independent GTC add, and the
+    // expiry sweep, replays identically.
+    assert_eq!(replayed.events, recording.events);
+
+    // Explicitly: the Clock / Evict `now_ms` are reproduced FROM the command, not a
+    // replay clock — the carried values are byte-identical across the round-trip.
+    let carried: Vec<u64> = replayed
+        .events
+        .iter()
+        .filter_map(|event| match &event.command {
+            VenueCommand::Clock { now_ms } | VenueCommand::EvictExpiredOrders { now_ms } => {
+                Some(now_ms.get())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(carried, vec![t1.get(), t2.get(), t2.get()]);
+}
+
+/// Two independent recordings of the same `Clock`-bearing command stream produce
+/// the identical `VenueEvent` stream — the reproducibility half of the oracle for
+/// a clock advance.
+#[test]
+fn test_clock_advance_is_reproducible_across_two_runs() {
+    let lineage = LineageId::new("run-clock-2");
+    let commands = vec![
+        VenueCommand::Clock {
+            now_ms: EventTimestamp::new(1_800_000_000_000),
+        },
+        add(
+            &lineage,
+            1,
+            CALL,
+            "mm",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Gtc,
+        ),
+    ];
+    let first = record(&commands, &lineage, &[sym(CALL)]);
+    let second = record(&commands, &lineage, &[sym(CALL)]);
+    assert_eq!(
+        first.events, second.events,
+        "the same Clock-bearing stream reproduces the same events"
+    );
+}
+
+/// **Named upstream limitation (#028).** Deterministic `Day` / `GTD` time-in-force
+/// *admission* requires an injected venue clock **at the leaf**, so TIF is decided
+/// against venue time rather than wall time. `orderbook-rs` 0.10.5 provides the API
+/// (`OrderBook::with_clock` / `Arc<dyn Clock>` / `MonotonicClock` / `StubClock`),
+/// but the pinned `option-chain-orderbook` 0.7.0 does **not** thread it through its
+/// lazy `get_or_create_*` leaf construction, exposes no `OptionOrderBook::with_clock`,
+/// and `OrderBook::set_clock` needs `&mut self` while the venue holds vivified leaves
+/// as `Arc<OptionOrderBook>` (shared). Until that named upstream work lands, the
+/// injectable-leaf-clock guarantee covers **no** hierarchy leaf, and the intraday
+/// expiry sweep (`EvictExpiredOrders`) is a journaled no-op the executor `Rejected`s.
+/// This test pins that current, documented reality — and that it *still* replays
+/// deterministically from the journaled `now_ms` — so the gap is **named, not
+/// silent** ([02 §5.5b](../docs/02-matching-architecture.md#5-determinism)).
+#[test]
+fn test_evict_expired_orders_is_a_documented_leaf_clock_limitation() {
+    let lineage = LineageId::new("run-evict");
+    let commands = vec![VenueCommand::EvictExpiredOrders {
+        now_ms: EventTimestamp::new(1_900_000_000_000),
+    }];
+    let recording = record(&commands, &lineage, &[]);
+    match &recording.events[0].outcome {
+        // Pending the upstream leaf clock, the intraday sweep is a journaled no-op.
+        VenueOutcome::Rejected { .. } => {}
+        other => panic!(
+            "EvictExpiredOrders outcome changed; revisit the named leaf-clock limitation: {other:?}"
+        ),
+    }
+    // It still replays deterministically from the journaled now_ms.
+    let replayed = replay(&recording);
+    assert_eq!(replayed.events, recording.events);
+}
+
+/// **Blocked, not passing — the honest form of the `Day`/`GTD`-admission
+/// determinism criterion.** `#[ignore]`d on purpose: with the pinned
+/// `option-chain-orderbook` 0.7.0 the venue **cannot** construct any hierarchy
+/// leaf with an injected venue clock (no `OptionOrderBook::with_clock`;
+/// `get_or_create_*` installs the default `MonotonicClock`; `OrderBook::set_clock`
+/// needs `&mut self` while leaves are `Arc`-shared), so `Day`/`GTD` *admission*
+/// still reads the leaf's wall clock and is **not** deterministic across runs.
+/// Asserting it identical would be a false green, so this test is not run. It is
+/// the ready-to-enable check for when the named upstream work lands (threading
+/// `Arc<dyn Clock>` through the managers); at that point drop the `#[ignore]` and
+/// it should pass unchanged ([02 §5.5b](../docs/02-matching-architecture.md#5-determinism)).
+#[test]
+#[ignore = "blocked: option-chain-orderbook 0.7.0 does not thread Arc<dyn Clock> to leaf construction, \
+            so Day/GTD TIF admission reads the leaf wall clock and is not deterministic across runs"]
+fn test_day_gtd_admission_determinism_blocked_by_leaf_clock_gap() {
+    // Under an injected venue clock at the leaf, a Day order admitted before its
+    // TIF cutoff and re-executed on replay would admit identically. Today the leaf
+    // reads wall time, so record vs replay can diverge — hence #[ignore].
+    let lineage = LineageId::new("run-day-gtd");
+    let commands = vec![
+        VenueCommand::Clock {
+            now_ms: EventTimestamp::new(1_800_000_000_000),
+        },
+        add(
+            &lineage,
+            1,
+            CALL,
+            "mm",
+            0x11,
+            Side::Sell,
+            50_000,
+            3,
+            TimeInForce::Day,
+        ),
+    ];
+    let first = record(&commands, &lineage, &[sym(CALL)]);
+    let second = record(&commands, &lineage, &[sym(CALL)]);
+    assert_eq!(
+        first.events, second.events,
+        "Day/GTD admission is identical across runs under an injected leaf clock"
+    );
+}
+
+/// Lint / grep GUARD (#028 acceptance): **no wall-clock read appears on the
+/// sequenced path.** Every timestamp on the sequenced order path is obtained from
+/// the injected venue clock ([`VenueClock`]) — never `SystemTime` / `Instant` /
+/// `chrono`. Asserted by source inspection over `src/exchange/` so a regression
+/// that reaches for the wall clock inside the actor turn or the executor fails the
+/// suite (the prose "never `SystemTime`" in doc comments is not a call and is not
+/// matched — only the call forms are).
+///
+/// The walk **recurses** subdirectories, so a future `src/exchange/<subdir>/`
+/// cannot silently bypass the guard; it also asserts it actually scanned files, so
+/// a mis-resolved path can't pass vacuously.
+#[test]
+fn test_no_wall_clock_read_on_the_sequenced_path() {
+    const FORBIDDEN: [&str; 4] = [
+        "SystemTime::now(",
+        "Instant::now(",
+        "Utc::now(",
+        "Local::now(",
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/exchange");
+    let mut pending = vec![root.clone()];
+    let mut offenders = Vec::new();
+    let mut scanned = 0_usize;
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => panic!("src/exchange must be readable at {}: {e}", dir.display()),
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(e) => panic!("reading a src/exchange entry: {e}"),
+            };
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(e) => panic!("reading {}: {e}", path.display()),
+            };
+            scanned += 1;
+            for needle in FORBIDDEN {
+                if contents.contains(needle) {
+                    offenders.push(format!("{}: {needle}", path.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 0,
+        "the sequenced-path guard scanned no files under {} — check the path",
+        root.display()
+    );
+    assert!(
+        offenders.is_empty(),
+        "wall-clock read found on the sequenced path (src/exchange); use the injected \
+         venue clock instead: {offenders:?}"
+    );
+}
+
+// ============================================================================
 // Shared helpers (positions fold + JSON key walk)
 // ============================================================================
 
