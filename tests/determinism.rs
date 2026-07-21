@@ -69,27 +69,33 @@
 //! (#030) is exercised directly by the `test_replay_driver_*` cases; the randomised
 //! sibling `journal_driver_replay_reconstructs_book` lives in `tests/property.rs`.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use fauxchange::exchange::{
     ActorConfig, AddOutcome, Cents, CommandExecutor, EventTimestamp, ExecutionContext,
-    ExecutionsStore, ExpirationDate, FanOut, FixedClock, Hash32, InMemoryExecutionsStore,
-    InMemoryPositionsStore, InMemoryVenueJournal, JournalCommand, JournalError, JournalHeader,
-    JournalRecord, LineageId, MarkPriceBook, MatchingExecutor, NoopFanOut, PositionsStore,
-    RecordKind, STPMode, SequenceNumber, Side, StoreFanOut, Symbol, SymbolError, SymbolParser,
-    TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal,
-    VenueOutcome, recover, validate_venue_expiry,
+    ExecutionFilter, ExecutionsStore, ExpirationDate, FanOut, FixedClock, Hash32,
+    InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, JournalCommand,
+    JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook, MatchingExecutor,
+    NoopFanOut, PositionsStore, RecordKind, STPMode, SequenceNumber, Side, SignedCents,
+    StoreFanOut, Symbol, SymbolError, SymbolParser, TimeInForce, TopOfBook, UnderlyingActor,
+    VenueClock, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, recover,
+    validate_venue_expiry,
 };
 use fauxchange::gateway::fix::enums::{OrdType as FixOrdType, OrderSide, TimeInForce as FixTif};
 use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
 use fauxchange::gateway::fix::order::NewOrderSingle;
 use fauxchange::gateway::fix::order_flow::to_add_command;
-use fauxchange::simulation::{
-    ClockMode, JournalStream, RunManifest, ScenarioBundle, SessionConfig, WalkTypeConfig,
-    replay_bundle, replay_streams, synthesize_chain,
+use fauxchange::microstructure::{
+    ContractSpecsConfig, FeeConfig, FileMicrostructure, MicrostructureConfig, StpConfig, StpMode,
 };
-use fauxchange::{AccountId, ClientOrderId, OrderType, VenueError, VenueOrderId};
+use fauxchange::simulation::{
+    ClockMode, JournalStream, ReplayError, RunManifest, ScenarioBundle, SessionConfig,
+    WalkTypeConfig, replay_bundle, replay_streams, synthesize_chain,
+};
+use fauxchange::state::{AppState, AppStateConfig};
+use fauxchange::{AccountId, ClientOrderId, LiquidityFlag, OrderType, VenueError, VenueOrderId};
 use ironfix_core::types::{CompId, SeqNum};
 
 const UNDERLYING: &str = "BTC";
@@ -2145,4 +2151,390 @@ fn test_fix_arriving_order_replays_to_identical_fills_events_and_top_of_book() {
     // Same journal → identical events, fills, and top-of-book on replay.
     let replay = replay(&recording);
     assert_replay_equals(&recording, &replay);
+}
+
+// ============================================================================
+// #044 microstructure wiring — fees / STP / admission cap + determinism
+// ============================================================================
+//
+// These exercise the four seams the venue wires around the upstream matching for
+// #044: the fee schedule + STP mode applied at book creation, the venue-owned
+// price-band admission cap at `AppState::submit`, the checked fee on every
+// `ExecutionRecord`, and — the flagship #044 test — a fee/STP-sensitive scenario
+// recorded live and replayed from the journal + bundled config into IDENTICAL fills
+// (incl `Fill.fee`), events, and top-of-book, with a fingerprint mismatch refusing
+// replay. Every mutation enters the sequenced order path through `AppState::submit`.
+
+/// Two distinct DateTime-expiry leaves so the fee cross (leaf A) and the STP
+/// self-cross (leaf B) never interact through price-time priority.
+const MS_CALL_A: &str = "BTC-20260626-50000-C";
+const MS_CALL_B: &str = "BTC-20260626-51000-C";
+
+/// A resolved venue microstructure with the given fee rates and STP mode over the
+/// baseline specs — the #044 config the venue applies at book creation.
+fn ms_config(maker_bps: i32, taker_bps: i32, stp: StpMode) -> MicrostructureConfig {
+    let file = FileMicrostructure {
+        fees: Some(FeeConfig {
+            maker_bps,
+            taker_bps,
+        }),
+        stp: Some(StpConfig { mode: stp }),
+        ..FileMicrostructure::default()
+    };
+    MicrostructureConfig::resolve(&file, &BTreeMap::new()).expect("microstructure resolves")
+}
+
+/// An in-memory single-underlying `AppState` carrying `micro` — the live venue the
+/// #044 seams are wired into.
+fn ms_state(micro: MicrostructureConfig) -> Arc<AppState> {
+    let config = AppStateConfig::new([UNDERLYING])
+        .with_lineage(LineageId::new("run-ms"))
+        .with_microstructure(micro);
+    match AppState::new(config) {
+        Ok(state) => state,
+        Err(error) => panic!("AppState with dev auth must build: {error}"),
+    }
+}
+
+/// A GTC limit `AddOrder` onto the venue's BTC book. The per-command `stp_mode` is
+/// unused by the executor (the leaf's configured STP governs), so it is `None`.
+#[allow(clippy::too_many_arguments)]
+fn ms_add(
+    symbol: &str,
+    order_id: &str,
+    account: &str,
+    owner: u8,
+    side: Side,
+    price: u64,
+    quantity: u64,
+) -> VenueCommand {
+    VenueCommand::AddOrder {
+        symbol: Symbol::parse(symbol).expect("symbol parses"),
+        order_id: VenueOrderId::new(order_id),
+        account: AccountId::new(account),
+        owner: Hash32([owner; 32]),
+        client_order_id: None,
+        side,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(price)),
+        quantity,
+        time_in_force: TimeInForce::Gtc,
+        stp_mode: STPMode::None,
+    }
+}
+
+/// Runs the shared fee/STP-sensitive scenario onto `state`: a two-account crossing
+/// fill on leaf A (maker rebate + taker fee) and a same-owner self-cross on leaf B
+/// resolved by the configured STP mode. Every command enters the sequenced path.
+async fn run_fee_stp_scenario(state: &Arc<AppState>) {
+    for command in [
+        ms_add(MS_CALL_A, "mk-0", "mkr", 0x11, Side::Sell, 50_000, 3),
+        ms_add(MS_CALL_A, "tk-1", "tkr", 0x22, Side::Buy, 50_000, 2),
+        ms_add(MS_CALL_B, "sc-2", "sc", 0x33, Side::Sell, 51_000, 2),
+        ms_add(MS_CALL_B, "sc-3", "sc", 0x33, Side::Buy, 51_000, 2),
+    ] {
+        state.submit(command).await.expect("command sequences");
+    }
+}
+
+/// The flagship #044 determinism test: a fee/STP-sensitive scenario recorded live,
+/// then replayed from the journal + the bundled resolved config, reconstructs
+/// IDENTICAL fills (including `Fill.fee`), events, and top-of-book — and a
+/// fingerprint mismatch refuses replay.
+#[tokio::test]
+async fn test_fee_stp_sensitive_scenario_replays_exactly_from_bundle() {
+    let micro = ms_config(-10, 35, StpMode::CancelTaker);
+    let state = ms_state(micro.clone());
+    run_fee_stp_scenario(&state).await;
+
+    // The live crossing fill carried the configured fees on BOTH legs of the match:
+    // notional 50_000 × 2 = 100_000 → maker rebate −10 bps = −100, taker 35 bps = +350.
+    let filter = ExecutionFilter::default();
+    let maker_leg = state
+        .executions()
+        .list(&AccountId::new("mkr"), &filter)
+        .expect("list mkr");
+    let taker_leg = state
+        .executions()
+        .list(&AccountId::new("tkr"), &filter)
+        .expect("list tkr");
+    assert_eq!(maker_leg.len(), 1);
+    assert_eq!(taker_leg.len(), 1);
+    assert_eq!(maker_leg[0].liquidity, LiquidityFlag::Maker);
+    assert_eq!(taker_leg[0].liquidity, LiquidityFlag::Taker);
+    assert_eq!(
+        maker_leg[0].fee_cents,
+        SignedCents::new(-100),
+        "the maker leg carries the configured rebate"
+    );
+    assert_eq!(
+        taker_leg[0].fee_cents,
+        SignedCents::new(350),
+        "the taker leg carries the configured fee"
+    );
+    // The self-cross was STP-prevented (no fill), so only the two-account match recorded.
+    assert_eq!(state.executions().len(), 2);
+
+    // The exported bundle carries the resolved config, and the recorded manifest
+    // fingerprint matches it (the config half of the determinism tuple).
+    let bundle = state.export_bundle().await.expect("export bundle");
+    assert_eq!(
+        bundle.microstructure, micro,
+        "the bundle carries the resolved venue config"
+    );
+    assert_eq!(
+        bundle.microstructure.fingerprint(),
+        bundle.manifest.microstructure_fingerprint,
+        "the recorded manifest fingerprint matches the carried config"
+    );
+
+    // Replay from the journal + bundled config. `Ok` is itself the identical-events
+    // proof: the recovery oracle halts on ANY re-derived VenueEvent — which carries
+    // every `Fill` including its `fee`, and the STP-cancel outcome — that ≠ the
+    // stored one. So a fee/STP scenario reconstructs exactly.
+    let report = replay_bundle(&bundle).expect("fee/STP scenario replays exactly");
+
+    // And the reconstructed executions store reproduces the fee-bearing legs
+    // byte-for-byte (every `ExecutionRecord` field is journal-derived, incl `fee_cents`).
+    let replay_maker = report
+        .executions
+        .list(&AccountId::new("mkr"), &filter)
+        .expect("replay mkr");
+    let replay_taker = report
+        .executions
+        .list(&AccountId::new("tkr"), &filter)
+        .expect("replay tkr");
+    assert_eq!(
+        replay_maker, maker_leg,
+        "the maker leg (incl fee) reconstructs identically"
+    );
+    assert_eq!(
+        replay_taker, taker_leg,
+        "the taker leg (incl fee) reconstructs identically"
+    );
+    assert_eq!(report.executions.len(), 2);
+
+    // Top-of-book reconstructs: leaf A rests the maker's 1 remaining at 50_000; leaf B
+    // rests the self-cross seller's 2 at 51_000 (the STP-cancelled taker left none).
+    let replay = report.underlying(UNDERLYING).expect("BTC replay");
+    let top_a = replay.top_of_book(&Symbol::parse(MS_CALL_A).expect("A parses"));
+    assert_eq!(top_a.best_ask, Some(Cents::new(50_000)));
+    assert_eq!(top_a.ask_depth, 1);
+    assert_eq!(top_a.best_bid, None);
+    let top_b = replay.top_of_book(&Symbol::parse(MS_CALL_B).expect("B parses"));
+    assert_eq!(top_b.best_ask, Some(Cents::new(51_000)));
+    assert_eq!(top_b.ask_depth, 2);
+
+    // A fingerprint mismatch refuses replay: a DIFFERENT config whose fingerprint no
+    // longer equals the recorded manifest is a typed reject (like the schema/version
+    // guards), never a divergent reproduction under the wrong fee/STP schedule.
+    let mut tampered = bundle.clone();
+    tampered.microstructure = ms_config(0, 0, StpMode::Off);
+    match replay_bundle(&tampered) {
+        Err(ReplayError::VersionMismatch {
+            kind,
+            expected,
+            found,
+        }) => {
+            assert_eq!(kind, "microstructure_fingerprint");
+            assert_eq!(expected, bundle.manifest.microstructure_fingerprint);
+            assert_eq!(found, tampered.microstructure.fingerprint());
+        }
+        other => panic!("a fingerprint mismatch must refuse replay, got {other:?}"),
+    }
+}
+
+/// STP integration: two of one account's own crossing orders resolve per the
+/// configured `STPMode` (keyed on the owner `Hash32`), and `off` allows the
+/// self-trade — every mutation on the live sequenced path.
+#[tokio::test]
+async fn test_stp_mode_resolves_a_self_cross_per_configured_mode() {
+    // `off`: an account's two crossing orders self-trade (both legs record).
+    let off = ms_state(ms_config(0, 0, StpMode::Off));
+    off.submit(ms_add(MS_CALL_A, "s0", "self", 0x44, Side::Sell, 50_000, 2))
+        .await
+        .expect("resting sell sequences");
+    off.submit(ms_add(MS_CALL_A, "s1", "self", 0x44, Side::Buy, 50_000, 2))
+        .await
+        .expect("crossing buy sequences");
+    assert_eq!(
+        off.executions().len(),
+        2,
+        "off allows the self-trade (two legs recorded)"
+    );
+
+    // `cancel_taker`: the same-owner aggressor is cancelled — no self-trade prints.
+    let stp = ms_state(ms_config(0, 0, StpMode::CancelTaker));
+    stp.submit(ms_add(MS_CALL_A, "s0", "self", 0x44, Side::Sell, 50_000, 2))
+        .await
+        .expect("resting sell sequences");
+    stp.submit(ms_add(MS_CALL_A, "s1", "self", 0x44, Side::Buy, 50_000, 2))
+        .await
+        .expect("self-cross sequences (STP-cancelled)");
+    assert_eq!(
+        stp.executions().len(),
+        0,
+        "cancel_taker prevents the self-trade"
+    );
+
+    // A DIFFERENT owner still crosses the resting sell under cancel_taker — STP is
+    // keyed on the account owner `Hash32`, not the symbol.
+    stp.submit(ms_add(MS_CALL_A, "o2", "other", 0x55, Side::Buy, 50_000, 2))
+        .await
+        .expect("distinct-owner cross sequences");
+    assert_eq!(
+        stp.executions().len(),
+        2,
+        "distinct owners cross normally under cancel_taker"
+    );
+}
+
+/// The venue-owned `max_price_cents` admission cap: an over-cap `AddOrder` is
+/// rejected at `AppState::submit` with `InvalidOrder` BEFORE the sequencer, so it is
+/// never journaled; an at-cap order is admitted and journaled.
+#[tokio::test]
+async fn test_over_max_price_add_order_is_rejected_at_submit_and_never_journaled() {
+    // The neutral venue uses the baseline band (max_price_cents = 100_000_000).
+    let state = ms_state(MicrostructureConfig::default());
+    let over = ms_add(MS_CALL_A, "hi", "acct", 0x11, Side::Buy, 100_000_001, 1);
+    match state.submit(over).await {
+        Err(VenueError::InvalidOrder(detail)) => assert!(
+            detail.contains("max_price_cents"),
+            "the rejection names the venue cap, got: {detail}"
+        ),
+        other => panic!("an over-cap price must be rejected at submit, got {other:?}"),
+    }
+    // Nothing was journaled: the command never reached the sequencer.
+    let snapshot = state
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("snapshot BTC");
+    assert!(
+        snapshot.records.is_empty(),
+        "a rejected-at-admission order is never journaled"
+    );
+
+    // An order at the exact cap IS admissible and reaches the sequencer.
+    let at_cap = ms_add(MS_CALL_A, "cap", "acct", 0x11, Side::Buy, 100_000_000, 1);
+    state
+        .submit(at_cap)
+        .await
+        .expect("the cap price is admissible");
+    let after = state
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("snapshot BTC again");
+    assert!(
+        !after.records.is_empty(),
+        "an in-band order IS journaled onto the sequenced path"
+    );
+}
+
+/// Fee-on-`ExecutionRecord`: a filled leg carries the integer-cents fee (a maker
+/// rebate negative, a taker fee positive) net on the authoritative record — no `f64`.
+#[tokio::test]
+async fn test_filled_leg_carries_the_integer_cents_fee_on_the_execution_record() {
+    let state = ms_state(ms_config(-10, 35, StpMode::Off));
+    state
+        .submit(ms_add(MS_CALL_A, "m", "mkr", 0x11, Side::Sell, 50_000, 2))
+        .await
+        .expect("resting sell sequences");
+    state
+        .submit(ms_add(MS_CALL_A, "t", "tkr", 0x22, Side::Buy, 50_000, 2))
+        .await
+        .expect("crossing buy sequences");
+
+    let filter = ExecutionFilter::default();
+    let maker = state
+        .executions()
+        .list(&AccountId::new("mkr"), &filter)
+        .expect("list mkr");
+    let taker = state
+        .executions()
+        .list(&AccountId::new("tkr"), &filter)
+        .expect("list tkr");
+    assert_eq!(maker.len(), 1);
+    assert_eq!(taker.len(), 1);
+    // notional 100_000 → maker rebate −100 cents, taker fee +350 cents (integer cents).
+    assert_eq!(maker[0].fee_cents, SignedCents::new(-100));
+    assert_eq!(taker[0].fee_cents, SignedCents::new(350));
+}
+
+/// P2-1 (security): the venue price band is enforced on the **replay re-execution**
+/// path, not only at live `AppState::submit`. A hostile `ScenarioBundle` carrying an
+/// `AddOrder` whose price bypasses the live admission seam is refused before the
+/// command re-executes.
+#[test]
+fn test_replay_refuses_an_out_of_band_price_in_a_bundle() {
+    const TS: EventTimestamp = EventTimestamp::new(1_700_000_000_000);
+    // A narrow-band venue config (max_price_cents = 1_000) that still passes the
+    // checked-fee proof; its fingerprint pins the manifest so the fingerprint gate
+    // passes and re-execution reaches the band check.
+    let file = FileMicrostructure {
+        specs: Some(ContractSpecsConfig {
+            max_price_cents: Some(1_000),
+            ..ContractSpecsConfig::default()
+        }),
+        ..FileMicrostructure::default()
+    };
+    let config = MicrostructureConfig::resolve(&file, &BTreeMap::new()).expect("resolves");
+
+    // A journaled AddOrder at 2_000 cents — above the 1_000 band. The live venue would
+    // have rejected this at submit before journaling; here it is smuggled into the
+    // bundle's journal stream directly.
+    let over = ms_add(MS_CALL_A, "hostile", "acct", 0x11, Side::Buy, 2_000, 1);
+    let records = vec![JournalRecord::command(SequenceNumber::new(0), TS, over)];
+    let stream = JournalStream::new(
+        UNDERLYING,
+        JournalHeader::new(LineageId::new("run-band")),
+        records,
+    );
+    let manifest = RunManifest::new(0, ClockMode::Realtime)
+        .with_microstructure_fingerprint(config.fingerprint());
+    let bundle = ScenarioBundle::new(manifest, vec![stream]).with_microstructure(config);
+
+    match replay_bundle(&bundle) {
+        Err(ReplayError::PriceOutOfBand { detail }) => assert!(
+            detail.contains("2000") && detail.contains("max_price_cents"),
+            "the reject names the band violation, got: {detail}"
+        ),
+        other => panic!("an out-of-band bundle price must be refused, got {other:?}"),
+    }
+}
+
+/// P2-2 (security + architect): the checked-fee proof is re-run on a bundle's carried
+/// config. `ScenarioBundle.microstructure` deserializes directly, bypassing
+/// `MicrostructureConfig::resolve` (and thus the proof); the fingerprint gate is
+/// tamper-DETECT, not authenticity, so a self-consistent hostile bundle self-computes
+/// a matching fingerprint. The driver re-runs the proof BEFORE any command
+/// re-executes → the unprovable fee config is refused with the SPECIFIC config
+/// rejection, not a downstream generic `MoneyError::Overflow` at the fill seam.
+#[test]
+fn test_replay_refuses_an_unprovable_fee_config_in_a_bundle() {
+    // A config that would saturate `FeeSchedule::calculate_fee` (taker 100% bps on a
+    // u64::MAX × u64::MAX notional) — one `resolve` would REJECT, deserialized here to
+    // model the bypass.
+    let json = r#"{
+        "fees": {"maker_bps": 0, "taker_bps": 10000},
+        "stp": {"mode": "off"},
+        "default_specs": {"tick_size_cents":1,"lot_size":1,"min_price_cents":1,"max_price_cents":18446744073709551615,"max_order_qty":18446744073709551615},
+        "per_underlying": {}
+    }"#;
+    let bad: MicrostructureConfig =
+        serde_json::from_str(json).expect("deserializes directly, bypassing resolve");
+    // The attacker pins a MATCHING fingerprint so the equality gate cannot catch it —
+    // only the re-run proof does.
+    let manifest =
+        RunManifest::new(0, ClockMode::Realtime).with_microstructure_fingerprint(bad.fingerprint());
+    let bundle = ScenarioBundle::new(manifest, Vec::new()).with_microstructure(bad);
+
+    match replay_bundle(&bundle) {
+        Err(ReplayError::ConfigRejected { detail }) => assert!(
+            detail.contains("fee") && detail.contains("notional"),
+            "the reject is the specific checked-fee proof failure, got: {detail}"
+        ),
+        other => {
+            panic!("an unprovable fee config must be refused with ConfigRejected, got {other:?}")
+        }
+    }
 }

@@ -79,9 +79,10 @@ use crate::exchange::{
     ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, InMemoryExecutionsStore,
     InMemoryPositionsStore, InMemoryVenueJournal, JournalHeader, JournalSnapshot, LineageId,
     MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, TeeFanOut, VenueCommand,
-    spawn_matching_actor_with_registry_and_index,
+    check_price_band, spawn_matching_actor_with_registry_and_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
+use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
 use crate::models::AccountId;
 use crate::simulation::{
     AssetConfig, ClockMode, CorrelationId, JournalStream, PriceSimulator, RecordingController,
@@ -142,6 +143,12 @@ pub enum AppStateError {
     /// runtime). Only reachable when `DATABASE_URL` is set.
     #[error(transparent)]
     Db(#[from] DbError),
+    /// The venue microstructure (#044) could not be applied to a book at creation —
+    /// the resolved contract specs were rejected by the upstream builder. Unreachable
+    /// for a resolver-validated config (the config seam proves it at load); surfaced
+    /// rather than unwrapped.
+    #[error(transparent)]
+    Microstructure(#[from] MicrostructureConfigError),
 }
 
 // ============================================================================
@@ -282,6 +289,11 @@ pub struct AppStateConfig {
     /// this `false` to enter the bounded **seeding** phase, runs the seed manifest,
     /// then flips to serving with [`AppState::begin_serving`].
     pub start_serving: bool,
+    /// The resolved venue microstructure (#044) — the fee schedule, STP mode, and
+    /// per-underlying contract specs applied at each book's creation, and the
+    /// venue-owned price band admitted at order entry. Defaults to the neutral
+    /// [`MicrostructureConfig::default`] (zero fee, STP off, baseline specs).
+    pub microstructure: MicrostructureConfig,
 }
 
 impl AppStateConfig {
@@ -302,6 +314,7 @@ impl AppStateConfig {
             simulation: SimulationConfig::default(),
             db: None,
             start_serving: true,
+            microstructure: MicrostructureConfig::default(),
         }
     }
 
@@ -370,6 +383,15 @@ impl AppStateConfig {
     #[must_use]
     pub fn with_simulation(mut self, simulation: SimulationConfig) -> Self {
         self.simulation = simulation;
+        self
+    }
+
+    /// Sets the resolved venue microstructure (#044) — the fee schedule, STP mode,
+    /// and per-underlying contract specs applied at book creation, and the
+    /// venue-owned price band admitted at order entry.
+    #[must_use]
+    pub fn with_microstructure(mut self, microstructure: MicrostructureConfig) -> Self {
+        self.microstructure = microstructure;
         self
     }
 }
@@ -486,6 +508,13 @@ pub struct AppState {
     /// whether a capture window is active for bundle export. Both the REST and WS
     /// record controls flip this **same** flag (control parity).
     recording: RecordingController,
+    /// The resolved venue microstructure (#044) — the **same** config applied to
+    /// every underlying's book at creation (fee schedule, STP mode, contract specs)
+    /// and consulted at the order-admission seam for the venue-owned price band.
+    /// Held behind an `Arc` so it can be carried into an exported [`ScenarioBundle`]
+    /// as the config half of the determinism tuple: a replay applies the identical
+    /// config, so a fee/STP-sensitive scenario reconstructs exactly.
+    microstructure: Arc<MicrostructureConfig>,
 }
 
 /// The result of a venue-control clock advance fanned across the underlyings —
@@ -579,7 +608,15 @@ impl AppState {
             simulation,
             db,
             start_serving,
+            microstructure,
         } = config;
+
+        // The one shared venue microstructure (#044): the SAME resolved config is
+        // applied to every underlying's book at creation, and its fingerprint is
+        // recorded in the run manifest so a replay scopes fee/STP/specs-sensitive
+        // reproduction. Held behind an `Arc` shared into the actors' book-creation
+        // and the admission seam.
+        let microstructure = Arc::new(microstructure);
 
         // The one shared venue clock (#028): the rate limiter, every actor's
         // `venue_ts`, and the simulator's `SimStep.now_ms` all read this SAME
@@ -587,7 +624,11 @@ impl AppState {
         // replay reuses the recorded value. Cloned as a cheap `Arc` handle into
         // each consumer; advancing happens off the sequenced read.
         let clock = SimClock::new(clock_config);
-        let manifest = RunManifest::new(seed, clock.mode());
+        // Record the microstructure fingerprint alongside the seed + clock mode: the
+        // config manifest is part of the determinism tuple, so an exported bundle's
+        // config is gated against this recorded fingerprint before replay.
+        let manifest = RunManifest::new(seed, clock.mode())
+            .with_microstructure_fingerprint(microstructure.fingerprint());
 
         // Build auth FIRST (the only fallible step): a `None` auth defaults to the
         // embedded dev key pair, then provision the registry and assemble the
@@ -671,6 +712,9 @@ impl AppState {
             // (`ActorConfig::start_sequence` + a recover-per-underlying in
             // `AppState::new`) is tracked in #85; the #030 replay driver replays a
             // journal/bundle **offline** into a fresh registry, not into this venue.
+            // The venue microstructure (#044) is applied to this underlying's book at
+            // creation, BEFORE any leaf is vivified — the SAME apply a replay/recovery
+            // reconstruction performs, so a fee/STP-sensitive scenario replays exactly.
             let (handle, join) = match db.as_ref() {
                 Some(pool) => {
                     let journal = PgVenueJournal::open(pool, ticker.as_ref(), header)?;
@@ -681,7 +725,8 @@ impl AppState {
                         clock.clone(),
                         Arc::clone(&registry),
                         Arc::clone(&symbol_index),
-                    )
+                        &microstructure,
+                    )?
                 }
                 None => {
                     let journal = InMemoryVenueJournal::new(header);
@@ -692,7 +737,8 @@ impl AppState {
                         clock.clone(),
                         Arc::clone(&registry),
                         Arc::clone(&symbol_index),
-                    )
+                        &microstructure,
+                    )?
                 }
             };
             // Detach: the actor's shutdown is its mailbox closing when this handle
@@ -753,6 +799,7 @@ impl AppState {
             manifest,
             correlation_counter: AtomicU64::new(0),
             recording: RecordingController::default(),
+            microstructure,
         }))
     }
 
@@ -771,15 +818,37 @@ impl AppState {
     ///
     /// # Errors
     ///
-    /// - [`VenueError::InvalidOrder`] if the command's symbol does not parse, or
-    ///   the command carries no routable underlying;
+    /// - [`VenueError::InvalidOrder`] if the command's symbol does not parse, the
+    ///   command carries no routable underlying, or the order price falls outside the
+    ///   venue-owned price band (#044);
     /// - [`VenueError::NotFound`] if the underlying is not hosted by this venue;
     /// - the actor's own typed rejection ([`VenueError::RateLimited`] on a full
     ///   mailbox, [`VenueError::JournalUnavailable`] if the actor has stopped, or
     ///   a sequencing seal) otherwise.
     pub async fn submit(&self, command: VenueCommand) -> Result<Receipt, VenueError> {
+        // The venue-owned price-band admission cap (#044) is checked BEFORE the
+        // command reaches the sequencer, so an over-band order is rejected at the
+        // gateway and never journaled — replay never re-executes a price the live
+        // venue refused.
+        self.admit_command_price(&command)?;
         let handle = self.route(&command)?;
         handle.submit(command).await
+    }
+
+    /// Admits a price-bearing order command against the venue-owned price band
+    /// (`[min_price_cents, max_price_cents]`, #044) resolved for the command's
+    /// underlying — the admission seam that runs **before matching** so an over-band
+    /// price never reaches a leaf and is never journaled
+    /// ([05 §4.1](../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
+    ///
+    /// Only `AddOrder` / `Replace` carrying a `limit_price` are checked; a market
+    /// order (no limit price) and every non-order command carry no price to admit.
+    /// Delegates to the **shared** [`check_price_band`] so the live submit seam and
+    /// the replay/recovery re-execution seam enforce the venue-owned band identically
+    /// (a non-parsing symbol is skipped here and rejected by [`route`](Self::route)).
+    fn admit_command_price(&self, command: &VenueCommand) -> Result<(), VenueError> {
+        check_price_band(&self.microstructure, command)
+            .map_err(|error| VenueError::InvalidOrder(error.to_string()))
     }
 
     /// Requests a read-only snapshot of `underlying`'s journal, routed to its
@@ -1033,6 +1102,17 @@ impl AppState {
         &self.manifest
     }
 
+    /// The resolved venue microstructure (#044) — the fee schedule, STP mode, and
+    /// per-underlying contract specs applied to every book at creation, and the
+    /// venue-owned price band admitted at order entry. The **same** `Arc` an
+    /// exported [`ScenarioBundle`] carries as the config half of the determinism
+    /// tuple.
+    #[must_use]
+    #[inline]
+    pub fn microstructure(&self) -> &Arc<MicrostructureConfig> {
+        &self.microstructure
+    }
+
     // ---- record / replay control plane (#030) ----------------------------
 
     /// Whether the venue's scenario-capture window is active (#030). The durable
@@ -1074,7 +1154,13 @@ impl AppState {
             let snapshot = self.journal_snapshot(ticker).await?;
             streams.push(JournalStream::new(ticker, header.clone(), snapshot.records));
         }
-        Ok(ScenarioBundle::new(self.manifest.clone(), streams))
+        // Carry the resolved venue microstructure (#044) — the config half of the
+        // determinism tuple — so a replay applies the identical fee/STP/specs and a
+        // fee-sensitive scenario reconstructs exactly. The manifest already pins the
+        // matching fingerprint (set at construction), so the replay equality gate
+        // holds.
+        Ok(ScenarioBundle::new(self.manifest.clone(), streams)
+            .with_microstructure((*self.microstructure).clone()))
     }
 
     /// Replays a recorded scenario [`ScenarioBundle`] **offline** into a fresh

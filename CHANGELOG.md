@@ -11,6 +11,80 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Fee schedule, self-trade prevention, and contract specs as declarative
+  venue config — the v0.5 microstructure opener** (#44) — a new
+  `src/microstructure/` config surface that exposes the **upstream**
+  `FeeSchedule`, `STPMode`, and `ContractSpecs` / `ValidationConfig` as
+  validated venue config, never forking matching
+  ([05 §1](docs/05-microstructure-config.md#1-scope)). `[microstructure.fees]`
+  → `FeeConfig` (`maker_bps` negative = rebate, `taker_bps` ≥ 0);
+  `[microstructure.stp]` → `StpConfig` with venue snake_case tokens
+  (`off` / `cancel_taker` / `cancel_maker` / `cancel_both`) mapping the upstream
+  `STPMode` keyed on the account owner `Hash32`; `[instruments."<SYM>".specs]`
+  and the venue-default `[microstructure.specs]` → `ContractSpecsConfig`
+  (`tick_size_cents`, `lot_size`, `min_price_cents`, `max_price_cents`,
+  `max_order_qty`), settable per instrument or per underlying with venue-default
+  inheritance for unset knobs. The **venue-owned `max_price_cents` /
+  `min_price_cents` admission band** has no upstream equivalent (verified: the
+  pinned `orderbook-rs` 0.10.5 `ValidationConfig` carries no price bound) and is
+  enforced before matching via `MicrostructureConfig::admit_price`. The
+  **checked-fee startup proof** (`FeeConfig::validate_notional_bound`, run per
+  resolved spec in `MicrostructureConfig::resolve`) rejects any config whose
+  widest notional (`max_price_cents × max_order_qty`) could drive the upstream
+  `FeeSchedule::calculate_fee` onto its `saturating_mul` branch — Part A bounds
+  it by the upstream `FeeSchedule::max_guaranteed_exact_notional()` (the
+  `try_calculate_fee` guarantee landed in 0.10.5), Part B keeps the worst-case
+  fee within the persisted `i64` cents — so the saturating branch is provably
+  unreachable at runtime (Override O-1: money is checked, never saturating).
+  A property test asserts no accepted config drives `try_calculate_fee` to an
+  error, and `apply_to_underlying` (the seam the venue calls at book creation)
+  is unit-tested against real upstream `UnderlyingOrderBook`s proving STP `off`
+  allows / `cancel_taker` prevents a same-owner self-trade, an off-tick price is
+  leaf-rejected, and two fresh books with the same config replay identical fills.
+  `#[serde(deny_unknown_fields)]` on every new struct; an out-of-range value is a
+  startup `ConfigError::Microstructure`. Surfaced through `src/config.rs`
+  (`Config.microstructure`, resolved from the file layer with the proof at load).
+- **The #44 microstructure wired into the venue's sequenced order path** (#44) —
+  the resolved `MicrostructureConfig` now flows from `AppStateConfig`/`main.rs`
+  into every book at creation and is applied **identically on the live and replay
+  paths**, so a fee/STP-sensitive scenario reconstructs exactly
+  ([02 §5](docs/02-matching-architecture.md#5-determinism)). Four seams:
+  (1) `MatchingExecutor::new_with_registry_and_index` (live) and
+  `new_with_microstructure` (recovery) apply the fee schedule, STP mode, and
+  contract specs before any leaf is vivified; (2) `AppState::submit` enforces the
+  venue-owned price band **before** the sequencer, so an over-`max_price_cents`
+  order is rejected (`InvalidOrder`) and never journaled; (3) journal recovery
+  (`recover_with_microstructure`) and the replay driver
+  (`replay_streams_with_microstructure`) thread the config so a replayed book
+  inherits the identical schedule — and a recorded `ScenarioBundle` now **carries
+  the resolved `MicrostructureConfig`** with `RunManifest.microstructure_fingerprint`
+  as the equality gate (a mismatch refuses replay, like the schema/version guards);
+  (4) the fill seam computes fees through the **checked** upstream
+  `FeeSchedule::try_calculate_fee` (its provably-unreachable overflow maps to the
+  typed `MoneyError::Overflow`, never a clamp). The flagship determinism test
+  records a maker-rebate / taker-fee self-cross scenario and replays it from the
+  bundle into identical fills (incl. `Fill.fee`), events, and top-of-book.
+- **Hardened the replay/bundle path so a hostile scenario bundle cannot bypass the
+  #44 controls** (#44) — closing two review findings on the Admin-only replay
+  surface: (1) the venue-owned price band is now enforced on the **replay
+  re-execution seam** (a shared `check_price_band` the live `AppState::submit` and
+  the recovery reducer both call), so a bundle smuggling an out-of-band `AddOrder` /
+  `Replace` price is refused (`ReplayError::PriceOutOfBand`) before the command
+  re-executes — the live and replay admission seams now enforce the band
+  identically; (2) the **checked-fee proof is re-run** on a bundle's carried
+  `MicrostructureConfig` (which deserializes directly, bypassing
+  `MicrostructureConfig::resolve` — the fingerprint gate is tamper-detection, not
+  authenticity) via `MicrostructureConfig::validate` in `verify_bundle_microstructure`,
+  so a self-consistent hostile bundle carrying an unprovable fee config is refused
+  with the **specific** `ReplayError::ConfigRejected` before any command
+  re-executes, never a downstream generic overflow. The `apply.rs` band-enforcement
+  claim is scoped honestly: the band holds at the gateway order-admission and replay
+  re-execution seams, but the internal market-maker requote producer
+  (`ActorCommandSink`) does not yet run it — a market-maker quote (incl. a
+  simulator-induced one) can rest outside the band, fail-safe today via the checked
+  fee seam — with the enforcement + the over-band behavioural choice (drop / clamp /
+  reject) tracked as follow-up #109. (The simulator sink forwards `SimStep` price
+  updates, which carry no order price, so the band does not apply to it.)
 - **The HP-3 FIX parse/encode hot-path budget in `BENCH.md` — the v0.4
   PERFORMANCE gate** (#43) — `benches/hp3_fix_parse.rs`, a `bench-hdr`
   benchmark (hdrhistogram p50/p99/p99.9/p99.99, never criterion's mean)

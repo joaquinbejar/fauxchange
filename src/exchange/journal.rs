@@ -317,6 +317,32 @@ pub enum JournalError {
         /// The enforced ceiling.
         ceiling: usize,
     },
+    /// The venue [`MicrostructureConfig`](crate::microstructure::MicrostructureConfig)
+    /// carried into a config-aware recovery could not be applied to the fresh book
+    /// — the upstream `ContractSpecsBuilder` rejected the resolved specs. Raised only
+    /// by [`recover_with_microstructure`](crate::exchange::recover_with_microstructure)
+    /// (a replay input carrying a malformed config); the live path resolves + proves
+    /// the config at boot, so it never constructs this. Carries the non-secret
+    /// upstream reason (never the config values that are secrets — they are not).
+    #[error("recovery microstructure config rejected: {detail}")]
+    ConfigRejected {
+        /// The non-secret rejection detail from the microstructure apply.
+        detail: String,
+    },
+    /// A journaled `AddOrder` / `Replace` carried a limit price outside the
+    /// venue-owned `[min_price_cents, max_price_cents]` band during a config-aware
+    /// recovery. Raised only by
+    /// [`recover_with_microstructure`](crate::exchange::recover_with_microstructure)
+    /// (the replay re-execution path re-runs the live admission-band check): a
+    /// legitimate journal never trips it because the live venue admitted every
+    /// command before journaling it, so this fires only on a **tampered** bundle /
+    /// durable journal, refusing the command before it re-executes. Carries the
+    /// non-secret band-violation detail.
+    #[error("recovery order price out of band: {detail}")]
+    PriceOutOfBand {
+        /// The non-secret price-band violation detail.
+        detail: String,
+    },
 }
 
 /// The **per-record byte ceiling** for a `venue.v1` journal record — enforced

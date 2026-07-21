@@ -73,6 +73,9 @@ use crate::market_maker::{
     DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, SIZE_SCALAR_MAX, SIZE_SCALAR_MIN,
     SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN,
 };
+use crate::microstructure::{
+    ContractSpecsConfig, FileMicrostructure, MicrostructureConfig, MicrostructureConfigError,
+};
 use crate::models::{AccountId, Permission};
 use option_chain_orderbook::utils::format_expiration_yyyymmdd;
 use optionstratlib::ExpirationDate;
@@ -596,6 +599,15 @@ pub enum ConfigError {
         /// What is wrong with the persona configuration.
         reason: String,
     },
+    /// A `[microstructure.*]` / `[instruments."<SYM>".specs]` value was invalid: a
+    /// negative taker fee, an out-of-range tick / lot / price / max-qty knob, or a
+    /// fee/spec combination that fails the checked-fee proof (a fee that could
+    /// drive the upstream `FeeSchedule::calculate_fee` onto its saturating branch,
+    /// or a fee that could not be persisted in `i64` cents). Fails startup fast
+    /// before the venue serves a request
+    /// ([05 §4.1](../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
+    #[error("invalid microstructure config: {0}")]
+    Microstructure(#[from] MicrostructureConfigError),
 }
 
 // ============================================================================
@@ -940,6 +952,14 @@ pub struct Config {
     /// sections have no env/CLI override); empty when no `--config` file (or no
     /// seed sections) is supplied ([06 §7](../docs/06-deployment.md#7-seed-data-and-scenarios)).
     pub seed: SeedManifest,
+    /// The resolved, validated venue microstructure — the fee schedule, STP mode,
+    /// per-underlying contract specs (with the venue default), and the venue-owned
+    /// price-band admission cap. Populated **only** from the file layer (like
+    /// [`seed`](Self::seed), the `[microstructure.*]` and `[instruments."X".specs]`
+    /// sections have no env/CLI override); the zero-fee / STP-off / baseline-specs
+    /// default when no `--config` file is supplied. The checked-fee startup proof
+    /// has already passed by the time this is populated.
+    pub microstructure: MicrostructureConfig,
 }
 
 impl Config {
@@ -986,20 +1006,28 @@ impl Config {
         F: Fn(&str) -> Option<String>,
     {
         let cli = parse_cli(args)?;
-        // The seed sections live on the file layer only (no env/CLI override), so
-        // the file config is parsed once and its raw scalar layer + resolved seed
-        // manifest are extracted together (seed borrows before `into_raw` moves).
-        let (file, seed) = match &cli.config_path {
+        // The seed and microstructure sections live on the file layer only (no
+        // env/CLI override), so the file config is parsed once and its raw scalar
+        // layer + resolved seed manifest + resolved microstructure are extracted
+        // together (both borrow before `into_raw` moves). The microstructure
+        // resolution runs the checked-fee startup proof.
+        let (file, seed, microstructure) = match &cli.config_path {
             Some(path) => {
                 let file_config = read_file_config(path)?;
                 let seed = file_config.seed_manifest()?;
-                (file_config.into_raw(), seed)
+                let microstructure = file_config.microstructure_config()?;
+                (file_config.into_raw(), seed, microstructure)
             }
-            None => (RawConfig::default(), SeedManifest::default()),
+            None => (
+                RawConfig::default(),
+                SeedManifest::default(),
+                MicrostructureConfig::default(),
+            ),
         };
         let env = raw_from_env(env);
         let mut config = Self::assemble(file, env, cli.raw)?;
         config.seed = seed;
+        config.microstructure = microstructure;
         Ok(config)
     }
 
@@ -1312,6 +1340,11 @@ impl RawConfig {
             // the parsed file manifest. Direct `assemble` callers (tests) get the
             // empty manifest.
             seed: SeedManifest::default(),
+            // Likewise the microstructure is file-only; `Config::load_from`
+            // overwrites this zero-fee / STP-off / baseline-specs default with the
+            // resolved config (after the checked-fee proof). Direct `assemble`
+            // callers (tests) get the default.
+            microstructure: MicrostructureConfig::default(),
         })
     }
 }
@@ -1831,15 +1864,19 @@ struct FileConfig {
     instruments: Option<BTreeMap<String, FileInstrument>>,
     #[serde(default)]
     market_maker: Option<FileMarketMaker>,
-    // ---- remaining extension points (accepted, validated by #44–#47) ----
-    // `microstructure` / `rate_limits` are still forward-looking placeholders so
-    // serde ACCEPTS a forward config without rejecting an unknown top-level key;
-    // the content is ignored here and validated by the microstructure issues.
-    // They are read only by serde during deserialization, so Rust's dead-code
-    // analysis (which does not count that) is scoped-silenced.
+    // ---- microstructure (real, validated as of #044) ----
+    // `[microstructure.fees]` / `[microstructure.stp]` / `[microstructure.specs]`
+    // resolve into `Config::microstructure` via `microstructure_config` (the
+    // checked-fee proof runs there); `[microstructure.latency]` is accepted and
+    // ignored inside `FileMicrostructure` until #045 owns it.
     #[serde(default)]
-    #[allow(dead_code)]
-    microstructure: Option<IgnoredAny>,
+    microstructure: Option<FileMicrostructure>,
+    // ---- remaining extension point (accepted, validated by #46) ----
+    // `rate_limits` is still a forward-looking placeholder so serde ACCEPTS a
+    // forward config without rejecting an unknown top-level key; the content is
+    // ignored here and validated by #046. It is read only by serde during
+    // deserialization, so Rust's dead-code analysis (which does not count that) is
+    // scoped-silenced.
     #[serde(default)]
     #[allow(dead_code)]
     rate_limits: Option<IgnoredAny>,
@@ -1963,6 +2000,35 @@ impl FileConfig {
             self.instruments.as_ref(),
             self.market_maker.as_ref(),
         )
+    }
+
+    /// Resolves the `[microstructure.*]` section and every per-underlying
+    /// `[instruments."<SYM>".specs]` into a validated [`MicrostructureConfig`],
+    /// running the **checked-fee startup proof** for the venue default and each
+    /// per-underlying override.
+    ///
+    /// Per-underlying specs are collected in **sorted underlying order**
+    /// ([`BTreeMap`]) so resolution is a fixed function of the file. The upstream
+    /// fee/STP/contract-spec types are surfaced, never forked
+    /// ([05 §1](../docs/05-microstructure-config.md#1-scope)).
+    ///
+    /// # Errors
+    ///
+    /// A [`ConfigError::Microstructure`] on a negative taker fee, an out-of-range
+    /// tick / lot / price / max-qty knob, or a fee/spec combination that fails the
+    /// checked-fee proof.
+    fn microstructure_config(&self) -> Result<MicrostructureConfig, ConfigError> {
+        let default_file = FileMicrostructure::default();
+        let file = self.microstructure.as_ref().unwrap_or(&default_file);
+        let mut instrument_specs: BTreeMap<String, ContractSpecsConfig> = BTreeMap::new();
+        if let Some(instruments) = &self.instruments {
+            for (underlying, instrument) in instruments {
+                if let Some(specs) = instrument.specs {
+                    instrument_specs.insert(underlying.clone(), specs);
+                }
+            }
+        }
+        Ok(MicrostructureConfig::resolve(file, &instrument_specs)?)
     }
 }
 
@@ -2247,8 +2313,9 @@ struct FileAccount {
     fix_target_comp_id: Option<String>,
 }
 
-/// `[instruments.<underlying>]` — one seeded underlying's opening price and chain.
-/// An unrecognised inner key (e.g. a `specs` typo) aborts startup.
+/// `[instruments.<underlying>]` — one seeded underlying's opening price, chain,
+/// and (as of #044) its per-underlying microstructure `[.specs]`. An unrecognised
+/// inner key aborts startup.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileInstrument {
@@ -2267,6 +2334,11 @@ struct FileInstrument {
     /// The persona bound to this underlying (validated to exist), or the default.
     #[serde(default)]
     persona: Option<String>,
+    /// `[instruments."<SYM>".specs]` — the per-underlying contract-spec override
+    /// (tick / lot / price band / max-qty); unset knobs inherit the venue default.
+    /// Resolved into `Config::microstructure`, not the seed manifest (#044).
+    #[serde(default)]
+    specs: Option<ContractSpecsConfig>,
 }
 
 /// `[market_maker]` — the persona definitions and the default binding.
@@ -2824,8 +2896,9 @@ mod tests {
         }
     }
 
-    /// The remaining extension-point sections (`microstructure` / `rate_limits`,
-    /// still owned by #44–#47) are accepted and ignored, not rejected.
+    /// `[microstructure.*]` is a real, validated section as of #044; `[rate_limits]`
+    /// is the remaining extension-point placeholder (owned by #046), accepted and
+    /// ignored, not rejected.
     #[test]
     fn test_config_extension_point_sections_are_accepted() -> Result<(), ConfigError> {
         let document = "\
@@ -2836,11 +2909,85 @@ taker_bps = 35
 [rate_limits]
 read_per_window = 6000
 ";
-        // Parses cleanly (accepted + ignored), and the v0.2 knobs keep defaults.
+        // Parses cleanly, and the v0.2 scalar knobs keep defaults.
         let raw = raw_from_toml_str(document)?;
         let config = Config::assemble(raw, raw_from_env(|_| None), RawConfig::default())?;
         assert_eq!(config.determinism.seed, 0);
         Ok(())
+    }
+
+    /// `[microstructure.*]` + per-underlying `[instruments."X".specs]` resolve into
+    /// the validated venue microstructure (the full surfacing path #044 adds).
+    #[test]
+    fn test_microstructure_resolves_fees_stp_and_per_underlying_specs() -> Result<(), ConfigError> {
+        use option_chain_orderbook::STPMode;
+
+        let document = "\
+[microstructure.fees]
+maker_bps = -10
+taker_bps = 35
+
+[microstructure.stp]
+mode = \"cancel_taker\"
+
+[instruments.BTC]
+opening_price_cents = 5000000
+expirations = [\"20260327\"]
+strikes = [50000]
+
+[instruments.BTC.specs]
+tick_size_cents = 5
+max_order_qty = 10000
+";
+        let micro = parse_file_config(document)?.microstructure_config()?;
+        assert_eq!(micro.fee_schedule().maker_fee_bps, -10);
+        assert_eq!(micro.fee_schedule().taker_fee_bps, 35);
+        assert_eq!(micro.stp_mode(), STPMode::CancelTaker);
+        let btc = micro.specs_for("BTC");
+        assert_eq!(btc.tick_size_cents(), 5);
+        assert_eq!(btc.max_order_qty(), 10_000);
+        // An unconfigured underlying inherits the venue-default specs.
+        assert_eq!(micro.specs_for("ETH"), micro.default_specs());
+        Ok(())
+    }
+
+    /// A negative taker fee is rejected at load with a typed `ConfigError`.
+    #[test]
+    fn test_microstructure_rejects_negative_taker_fee() {
+        let document = "\
+[microstructure.fees]
+maker_bps = 0
+taker_bps = -1
+";
+        match parse_file_config(document).and_then(|file| file.microstructure_config()) {
+            Err(ConfigError::Microstructure(_)) => {}
+            other => panic!("expected ConfigError::Microstructure, got {other:?}"),
+        }
+    }
+
+    /// A fee/spec combination that fails the checked-fee proof (a huge notional at
+    /// a real fee) is rejected at load, so the upstream saturating branch stays
+    /// provably unreachable at runtime.
+    #[test]
+    fn test_microstructure_rejects_config_failing_checked_fee_proof() {
+        let document = "\
+[microstructure.fees]
+maker_bps = 0
+taker_bps = 10000
+
+[instruments.BTC]
+opening_price_cents = 5000000
+expirations = [\"20260327\"]
+strikes = [50000]
+
+[instruments.BTC.specs]
+max_price_cents = 18446744073709551615
+max_order_qty = 18446744073709551615
+";
+        match parse_file_config(document).and_then(|file| file.microstructure_config()) {
+            Err(ConfigError::Microstructure(_)) => {}
+            other => panic!("expected ConfigError::Microstructure, got {other:?}"),
+        }
     }
 
     /// An invalid clock value aborts startup naming the value.
@@ -3575,8 +3722,26 @@ fix_password = \"taker-secret\"
 
     #[test]
     fn test_seed_unknown_key_inside_instrument_is_rejected() {
-        // `specs` is not an instrument field (it belongs to microstructure #44–#47);
-        // the real struct now catches the typo the IgnoredAny placeholder swallowed.
+        // A genuinely unknown instrument key still aborts startup naming it
+        // (`specs` is now a real field as of #044, tested separately below).
+        let document = "\
+[instruments.BTC]
+opening_price_cents = 5000000
+expirations = [\"20260327\"]
+strikes = [50000]
+frobnicate = 7
+";
+        match SeedManifest::from_toml_str(document) {
+            Err(ConfigError::UnknownKey { key }) => assert_eq!(key, "frobnicate"),
+            other => panic!("expected UnknownKey(frobnicate), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_instrument_specs_is_accepted_but_unknown_specs_key_rejected() {
+        // `[instruments."X".specs]` is a real microstructure field now, but a typo
+        // INSIDE it still aborts startup naming the key (`deny_unknown_fields` on
+        // `ContractSpecsConfig`).
         let document = "\
 [instruments.BTC]
 opening_price_cents = 5000000
@@ -3584,11 +3749,13 @@ expirations = [\"20260327\"]
 strikes = [50000]
 
 [instruments.BTC.specs]
-tick_size_cents = 5
+tick_size_cent = 5
 ";
-        match SeedManifest::from_toml_str(document) {
-            Err(ConfigError::UnknownKey { key }) => assert_eq!(key, "specs"),
-            other => panic!("expected UnknownKey(specs), got {other:?}"),
+        match parse_file_config(document) {
+            Err(ConfigError::UnknownKey { key }) => assert_eq!(key, "tick_size_cent"),
+            Err(other) => panic!("expected UnknownKey(tick_size_cent), got {other:?}"),
+            // `FileConfig` is not `Debug` (it holds secrets), so report success plainly.
+            Ok(_) => panic!("expected UnknownKey(tick_size_cent), but the file parsed cleanly"),
         }
     }
 

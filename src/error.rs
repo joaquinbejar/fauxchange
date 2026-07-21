@@ -177,7 +177,12 @@ impl From<ReplayError> for VenueError {
             | ReplayError::BundleDecode(_)
             // An oversized / over-ceiling bundle is a client-input validation failure;
             // the message carries only non-secret size/count detail, safe to echo.
-            | ReplayError::ResourceLimit { .. } => VenueError::InvalidOrder(err.to_string()),
+            | ReplayError::ResourceLimit { .. }
+            // A rejected microstructure config (unprovable fee / out-of-range specs)
+            // or an out-of-band journaled order price is a client-input validation
+            // failure on the submitted bundle; the detail is non-secret, safe to echo.
+            | ReplayError::ConfigRejected { .. }
+            | ReplayError::PriceOutOfBand { .. } => VenueError::InvalidOrder(err.to_string()),
             ReplayError::Backend { .. } => VenueError::JournalUnavailable,
         }
     }

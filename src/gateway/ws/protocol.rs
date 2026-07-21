@@ -107,8 +107,11 @@ pub enum ClientAction {
     /// Flip the scenario-capture window on or off (control; `Admin`, #030).
     Record(RecordParam),
     /// Replay a recorded scenario bundle offline into a fresh registry (control;
-    /// `Admin`, #030).
-    ReplayBundle(ReplayBundleParam),
+    /// `Admin`, #030). **Boxed** so the large [`ScenarioBundle`] payload (which grew
+    /// with the #044 microstructure-config field) does not bloat every `ClientAction`
+    /// variant (`clippy::large_enum_variant`); the box is transparent to serde and to
+    /// the match sites (field access auto-derefs).
+    ReplayBundle(Box<ReplayBundleParam>),
 }
 
 /// The outcome of parsing one client text frame.

@@ -94,8 +94,9 @@ use crate::exchange::{
     ExecutionsStore, FanOut, InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal,
     JournalError, JournalHeader, JournalRecord, MarkPriceBook, MatchingExecutor, Recovered,
     SequenceNumber, StoreFanOut, Symbol, TopOfBook, VenueEvent, VenueJournal, check_record_size,
-    recover,
+    recover, recover_with_microstructure,
 };
+use crate::microstructure::MicrostructureConfig;
 use crate::models::{ReplayReportResponse, UnderlyingReplaySummary};
 use crate::simulation::manifest::RunManifest;
 
@@ -194,6 +195,27 @@ pub enum ReplayError {
         /// The enforced ceiling.
         ceiling: usize,
     },
+    /// The bundle's carried [`MicrostructureConfig`] was **rejected** — either the
+    /// re-run checked-fee proof / spec-range validation refused it before replay
+    /// (`verify_bundle_microstructure`, so a self-consistent hostile bundle cannot
+    /// skip #44's proof), or the upstream `ContractSpecsBuilder` refused its resolved
+    /// specs while constructing a reconstruction book. A typed reject on a malformed /
+    /// hostile bundle config, never a downstream generic overflow or a panic.
+    #[error("scenario bundle microstructure config rejected: {detail}")]
+    ConfigRejected {
+        /// The non-secret config-rejection detail.
+        detail: String,
+    },
+    /// A journaled `AddOrder` / `Replace` in the bundle carried a limit price outside
+    /// the venue-owned `[min_price_cents, max_price_cents]` band — the replay
+    /// re-execution seam re-runs the live admission-band check, so a hostile bundle
+    /// cannot smuggle an out-of-band price past the gateway. Refused **before** the
+    /// offending command re-executes.
+    #[error("scenario bundle order price out of band: {detail}")]
+    PriceOutOfBand {
+        /// The non-secret price-band violation detail.
+        detail: String,
+    },
 }
 
 impl ReplayError {
@@ -230,6 +252,17 @@ impl ReplayError {
                 limit,
                 found,
                 ceiling,
+            },
+            // The bundle's carried microstructure config produced specs the upstream
+            // builder rejected while constructing a reconstruction book — a typed
+            // config reject on a malformed bundle, never a live-path state.
+            JournalError::ConfigRejected { detail } => Self::ConfigRejected {
+                detail: format!("underlying {underlying}: {detail}"),
+            },
+            // A journaled order price fell outside the venue band on the replay
+            // re-execution seam — a tampered bundle, refused before it re-executes.
+            JournalError::PriceOutOfBand { detail } => Self::PriceOutOfBand {
+                detail: format!("underlying {underlying}: {detail}"),
             },
         }
     }
@@ -312,23 +345,50 @@ impl JournalStream {
 pub struct ScenarioBundle {
     /// The bundle wire-contract tag — always [`SCENARIO_BUNDLE_SCHEMA`].
     pub schema: String,
-    /// The run manifest (seed, clock mode, microstructure config, instrument seed,
-    /// pinned versions). **Required** — a bundle without it does not decode.
+    /// The run manifest (seed, clock mode, microstructure fingerprint, instrument
+    /// seed, pinned versions). **Required** — a bundle without it does not decode.
     pub manifest: RunManifest,
+    /// The **resolved venue microstructure** (fee schedule, STP mode, per-underlying
+    /// contract specs) applied at book creation — the config manifest half of the
+    /// determinism tuple, so replay applies the identical fee/STP/specs the live
+    /// venue applied and a fee/STP-sensitive scenario reconstructs exactly. Its
+    /// [`fingerprint`](MicrostructureConfig::fingerprint) is checked against
+    /// [`RunManifest::microstructure_fingerprint`] as an equality gate before replay
+    /// ([02 §5](../../docs/02-matching-architecture.md#5-determinism),
+    /// [05 §11](../../docs/05-microstructure-config.md#11-determinism-of-microstructure)).
+    /// `#[serde(default)]` so a legacy bundle without it decodes as the neutral
+    /// [`MicrostructureConfig::default`] (whose fingerprint is the reserved default
+    /// slot, matching a legacy manifest).
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub microstructure: MicrostructureConfig,
     /// The per-underlying journal streams to re-execute.
     pub streams: Vec<JournalStream>,
 }
 
 impl ScenarioBundle {
     /// Builds a current-schema bundle from a manifest and its per-underlying
-    /// streams.
+    /// streams, carrying the neutral [`MicrostructureConfig::default`]. Set the
+    /// venue config with [`with_microstructure`](Self::with_microstructure) so a
+    /// fee/STP-sensitive scenario replays exactly.
     #[must_use]
     pub fn new(manifest: RunManifest, streams: Vec<JournalStream>) -> Self {
         Self {
             schema: SCENARIO_BUNDLE_SCHEMA.to_string(),
             manifest,
+            microstructure: MicrostructureConfig::default(),
             streams,
         }
+    }
+
+    /// Sets the resolved venue [`MicrostructureConfig`] this bundle carries — the
+    /// config the replay driver applies to every reconstructed book. The recording
+    /// venue pins the matching [`RunManifest::microstructure_fingerprint`] so the
+    /// replay equality gate holds.
+    #[must_use]
+    pub fn with_microstructure(mut self, microstructure: MicrostructureConfig) -> Self {
+        self.microstructure = microstructure;
+        self
     }
 
     /// Whether the bundle's `schema` tag is the one the running binary
@@ -509,6 +569,37 @@ impl std::fmt::Debug for ReplayReport {
 ///   inconsistent (a conflicting `(sequence, kind)` key);
 /// - [`ReplayError::Backend`] on a durable-store read failure.
 pub fn replay_streams(streams: &[JournalStream]) -> Result<ReplayReport, ReplayError> {
+    replay_streams_inner(streams, None)
+}
+
+/// Replays the **native journal** input format with the venue [`MicrostructureConfig`]
+/// applied to every reconstructed book — the determinism-critical driver a recorded
+/// scenario bundle uses so a book vivified during replay inherits the identical fee
+/// schedule, STP mode, and contract specs the live venue applied, and a
+/// fee/STP-sensitive scenario replays **exactly** (identical fills incl. `Fill.fee`).
+///
+/// # Errors
+///
+/// Every error [`replay_streams`] can return, plus [`ReplayError::BundleDecode`] if
+/// the carried config's resolved specs are rejected while building a reconstruction
+/// book (a malformed bundle config).
+pub fn replay_streams_with_microstructure(
+    streams: &[JournalStream],
+    microstructure: &MicrostructureConfig,
+) -> Result<ReplayReport, ReplayError> {
+    replay_streams_inner(streams, Some(microstructure))
+}
+
+/// The shared driver behind [`replay_streams`] (bare re-execution) and
+/// [`replay_streams_with_microstructure`] (config-scoped): each stream re-executes
+/// independently into a **fresh** registry via the shared recovery core, with the
+/// stored event as the integrity oracle. `microstructure` is `None` for a bare
+/// reconstruction, or `Some(config)` to apply the venue fee/STP/specs at each book's
+/// creation (the same apply the live venue performs).
+fn replay_streams_inner(
+    streams: &[JournalStream],
+    microstructure: Option<&MicrostructureConfig>,
+) -> Result<ReplayReport, ReplayError> {
     // Deterministic per-underlying processing order (the cross-underlying total
     // order of the reconstructed executions log).
     let mut ordered: Vec<&JournalStream> = streams.iter().collect();
@@ -525,13 +616,20 @@ pub fn replay_streams(streams: &[JournalStream]) -> Result<ReplayReport, ReplayE
         let journal = stream.build_journal()?;
         // THE reuse: the #029 recovery core is the single re-execution algorithm.
         // `recover` re-executes into a fresh registry with the stored event as the
-        // oracle — `Ok` proves every re-derived event equalled the stored one.
+        // oracle — `Ok` proves every re-derived event equalled the stored one. The
+        // config-scoped variant applies the SAME microstructure the live venue used,
+        // so fees/STP/specs-sensitive fills reconstruct exactly.
+        let recovered = match microstructure {
+            None => recover(&journal, stream.underlying.as_str()),
+            Some(config) => {
+                recover_with_microstructure(&journal, stream.underlying.as_str(), config)
+            }
+        };
         let Recovered {
             events,
             executor,
             last_sequence,
-        } = recover(&journal, stream.underlying.as_str())
-            .map_err(|error| ReplayError::from_journal(&stream.underlying, error))?;
+        } = recovered.map_err(|error| ReplayError::from_journal(&stream.underlying, error))?;
 
         // Reconstruct the executions store + positions fold from the SAME events,
         // through the same post-journal fan-out the live actor drives.
@@ -561,18 +659,26 @@ pub fn replay_streams(streams: &[JournalStream]) -> Result<ReplayReport, ReplayE
 }
 
 /// Replays a **recorded scenario bundle** (input format 2) — verifying the bundle
-/// schema and the manifest's pinned versions against the running binary **first**
-/// (a mismatch is a typed reject, never a divergent reproduction), then replaying
-/// its streams via [`replay_streams`].
+/// schema, the manifest's pinned versions, **and the microstructure fingerprint**
+/// against the running binary / the bundle's own manifest **first** (a mismatch is a
+/// typed reject, never a divergent reproduction), then replaying its streams with the
+/// carried [`MicrostructureConfig`] applied via [`replay_streams_with_microstructure`].
+///
+/// The microstructure gate closes the config half of the determinism tuple: the
+/// carried config's [`fingerprint`](MicrostructureConfig::fingerprint) must equal the
+/// recorded [`RunManifest::microstructure_fingerprint`], so a bundle whose config was
+/// tampered with (or does not match what was recorded) is refused rather than
+/// reproduced under a divergent fee/STP/specs schedule.
 ///
 /// # Errors
 ///
-/// - [`ReplayError::VersionMismatch`] if the bundle `schema` or any pinned manifest
-///   version does not match the running binary;
-/// - every error [`replay_streams`] can return.
+/// - [`ReplayError::VersionMismatch`] if the bundle `schema`, any pinned manifest
+///   version, or the microstructure fingerprint does not match;
+/// - every error [`replay_streams_with_microstructure`] can return.
 pub fn replay_bundle(bundle: &ScenarioBundle) -> Result<ReplayReport, ReplayError> {
     verify_bundle_versions(bundle)?;
-    replay_streams(&bundle.streams)
+    verify_bundle_microstructure(bundle)?;
+    replay_streams_with_microstructure(&bundle.streams, &bundle.microstructure)
 }
 
 /// Verifies a bundle's wire-contract schema and its manifest's pinned versions
@@ -590,6 +696,38 @@ fn verify_bundle_versions(bundle: &ScenarioBundle) -> Result<(), ReplayError> {
             kind: field,
             expected,
             found,
+        });
+    }
+    Ok(())
+}
+
+/// The **microstructure gate** before any command re-executes: (1) re-run the
+/// resolver's checked-fee proof + spec-range validation on the carried config — it
+/// was deserialized directly, bypassing [`MicrostructureConfig::resolve`], and the
+/// fingerprint below is tamper-*detection*, not *authenticity*, so a self-consistent
+/// hostile bundle could otherwise carry an unprovable fee config; and (2) the
+/// **equality gate** — the carried config's [`fingerprint`](MicrostructureConfig::fingerprint)
+/// must equal the recorded [`RunManifest::microstructure_fingerprint`], so the config
+/// the driver applies is exactly the one the run recorded (the config manifest is part
+/// of the determinism tuple, mirroring the schema/version guards).
+fn verify_bundle_microstructure(bundle: &ScenarioBundle) -> Result<(), ReplayError> {
+    // (1) The proof is non-bypassable: run it independently of the fingerprint so an
+    // unprovable config yields the SPECIFIC config-rejection error, never a downstream
+    // generic `MoneyError::Overflow` at the fill seam.
+    bundle
+        .microstructure
+        .validate()
+        .map_err(|error| ReplayError::ConfigRejected {
+            detail: error.to_string(),
+        })?;
+    // (2) The fingerprint equality gate.
+    let carried = bundle.microstructure.fingerprint();
+    let recorded = &bundle.manifest.microstructure_fingerprint;
+    if &carried != recorded {
+        return Err(ReplayError::VersionMismatch {
+            kind: "microstructure_fingerprint",
+            expected: recorded.clone(),
+            found: carried,
         });
     }
     Ok(())
