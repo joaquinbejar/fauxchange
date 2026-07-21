@@ -78,10 +78,13 @@ dashmap = "6"
 #     (MIT/Apache-2.0), maintained crates; `cargo audit` / `cargo deny` (#019)
 #     gate them. `sha1` + `base64` (the RFC-6455 handshake accept-key) were
 #     ALREADY resolved in the tree, so the `ws` feature adds only a new dependency
-#     EDGE to them, not new crate versions. No CLIENT WebSocket crate is added —
-#     the conformance tests drive the handshake over a bound server with a raw TCP
-#     client (`std::net::TcpStream`), so no `tokio-tungstenite` client
-#     dev-dependency is introduced.
+#     EDGE to them, not new crate versions. The #014 conformance tests drive the
+#     handshake over a bound server with a raw TCP client (`std::net::TcpStream`)
+#     and add no client dependency; #027's Docker e2e smoke DOES add a real
+#     `tokio-tungstenite` CLIENT — see the `[dev-dependencies]` audit note below
+#     (`tests/docker_smoke.rs` observes a fill over `GET /ws` against the actual
+#     running container, a black-box socket a `[dependencies]` router can't help
+#     with).
 # `Path`, `State`, and `middleware::from_fn*` need no feature flag. No new
 # top-level crate is declared — these are feature flags on the already-present
 # axum 0.8. MIT, maintained by the tokio project.
@@ -317,6 +320,32 @@ stats_alloc = { version = "0.1.10", default-features = false }
 # gate them. MIT/Apache-2.0, maintained by the testcontainers-rs project.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+# The Docker e2e smoke test's WS client (#027, `tests/docker_smoke.rs`):
+# observing a fill over `GET /ws` against the ACTUAL running container is a
+# real black-box socket the in-process `[dependencies]` axum router can't
+# help with (unlike #014's conformance tests, which drive the handshake over
+# a bound server with a raw `std::net::TcpStream` and need no WS client at
+# all — see the `axum` `ws`-feature audit note above). `tokio-tungstenite`
+# 0.29 is the client; `futures-util` supplies the `StreamExt`/`SinkExt` traits
+# `WebSocketStream::next`/`send` need. BOTH are a zero-new-resolved-version
+# addition: `axum` 0.8.9's own `ws` feature already pulls `tokio-tungstenite`
+# 0.29.0 + `tungstenite` 0.29.0 transitively (its server-side implementation),
+# and `futures-util` 0.3.32 is already resolved transitively via axum/tower —
+# verified against `Cargo.lock` before adding either line; declaring them
+# here at these exact version constraints resolves to the SAME already-locked
+# versions, no new crate enters the tree (the same "already in the tree, adds
+# no new version" precedent as `tower` above). Dev-only: never reaches the
+# shipped binary; `cargo audit` / `cargo deny` (#019) already gate both as
+# existing transitive deps. MIT/Apache-2.0, maintained by the
+# snapview/tokio-tungstenite and rust-lang/futures-rs projects respectively.
+# The REST leg of the same test (health poll, token mint, order placement)
+# deliberately does NOT add a client dependency — a small hand-rolled
+# HTTP/1.1 client over the already-present `tokio::net::TcpStream` +
+# `serde_json` covers three simple JSON calls, avoiding hyper-util's client
+# machinery (also already in the tree, but only for axum's own server usage
+# today) for a need this small.
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
 
 [[bench]]
 name = "hp1_order_path"

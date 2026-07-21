@@ -11,6 +11,62 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The Docker e2e smoke test and the cold-bring-up wall-clock budget — the
+  v0.2 "one command" proof** (#27) in the new `tests/docker_smoke.rs`,
+  `.github/workflows/ci.yml`, `Makefile`, and `BENCH.md`
+  ([027](milestones/v0.2-packaging/027-cold-bringup-e2e-smoke.md),
+  [TESTING.md §9](docs/TESTING.md#9-docker-e2e-smoke),
+  [07 §7](docs/07-performance-budgets.md#7-what-is-explicitly-out-of-budget),
+  [PRD NFR-3](docs/PRD.md#4-non-functional-requirements)). `DOCKER=1`-gated
+  (a plain `cargo test` self-skips cleanly — verified, the default suite stays
+  green with no Docker present): `docker compose -f docker/docker-compose.yml
+  up -d` (image built once, untimed, ahead of the measured window — cold start
+  is container-start + self-seed → serving, never `cargo build`) → the first
+  successful `GET /health` `200` (the REST listener binds only AFTER the
+  bounded seeding phase completes and `AppState::begin_serving()` flips,
+  `src/main.rs`, so a live `/health` alone IS the serving-and-seeded signal) →
+  mint a bootstrap token for the seeded `market-taker` account
+  (`seeds/default.toml`) → place one market order over REST against the seeded
+  at-the-money `BTC-20261231-50000-C` contract → observe the resulting fill
+  over the SAME `fills` WS channel (subscribed BEFORE the order is placed, so
+  the broadcast is never raced) → assert no panic in the container logs and a
+  clean `docker compose down`. A `ComposeGuard` runs `docker compose down -v`
+  in its `Drop` impl — proven to run on every exit path (`Ok`, `Err`, a panic
+  unwind, or the outer `tokio::time::timeout` dropping the in-flight future) —
+  so a failed run never leaks containers/volumes; the dedicated CI
+  `docker-smoke` stage additionally runs an unconditional teardown step as a
+  belt-and-braces safety net. **Verified against the real container, twice**
+  (Docker 29.6.1, `fauxchange:local` 187 MB `runtime-slim`): cold bring-up
+  measured **0.556 s** (image freshly built in the same invocation) and
+  **0.483 s** (image already cached) — both real numbers, ~14× under the
+  30 s DESIGN TARGET budget on a DB-less default local run (`BENCH.md` §8;
+  never a fabricated figure, and explicitly not claimed to generalise to a
+  `--profile persistent` cold start, a larger seed manifest, or a slower CI
+  disk). **The persistent-mode durable journal append is now an explicit,
+  binding separate budget line** (`BENCH.md` §7's HP-5 bullet), never folded
+  into HP-1's in-memory sub-millisecond target — the durable quantiles
+  themselves still land with the durable journal in v0.3 (#035); #027 only
+  establishes and documents the separation. New CI stage `docker-smoke`
+  (`needs: [image-build]`, `DOCKER=1`, NOT on the plain `test` job) builds the
+  compose image, runs the test, and adds a belt-and-braces teardown step; new
+  `make docker-smoke` target mirrors it locally. Two new dev-only
+  dependencies, each a **zero-new-resolved-version** addition (verified
+  against `Cargo.lock` before and after: no new `[[package]]` entry, only two
+  new dependency edges from the `fauxchange` package itself) — `tokio-tungstenite`
+  0.29 (the black-box WS client observing the fill over the real running
+  container; already resolved transitively via `axum` 0.8.9's own `ws`
+  feature) and `futures-util` 0.3 (the `StreamExt`/`SinkExt` traits
+  `WebSocketStream` needs; already resolved transitively via `axum`/`tower`) —
+  both dev-only, never reach the shipped image, already `cargo audit`/`cargo
+  deny`-gated as existing transitive deps. The REST leg (health poll, token
+  mint, order placement) deliberately adds **no** client dependency instead: a
+  small hand-rolled HTTP/1.1 JSON client over the already-present
+  `tokio::net::TcpStream` (`Connection: close`, read-to-EOF, no
+  `Content-Length`/chunked parser needed) covers the three simple JSON calls,
+  avoiding `hyper-util`'s client machinery (also already in the tree, but only
+  for `axum`'s own server-side usage today). The stale `axum` `ws`-feature
+  audit note ("no CLIENT WebSocket crate is added") is corrected to describe
+  this new client honestly rather than left contradicting it.
 - **Container hardening — non-root, a distroless variant, a no-baked-secrets
   scan, loopback metrics, read-only/dropped-caps run posture, and the
   supply-chain gate on the image build** (#26)

@@ -368,7 +368,14 @@ here only to show the target genuinely runs, not skipped to make the suite
   milestone's explicit "Out" scope.
 - **HP-4 (market-maker requote)** — out of scope for #020; lands v0.5 (#050).
 - **HP-5, durable/PostgreSQL journal append** — out of scope for #020; lands
-  v0.3 (#035). Only the in-memory journal mode is measured here.
+  v0.3 (#035). Only the in-memory journal mode is measured here. **v0.2 #027
+  makes the separation explicit and binding**, not just an omission: the
+  persistent-mode durable append is its OWN budget line
+  (docs/07 §3-HP5), never folded into HP-1's in-memory sub-millisecond
+  target — HP-1 above (§3) is, and stays, an in-memory-journal number only.
+  §9 below records what #027 *did* land this milestone (the cold-bring-up
+  wall-clock budget); the durable HP-5 quantiles themselves remain
+  unmeasured until #035.
 - **A CI `bench-regression` gate** — deliberately not wired by this change
   (out of scope per the #020 milestone; armed before v1.0, #053). Nothing in
   CI fails a PR on these numbers today; `clippy --all-targets --all-features
@@ -382,7 +389,58 @@ here only to show the target genuinely runs, not skipped to make the suite
   append's journal-depth dependence, HP-2's flatness in N, the non-zero
   allocation count) is expected to reproduce qualitatively.
 
-## 8. Files
+## 8. Cold-bring-up (NFR-3, wall-clock — not a `bench-hdr` quantile)
+
+`tests/docker_smoke.rs` (#027, `DOCKER=1`-gated) is the enforcement
+mechanism for [PRD NFR-3](docs/PRD.md#4-non-functional-requirements) / [07
+§7](docs/07-performance-budgets.md#7-what-is-explicitly-out-of-budget)'s
+**cold bring-up budget**: `docker compose -f docker/docker-compose.yml up -d`
+(image already built, untimed — compilation is explicitly excluded from this
+budget) → the first successful `GET /health` `200`. The REST listener binds
+only AFTER the bounded seeding phase completes and `AppState::begin_serving()`
+flips (`src/main.rs`), so a live `/health` IS the "serving, seeded chain"
+signal — there is no separate race to account for. This is a **single
+wall-clock duration**, deliberately NOT a `bench-hdr` p50/p99/p99.9/p99.99
+distribution (docs/07 §7 is explicit: cold start is a wall-clock NFR, not a
+hot-path latency quantile) — one real measurement against a fixed budget, not
+a statistical sample.
+
+| Item | Value |
+|---|---|
+| DESIGN TARGET (NFR-3) | < 30 s cold |
+| Measured, run 1 (image freshly built by the same test invocation) | **0.556 s** |
+| Measured, run 2 (image already built, `docker`-layer-cached) | **0.483 s** |
+| Image | `fauxchange:local`, 187 MB (`docker compose -f docker/docker-compose.yml build`, `runtime-slim` target) |
+| Compose profile | DB-less default (no `postgres` service) |
+| Machine | Apple M4 Max developer laptop (macOS, Darwin 25.5.0, `arm64`) — same class as §1, not a tuned bench rig |
+| Docker | 29.6.1 |
+
+Both runs were real `DOCKER=1 cargo test --test docker_smoke -- --nocapture`
+invocations against the actual `docker compose up -d` → first `GET /health`
+`200` window ([`tests/docker_smoke.rs`](tests/docker_smoke.rs)); the image
+`build` step itself is excluded from the timed window in both (run 1 still
+paid a real, untimed build inside the SAME test invocation since no image was
+cached beforehand; run 2's untimed build step was a cache hit). Both numbers
+are real, not estimated — the ~14× headroom under the 30 s budget reflects the
+DB-less default (fully in-memory, no Postgres wait) and the current small seed
+manifest (two underlyings, a handful of contracts, `seeds/default.toml`) on a
+fast local NVMe/SSD host, not a claim about every environment; a
+Postgres-backed `--profile persistent` cold start, a much larger seed
+manifest, or a slower CI runner disk could all push this number up — none of
+those variants are measured here, only the DB-less default the smoke test
+exercises.
+
+**Interpretation.** This is a v0.2 (#027) wall-clock NFR assertion, not a
+hot-path `bench-hdr` budget — it belongs in `BENCH.md` because it is a real,
+measured number this document tracks, but it is reported separately from §3's
+quantile tables on purpose (a single duration against a fixed budget, not a
+p50/p99/p99.9/p99.99 distribution). The DESIGN TARGET is comfortably met on
+this host today; re-measure here (not re-estimate) if the seed manifest grows
+materially or the compose topology changes. The durable-append separation
+this same issue establishes is recorded in §7's HP-5 bullet above, not
+duplicated here.
+
+## 9. Files
 
 - `benches/hp1_order_path.rs`, `benches/hp2_ws_fanout.rs`,
   `benches/alloc_profile.rs`, `benches/criterion_match_cost.rs` — the four
@@ -395,3 +453,6 @@ here only to show the target genuinely runs, not skipped to make the suite
 - `tests/bench_harness.rs` — 5 unit tests proving the histogram/quantile
   plumbing itself is correct against known distributions (uniform, constant,
   bimodal, empty, and a `report`-return-value consistency check).
+- `tests/docker_smoke.rs` (#027) — the Docker e2e smoke test that measures §8's
+  cold-bring-up number and proves the one-order REST → WS-fill round-trip
+  against the real container.

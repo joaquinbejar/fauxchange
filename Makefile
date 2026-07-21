@@ -18,8 +18,8 @@ LOGLEVEL ?= WARN
 .DEFAULT_GOAL := help
 
 .PHONY: all help build release run run-seeded check test test-conformance \
-	fmt fmt-check lint lint-fix fix clean doc readme coverage coverage-html \
-	audit deny check-spanish pre-push publish
+	docker-smoke fmt fmt-check lint lint-fix fix clean doc readme coverage \
+	coverage-html audit deny check-spanish pre-push publish
 
 all: help ## Alias for `help`
 
@@ -34,7 +34,7 @@ help: ## List the common targets
 	@echo "  workflow-<job-id>  Run a .github/workflows/ci.yml job locally via act"
 	@echo "                     (fmt, clippy, test, build-release, doctests, msrv,"
 	@echo "                     golden, determinism, parity, migrations, cargo-audit,"
-	@echo "                     cargo-deny, image-build)"
+	@echo "                     cargo-deny, image-build, docker-smoke)"
 
 # --- Build / run -------------------------------------------------------
 
@@ -93,6 +93,10 @@ test: ## Unit + integration + doctest suite — mirrors CI job `test`
 
 test-conformance: ## The tests/ protocol conformance + e2e suite (golden/determinism/parity/rest/ws/...)
 	LOGLEVEL=$(LOGLEVEL) $(CARGO) test --tests --all-features
+
+docker-smoke: ## Docker e2e smoke (DOCKER=1): compose up -> health -> order -> WS fill -> clean shutdown, < 30s cold budget (builds the image first)
+	docker compose -f docker/docker-compose.yml build
+	DOCKER=1 $(CARGO) test --test docker_smoke --all-features -- --nocapture
 
 # --- Supply-chain gate (docs/08-threat-model.md §8) -------------------------
 

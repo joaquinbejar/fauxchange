@@ -37,9 +37,10 @@
 #
 # Explicitly OUT of this workflow (see
 # milestones/v0.1-backend-core/019-ci-audit-deny-lint.md "Scope"):
-# the `fuzz` job (FIX gateway lands v0.4), the `bench-regression` gate
-# (armed before v1.0), and the `docker-smoke` cold-bring-up +
-# one-order-round-trip e2e stage (v0.2 #027).
+# the `fuzz` job (FIX gateway lands v0.4) and the `bench-regression` gate
+# (armed before v1.0). The `docker-smoke` cold-bring-up + one-order-round-trip
+# e2e stage (v0.2 #027) is wired below, dedicated and DOCKER=1-gated — not on
+# every unit-test job.
 #
 # `make workflow-<job-id>` (see Makefile) runs any job here locally via
 # `act` — job ids below are the stable contract those targets rely on.
@@ -373,3 +374,50 @@ jobs:
           docker logs fx-hardening-check
           docker stop fx-hardening-check
           [ "$status" = "200" ] || { echo "venue did not serve /health under --read-only --cap-drop=ALL --security-opt no-new-privileges:true" >&2; exit 1; }
+
+  # --- Docker e2e smoke: cold-bring-up budget + one-order round-trip (v0.2, ---
+  # --- #027, docs/TESTING.md §9) ----------------------------------------------
+  # The dedicated stage docs/TESTING.md §9/§11 requires: NOT on every
+  # unit-test job — only `DOCKER=1` activates `tests/docker_smoke.rs`; the
+  # plain `test` job above never sets it, so the default suite stays green on
+  # a machine with no Docker. `needs: [image-build]` — only run the full e2e
+  # flow once the Dockerfile itself is known to build and pass the #26
+  # hardening checks, so a broken image fails fast in `image-build` rather
+  # than burning the extra minutes this stage's own `docker compose build`
+  # would otherwise spend re-discovering the same break.
+  #
+  # The test itself (not this workflow) is what enforces the < 30 s cold NFR-3
+  # budget (docs/07-performance-budgets.md §7, docs/PRD.md §4) — it times
+  # `docker compose up -d` → the first successful `GET /health` (the REST
+  # listener binds only AFTER the bounded seeding phase completes and the
+  # venue flips to serving, `src/main.rs`, so a live `/health` IS the
+  # serving-and-seeded signal), mints a bootstrap token for the seeded
+  # `market-taker` account, places one market order over REST that crosses the
+  # seeded market-maker's resting quote, observes the resulting fill over the
+  # `fills` WS channel, and asserts no panic in the container logs plus a
+  # clean `docker compose down`. The test owns its own Drop-guard teardown; the
+  # explicit `down -v` step below is a belt-and-braces safety net in case the
+  # test process is killed before its Drop runs (e.g. a CI job timeout).
+  docker-smoke:
+    name: docker-smoke
+    runs-on: ubuntu-24.04
+    needs: [image-build]
+    env:
+      DOCKER: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: docker-smoke
+      - name: Build the compose image once (untimed — the smoke test's cold budget covers container-start + self-seed only, never compilation)
+        run: docker compose -f docker/docker-compose.yml build
+      - run: cargo test --test docker_smoke --all-features -- --nocapture
+      - name: Compose logs (always, for CI triage)
+        if: always()
+        run: docker compose -f docker/docker-compose.yml logs || true
+      - name: Ensure the compose stack is torn down (belt-and-braces alongside the test's own Drop guard)
+        if: always()
+        run: docker compose -f docker/docker-compose.yml down -v --remove-orphans || true
