@@ -5,3 +5,5 @@
 /AGENTS.md
 /CLAUDE.md
 /milestones
+# Local environment secrets (never commit; use .env.example as the template)
+.env

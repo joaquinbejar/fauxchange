@@ -11,6 +11,76 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The layered venue config surface — file + env + CLI with
+  `deny_unknown_fields`** (#22) in `src/config.rs`, wired into `src/main.rs`,
+  with a new `.env.example` and a `config_validate_rejects_out_of_range`
+  property ([022](milestones/v0.2-packaging/022-config-surface.md),
+  [06 §4](docs/06-deployment.md#4-configuration),
+  [05 §2](docs/05-microstructure-config.md#2-config-model),
+  [08 §7](docs/08-threat-model.md#7-secrets-handling)). The v0.2 config
+  foundation the later milestones **extend, never replace**. A run is
+  configured from four layers merged in a **fixed precedence** — defaults
+  (in code) → TOML file (`--config <path>`) → environment → CLI flags, later
+  winning — each layer a field-wise overlay over an untyped `RawConfig`, then
+  **validated once** into the typed effective `Config`. The v0.2 concerns:
+  `[server]` (`FAUXCHANGE_HTTP_ADDR` / `--http-addr`, default `0.0.0.0:8080`),
+  `[fix]` (`FAUXCHANGE_FIX_ADDR` / `--fix-addr`, default `0.0.0.0:9878`),
+  `[persistence]` (`DATABASE_URL` / `--database-url` — **unset ⇒ in-memory**,
+  set ⇒ the `PersistenceBackend::Postgres` toggle #23 consumes; the config
+  decides the backend, not the DB module), `[clock]` (`FAUXCHANGE_CLOCK` /
+  `--clock`, the `realtime | accelerated | stepped` enum carried through for
+  the clock services #28), `[determinism]` (`FAUXCHANGE_SEED` / `--seed`, one
+  run-level `u64` feeding the run **lineage id** namespace), `[auth]`
+  (`AUTH_BOOTSTRAP_SECRET`), and `[logging]` (`FAUXCHANGE_LOG_FORMAT` /
+  `--log-format`, the `json | pretty` enum; structured-JSON emission is the
+  observability milestone's #06). **`#[serde(deny_unknown_fields)]` on every
+  file section + the top level**, so a typo aborts startup with a typed
+  `ConfigError::UnknownKey` **naming the offending key** (extracted from
+  serde's diagnostic) rather than silently defaulting — the ROADMAP v0.2
+  acceptance item. **Boot-time validation before a single request**: bind
+  addresses parse to `SocketAddr` (`BadAddress`), the clock/log-format enums
+  check against their closed vocabularies (`InvalidClock` /
+  `InvalidLogFormat`), and the seed parses as `u64` (`BadSeed`) — a
+  `thiserror` `ConfigError` (no `anyhow`; distinct from the request-boundary
+  `VenueError`) fails the process fast. **Secrets never reach a log**:
+  `AUTH_BOOTSTRAP_SECRET` and `DATABASE_URL` are wrapped in a `Secret` newtype
+  whose `Debug`/`Display` render `<redacted>` — redaction lives in one type,
+  not at each call site — so the **effective config is logged once at boot**
+  (`Config::render_effective`) with both secrets absent; the plaintext is
+  reachable only through the explicitly-named `Secret::expose`, called at the
+  DB pool / bootstrap gate. The `[accounts.*]` / `[instruments.*]` /
+  `[microstructure.*]` / `[market_maker.*]` / `[rate_limits]` sections are
+  **documented extension points** — accepted by the file loader today (typed
+  `serde::de::IgnoredAny`, so a forward-looking config file is not rejected)
+  but not validated here; the seed (#24) and v0.5 microstructure (#44–#47)
+  swap each placeholder for a real `deny_unknown_fields` struct **without
+  reshaping** the loader. `main.rs` now loads + validates the config first,
+  logs the redacted effective config, and builds `AppStateConfig` from it
+  (server bind address, seed → run lineage, bootstrap secret; the underlyings
+  stay env-seeded until the `[instruments.*]` manifest #24). New dependency:
+  `toml` 1 (`default-features = false, features = ["parse", "serde"]` — parse
+  only, no serializer), which adds `toml` + `serde_spanned` to the tree (both
+  `toml-rs`, MIT OR Apache-2.0, already on the `deny.toml` allow-list — **no
+  new SPDX id, no `deny.toml` change**; `cargo audit` / `cargo deny` green);
+  its parser deps (`toml_parser` / `toml_datetime` / `winnow` / `serde_core`)
+  were already resolved, and **no CLI crate is added** — a small hand-rolled
+  `--config`/scalar-override parser keeps `clap` (a dev-only transitive of
+  `criterion`) out of the runtime binary. Injectable env lookup + explicit CLI
+  args make the loader a pure, deterministic seam the unit and property tests
+  drive without mutating the process environment (edition-2024 `set_var` is
+  `unsafe`, forbidden here). Tests: unit (`src/config.rs`) — precedence
+  (default/file/env/CLI each winning at its level), unknown-key rejection
+  (naming the key, section + top-level), invalid clock / log-format / bind
+  address / seed, the `DATABASE_URL` backend toggle, `--config` file selection
+  + missing-file `FileRead`, empty-env-as-unset, seed → lineage, and the
+  effective-config **secret redaction** (asserting both markers are absent
+  from the render and the derived `Debug`); property
+  (`config_validate_rejects_out_of_range`, `tests/property.rs`) — the
+  validator accepts a clock/log-format/seed/address value **iff** it is
+  genuinely valid, else fails with the matching typed `ConfigError`, the
+  harness stood up for v0.5 to extend. `.env.example` declares every env var
+  with its default and range per `rules/global_rules.md` *Configuration*.
+
 - **Threat-model input hardening + captured-log credential test — the v0.1
   security capstone** (#21) across `src/models.rs`, `src/gateway/rest/mod.rs`,
   `src/auth.rs`, and a new `tests/security.rs`

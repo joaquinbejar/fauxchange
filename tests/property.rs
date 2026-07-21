@@ -26,7 +26,14 @@
 //!   sequence, a position's `realized + unrealized` P&L equals the net cash flow
 //!   plus `net_quantity × mark`, exactly, in integer cents
 //!   ([008](../milestones/v0.1-backend-core/008-executions-positions-stores.md)).
+//! - `config_validate_rejects_out_of_range` — the layered config validator
+//!   accepts no out-of-range value for the v0.2 knobs (clock, log format, seed,
+//!   bind address): a value is accepted **iff** it is genuinely valid, otherwise
+//!   the load fails with the matching typed [`ConfigError`]. The harness is stood
+//!   up here for v0.5 (#44–#47) to extend
+//!   ([022](../milestones/v0.2-packaging/022-config-surface.md)).
 
+use fauxchange::config::{ClockMode, Config, ConfigError, LogFormat};
 use fauxchange::exchange::{
     ActorConfig, CancelReason, CancelledLeg, Cents, CommandExecutor, EventTimestamp,
     ExecutionContext, Fill as VenueFill, FixedClock, InMemoryPositionsStore, InMemoryVenueJournal,
@@ -801,6 +808,118 @@ proptest! {
                 skewed.ask_price.get() - skewed.bid_price.get(),
                 neutral.ask_price.get() - neutral.bid_price.get()
             );
+        }
+    }
+}
+
+// ============================================================================
+// Layered config validation (#022)
+// ============================================================================
+//
+// - `config_validate_rejects_out_of_range` — for the v0.2 config knobs (clock
+//   mode, log format, run seed, bind address), the layered validator accepts a
+//   value IFF it is genuinely valid; every other value fails fast with the
+//   matching typed `ConfigError` (never a silent default). Each knob is exercised
+//   independently through the public `Config::load_from` CLI seam (the others
+//   keep their defaults), so a single knob's out-of-range value is isolated from
+//   the fixed validation order. The harness stands up here for v0.5 (#44–#47) to
+//   extend with the microstructure ranges.
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1024, max_shrink_iters: 50_000, ..ProptestConfig::default() })]
+
+    #[test]
+    fn config_validate_rejects_out_of_range(
+        clock_token in "[a-zA-Z]{0,12}",
+        log_token in "[a-zA-Z]{0,12}",
+        seed_token in "[A-Za-z0-9 +-]{0,24}",
+        addr_token in "[A-Za-z0-9.:]{0,24}",
+    ) {
+        // The env layer is always empty; each knob is overridden via one CLI flag
+        // so the others keep their valid defaults and cannot mask this knob.
+        let empty_env = |_: &str| None;
+
+        // ---- clock mode: valid IFF a known token ----
+        let clock_result = Config::load_from(
+            vec!["--clock".to_string(), clock_token.clone()],
+            empty_env,
+        );
+        match ClockMode::from_token(&clock_token) {
+            Some(mode) => {
+                let config = clock_result.map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(config.clock.mode, mode);
+            }
+            None => match clock_result {
+                Err(ConfigError::InvalidClock { value }) => prop_assert_eq!(value, clock_token),
+                other => {
+                    return Err(TestCaseError::fail(format!(
+                        "clock '{clock_token}' must be InvalidClock, got {other:?}"
+                    )));
+                }
+            },
+        }
+
+        // ---- log format: valid IFF a known token ----
+        let log_result = Config::load_from(
+            vec!["--log-format".to_string(), log_token.clone()],
+            empty_env,
+        );
+        match LogFormat::from_token(&log_token) {
+            Some(format) => {
+                let config = log_result.map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(config.logging.format, format);
+            }
+            None => match log_result {
+                Err(ConfigError::InvalidLogFormat { value }) => prop_assert_eq!(value, log_token),
+                other => {
+                    return Err(TestCaseError::fail(format!(
+                        "log format '{log_token}' must be InvalidLogFormat, got {other:?}"
+                    )));
+                }
+            },
+        }
+
+        // ---- run seed: valid IFF it parses as u64 (the validator trims) ----
+        let seed_result = Config::load_from(
+            vec!["--seed".to_string(), seed_token.clone()],
+            empty_env,
+        );
+        match seed_token.trim().parse::<u64>() {
+            Ok(seed) => {
+                let config = seed_result.map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(config.determinism.seed, seed);
+            }
+            Err(_) => match seed_result {
+                Err(ConfigError::BadSeed { value }) => prop_assert_eq!(value, seed_token),
+                other => {
+                    return Err(TestCaseError::fail(format!(
+                        "seed '{seed_token}' must be BadSeed, got {other:?}"
+                    )));
+                }
+            },
+        }
+
+        // ---- bind address: valid IFF it parses as a SocketAddr ----
+        let addr_result = Config::load_from(
+            vec!["--http-addr".to_string(), addr_token.clone()],
+            empty_env,
+        );
+        match addr_token.parse::<std::net::SocketAddr>() {
+            Ok(addr) => {
+                let config = addr_result.map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(config.server.http_addr, addr);
+            }
+            Err(_) => match addr_result {
+                Err(ConfigError::BadAddress { field, value, .. }) => {
+                    prop_assert_eq!(field, "http_addr");
+                    prop_assert_eq!(value, addr_token);
+                }
+                other => {
+                    return Err(TestCaseError::fail(format!(
+                        "address '{addr_token}' must be BadAddress, got {other:?}"
+                    )));
+                }
+            },
         }
     }
 }
