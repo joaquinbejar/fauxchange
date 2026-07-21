@@ -77,7 +77,7 @@ use crate::auth::{
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, ExpirationDate,
+    ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, ExpirationDate, FanoutSummary,
     InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
     JournalHeader, JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink,
     MassCancelScope, Receipt, StoreFanOut, Symbol, TeeFanOut, VenueCommand, check_price_band,
@@ -943,9 +943,12 @@ impl AppState {
     /// raw submit path.
     ///
     /// A fan-out returns a **representative** [`Receipt`] (the last committed
-    /// underlying's); a **partial** fan-out (committed on some underlyings, not
-    /// others) is logged (`WARN`) rather than hidden — the venue does not promise
-    /// atomic venue-wide fan-out.
+    /// underlying's) carrying a [`FanoutSummary`](crate::exchange::FanoutSummary)
+    /// in [`Receipt::fanout`]; a **partial** fan-out (committed on some underlyings,
+    /// not others) is both logged (`WARN`) and surfaced through that summary
+    /// (`ok_count` / `total` / `fully_applied`) so a control-plane response reports
+    /// it rather than hiding it — the venue does not promise atomic venue-wide
+    /// fan-out (#118).
     ///
     /// # Errors
     ///
@@ -1149,9 +1152,11 @@ impl AppState {
     /// Fans a **venue-global** command (a `MarketMakerControl`, an
     /// `EvictExpiredOrders`, or a hierarchy-wide non-`Book` `MassCancel`) to every
     /// hosted underlying's actor, in the deterministic **sorted** order, each
-    /// journaled in its own stream. Returns the last committed [`Receipt`]; a partial
-    /// fan-out is logged under a shared [`CorrelationId`], never hidden. No borrow of
-    /// `self` is held across an `.await` — each handle is cloned out first.
+    /// journaled in its own stream. Returns the last committed [`Receipt`] with a
+    /// [`FanoutSummary`](crate::exchange::FanoutSummary) attached in
+    /// [`Receipt::fanout`]; a partial fan-out is logged under a shared
+    /// [`CorrelationId`] **and** reported through that summary, never hidden. No
+    /// borrow of `self` is held across an `.await` — each handle is cloned out first.
     async fn submit_venue_global(&self, command: VenueCommand) -> Result<Receipt, VenueError> {
         let correlation_id = self.next_correlation_id();
         let tickers: Vec<String> = self.underlyings().into_iter().map(str::to_string).collect();
@@ -1160,6 +1165,7 @@ impl AppState {
                 "no hosted underlyings for a venue-global command".to_string(),
             ));
         }
+        let total = tickers.len();
         let mut committed: Option<Receipt> = None;
         let mut first_error: Option<VenueError> = None;
         let mut ok_count = 0usize;
@@ -1170,7 +1176,9 @@ impl AppState {
             };
             match result {
                 Ok(receipt) => {
-                    ok_count += 1;
+                    // Checked (rule 9); the count is bounded by the hosted-underlying
+                    // set, so the floor is unreachable but keeps the crate `+=`-free.
+                    ok_count = ok_count.checked_add(1).unwrap_or(ok_count);
                     committed = Some(receipt);
                 }
                 Err(error) => {
@@ -1180,16 +1188,21 @@ impl AppState {
                 }
             }
         }
-        if ok_count != 0 && ok_count != tickers.len() {
+        if ok_count != 0 && ok_count != total {
             tracing::warn!(
                 correlation_id = %correlation_id,
                 committed = ok_count,
-                total = tickers.len(),
+                total,
                 "venue-global command fan-out was partial across underlyings"
             );
         }
+        // Surface the fan-out delivery on the representative receipt (#118): a
+        // control-plane response reads `ok_count`/`total`/`fully_applied` from it and
+        // reports a partial fan-out rather than an unqualified success. The counts are
+        // simple loop totals — no wall-clock, no RNG.
+        let summary = FanoutSummary { ok_count, total };
         match (committed, first_error) {
-            (Some(receipt), _) => Ok(receipt),
+            (Some(receipt), _) => Ok(receipt.with_fanout(summary)),
             (None, Some(error)) => Err(error),
             // Non-empty `tickers` with no Ok and no Err is unreachable; return a
             // typed rejection rather than fabricate a receipt.

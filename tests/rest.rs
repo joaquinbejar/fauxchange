@@ -737,6 +737,98 @@ async fn test_fok_order_against_empty_book_is_rejected_not_accepted() {
     assert_eq!(body["filled_quantity"], 0);
 }
 
+// ---- #118: a place into a halted instrument surfaces Rejected over REST -------
+
+#[tokio::test]
+async fn test_place_into_halted_instrument_reports_rejected_not_accepted() {
+    let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
+    let admin = token(&state, "admin-1");
+    let trader = token(&state, "trader-1");
+
+    // Halt the contract via the admin toggle (enabled:false = halt) — a LEGAL
+    // Active→Halted transition, so the toggle itself reports success.
+    let (status, toggle) = send(
+        &state,
+        build_request(
+            "POST",
+            "/api/v1/controls/instrument/BTC-20240329-50000-C/toggle",
+            Some(&admin),
+            Some(serde_json::json!({ "enabled": false })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(toggle["success"], true);
+
+    // A resting-TIF (GTC) limit into the halted book is a journaled Rejected — the
+    // REST response must report that reject, NOT a false "accepted; resting" (#118).
+    let uri = format!("{CONTRACT}/orders");
+    let (status, body) = send(
+        &state,
+        build_request(
+            "POST",
+            &uri,
+            Some(&trader),
+            Some(limit_body("buy", 50_000, 3)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "rejected");
+    assert_eq!(body["filled_quantity"], 0);
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Halted")),
+        "the reject reason names the refusing status: {}",
+        body["message"]
+    );
+}
+
+// ---- #118: resume-an-Expired is an illegal transition → typed 409 over REST ---
+
+#[tokio::test]
+async fn test_illegal_toggle_transition_reports_409_not_false_success() {
+    let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
+    let admin = token(&state, "admin-1");
+    let symbol = "BTC-20240329-50000-C";
+
+    // Drive the instrument to the terminal Expired state on the sequenced path.
+    for status in ["Settling", "Expired"] {
+        state
+            .submit(VenueCommand::SetInstrumentStatus {
+                symbol: match Symbol::parse(symbol) {
+                    Ok(s) => s,
+                    Err(e) => panic!("symbol: {e:?}"),
+                },
+                status: match status {
+                    "Settling" => fauxchange::exchange::InstrumentStatus::Settling,
+                    _ => fauxchange::exchange::InstrumentStatus::Expired,
+                },
+            })
+            .await
+            .expect("lifecycle submit");
+    }
+
+    // Resume (enabled:true → Active) an Expired instrument is illegal: the registry
+    // rejects it, and the toggle handler surfaces a typed 409, never success:true.
+    let (status, body) = send(
+        &state,
+        build_request(
+            "POST",
+            &format!("/api/v1/controls/instrument/{symbol}/toggle"),
+            Some(&admin),
+            Some(serde_json::json!({ "enabled": true })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_ne!(
+        body["success"], true,
+        "an illegal transition is not a success"
+    );
+}
+
 // ---- determinism of the sequenced path the handlers use -------------------
 
 #[tokio::test]

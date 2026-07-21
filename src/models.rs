@@ -690,9 +690,11 @@ pub struct PlaceMarketOrderResponse {
 /// Response for canceling an order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CancelOrderResponse {
-    /// Whether the cancel command was **accepted and sequenced** (not a
-    /// confirmation the resting order existed — the found/not-found outcome is
-    /// not carried on the receipt until the `Receipt`→`VenueOutcome` seam lands).
+    /// Whether the resting order was **observed to be cancelled** — the handler
+    /// reads the sequenced [`VenueOutcome`](crate::exchange::VenueOutcome) off the
+    /// receipt, so `success` is `true` only for a `Cancelled` outcome; an
+    /// unknown / unowned / already-gone order (a journaled `Rejected`) reports
+    /// `success:false` with the reason instead of a false success (#118).
     pub success: bool,
     /// The `underlying_sequence` of the resulting event, for cross-surface
     /// correlation with the WS/FIX fan-out ([03 §3](../docs/03-protocol-surfaces.md)).
@@ -1674,14 +1676,27 @@ pub struct KillSwitchRequest {
 }
 
 /// Response for a kill-switch or enable action.
+///
+/// The control is **venue-global**: it fans out to every underlying's actor. Its
+/// `success` reflects the **observed** fan-out delivery, not merely that the
+/// command was dispatched — for an emergency-stop control, `success` is `true`
+/// only when the command committed on **every** underlying (`fully_applied`), so a
+/// partial fan-out is never reported as an unqualified success (#118).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct KillSwitchResponse {
-    /// Whether the action succeeded.
+    /// Whether the action was **fully applied** across every underlying (an
+    /// emergency-stop control does not report success on a partial fan-out).
     pub success: bool,
     /// Human-readable, client-safe message.
     pub message: String,
     /// The current master-enabled state.
     pub master_enabled: bool,
+    /// How many underlyings the control committed on.
+    pub ok_count: usize,
+    /// How many underlyings the control was fanned to.
+    pub total: usize,
+    /// Whether the control committed on **every** underlying (`ok_count == total`).
+    pub fully_applied: bool,
 }
 
 /// Request body to update the market-maker parameters. All fields optional;
@@ -1701,9 +1716,14 @@ pub struct UpdateParametersRequest {
 }
 
 /// Response after updating the market-maker parameters.
+///
+/// The control is **venue-global** and fans out to every underlying's actor; its
+/// `success` reflects the **observed** fan-out delivery — `true` only when the
+/// update committed on every underlying — so a partial fan-out is reported through
+/// `ok_count` / `total` / `fully_applied` rather than hidden (#118).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct UpdateParametersResponse {
-    /// Whether the update succeeded.
+    /// Whether the update was **fully applied** across every underlying.
     pub success: bool,
     /// The resulting spread multiplier.
     pub spread_multiplier: f64,
@@ -1711,20 +1731,28 @@ pub struct UpdateParametersResponse {
     pub size_scalar: f64,
     /// The resulting directional skew.
     pub directional_skew: f64,
+    /// How many underlyings the update committed on.
+    pub ok_count: usize,
+    /// How many underlyings the update was fanned to.
+    pub total: usize,
+    /// Whether the update committed on **every** underlying (`ok_count == total`).
+    pub fully_applied: bool,
 }
 
 /// Response for an instrument status toggle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InstrumentToggleResponse {
-    /// Whether the toggle command was **accepted and sequenced** — not a
-    /// confirmation the halt/resume took effect (the applied/rejected outcome is
-    /// not carried on the receipt until the `Receipt`→`VenueOutcome` seam lands).
+    /// Whether the transition was **observed to apply** — the handler reads the
+    /// sequenced [`VenueOutcome`](crate::exchange::VenueOutcome) off the receipt, so
+    /// `success` is `true` only for an applied `InstrumentStatusChanged`; an illegal
+    /// lifecycle transition (a journaled `Rejected`) surfaces as a typed `409`
+    /// instead of a false `success:true` (#118).
     pub success: bool,
     /// The canonical contract symbol addressed.
     #[schema(value_type = String)]
     pub symbol: Symbol,
-    /// The **requested** enabled state (`true` = resume, `false` = halt) — the
-    /// state the caller asked for, not an observed effect.
+    /// The enabled state that took effect (`true` = resume/`Active`, `false` =
+    /// halt) — reported only on an applied transition.
     pub enabled: bool,
     /// The `underlying_sequence` of the resulting event, for cross-surface
     /// correlation.
@@ -2057,8 +2085,16 @@ pub enum WsMessage {
         #[schema(value_type = u64)]
         price_cents: Cents,
     },
-    /// A market-maker configuration change. The knobs are documented analytic
-    /// floats.
+    /// A market-maker configuration change / control acknowledgement. The knobs are
+    /// documented analytic floats.
+    ///
+    /// When this is a WS **control ack** for a `MarketMakerControl` (which is
+    /// venue-global and fans out to every underlying's actor), it also carries the
+    /// observed fan-out delivery — `ok_count` / `total` / `fully_applied` — mirroring
+    /// the REST control response, so a **partial** fan-out (committed on some
+    /// underlyings, not others) is reported on the ack rather than hidden behind an
+    /// unconditional success (#118). The three delivery fields are omitted (`None`) on a
+    /// plain market-maker config broadcast that is not a control ack.
     #[serde(rename = "config")]
     Config {
         /// Whether quoting is enabled.
@@ -2069,6 +2105,17 @@ pub enum WsMessage {
         size_scalar: f64,
         /// Directional skew (`-1.0`–`1.0`).
         directional_skew: f64,
+        /// How many underlyings the venue-global control committed on. Present only on
+        /// a control ack.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok_count: Option<usize>,
+        /// How many underlyings the control was fanned to. Present only on a control ack.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<usize>,
+        /// Whether the control committed on **every** underlying (`ok_count == total`).
+        /// Present only on a control ack.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fully_applied: Option<bool>,
     },
     /// A **public, anonymised** fill print ([03 §4](../docs/03-protocol-surfaces.md)).
     ///

@@ -223,14 +223,101 @@ where
 /// that the command was accepted, journaled write-ahead, and assigned a place in
 /// the underlying's total order ([ADR-0006 §3](../../../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
 ///
-/// #007 extends the fan-out path with the captured outcome; #006 commits the
-/// assigned sequence and venue timestamp.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// It carries the **observed** [`VenueOutcome`] the single-writer turn captured,
+/// not merely the accepted-and-sequenced fact: a gateway renders the observed
+/// reject / applied transition / fill state from [`outcome`](Self::outcome)
+/// instead of the *requested* state, so a caller reading only the live response
+/// can never believe a journaled `Rejected` (a halted / `Settling` / `Expired`
+/// instrument, an illegal lifecycle transition) took effect (#118). The outcome
+/// is the same value journaled write-ahead, so surfacing it changes nothing on
+/// replay — it adds no wall-clock and no RNG.
+///
+/// Not `Copy` (the [`VenueOutcome`] carries owned fill / reason data); it is
+/// cloned rarely — one receipt per committed command.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Receipt {
     /// The per-underlying sequence assigned to the command.
     pub underlying_sequence: SequenceNumber,
     /// The venue-clock instant stamped on the paired event.
     pub venue_ts: EventTimestamp,
+    /// The losslessly captured outcome of the command, as journaled in the paired
+    /// [`VenueEvent`]. `None` only for a control artifact that executes no
+    /// [`VenueCommand`] (a snapshot [`restore`](UnderlyingActor::restore), which
+    /// journals an epoch marker rather than a captured command outcome).
+    pub outcome: Option<VenueOutcome>,
+    /// The venue-global fan-out delivery summary, present only when this receipt
+    /// is the representative of a command fanned to **every** underlying's actor
+    /// (a `MarketMakerControl` / `EvictExpiredOrders` / hierarchy-wide `MassCancel`);
+    /// `None` for a single-underlying command. It lets a control-plane caller
+    /// report how many underlyings actually applied a partial fan-out (#118).
+    pub fanout: Option<FanoutSummary>,
+}
+
+impl Receipt {
+    /// A committed single-underlying command receipt carrying its captured
+    /// [`VenueOutcome`].
+    #[must_use]
+    #[inline]
+    fn committed(
+        underlying_sequence: SequenceNumber,
+        venue_ts: EventTimestamp,
+        outcome: VenueOutcome,
+    ) -> Self {
+        Self {
+            underlying_sequence,
+            venue_ts,
+            outcome: Some(outcome),
+            fanout: None,
+        }
+    }
+
+    /// A control-artifact receipt with no captured command outcome (a snapshot
+    /// restore executes no [`VenueCommand`]).
+    #[must_use]
+    #[inline]
+    fn control(underlying_sequence: SequenceNumber, venue_ts: EventTimestamp) -> Self {
+        Self {
+            underlying_sequence,
+            venue_ts,
+            outcome: None,
+            fanout: None,
+        }
+    }
+
+    /// Attaches the venue-global fan-out delivery summary, returning `self` — the
+    /// application-layer builder for a fanned command's representative receipt.
+    #[must_use]
+    #[inline]
+    pub fn with_fanout(mut self, fanout: FanoutSummary) -> Self {
+        self.fanout = Some(fanout);
+        self
+    }
+}
+
+/// How many of a venue-global command's per-underlying fan-out deliveries
+/// committed — the delivery visibility a control-plane response needs so a
+/// **partial** fan-out (some underlyings committed, some rejected) is reported,
+/// never hidden behind an unqualified success (#118).
+///
+/// The venue makes **no** promise of atomic venue-wide fan-out (there is no
+/// venue-wide total order), so `ok_count < total` is a real, reportable state —
+/// an emergency-stop control must not claim success when the fan-out
+/// under-delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanoutSummary {
+    /// How many underlyings the command committed on.
+    pub ok_count: usize,
+    /// How many underlyings the command was fanned to.
+    pub total: usize,
+}
+
+impl FanoutSummary {
+    /// Whether the command committed on **every** underlying it was fanned to.
+    #[must_use]
+    #[inline]
+    pub fn fully_applied(&self) -> bool {
+        self.ok_count == self.total
+    }
 }
 
 /// Why an underlying was sealed — a **permanent** rejection of all further
@@ -455,10 +542,10 @@ where
             }
         }
 
-        Ok(Receipt {
-            underlying_sequence: sequence,
-            venue_ts,
-        })
+        // Surface the OBSERVED outcome on the receipt (the same value journaled in
+        // the paired event, moved out — `event` is no longer read) so the gateway
+        // renders the reject / applied / fill state a caller can trust (#118).
+        Ok(Receipt::committed(sequence, venue_ts, event.outcome))
     }
 
     /// Resolves the write-ahead command append (step 1): a confirmed commit
@@ -699,10 +786,10 @@ where
             underlying_sequence = sequence.get(),
             "snapshot restored; opened a fresh journal epoch"
         );
-        Ok(Receipt {
-            underlying_sequence: sequence,
-            venue_ts,
-        })
+        // A restore is a control-plane epoch operation, not a sequenced command —
+        // it journals a `SnapshotRestored` marker, not a captured `VenueOutcome` —
+        // so its receipt carries no command outcome (#118).
+        Ok(Receipt::control(sequence, venue_ts))
     }
 }
 
@@ -1193,6 +1280,61 @@ mod tests {
             0,
             "a refused restore must not open a new epoch"
         );
+    }
+
+    // ---- receipt surfaces the captured outcome (#118) --------------------
+
+    #[test]
+    fn test_handle_surfaces_captured_outcome_matching_the_journaled_event() {
+        // The receipt now carries the OBSERVED `VenueOutcome`, byte-identical to the
+        // paired event the turn journaled — so a gateway renders the reject / fill
+        // state a caller can trust, and it is exactly the replay-stable value (#118).
+        let mut actor = real_actor(SequenceNumber::START);
+
+        let maker = match actor.handle(add_order("m", 0, Side::Sell, 50_000, 2)) {
+            Ok(r) => r,
+            Err(e) => panic!("maker handle failed: {e}"),
+        };
+        assert!(
+            matches!(
+                maker.outcome,
+                Some(VenueOutcome::Added {
+                    resting_quantity: 2,
+                    ..
+                })
+            ),
+            "a resting maker surfaces Added with the resting remainder"
+        );
+        assert!(
+            maker.fanout.is_none(),
+            "a single-underlying command has no fan-out"
+        );
+
+        let taker = match actor.handle(add_order("t", 1, Side::Buy, 50_000, 2)) {
+            Ok(r) => r,
+            Err(e) => panic!("taker handle failed: {e}"),
+        };
+        match &taker.outcome {
+            Some(VenueOutcome::Added { fills, .. }) => {
+                assert!(!fills.is_empty(), "the crossing taker surfaces its fills")
+            }
+            other => panic!("crossing taker must surface Added with fills, got {other:?}"),
+        }
+
+        // The surfaced outcome equals the journaled paired event's outcome per seq —
+        // the receipt is a live view of exactly what recovery/replay reconstructs.
+        let journaled: Vec<VenueOutcome> = match actor.journal().read_from(SequenceNumber::START) {
+            Ok(records) => records
+                .into_iter()
+                .filter_map(|record| match record {
+                    JournalRecord::Event(event) => Some(event.outcome),
+                    _ => None,
+                })
+                .collect(),
+            Err(e) => panic!("read_from failed: {e:?}"),
+        };
+        assert_eq!(maker.outcome.as_ref(), journaled.first());
+        assert_eq!(taker.outcome.as_ref(), journaled.get(1));
     }
 
     // ---- pre-execution append failure: reuse N, book untouched -----------

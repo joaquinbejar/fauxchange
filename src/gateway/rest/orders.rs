@@ -12,17 +12,18 @@
 //! commands** requiring [`Permission::Trade`]
 //! ([03 §10](../../../docs/03-protocol-surfaces.md#10-state-changing-operation-classification)).
 //!
-//! **Receipt limitation (a `matching-expert` seam dependency).** `AppState::submit`
-//! returns a [`Receipt`](crate::exchange::Receipt) carrying only the assigned
-//! `underlying_sequence` + `venue_ts`, NOT the lossless `VenueOutcome`. Fill
-//! counts are read back from the shared executions store (accurate for crossing
-//! orders), and the limit-order status is derived from those fills **plus the
-//! time-in-force** (`limit_status`) so a killed `IOC`/`FOK` is reported
-//! `Rejected`, never a false `Accepted`. The disambiguations that still need the
-//! outcome — a cancel `found` vs `not-found`, a `SetInstrumentStatus`
-//! applied vs rejected — are reported as **accepted and sequenced** (with the
-//! `underlying_sequence`), never as a confirmed effect, until the order path
-//! surfaces the outcome in the receipt.
+//! **Observed-outcome rendering (#118).** `AppState::submit` returns a
+//! [`Receipt`](crate::exchange::Receipt) carrying the losslessly captured
+//! [`VenueOutcome`](crate::exchange::VenueOutcome) the sequenced turn observed, so
+//! each handler renders the **observed** outcome, not the *requested* state: a
+//! place into a halted / `Settling` / `Expired` instrument is a journaled
+//! `Rejected` reported as `Rejected` (never a false `Accepted` for a resting TIF),
+//! and a cancel of an unknown / unowned / already-gone order reports
+//! `success:false` with the reject reason. For an accepted placement the fill
+//! counts are still read back from the shared executions store and the limit-order
+//! status derived from those fills plus the time-in-force (`limit_status`) so a
+//! killed `IOC`/`FOK` also reports `Rejected`. The `underlying_sequence` remains on
+//! every response for cross-surface correlation.
 
 use std::sync::Arc;
 
@@ -31,7 +32,7 @@ use axum::extract::{Extension, Path, Query, State};
 
 use crate::auth::Authorized;
 use crate::error::VenueError;
-use crate::exchange::{STPMode, SymbolParser, VenueCommand};
+use crate::exchange::{STPMode, SymbolParser, VenueCommand, VenueOutcome};
 use crate::gateway::rest::middleware::require;
 use crate::gateway::rest::support::{
     add_order_command, build_symbol, immediate_fills, mint_order_id, owner_for, parse_style,
@@ -119,7 +120,7 @@ fn limit_status(tif: TimeInForce, filled: u64, quantity: u64) -> (LimitOrderStat
     ),
     request_body = PlaceLimitOrderRequest,
     responses(
-        (status = 200, description = "Order accepted (carries underlying_sequence)", body = PlaceLimitOrderResponse),
+        (status = 200, description = "Order outcome — status is the observed Accepted/Filled/Partial/Rejected (carries underlying_sequence)", body = PlaceLimitOrderResponse),
         (status = 400, description = "Invalid order shape or symbol"),
         (status = 401, description = "Missing or invalid token"),
         (status = 403, description = "Missing Trade permission"),
@@ -161,13 +162,24 @@ pub async fn place_limit_order(
         ))
         .await?;
 
-    let fills = immediate_fills(&state, &account, &order_id, receipt.underlying_sequence);
-    let filled: u64 = fills.iter().map(|(_, q)| q).sum();
-    let (status, message) = limit_status(
-        request.time_in_force.unwrap_or_default(),
-        filled,
-        request.quantity,
-    );
+    // Render the OBSERVED outcome, not the requested state (#118): an order into a
+    // halted / `Settling` / `Expired` instrument is a journaled `Rejected` — surface
+    // that reject rather than deriving a false `Accepted` for a resting TIF.
+    let (status, filled, message) = match &receipt.outcome {
+        Some(VenueOutcome::Rejected { reason }) => {
+            (LimitOrderStatus::Rejected, 0u64, reason.clone())
+        }
+        _ => {
+            let fills = immediate_fills(&state, &account, &order_id, receipt.underlying_sequence);
+            let filled: u64 = fills.iter().map(|(_, q)| q).sum();
+            let (status, message) = limit_status(
+                request.time_in_force.unwrap_or_default(),
+                filled,
+                request.quantity,
+            );
+            (status, filled, message.to_string())
+        }
+    };
 
     Ok(Json(PlaceLimitOrderResponse {
         order_id,
@@ -175,7 +187,7 @@ pub async fn place_limit_order(
         filled_quantity: filled,
         remaining_quantity: remaining(request.quantity, filled),
         sequence: receipt.underlying_sequence,
-        message: message.to_string(),
+        message,
     }))
 }
 
@@ -277,7 +289,7 @@ pub async fn place_market_order(
         ("order_id" = String, Path, description = "The venue order id to cancel"),
     ),
     responses(
-        (status = 200, description = "Cancel accepted and sequenced", body = CancelOrderResponse),
+        (status = 200, description = "Cancel outcome (success reflects the observed Cancelled vs Rejected)", body = CancelOrderResponse),
         (status = 400, description = "Invalid symbol"),
         (status = 401, description = "Missing or invalid token"),
         (status = 403, description = "Missing Trade permission"),
@@ -303,14 +315,26 @@ pub async fn cancel_order(
         })
         .await?;
 
-    // The receipt confirms the cancel was accepted and sequenced; the
-    // found/not-found outcome is not carried on the receipt (see module docs).
-    // `sequence` is the typed cross-surface correlation key (#018 cannot parse
-    // prose); `success` means accepted-and-sequenced, not confirmed-removed.
+    // Render the OBSERVED outcome (#118): `success` is true only for a `Cancelled`
+    // outcome; an unknown / unowned / already-gone order is a journaled `Rejected`
+    // and reports `success:false` with the reason, never a false success. `sequence`
+    // remains the typed cross-surface correlation key (#018 cannot parse prose).
+    let (success, message) = match &receipt.outcome {
+        Some(VenueOutcome::Cancelled { .. }) => (true, "order cancelled".to_string()),
+        // Uniform client-safe reject: do NOT echo which of not-found / not-owner /
+        // already-gone occurred — with deterministically-minted order ids that would
+        // be a cross-account existence/ownership enumeration oracle (BOLA/IDOR). The
+        // specific reason stays in the journal/tracing; the typed reject discriminant
+        // + full gateway masking land in #132.
+        Some(VenueOutcome::Rejected { .. }) => {
+            (false, "order not found or not cancellable".to_string())
+        }
+        _ => (true, "cancel accepted and sequenced".to_string()),
+    };
     Ok(Json(CancelOrderResponse {
-        success: true,
+        success,
         sequence: receipt.underlying_sequence,
-        message: "cancel accepted and sequenced".to_string(),
+        message,
     }))
 }
 

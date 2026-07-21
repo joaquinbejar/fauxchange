@@ -42,8 +42,8 @@ use std::sync::{Arc, Mutex};
 use ironfix_core::types::{CompId, SeqNum};
 
 use crate::auth::{AccountStore, RateLimitKey, RateLimitTier, RevocationOracle};
-use crate::error::{FixReject, FixRejectContext, VenueError};
-use crate::exchange::{Cents, Symbol, SymbolParser, TimeInForce as SeamTif};
+use crate::error::{FixReject, FixRejectContext, FixRejectReason, VenueError};
+use crate::exchange::{Cents, Symbol, SymbolParser, TimeInForce as SeamTif, VenueOutcome};
 use crate::gateway::rest::support::{
     immediate_execution_records, mint_order_id, owner_for, taker_legs_for_order,
 };
@@ -2129,6 +2129,15 @@ impl VenueFixSession {
             };
         match self.state.submit(command).await {
             Ok(receipt) => {
+                // Render the OBSERVED outcome (#118), never a false accept: a place into
+                // a halted / `Settling` / `Expired` instrument (or another journaled
+                // place rejection) is an `Ok(Receipt)` whose captured `VenueOutcome` is
+                // `Rejected` — REST renders that as `Rejected`, so FIX MUST emit
+                // `8 Rejected`, NOT a `New`. A rejected order is NOT tracked as placed,
+                // so no phantom `F`/`G` correlation is created.
+                if let Some(VenueOutcome::Rejected { reason }) = &receipt.outcome {
+                    return self.reject_new_order_outcome(&order, reason, now_ms);
+                }
                 self.track_placed(
                     order.cl_ord_id.clone(),
                     order_id.clone(),
@@ -2156,6 +2165,30 @@ impl VenueFixSession {
             }
             Err(error) => self.reject_new_order(&order, &error, now_ms),
         }
+    }
+
+    /// The `ExecutionReport (8) Rejected` for a `NewOrderSingle (D)` whose **observed**
+    /// sequenced outcome was a [`VenueOutcome::Rejected`] (a halted / `Settling` /
+    /// `Expired` instrument, or another journaled place rejection) — REST ≡ FIX order
+    /// entry (#118). It carries the same journaled, client-safe `reason` REST renders as
+    /// its `Rejected` message: a place reject's reason is instrument-/order-level (never
+    /// per-account), so it is safe to name in `Text (58)`. The `OrdRejReason (103)` is
+    /// the venue's business-validation code (`11`), the same code the error seam maps a
+    /// business rejection to.
+    fn reject_new_order_outcome(
+        &mut self,
+        order: &NewOrderSingle,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        self.fsm.emit_order_rejected_code(
+            order.symbol.clone(),
+            order.side,
+            order.price,
+            order_flow::ord_rej_reason(FixRejectReason::Invalid),
+            Some(reason.to_string()),
+            now_ms,
+        )
     }
 
     /// The `8 Rejected` for a `NewOrderSingle` failure — the reject message is
@@ -2199,18 +2232,34 @@ impl VenueFixSession {
             );
         }
         let Some(placed) = self.placed.get(&cancel.orig_cl_ord_id).cloned() else {
+            // Never placed this session — the uniform masked reject (never revealing
+            // not-found vs not-owner vs already-gone, #118).
             return self.reject_cancel(
                 VenueOrderId::new("NONE"),
                 &cancel.orig_cl_ord_id,
                 &cancel.cl_ord_id,
                 CxlRejResponseTo::OrderCancelRequest,
-                &VenueError::NotFound("unknown order".to_string()),
+                &VenueError::NotFound(order_flow::CANCEL_REJECT_MASKED_REASON.to_string()),
                 now_ms,
             );
         };
         let command = order_flow::to_cancel_command(&cancel, account, placed.order_id.clone());
         match self.state.submit(command).await {
             Ok(receipt) => {
+                // Render the OBSERVED outcome (#118), never a false `Canceled`: a cancel
+                // of an unowned / already-gone order is an `Ok(Receipt)` whose captured
+                // outcome is `Rejected` — emit a masked `OrderCancelReject (9)`, not a
+                // `Canceled`, and keep the session correlation (do not drop tracking).
+                if let Some(VenueOutcome::Rejected { reason }) = &receipt.outcome {
+                    return self.reject_cancel_masked(
+                        placed.order_id.clone(),
+                        &cancel.orig_cl_ord_id,
+                        &cancel.cl_ord_id,
+                        CxlRejResponseTo::OrderCancelRequest,
+                        reason,
+                        now_ms,
+                    );
+                }
                 let underlying = underlying_of_symbol(&placed.symbol);
                 let spec = order_flow::render_cancel_report(
                     placed.symbol.clone(),
@@ -2256,12 +2305,13 @@ impl VenueFixSession {
             );
         }
         let Some(placed) = self.placed.get(&replace.orig_cl_ord_id).cloned() else {
+            // Never placed this session — the uniform masked reject (#118).
             return self.reject_cancel(
                 VenueOrderId::new("NONE"),
                 &replace.orig_cl_ord_id,
                 &replace.cl_ord_id,
                 CxlRejResponseTo::OrderCancelReplaceRequest,
-                &VenueError::NotFound("unknown order".to_string()),
+                &VenueError::NotFound(order_flow::CANCEL_REJECT_MASKED_REASON.to_string()),
                 now_ms,
             );
         };
@@ -2275,6 +2325,22 @@ impl VenueFixSession {
         );
         match self.state.submit(command).await {
             Ok(receipt) => {
+                // Render the OBSERVED outcome (#118), never a false `Replaced`: a replace
+                // the order path refused (unknown / unowned / already-gone original) is an
+                // `Ok(Receipt)` whose captured outcome is `Rejected` — emit a masked
+                // `OrderCancelReject (9)`. The replace did NOT take effect, so keep the
+                // ORIGINAL tracking (do not re-key to the new ClOrdID) and do not track the
+                // rejected new order as placed.
+                if let Some(VenueOutcome::Rejected { reason }) = &receipt.outcome {
+                    return self.reject_cancel_masked(
+                        placed.order_id.clone(),
+                        &replace.orig_cl_ord_id,
+                        &replace.cl_ord_id,
+                        CxlRejResponseTo::OrderCancelReplaceRequest,
+                        reason,
+                        now_ms,
+                    );
+                }
                 // The old order is replaced; re-key tracking under the new ClOrdID.
                 self.placed.remove(&replace.orig_cl_ord_id);
                 self.track_placed(
@@ -2329,6 +2395,37 @@ impl VenueFixSession {
             cl_ord_id.clone(),
             response_to,
             &reject,
+            now_ms,
+        )
+    }
+
+    /// The **masked** `OrderCancelReject (9)` for an observed [`VenueOutcome::Rejected`]
+    /// on an `F`/`G` (#118). The order path's specific journaled reason — `order not
+    /// found`, the not-owner reason, or `order is not resting` — is logged internally,
+    /// but the client sees the SAME uniform text + `CxlRejReason (102) = 1` the
+    /// never-placed reject renders, so the reject can never be used to distinguish
+    /// not-found vs not-owner vs already-gone (a cross-account enumeration oracle). The
+    /// echoed `OrderID (37)` is the client's own placed order id, not a cross-account leak.
+    fn reject_cancel_masked(
+        &mut self,
+        order_id: VenueOrderId,
+        orig_cl_ord_id: &ClientOrderId,
+        cl_ord_id: &ClientOrderId,
+        response_to: CxlRejResponseTo,
+        internal_reason: &str,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        tracing::info!(
+            order_id = %order_id.as_str(),
+            internal_reason = %internal_reason,
+            "cancel/replace rejected on the sequenced order path; emitting a uniform client-safe reject"
+        );
+        self.reject_cancel(
+            order_id,
+            orig_cl_ord_id,
+            cl_ord_id,
+            response_to,
+            &VenueError::NotFound(order_flow::CANCEL_REJECT_MASKED_REASON.to_string()),
             now_ms,
         )
     }

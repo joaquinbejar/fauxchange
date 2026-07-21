@@ -629,6 +629,11 @@ fn test_golden_ws_config() {
         spread_multiplier: 1.5,
         size_scalar: 0.5,
         directional_skew: -0.25,
+        // A plain market-maker config broadcast (not a control ack) omits the
+        // venue-global fan-out delivery fields, so the wire shape is unchanged (#118).
+        ok_count: None,
+        total: None,
+        fully_applied: None,
     };
     assert_golden("ws/config.json", &msg);
 }
