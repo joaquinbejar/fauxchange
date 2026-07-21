@@ -358,6 +358,11 @@ path = "benches/hp2_ws_fanout.rs"
 harness = false
 
 [[bench]]
+name = "hp5_durable_append"
+path = "benches/hp5_durable_append.rs"
+harness = false
+
+[[bench]]
 name = "alloc_profile"
 path = "benches/alloc_profile.rs"
 harness = false
