@@ -11,6 +11,40 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The HP-3 FIX parse/encode hot-path budget in `BENCH.md` — the v0.4
+  PERFORMANCE gate** (#43) — `benches/hp3_fix_parse.rs`, a `bench-hdr`
+  benchmark (hdrhistogram p50/p99/p99.9/p99.99, never criterion's mean)
+  measuring `fauxchange::gateway::fix::decode` on a framed `NewOrderSingle
+  (D)` and `FixBody::encode` on a typed `ExecutionReport (8)` — the EXACT
+  functions the live acceptor's dispatch seam calls, never a
+  reimplementation, and pure wire-seam venue overhead (no matching, no order
+  path, [07 §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention)'s
+  match/overhead separation). Fixtures
+  (`benches/support/fix_fixtures.rs`) reuse the identical golden `D`/`8`
+  shapes `tests/golden_fix.rs` already golden-tests (#036), with two new
+  `tests/bench_harness.rs` unit tests proving both fixtures decode to
+  themselves rather than silently measuring a reject path. Warmup precedes
+  every measured loop; coordinated omission is disclosed and corrected via a
+  new `support::openloop::run_open_loop_pure` (extending
+  `benches/support/openloop.rs`'s existing `ActorHandle`-shaped
+  `run_open_loop` to a generic, mailbox-free open-loop generator for a plain
+  synchronous call) — each call dispatches on a fixed intended-send schedule
+  independent of completion, recording sojourn time. `BENCH.md` §11 records
+  three independent real runs on this machine: closed-loop decode `p50` is
+  **sub-microsecond** (750–875 ns) with a low-single-digit-µs `p99`/`p99.9` tail
+  (1.08–2.54 µs), and encode is **sub-microsecond through `p99.9`** (417–750 ns)
+  — one to two orders of magnitude inside a sub-millisecond reading, stated as the
+  grounding DESIGN TARGET data docs/07 §3-HP3 has withheld a number pending
+  ("architect follow-up to state the actual budget, not set by this bench").
+  The open-loop sojourn numbers are honestly disclosed as dominated by the
+  harness's own Tokio task-spawn/scheduling overhead at this sub-microsecond
+  operation scale (~10–25× the closed-loop service time) rather than a
+  decode/encode regression — a real, different effect from HP-1's open-loop
+  section, where that same overhead is negligible next to a
+  hundreds-of-microseconds actor turn. No new dependency: reuses the existing
+  `hdrhistogram`/`criterion` dev-dependencies and the already-present
+  `ironfix-core` types. Does not arm the CI `bench-regression` gate
+  (deliberately out of scope, lands before v1.0, #053).
 - **The FIX parser fuzz target, adversarial corpus, and no-credential-echo
   proof — the v0.4 security gate** (#42) — `fuzz/fuzz_targets/fix_decode.rs`
   (a `cargo-fuzz`/`libfuzzer-sys` harness, its own deliberately separate Cargo
