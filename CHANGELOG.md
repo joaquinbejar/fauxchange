@@ -11,6 +11,61 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Multi-stage `docker/Dockerfile` and the `docker/docker-compose.yml`
+  one-command topology** (#25)
+  ([025](milestones/v0.2-packaging/025-dockerfile-compose.md),
+  [06 §2](docs/06-deployment.md#2-distribution-model),
+  [06 §3](docs/06-deployment.md#3-docker-compose-topology),
+  [06 §5](docs/06-deployment.md#5-ports-and-endpoints)). ONE crate, ONE
+  binary, ONE image: a pinned `rust:1.97.0-bookworm` builder (matching
+  `rust-toolchain.toml`, `SQLX_OFFLINE=true` against the committed `.sqlx/`,
+  zero-warning `cargo build --release`) into a `debian:bookworm-slim` runtime
+  (chosen over alpine/musl — the crate depends on `ring` via `jsonwebtoken`
+  and `sqlx`'s `tls-rustls-ring`); non-root/distroless/read-only-rootfs
+  hardening is #26 on top of this working image. The container `HEALTHCHECK`
+  and the compose service healthcheck both poll `GET /health` (auth- and
+  rate-limit-exempt, `src/gateway/rest/meta.rs`) via `curl`. Both persistence
+  modes run from the **same image**: `DATABASE_URL` unset is fully in-memory
+  (compose default); the `--profile persistent` overlay adds a pinned
+  `postgres:18-alpine` (internal-only, no host port) and, once `DATABASE_URL`
+  is exported pointing at it, `main.rs` opens the `PgPool` and runs
+  `sqlx::migrate!` at boot — verified end-to-end locally in both modes
+  (`docker compose up` and `--profile persistent up`), including a real
+  `postgres:18-alpine` fix: its 18+ image layout requires a single volume
+  mount at `/var/lib/postgresql`, not the pre-18 `.../data` convention.
+  **Seed model reconciled against #24**: `docs/06 §3` (drafted pre-#24)
+  describes a one-shot `seed` service driving the manifest over REST after a
+  health check; #24 shipped a different, now-authoritative mechanism instead
+  — the venue **self-seeds in-process** at boot (`src/seed.rs
+  apply_seed_phase`, applied *before* `AppState::begin_serving()`, after which
+  runtime hierarchy mutation is refused as a seed-time manifest input). A
+  separate REST-driving seed service would duplicate that work or hit the
+  post-flip refusal, so there is none: `docker-compose.yml` instead passes
+  `--config /app/seeds/default.toml` (baked into the image) to the
+  `fauxchange` service itself, in both profiles — `seeds/default.toml` and
+  `seeds/README.md` are corrected to describe this (they previously also
+  referenced a non-existent `FAUXCHANGE_CONFIG` env var; the seed sections
+  load from the `--config <file>` layer only, `src/config.rs`). Ports match
+  [06 §5](docs/06-deployment.md#5-ports-and-endpoints): `8080` REST/WS is
+  live; `9878` FIX and `9090` metrics are **reserved** (`EXPOSE`d, and for
+  metrics loopback-published in compose) but not yet backed by a listener —
+  the FIX acceptor is v0.4 (`src/gateway/fix` is still a stub) and no
+  Prometheus endpoint exists yet (verified: nothing answers on either port
+  today). `FAUXCHANGE_DEV=1` is set in `docker-compose.yml` (not baked into
+  the Dockerfile) because `main.rs` does not yet load a real RS256 key pair
+  from mounted paths — only the embedded dev fixture, gated by
+  `JwtAuth::release_gated`; without it the process **exits at startup**
+  (`DevKeyRefused`) and the container never becomes healthy (a real deployment
+  must not set this once real-key mounting lands, tracked with #26).
+  `AUTH_BOOTSTRAP_SECRET` gets a documented,
+  overridable dev default so the compose venue can mint a token immediately.
+  `.dockerignore` (repo root) keeps `target/` (tens of GB locally) and every
+  developer-only path (`docs/`, `rules/`, `milestones/`, `.claude/`,
+  `CLAUDE.md`, `AGENTS.md`) out of the build context and every image layer.
+  CI gets an additive `image-build` job (`.github/workflows/ci.yml`) that
+  builds the image and validates `docker compose config` in both profiles —
+  build only, no push (a release-pipeline concern, docs/06 §10); the
+  `docker-smoke` compose-up + one-order-round-trip e2e is #27.
 - **The scenario seed format + the bounded seeding phase** (#24) in
   `src/config.rs`, the new `src/seed.rs`, and `seeds/`
   ([024](milestones/v0.2-packaging/024-seed-data-format.md),

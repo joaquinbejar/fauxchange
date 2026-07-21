@@ -15,12 +15,19 @@
 # `sqlx::query!` macros never need a DB — a query changed without a regenerated
 # `.sqlx/` fails the offline build.
 #
+# The `image-build` job (added in v0.2 #025) proves `docker/Dockerfile`
+# BUILDS on every push/PR (the scope #025 owns) and validates
+# `docker/docker-compose.yml` with `docker compose config`. It does NOT push
+# anywhere — publishing a tagged image to a registry is a release-pipeline
+# concern (docs/06-deployment.md §10, RELEASE-PROCESS.md) and a risky action
+# requiring explicit confirmation, out of scope here.
+#
 # Explicitly OUT of this workflow (see
 # milestones/v0.1-backend-core/019-ci-audit-deny-lint.md "Scope"):
 # the `fuzz` job (FIX gateway lands v0.4), the `bench-regression` gate
-# (armed before v1.0), and the `docker-smoke` / `image-build` stages (land
-# with the Dockerfile/compose topology and container hardening, v0.2
-# #025/#026, and the cold-bring-up e2e smoke, v0.2 #027).
+# (armed before v1.0), the container HARDENING posture (non-root /
+# distroless / dev-key release-refusal test, v0.2 #026), and the
+# `docker-smoke` cold-bring-up + one-order-round-trip e2e stage (v0.2 #027).
 #
 # `make workflow-<job-id>` (see Makefile) runs any job here locally via
 # `act` — job ids below are the stable contract those targets rely on.
@@ -271,3 +278,26 @@ jobs:
       # cargo-audit above), the bans (duplicate-version visibility, no
       # wildcard versions) and sources (crates.io only) policy.
       - run: cargo deny check
+
+  # --- Image build (docs/06-deployment.md §2/§3, #025) -----------------------
+  # Proves `docker/Dockerfile` builds the single `fauxchange` release image
+  # (multi-stage: the pinned `rust:1.97.0-bookworm` builder, offline `sqlx`
+  # via the committed `.sqlx/`, into the `debian:bookworm-slim` runtime) and
+  # that `docker/docker-compose.yml` is valid, both profiles. It does NOT push
+  # an image anywhere and does NOT run the compose-up / one-order-round-trip
+  # e2e (that is the dedicated `docker-smoke` stage, v0.2 #027). The runner's
+  # preinstalled Docker Engine + Compose plugin (ubuntu-24.04) are used
+  # directly — no extra action to pin for a plain `docker build`.
+  image-build:
+    name: image-build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build the fauxchange image (proves it builds; SQLX_OFFLINE from the committed .sqlx/)
+        run: docker build -f docker/Dockerfile -t fauxchange:ci .
+      - name: Validate docker-compose.yml (DB-less default profile)
+        run: docker compose -f docker/docker-compose.yml config
+      - name: Validate docker-compose.yml (persistent profile)
+        run: |
+          DATABASE_URL="postgres://fauxchange:fauxchange@postgres:5432/fauxchange" \
+            docker compose -f docker/docker-compose.yml --profile persistent config

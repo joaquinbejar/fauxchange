@@ -11,7 +11,12 @@ config + REST calls, versioned here and reproducible
 fauxchange --config seeds/default.toml
 ```
 
-The compose one-shot `seed` service (#25) drives this same manifest.
+`docker/docker-compose.yml` (#25) bakes this same file into the image and
+passes `--config /app/seeds/default.toml` to the `fauxchange` service itself —
+there is no separate compose `seed` service. The venue applies the manifest
+**in-process**, before it starts serving (see "The seeding phase" below), so a
+service driving the same manifest over REST after a health check would either
+duplicate that work or hit the post-flip refusal described there.
 
 ## The seeding phase
 

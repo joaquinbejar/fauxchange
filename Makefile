@@ -33,7 +33,8 @@ help: ## List the common targets
 	@echo ""
 	@echo "  workflow-<job-id>  Run a .github/workflows/ci.yml job locally via act"
 	@echo "                     (fmt, clippy, test, build-release, doctests, msrv,"
-	@echo "                     golden, determinism, parity, cargo-audit, cargo-deny)"
+	@echo "                     golden, determinism, parity, migrations, cargo-audit,"
+	@echo "                     cargo-deny, image-build)"
 
 # --- Build / run -------------------------------------------------------
 
