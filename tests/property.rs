@@ -14,10 +14,15 @@
 //! - `venue_id_grammar_collision_free` — the composite id grammar is
 //!   deterministic and collision-free across `(lineage, underlying, sequence,
 //!   index)` tuples (colon-free tokens).
+//! - `sequence_monotonic_per_symbol` — the per-underlying single-writer actor
+//!   assigns `0, 1, 2, …` gaplessly in its turn order, independently per symbol,
+//!   over an arbitrary interleaving of commands across two underlyings.
 
 use fauxchange::exchange::{
-    CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as VenueFill, LineageId, Notional,
-    SequenceNumber, SignedCents, Symbol, VenueCommand, VenueEvent, VenueOutcome,
+    ActorConfig, CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as VenueFill, FixedClock,
+    InMemoryVenueJournal, JournalHeader, LineageId, NoopFanOut, Notional, PlaceholderExecutor,
+    SequenceNumber, SignedCents, Symbol, UnderlyingActor, VenueCommand, VenueEvent, VenueJournal,
+    VenueOutcome,
 };
 use fauxchange::exchange::{Hash32, STPMode, Side as SeamSide, TimeInForce as SeamTif};
 use fauxchange::{
@@ -436,5 +441,67 @@ proptest! {
         let exec_a = LineageId::new(lin_b)
             .execution_id(und_b.as_str(), SequenceNumber::new(seq_b), idx_b);
         prop_assert_eq!(id_b.as_str(), exec_a.as_str());
+    }
+
+    /// The `underlying_sequence` is monotonic and gapless **per symbol**: driving
+    /// two independent underlying actors with an arbitrary interleaving of
+    /// commands (`true` → BTC, `false` → ETH), each actor assigns `0, 1, 2, …` in
+    /// its own turn order via its venue-owned checked counter, and the two
+    /// counters never interfere (`BTC` and `ETH` sequence independently). Driven
+    /// synchronously through the actor's `handle` turn, which is the same total
+    /// order the spawned mailbox produces.
+    #[test]
+    fn sequence_monotonic_per_symbol(routes in prop::collection::vec(any::<bool>(), 0..96)) {
+        // The command payload is irrelevant to sequence assignment (the #006
+        // placeholder executor captures a neutral outcome); a cancel suffices.
+        let symbol = Symbol::parse("BTC-20240329-50000-C")
+            .map_err(|e| TestCaseError::fail(format!("{e:?}")))?;
+        let command = VenueCommand::CancelOrder {
+            symbol,
+            order_id: VenueOrderId::new("order-x"),
+            account: AccountId::new("acct-1"),
+        };
+
+        let make = |underlying: &str| {
+            let lineage = LineageId::new("run-1");
+            let journal = InMemoryVenueJournal::new(JournalHeader::new(lineage.clone()));
+            UnderlyingActor::new(
+                ActorConfig::new(underlying, lineage, 16),
+                journal,
+                PlaceholderExecutor,
+                NoopFanOut,
+                FixedClock::new(EventTimestamp::new(1)),
+            )
+        };
+        let mut btc = make("BTC");
+        let mut eth = make("ETH");
+        let mut next_btc = 0u64;
+        let mut next_eth = 0u64;
+
+        for route in routes {
+            if route {
+                let receipt = btc
+                    .handle(command.clone())
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(receipt.underlying_sequence, SequenceNumber::new(next_btc));
+                next_btc += 1;
+            } else {
+                let receipt = eth
+                    .handle(command.clone())
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(receipt.underlying_sequence, SequenceNumber::new(next_eth));
+                next_eth += 1;
+            }
+        }
+
+        // Independence: each stream's highest sequence reflects only its own count.
+        prop_assert_eq!(
+            btc.journal().last_sequence(),
+            next_btc.checked_sub(1).map(SequenceNumber::new)
+        );
+        prop_assert_eq!(
+            eth.journal().last_sequence(),
+            next_eth.checked_sub(1).map(SequenceNumber::new)
+        );
     }
 }

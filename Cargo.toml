@@ -15,10 +15,23 @@ include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
 [dependencies]
 # Upstream matching stack. `option-chain-orderbook` re-exports the boundary
 # newtypes (`OrderId`, `Side`, `Price`, `Quantity`, `TimeInForce`, `TimestampMs`,
-# `Hash32`, `InstrumentStatus`) and owns the `SymbolParser` grammar. Default
-# features are empty upstream; the `sequencer` feature is deliberately NOT
-# enabled here (it lands with the order path in a later issue).
-option-chain-orderbook = "0.7"
+# `Hash32`, `InstrumentStatus`) and owns the `SymbolParser` grammar. The
+# `sequencer` feature is enabled from #006 (the single-writer order path): it
+# activates the upstream `dep:tokio` (`rt` + `sync`) and `orderbook-rs/journal`,
+# which pulls `crc32fast` 1.5 and `memmap2` 0.9 into the tree (the upstream
+# on-disk journal machinery). #006 does not use that machinery — it builds the
+# venue's own write-ahead envelope journal — but the feature makes the upstream
+# sequencer / `MassCancelScope` / `MassCancelType` types reachable for the
+# matching wiring in #007, and the audit note is recorded now.
+option-chain-orderbook = { version = "0.7", features = ["sequencer"] }
+# The async runtime for the per-underlying single-writer actor (#006): the
+# bounded `mpsc` mailbox, the `oneshot` receipts, and the spawned actor task.
+# `fauxchange` is async-first on `tokio` by design (CLAUDE.md; `rules` mandates
+# `tokio::sync` primitives). Lean feature set — `rt` (the current-thread runtime
+# + `spawn`), `sync` (`mpsc` / `oneshot`), and `macros` (`#[tokio::test]`); the
+# `sequencer` feature above already activates tokio `rt` + `sync`, so this adds
+# only the `macros` proc-macro to the tree. MIT, maintained by the tokio project.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
 # Needed directly only to name `OptionStyle` / `ExpirationDate`: upstream
 # `option-chain-orderbook` v0.7.0 does not re-export them, so they must come
 # from `optionstratlib` at the seam. `default-features = false` keeps the build
@@ -32,6 +45,14 @@ optionstratlib = { version = "0.17", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+# Structured logging for the actor lifecycle and its degraded paths — the venue
+# logs through `tracing` exclusively (never `println!` / `log`), per CLAUDE.md
+# and `rules/global_rules.md`. #006 is the first issue to emit events (actor
+# stopped, a dropped write on a reused/sealed sequence, a sequencer write that
+# cannot proceed). Version `0.1` is already resolved transitively via the
+# upstream stack, so this direct dependency adds NO new version to the tree.
+# MIT, maintained by the tokio project.
+tracing = "0.1"
 # OpenAPI schema derivation: `ToSchema` on every REST/WS DTO and on the shared
 # error envelopes, so #013 can register them in the OpenAPI document. Version 5
 # (`5.5.0`) is already resolved transitively via the upstream stack, so this
@@ -43,3 +64,7 @@ utoipa = "5"
 [dev-dependencies]
 proptest = "1"
 serde_json = "1"
+# Multi-threaded runtime for the actor's concurrent-submit ordering test
+# (`#[tokio::test(flavor = "multi_thread")]`); additive to the `[dependencies]`
+# tokio features above.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
