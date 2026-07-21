@@ -34,7 +34,10 @@ use fauxchange::exchange::{
     PositionLeg, PositionsStore, SequenceNumber, SignedCents, Symbol, TopOfBook, UnderlyingActor,
     VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
 };
-use fauxchange::exchange::{Hash32, STPMode, Side as SeamSide, TimeInForce as SeamTif};
+use fauxchange::exchange::{
+    Hash32, OptionStyle, STPMode, Side as SeamSide, TimeInForce as SeamTif,
+};
+use fauxchange::market_maker::{QuoteInput, Quoter};
 use fauxchange::subscription::OrderbookSubscriptionManager;
 use fauxchange::{
     AccountId, ClientOrderId, ExecutionId, LiquidityFlag, Order, OrderStatus, OrderType,
@@ -698,5 +701,106 @@ proptest! {
         let unrealized = i128::from(position.unrealized_pnl.map(SignedCents::get).unwrap_or(0));
         let total_mtm = expected_cash + expected_net * i128::from(mark);
         prop_assert_eq!(realized + unrealized, total_mtm);
+    }
+}
+
+// ============================================================================
+// Market-maker persona quoting (#015)
+// ============================================================================
+//
+// - `mm_persona_spread_widens_with_multiplier` — a wider `spread_multiplier`
+//   never narrows the quoted spread (the clamp knob is honoured monotonically).
+// - `mm_persona_skew_shifts_symmetric` — directional skew is a same-signed
+//   PARALLEL shift of bid and ask (the spread width is preserved), across the
+//   clamp range `[-1.0, 1.0]`.
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 1024, max_shrink_iters: 50_000, ..ProptestConfig::default() })]
+
+    /// A wider spread multiplier (within `[0.1, 10.0]`) must not narrow the
+    /// quoted spread — the persona knob is honoured monotonically.
+    #[test]
+    fn mm_persona_spread_widens_with_multiplier(
+        spot in 100_000u64..10_000_000,
+        strike_ratio in 70u64..130,
+        days in 1.0f64..365.0,
+        iv in 0.05f64..1.5,
+        m_lo in 0.1f64..5.0,
+        m_delta in 0.0f64..4.9,
+        is_call in any::<bool>(),
+    ) {
+        let strike = (spot.saturating_mul(strike_ratio) / 100).max(1);
+        let m_hi = (m_lo + m_delta).min(10.0);
+        let style = if is_call { OptionStyle::Call } else { OptionStyle::Put };
+        let quoter = Quoter::default();
+        let input = |mult| QuoteInput {
+            spot_cents: spot,
+            strike_cents: strike,
+            days_to_expiry: days,
+            style,
+            spread_multiplier: mult,
+            size_scalar: 1.0,
+            directional_skew: 0.0,
+            iv: Some(iv),
+        };
+        if let (Some(narrow), Some(wide)) =
+            (quoter.generate_quote(&input(m_lo)), quoter.generate_quote(&input(m_hi)))
+        {
+            let narrow_spread = narrow.ask_price.get() - narrow.bid_price.get();
+            let wide_spread = wide.ask_price.get() - wide.bid_price.get();
+            prop_assert!(
+                wide_spread >= narrow_spread,
+                "a wider multiplier must not narrow the spread: {wide_spread} < {narrow_spread}"
+            );
+        }
+    }
+
+    /// Directional skew shifts the bid and the ask by the SAME signed amount
+    /// (a parallel shift that preserves the spread width), across `[-1.0, 1.0]`.
+    #[test]
+    fn mm_persona_skew_shifts_symmetric(
+        spot in 1_000_000u64..10_000_000,
+        strike_ratio in 90u64..110,
+        days in 20.0f64..365.0,
+        iv in 0.2f64..1.0,
+        skew in -1.0f64..1.0,
+        is_call in any::<bool>(),
+    ) {
+        let strike = (spot.saturating_mul(strike_ratio) / 100).max(1);
+        let style = if is_call { OptionStyle::Call } else { OptionStyle::Put };
+        let quoter = Quoter::default();
+        // A wide multiplier + a large near-ATM theo keep both legs comfortably
+        // above their floors, so the parallel shift is not clipped.
+        let input = |sk| QuoteInput {
+            spot_cents: spot,
+            strike_cents: strike,
+            days_to_expiry: days,
+            style,
+            spread_multiplier: 10.0,
+            size_scalar: 1.0,
+            directional_skew: sk,
+            iv: Some(iv),
+        };
+        if let (Some(neutral), Some(skewed)) =
+            (quoter.generate_quote(&input(0.0)), quoter.generate_quote(&input(skew)))
+        {
+            // Only assert when neither floor clipped a leg (large theo case).
+            prop_assume!(neutral.bid_price.get() > 1 && skewed.bid_price.get() > 1);
+            prop_assume!(
+                skewed.ask_price.get() > skewed.bid_price.get() + 1
+                    && neutral.ask_price.get() > neutral.bid_price.get() + 1
+            );
+            let bid_shift = skewed.bid_price.get() as i128 - neutral.bid_price.get() as i128;
+            let ask_shift = skewed.ask_price.get() as i128 - neutral.ask_price.get() as i128;
+            prop_assert_eq!(
+                bid_shift, ask_shift,
+                "skew must shift bid and ask by the same signed amount"
+            );
+            // The spread width is preserved under the parallel shift.
+            prop_assert_eq!(
+                skewed.ask_price.get() - skewed.bid_price.get(),
+                neutral.ask_price.get() - neutral.bid_price.get()
+            );
+        }
     }
 }

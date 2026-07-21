@@ -493,18 +493,34 @@ impl OrderbookSubscriptionManager {
             return None;
         };
 
+        // Market-maker requotes do NOT emit an `orderbook_delta` — they land in
+        // the next periodic snapshot (Backend semantics kept,
+        // [02 §6](../docs/02-matching-architecture.md)). The rule keys on the
+        // venue-reserved market-maker identity the #015 engine tags its
+        // `AddOrder`/`CancelOrder` with ([`crate::exchange::is_market_maker_command`]).
+        // The marker is a venue-wide contract that lives in the domain core, so
+        // this service reads it DOWNWARD from `crate::exchange`, never sideways
+        // from the market-maker domain peer. The book effect is still folded into
+        // the aggregate so a snapshot reflects the maker's resting liquidity, and
+        // any fill/trade prints below still fire (a fill is a real print, not a
+        // book delta).
+        let is_market_maker = crate::exchange::is_market_maker_command(&event.command);
+
         // Fold the book effect under the instrument's shard guard, assigning the
-        // next `instrument_sequence` only when the book actually changed. The
-        // guard is released before any `broadcast::send` (send is non-blocking, so
-        // no lock is held across a stall).
+        // next `instrument_sequence` only when the book actually changed AND the
+        // mutation was user-driven. The guard is released before any
+        // `broadcast::send` (send is non-blocking, so no lock is held across a
+        // stall).
         let (sequence, changes) = {
             let mut state = self
                 .instruments
                 .entry(symbol.clone())
                 .or_insert_with(InstrumentState::new);
             let changes = state.apply(&event.command, &event.outcome);
-            if changes.is_empty() {
-                (state.sequence, changes)
+            if changes.is_empty() || is_market_maker {
+                // No delta and no sequence bump for a requote (or a book no-op);
+                // the aggregate was still updated above so snapshots stay correct.
+                (state.sequence, Vec::new())
             } else {
                 // Checked, never wrapping: the market-data sequence is a protocol
                 // counter. `u64::MAX` is unreachable (2^64 mutations per

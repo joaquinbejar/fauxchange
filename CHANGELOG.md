@@ -11,6 +11,48 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The market maker on the sequenced order path — `MarketMakerEngine` /
+  `OptionPricer` / `Quoter`** (#15) in `src/market_maker/`
+  ([015](milestones/v0.1-backend-core/015-market-maker-on-sequenced-path.md),
+  [02 §4](docs/02-matching-architecture.md),
+  [specs §3](docs/specs/option-chain-orderbook-backend.md#3-market-maker)). The
+  Backend market maker is ported as the persona substrate with the `fauxchange`
+  seam wired in: a requote is a **journaled `VenueCommand`, not a side channel**.
+  A price update triggers `update_price → requote_symbol → update_quote`, which
+  cancels the stale two-sided quote and adds a fresh one **through a
+  `CommandSink`** onto the same per-underlying single-writer actor + journal as
+  client orders — never a direct book call — so generated liquidity is part of
+  the determinism oracle and replays exactly. Every requote order carries the
+  venue-reserved market-maker identity (`market_maker_account()` /
+  `MARKET_MAKER_OWNER`) so fills attribute to the maker and the WS subscription
+  manager **suppresses the `orderbook_delta` for a requote** (MM liquidity lands
+  in the next periodic snapshot; the rule keys on `is_market_maker_command`).
+  **Options math goes entirely through `optionstratlib`** — `OptionPricer` builds
+  an `optionstratlib::Options` and calls `optionstratlib::pricing::black_scholes`
+  for the theoretical value and the `optionstratlib::greeks::Greeks` trait for
+  `delta`/`gamma`/`vega`/`theta` (no hand-rolled Black-Scholes or Greeks; the
+  Backend's `erf`/`norm_cdf` pricer is dropped). The **`f64` boundary is guarded**
+  end-to-end: a non-finite/degenerate input yields `None`, never a poisoned
+  value into a `QuoteParams`, an `AddOrder`, or a broadcast; money stays integer
+  cents on the surface. **Determinism**: time-to-expiry is derived from the
+  **venue clock** (`set_venue_now_ms`), never the wall clock, so
+  `generate_quote` is a pure function of its `QuoteInput`. The persona knobs
+  (`MarketMakerConfig { enabled, spread_multiplier, size_scalar,
+  directional_skew }`) are clamped to `[0.1,10.0]` / `[0.0,1.0]` / `[-1.0,1.0]`
+  with NaN-rejecting `validate_control_value`; every clamp change ends in a
+  requote + a `ConfigChanged` broadcast. Also: the kill switch
+  (`set_enabled`/`set_symbol_enabled`, `cancel_all_orders`/`cancel_symbol_orders`),
+  the `on_order_filled` edge calc (`calculate_edge`, integer & overflow-safe),
+  the bounded `MarketMakerEvent` broadcast (`subscribe()`), and the **replay-mute
+  hook** (`set_muted` — a muted engine records prices but cascades no live
+  requote, so the v0.3 replay driver's journaled requotes are never duplicated).
+  Wired into `AppState` (replacing the `MarketMakerPlaceholder`) via an
+  `ActorCommandSink` over the per-underlying actor handles; the requote loop runs
+  off the client order path (a slow requote never inflates a client `AddOrder`'s
+  latency). Venue-global `MarketMakerControl` routing through `AppState::submit`
+  stays a documented control-plane seam — the engine and its setters are ready
+  for it, but `submit` still declines a `MarketMakerControl` as not
+  per-underlying-routable.
 - **The WebSocket surface — the `WsMessage` protocol, channel producers, and the
   subscription manager** (#14) in `src/gateway/ws/` + the new `src/subscription.rs`
   service module ([03 §4, §4.1, §4.2](docs/03-protocol-surfaces.md),

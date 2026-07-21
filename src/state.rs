@@ -56,7 +56,7 @@
 //! | `auth`          | [`AuthService`] (real)             | #011/#012 |
 //! | `accounts`      | [`AccountRegistry`] (real)         | #012      |
 //! | `subscriptions` | [`crate::subscription::OrderbookSubscriptionManager`] (real) | #014 |
-//! | `market_maker`  | [`MarketMakerPlaceholder`]        | #015      |
+//! | `market_maker`  | [`crate::market_maker::MarketMakerEngine`] (real) | #015 |
 //! | `simulator`     | [`SimulatorPlaceholder`]          | #016      |
 
 use std::collections::HashMap;
@@ -75,6 +75,7 @@ use crate::exchange::{
     MarkPriceBook, MassCancelScope, Receipt, StoreFanOut, TeeFanOut, VenueCommand,
     spawn_matching_actor_with_registry_and_index,
 };
+use crate::market_maker::{ActorCommandSink, MarketMakerEngine, Quoter};
 use crate::models::AccountId;
 // The WebSocket market-data SERVICE (#014) — a `crate::subscription` service (a
 // sibling of `crate::auth` / `crate::ohlc`), NOT a gateway. `AppState` owns the
@@ -104,10 +105,6 @@ pub const DEFAULT_LINEAGE_TOKEN: &str = "fauxchange";
 // ============================================================================
 // Service placeholders — stable field types for #014–#016
 // ============================================================================
-
-/// Placeholder for the market-maker engine handle — filled by **#015**.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct MarketMakerPlaceholder;
 
 /// Placeholder for the price simulator handle — filled by **#016**.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -339,8 +336,10 @@ pub struct AppState {
     /// broadcast + per-instrument `instrument_sequence` service every `/ws`
     /// connection reads, fed post-journal by each actor's [`WsFanOut`].
     subscriptions: Arc<OrderbookSubscriptionManager>,
-    /// The market-maker engine handle (placeholder until #015).
-    market_maker: MarketMakerPlaceholder,
+    /// The market-maker engine (real as of #015): the price → requote pipeline
+    /// that routes every generated quote onto the sequenced order path through
+    /// an [`ActorCommandSink`] over the same per-underlying actors.
+    market_maker: Arc<MarketMakerEngine>,
     /// The price simulator handle (placeholder until #016).
     simulator: SimulatorPlaceholder,
 }
@@ -477,6 +476,17 @@ impl AppState {
             handles.insert(ticker, handle);
         }
 
+        // The market-maker engine (#015): its requotes enter the SAME per-underlying
+        // actors as client orders, through an `ActorCommandSink` over cloned actor
+        // handles — so generated liquidity is journaled and replayable, never a
+        // direct book mutation. The sink's forwarder task is detached (its lifetime
+        // is the `AppState`'s, like the actors').
+        let market_maker = Arc::new(MarketMakerEngine::new(
+            ActorCommandSink::new(handles.clone()),
+            lineage_id.clone(),
+            Quoter::default(),
+        ));
+
         tracing::info!(
             underlyings = handles.len(),
             accounts = account_registry.account_count(),
@@ -495,7 +505,7 @@ impl AppState {
             auth: auth_service,
             bootstrap_gate,
             subscriptions,
-            market_maker: MarketMakerPlaceholder,
+            market_maker,
             simulator: SimulatorPlaceholder,
         }))
     }
@@ -715,10 +725,20 @@ impl AppState {
         &self.subscriptions
     }
 
-    /// The market-maker engine handle (placeholder until #015).
+    /// The market-maker engine (real as of #015) — the price → requote pipeline
+    /// whose generated quotes route onto the sequenced order path, the kill
+    /// switch, the clamped persona knobs, and the [`MarketMakerEvent`] broadcast.
+    ///
+    /// The venue-global market-maker control plane (`MarketMakerControl` routing:
+    /// kill / enable / clamp changes applied to this engine and journaled) is a
+    /// later control-plane issue; [`AppState::submit`] still declines a
+    /// `MarketMakerControl` as not per-underlying-routable. Operators reach the
+    /// engine's setters directly through this handle.
+    ///
+    /// [`MarketMakerEvent`]: crate::market_maker::MarketMakerEvent
     #[must_use]
     #[inline]
-    pub fn market_maker(&self) -> &MarketMakerPlaceholder {
+    pub fn market_maker(&self) -> &Arc<MarketMakerEngine> {
         &self.market_maker
     }
 
