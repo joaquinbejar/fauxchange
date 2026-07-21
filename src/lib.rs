@@ -58,6 +58,31 @@
 //! No module outside `gateway/` reaches into another gateway's
 //! internals, and nothing in `src/` imports back from this crate root —
 //! see `CLAUDE.md` "Module Boundaries" for the enforced rules.
+//!
+//! ## Determinism — the bounded, testable guarantee
+//!
+//! Determinism is `fauxchange`'s product, stated as a **bounded contract**, not a
+//! byte-for-byte promise the dependencies cannot keep. Given the **same journal**
+//! (the `venue.v1` `VenueEvent` stream, including the `MarketMakerControl` /
+//! `Clock` / `SimStep` commands), the **same config manifest** (seed, clock mode,
+//! microstructure config, instrument seed), and the **same pinned crate/dependency
+//! versions**, a replay reproduces **identical fills, events, and resting book
+//! state per underlying**, judged by *ordered `VenueEvent`-stream equality per
+//! underlying* — top-of-book after each event is a cheap witness. Replay and
+//! recovery share **one algorithm**: re-execution with the stored event as the
+//! integrity oracle, always into a **fresh** registry.
+//!
+//! Excluded from the oracle, recomputed live and **never asserted equal**: mark
+//! price, unrealised P&L, Greeks, and any derived analytic float; process-global
+//! numeric registry ids (the canonical symbol string is the identity); the engine
+//! clock and its `Uuid::new_v4()` trade-id namespace; cross-underlying interleaving
+//! (there is no venue-wide total order); out-of-sequencer state (an admin snapshot
+//! restore starts a new journal lineage — it is not a replay input); and OHLC bars
+//! (an exclusion **by derivation** — the same fills reproduce the same bars). The
+//! synthetic price **walk** is reproduced from the journal, **not** by seed
+//! regeneration (the `optionstratlib` sampler owns its own RNG); every stored
+//! expiry is an absolute `ExpirationDate::DateTime`. The guarantee and its full
+//! exclusion index are enforced by the `tests/determinism.rs` oracle.
 
 pub mod auth;
 pub mod config;
