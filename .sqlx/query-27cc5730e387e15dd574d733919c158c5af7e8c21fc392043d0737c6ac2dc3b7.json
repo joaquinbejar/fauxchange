@@ -1,0 +1,197 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                execution_id, order_id, account, symbol, instrument, side, liquidity,\n                quantity, price_cents, fee_cents, theo_value_cents, edge_cents,\n                underlying_sequence, latency_us, executed_at_ms\n            FROM executions\n            WHERE execution_id = $1 AND account = $2\n            ORDER BY CASE liquidity WHEN 'taker' THEN 0 ELSE 1 END\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "execution_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "execution_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "order_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "order_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "account",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "account"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "symbol",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "symbol"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "instrument",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "instrument"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "side",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "side"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "liquidity",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "liquidity"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "quantity",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "quantity"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "price_cents",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "price_cents"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "fee_cents",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "fee_cents"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "theo_value_cents",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "theo_value_cents"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "edge_cents",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "edge_cents"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "underlying_sequence",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "underlying_sequence"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "latency_us",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "latency_us"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "executed_at_ms",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "executions",
+            "name": "executed_at_ms"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "27cc5730e387e15dd574d733919c158c5af7e8c21fc392043d0737c6ac2dc3b7"
+}

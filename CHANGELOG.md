@@ -11,6 +11,60 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **The optional `sqlx`/PostgreSQL persistence layer — a durable executions
+  backend behind the v0.1 store contract** (#23) in `src/db/`, `migrations/`,
+  and `.sqlx/`, wired into `src/main.rs` and `AppState`
+  ([023](milestones/v0.2-packaging/023-optional-pg-persistence.md),
+  [06 §6](docs/06-deployment.md#6-persistence),
+  [05 §4.1](docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable),
+  [08 §7](docs/08-threat-model.md#7-secrets-handling)). Persistence is
+  **optional** and selected at **runtime**, not by a cargo feature: with
+  `DATABASE_URL` unset the venue is fully in-memory; with it set, `main.rs`
+  opens a `PgPool` and runs `sqlx::migrate!("./migrations")` at boot — one
+  binary, both modes. The `sqlx` dependency (`0.9.0`, matching `sqlx-cli`) uses
+  the `runtime-tokio` + `tls-rustls-ring` (ring-backed rustls, no OpenSSL/C) +
+  `postgres` + `macros` + `migrate` features; pool size and the slow-`acquire`
+  warning threshold come from a new `[persistence]` config surface
+  (`FAUXCHANGE_DB_MAX_CONNECTIONS` / `FAUXCHANGE_DB_SLOW_ACQUIRE_MS`), never
+  hard-coded. `PgExecutionsStore` implements the **same** #8 `ExecutionsStore`
+  trait as the in-memory backend, and `select_executions_store(db)` returns
+  whichever backend behind that one contract. **Scope, stated honestly:** in
+  #23 the durable store is migration-verified and parity-tested through the #8
+  contract (`tests/db.rs`), but the **live single-writer actor fan-out still
+  writes and reads the in-memory store** — `AppState` does not yet route live
+  fills through the PG backend, so with `DATABASE_URL` set live executions do
+  **not** persist to Postgres yet. Promoting the durable store onto the live
+  fan-out is coupled to the sync→async single-writer rewire + the durable
+  journal/recovery (v0.3, #29). Every query is a **compile-time-checked**
+  `sqlx::query!` / `query_as!`
+  with bound parameters (`$1, $2, …`); no value or identifier is ever
+  interpolated. Cents persist as `BIGINT` (`i64`) — lossless because
+  `MAX_PRICE_CENTS` bounds them (no `f64` money). Migrations are timestamp-
+  prefixed and immutable once merged: `executions` (the authoritative fill log,
+  the only table with read/write code here), plus the `underlying_prices` /
+  `market_maker_configs` / `system_control` / `accounts` **schema skeletons**
+  (grounded in the #12 `Account` / `Credentials` model — `id`, `owner`,
+  `permissions`, the Argon2id `password_hash` **never plaintext**,
+  `fix_username`, the comp-id binding, `revocation_epoch`; their read/write
+  code lands with the surfaces that own them, #24). `sqlx::Error` is mapped to
+  a typed `DbError` carrying only a non-secret label and **never leaked through
+  a `pub` signature** (`DbError` → `StoreError::Backend` for the store contract
+  and → a redacted internal `VenueError`); the `DATABASE_URL` is never logged.
+  **The durable command journal is NOT built here** — it stays in-memory, and
+  journal-backed recovery is v0.3 (#29): this layer supplies the durable
+  executions backend + the config/account tables (behind the #8 contract, not
+  yet on the live fan-out; see above), but book/fold state is not recovered on
+  restart, so **a restart without an admin snapshot is a fresh venue**
+  (documented, not silently implied). Positions are a derived fold —
+  **not** persisted (no PG positions store). The committed `.sqlx/` offline
+  data lets every non-DB CI job (and the release build) compile **offline**
+  (`SQLX_OFFLINE=true`); a new **`migrations`** CI job runs the migrations + the
+  DB integration test against a real ephemeral `postgres:18-alpine` via
+  `testcontainers` (an `#[ignore]`-gated `tests/db.rs` test proving durable ≡
+  in-memory backend parity behind one contract; the default `cargo test` suite
+  stays green WITHOUT Docker). `deny.toml` gains `CDLA-Permissive-2.0` (the
+  Mozilla CA-bundle license from `webpki-roots`, via the rustls TLS stack) to
+  its allow-list, with a justification; `cargo audit` / `cargo deny` stay green.
 - **The layered venue config surface — file + env + CLI with
   `deny_unknown_fields`** (#22) in `src/config.rs`, wired into `src/main.rs`,
   with a new `.env.example` and a `config_validate_rejects_out_of_range`

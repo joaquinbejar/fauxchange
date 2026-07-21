@@ -76,6 +76,15 @@ allow = [
     "Unlicense",       # aho-corasick, csv, memchr, same-file, walkdir
     "Zlib",            # bytemuck, safe_arch, wide, zlib-rs
     "bzip2-1.0.6",     # libbz2-rs-sys (via zip -> bzip2, permissive BSD-style)
+    # webpki-roots 1.0.x — the Mozilla trusted-CA root bundle pulled by the sqlx
+    # `tls-rustls-ring` feature (#023). CDLA-Permissive-2.0 (Community Data License
+    # Agreement — Permissive 2.0) is the license the Mozilla CA *data set* ships
+    # under: a permissive, MIT-compatible data license with no copyleft / share-
+    # alike obligation. It covers the embedded CA certificate DATA, not code, and
+    # the crate's own Rust code is MPL-2.0-free / permissive. Present only on the
+    # durable-persistence path's TLS stack; verified via `cargo deny list` as the
+    # sole carrier. Re-check if rustls/webpki-roots relicenses.
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA bundle, via sqlx tls-rustls-ring)
 ]
 confidence-threshold = 0.8
 

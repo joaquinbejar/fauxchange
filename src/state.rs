@@ -68,6 +68,7 @@ use crate::auth::{
     AccountProvision, AccountRegistry, AccountStore, Argon2Hasher, AuthError, AuthService,
     BootstrapGate, DEFAULT_RATE_LIMIT_PER_WINDOW, JwtAuth, RateLimiter, RevocationOracle,
 };
+use crate::db::DatabasePool;
 use crate::error::VenueError;
 use crate::exchange::{
     ActorConfig, ActorHandle, EventTimestamp, ExecutionsStore, FixedClock, InMemoryExecutionsStore,
@@ -228,6 +229,10 @@ pub struct AppStateConfig {
     pub assets: Vec<AssetConfig>,
     /// The simulation-wide parameters (cadence, horizon, virtual clock).
     pub simulation: SimulationConfig,
+    /// The **optional** durable persistence pool (#023) — `None` (the default) is
+    /// the fully in-memory venue; `Some` is the durable path
+    /// (`DATABASE_URL` set), opened + migrated at boot by `main.rs` and passed in.
+    pub db: Option<DatabasePool>,
 }
 
 impl AppStateConfig {
@@ -245,7 +250,17 @@ impl AppStateConfig {
             auth: None,
             assets: Vec::new(),
             simulation: SimulationConfig::default(),
+            db: None,
         }
+    }
+
+    /// Sets the optional durable persistence pool (#023). `None` (the default)
+    /// keeps the fully in-memory venue; `Some` is the durable path, opened +
+    /// migrated at boot before this call.
+    #[must_use]
+    pub fn with_db(mut self, db: Option<DatabasePool>) -> Self {
+        self.db = db;
+        self
     }
 
     /// Overrides the run lineage.
@@ -361,6 +376,14 @@ pub struct AppState {
     /// [`PriceSimulator::step_once`](crate::simulation::PriceSimulator::step_once)
     /// or [`PriceSimulator::spawn`](crate::simulation::PriceSimulator::spawn).
     simulator: Arc<PriceSimulator>,
+    /// The **optional** durable persistence pool (#023). `None` when
+    /// `DATABASE_URL` is unset (the venue is fully in-memory); `Some` when the
+    /// durable path was opened + migrated at boot. Held so the durable
+    /// executions/config/account repositories reach it; the in-memory
+    /// executions/positions fold above stays the live actor fan-out backend
+    /// (promoting the durable store onto the fan-out is coupled to the v0.3
+    /// journal + recovery, #029).
+    db: Option<DatabasePool>,
 }
 
 impl AppState {
@@ -406,6 +429,7 @@ impl AppState {
             auth,
             assets,
             simulation,
+            db,
         } = config;
 
         // A deterministic fixed clock (`venue_ts` is not the journaled order); the
@@ -523,6 +547,7 @@ impl AppState {
         tracing::info!(
             underlyings = handles.len(),
             accounts = account_registry.account_count(),
+            durable = db.is_some(),
             "AppState assembled; one single-writer actor spawned per underlying"
         );
 
@@ -540,6 +565,7 @@ impl AppState {
             subscriptions,
             market_maker,
             simulator,
+            db,
         }))
     }
 
@@ -644,6 +670,23 @@ impl AppState {
     #[inline]
     pub fn marks(&self) -> &Arc<MarkPriceBook> {
         &self.marks
+    }
+
+    /// The **optional** durable persistence pool (#023) — `Some` on the durable
+    /// path (`DATABASE_URL` set, opened + migrated at boot), `None` for the fully
+    /// in-memory venue. Never `.unwrap()`ed; a durable consumer degrades
+    /// explicitly when it is `None`.
+    #[must_use]
+    #[inline]
+    pub fn db(&self) -> Option<&DatabasePool> {
+        self.db.as_ref()
+    }
+
+    /// Whether the venue is running the durable persistence path.
+    #[must_use]
+    #[inline]
+    pub fn is_persistent(&self) -> bool {
+        self.db.is_some()
     }
 
     /// The venue-wide instrument registry.
@@ -797,6 +840,7 @@ impl std::fmt::Debug for AppState {
             .field("underlyings", &self.underlyings.len())
             .field("lineage_id", &self.lineage_id)
             .field("executions", &self.executions.len())
+            .field("durable", &self.db.is_some())
             .finish_non_exhaustive()
     }
 }

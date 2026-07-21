@@ -8,14 +8,19 @@
 # docs/TESTING.md §12 — a green run here means all of them passed, nothing
 # is skipped to turn the pipeline green.
 #
+# The `migrations` job (added in v0.2 #023) runs the optional PostgreSQL
+# persistence layer's migrations + DB integration test against an ephemeral
+# `postgres:18-alpine` via testcontainers. The non-DB jobs build OFFLINE from the
+# committed `.sqlx/` (top-level `SQLX_OFFLINE: "true"`), so the compile-time
+# `sqlx::query!` macros never need a DB — a query changed without a regenerated
+# `.sqlx/` fails the offline build.
+#
 # Explicitly OUT of this workflow (see
 # milestones/v0.1-backend-core/019-ci-audit-deny-lint.md "Scope"):
 # the `fuzz` job (FIX gateway lands v0.4), the `bench-regression` gate
-# (armed before v1.0), the `migrations` job (lands with the optional
-# PostgreSQL persistence layer, v0.2 #023), and the `docker-smoke` /
-# `image-build` stages (land with the Dockerfile/compose topology and
-# container hardening, v0.2 #025/#026, and the cold-bring-up e2e smoke,
-# v0.2 #027).
+# (armed before v1.0), and the `docker-smoke` / `image-build` stages (land
+# with the Dockerfile/compose topology and container hardening, v0.2
+# #025/#026, and the cold-bring-up e2e smoke, v0.2 #027).
 #
 # `make workflow-<job-id>` (see Makefile) runs any job here locally via
 # `act` — job ids below are the stable contract those targets rely on.
@@ -42,6 +47,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Build the compile-time `sqlx::query!` macros from the committed `.sqlx/`
+  # offline data (#023) — NO database is contacted at build time by any job. The
+  # `migrations` job below still runs the queries against a REAL ephemeral
+  # `postgres:18-alpine` at test RUNTIME (SQLX_OFFLINE only governs compile-time
+  # macro resolution, never runtime connections).
+  SQLX_OFFLINE: "true"
   # The pinned stable toolchain (matches rust-toolchain.toml). Bump both
   # together, deliberately.
   RUST_TOOLCHAIN: "1.97.0"
@@ -190,6 +201,31 @@ jobs:
         with:
           shared-key: parity
       - run: cargo test --test parity --all-features
+
+  # --- Optional PostgreSQL persistence (docs/06 §6, #023) -------------------
+  # Runs the durable persistence layer's migrations + DB integration test
+  # against a REAL ephemeral `postgres:18-alpine`, provisioned by
+  # `testcontainers` (the `#[ignore]`-gated `tests/db.rs` test uses the runner's
+  # host Docker, always present on ubuntu-24.04). The test opens the pool, runs
+  # `sqlx::migrate!("./migrations")`, writes + reads back executions, and asserts
+  # the durable backend serves records IDENTICAL to the in-memory backend behind
+  # the SAME #008 store contract. The crate compiles OFFLINE from the committed
+  # `.sqlx/` (top-level `SQLX_OFFLINE`); only the test RUNTIME touches Postgres.
+  migrations:
+    name: migrations
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: migrations
+      # `--ignored` runs ONLY the Docker-gated DB test; the DB-less test in the
+      # same file already ran in the `test` job. Migrations apply cleanly against
+      # `postgres:18-alpine` inside the test (via `connect_and_migrate`).
+      - run: cargo test --test db --all-features -- --ignored
 
   # --- Supply-chain gate (docs/08-threat-model.md §8) -----------------------
   # Both jobs install the REAL cargo-audit / cargo-deny binaries (pinned
