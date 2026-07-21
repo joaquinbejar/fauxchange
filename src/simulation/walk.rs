@@ -100,13 +100,16 @@ pub enum SimError {
     /// A programmatic override named an underlying the simulator does not host.
     #[error("no such simulated underlying: {0}")]
     UnknownUnderlying(String),
-    /// The deterministic virtual timeline is exhausted — the step counter or the
-    /// virtual clock reached the `u64` ceiling. Unreachable in practice (a
-    /// `2^64`-step / `2^64`-ms horizon), but the simulator fails **closed**
-    /// (halts) rather than emitting a wrapped index or a clamped, non-monotonic
-    /// instant that would corrupt replay (rule 3).
+    /// The deterministic virtual timeline is exhausted — the virtual clock reached
+    /// the `u64` ceiling. Unreachable in practice (a `2^64`-ms horizon), but the
+    /// simulator fails **closed** (halts) rather than emitting a clamped,
+    /// non-monotonic instant that would corrupt replay (rule 3).
     #[error("simulation virtual timeline exhausted")]
     TimelineExhausted,
+    /// Stepped-session chain synthesis (#031) could not materialise the grid — an
+    /// unresolvable expiry or an invalid contract symbol from the upstream grammar.
+    #[error("chain synthesis failed: {0}")]
+    ChainSynthesisFailed(String),
 }
 
 // ============================================================================

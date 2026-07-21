@@ -61,6 +61,7 @@
 pub mod clock;
 pub mod manifest;
 pub mod replay;
+pub mod session;
 pub mod simulator;
 pub mod sink;
 pub mod walk;
@@ -73,6 +74,10 @@ pub use self::manifest::{DEFAULT_MICROSTRUCTURE_FINGERPRINT, DependencyVersions,
 pub use self::replay::{
     JournalStream, RecordingController, ReplayError, ReplayReport, SCENARIO_BUNDLE_SCHEMA,
     ScenarioBundle, UnderlyingReplay, replay_bundle, replay_streams,
+};
+pub use self::session::{
+    DEFAULT_CHAIN_SIZE, DEFAULT_SKEW_SLOPE, DEFAULT_SMILE_CURVE, DEFAULT_SPREAD, SessionConfig,
+    SynthesizedChain, SynthesizedStrike, synthesize_chain,
 };
 pub use self::simulator::{
     AssetConfig, DEFAULT_HORIZON_STEPS, DEFAULT_PRICE_CHANNEL_CAPACITY, DEFAULT_START_MS,

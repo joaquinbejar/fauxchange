@@ -53,7 +53,8 @@ use fauxchange::exchange::{
     VenueOutcome, recover, validate_venue_expiry,
 };
 use fauxchange::simulation::{
-    ClockMode, JournalStream, RunManifest, ScenarioBundle, replay_bundle, replay_streams,
+    ClockMode, JournalStream, RunManifest, ScenarioBundle, SessionConfig, WalkTypeConfig,
+    replay_bundle, replay_streams, synthesize_chain,
 };
 use fauxchange::{AccountId, OrderType, VenueError};
 
@@ -1399,6 +1400,107 @@ fn test_no_wall_clock_read_on_the_sequenced_path() {
         offenders.is_empty(),
         "wall-clock read found on the sequenced path (src/exchange); use the injected \
          venue clock instead: {offenders:?}"
+    );
+}
+
+// ============================================================================
+// #031: stepped synthetic sessions — deterministic synthesis
+// ============================================================================
+//
+// The chain SYNTHESIS (grid + smile-shaped IVs + DateTime expiry + instrument set)
+// is a pure deterministic function of the `SessionConfig` — no clock, no RNG — so
+// the same config yields the byte-identical chain every time (the deterministic
+// half of the v0.3 "advances identically for the same seed" line). The stochastic
+// stepped PRICE PATH is reproduced from the journal (replay), not seed-regenerated
+// — that half is exercised in `tests/integration.rs`
+// (`test_stepped_session_replays_from_the_journal`) via the #030 driver with the
+// live requote engine muted.
+
+/// The deterministic base instant (the venue clock's default virtual epoch).
+const SESSION_BASE_MS: u64 = 1_735_689_600_000;
+
+fn session_config() -> SessionConfig {
+    SessionConfig::new(
+        "BTC",
+        Cents::new(5_000_000),
+        30.0,
+        0.20,
+        WalkTypeConfig::GeometricBrownian,
+    )
+    .with_strike_interval(500)
+    .with_chain_size(7)
+    .with_smile_curve(0.6)
+    .with_skew_slope(-0.2)
+}
+
+#[test]
+fn test_stepped_session_synthesis_is_deterministic_for_the_same_config() {
+    let config = session_config();
+    let a = synthesize_chain(&config, SESSION_BASE_MS).expect("synthesise a");
+    let b = synthesize_chain(&config, SESSION_BASE_MS).expect("synthesise b");
+    assert_eq!(
+        a, b,
+        "the same session config synthesises the identical chain (grid + smile IVs)"
+    );
+
+    // Non-vacuous: the grid materialised, the smile + (negative) skew shaped the
+    // surface — the downside (low) wing is raised — and every expiry is an absolute
+    // DateTime (replay-stable).
+    assert_eq!(a.strikes.len(), 7);
+    let atm = a
+        .strikes
+        .iter()
+        .find(|s| s.strike == 50_000)
+        .expect("ATM strike");
+    let low_wing = a.strikes.first().expect("a downside wing strike");
+    assert!(
+        low_wing.iv > atm.iv,
+        "the smile + negative skew raise the downside-wing IV: {} !> {}",
+        low_wing.iv,
+        atm.iv
+    );
+    assert!(
+        matches!(a.expiration, ExpirationDate::DateTime(_)),
+        "a synthesised expiry is an absolute DateTime"
+    );
+}
+
+#[test]
+fn test_stepped_session_smile_reshapes_with_the_curve_parameter() {
+    // Changing `smile_curve` changes the synthesised surface deterministically —
+    // the parameter shapes the chain (the acceptance line), through optionstratlib.
+    let flat = synthesize_chain(
+        &session_config().with_smile_curve(0.0).with_skew_slope(0.0),
+        SESSION_BASE_MS,
+    )
+    .expect("flat");
+    let smiled = synthesize_chain(
+        &session_config().with_smile_curve(1.2).with_skew_slope(0.0),
+        SESSION_BASE_MS,
+    )
+    .expect("smiled");
+    let flat_wing = flat.strikes.last().expect("wing").iv;
+    let smiled_wing = smiled.strikes.last().expect("wing").iv;
+    assert!(
+        smiled_wing > flat_wing,
+        "a larger smile_curve raises the wing IV: {smiled_wing} !> {flat_wing}"
+    );
+    // The ATM strike is invariant to the smile (m = 0), so only the wings move.
+    let flat_atm = flat
+        .strikes
+        .iter()
+        .find(|s| s.strike == 50_000)
+        .expect("atm")
+        .iv;
+    let smiled_atm = smiled
+        .strikes
+        .iter()
+        .find(|s| s.strike == 50_000)
+        .expect("atm")
+        .iv;
+    assert!(
+        (flat_atm - smiled_atm).abs() < 1e-9,
+        "the ATM IV is smile-invariant"
     );
 }
 

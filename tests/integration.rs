@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use fauxchange::exchange::{Cents, EventTimestamp, VenueCommand};
 use fauxchange::models::{AccountId, VenueOrderId};
-use fauxchange::simulation::{AssetConfig, PriceUpdate, VenueClockConfig, WalkTypeConfig};
+use fauxchange::simulation::{
+    AssetConfig, PriceUpdate, SessionConfig, VenueClockConfig, WalkTypeConfig, synthesize_chain,
+};
 use fauxchange::state::{AppState, AppStateConfig};
 use tokio::sync::broadcast;
 
@@ -132,6 +134,230 @@ async fn test_sequenced_venue_ts_and_price_walk_share_the_one_injected_clock() {
         expected,
         "the SimStep now_ms matches the advanced venue clock"
     );
+}
+
+// ============================================================================
+// #031: stepped synthetic sessions — end to end (in-memory, no Docker)
+// ============================================================================
+
+/// The deterministic virtual epoch the session clock and expiry share.
+const SESSION_START_MS: u64 = 1_735_689_600_000;
+/// One virtual minute per stepped advance.
+const SESSION_STEP_MS: u64 = 60_000;
+
+/// A stepped-clock venue hosting `BTC` as the session's walked underlying.
+fn session_config() -> SessionConfig {
+    SessionConfig::new(
+        "BTC",
+        Cents::new(5_000_000), // $50,000
+        30.0,
+        0.20,
+        WalkTypeConfig::GeometricBrownian,
+    )
+    .with_strike_interval(500)
+    .with_chain_size(5)
+    .with_smile_curve(0.5)
+}
+
+fn session_state(config: &SessionConfig) -> Arc<AppState> {
+    let app_config = AppStateConfig::new(["BTC"])
+        .with_lineage(LineageId::new("run-1"))
+        .with_clock(VenueClockConfig::stepped(SESSION_START_MS, SESSION_STEP_MS))
+        .with_assets(vec![config.to_asset_config()]);
+    match AppState::new(app_config) {
+        Ok(state) => state,
+        Err(e) => panic!("session AppState must build: {e}"),
+    }
+}
+
+/// Bounded wait for the async requote forwarders to drain, so the venue journal is
+/// stable before it is snapshotted (the market-maker's requotes are journaled
+/// off-thread). Polls until the highest journaled sequence holds steady across two
+/// consecutive reads, or the window elapses.
+async fn settle_journal(state: &Arc<AppState>, underlying: &str) {
+    let mut last = None;
+    let mut stable = 0;
+    for _ in 0..400 {
+        let snapshot = state
+            .journal_snapshot(underlying)
+            .await
+            .expect("journal snapshot");
+        let seq = snapshot.last_sequence;
+        if seq == last {
+            stable += 1;
+            if stable >= 3 {
+                return;
+            }
+        } else {
+            stable = 0;
+            last = seq;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test]
+async fn test_stepped_session_synthesises_seeds_and_advances() {
+    let config = session_config();
+    let state = session_state(&config);
+
+    // Chain synthesis: expirations × strikes with the smile-shaped IVs.
+    let chain = synthesize_chain(&config, SESSION_START_MS).expect("synthesise the chain");
+    assert_eq!(chain.strikes.len(), 5);
+
+    // Materialise onto the live venue: register each leaf with its IV + seed the
+    // opening price; the maker's requotes vivify the leaf books.
+    let contracts = state
+        .materialize_session(&chain)
+        .await
+        .expect("materialise the session chain");
+    assert_eq!(contracts, 10, "5 strikes × (call + put) registered");
+
+    // The chain is live: every synthesised contract vivified onto the shared index.
+    let present: std::collections::HashSet<String> =
+        state.symbol_index().symbols().into_iter().collect();
+    for strike in &chain.strikes {
+        assert!(present.contains(strike.call.as_str()), "call leaf vivified");
+        assert!(present.contains(strike.put.as_str()), "put leaf vivified");
+    }
+
+    // Step the session a few times on the stepped clock: each step advances the
+    // venue clock and walks the price, journaled and driving the maker's requotes.
+    for _ in 0..3 {
+        let advance = state.step_session().await;
+        assert!(!advance.is_partial(), "the clock fan-out is complete");
+    }
+    settle_journal(&state, "BTC").await;
+
+    // The venue clock advanced by exactly three stepped intervals.
+    assert_eq!(
+        state.clock().now_ms(),
+        EventTimestamp::new(SESSION_START_MS + 3 * SESSION_STEP_MS),
+        "three stepped advances moved the venue clock deterministically"
+    );
+}
+
+#[tokio::test]
+async fn test_stepped_session_replays_from_the_journal() {
+    // The session's journaled SimStep / Clock commands and the maker's derived
+    // requote AddOrders replay from the journal IDENTICALLY through the #030 driver
+    // (its `Ok` proves every re-derived event equalled the stored one), with the
+    // live requote engine muted by construction (the offline driver never invokes
+    // it, so no cascading duplicate requotes are generated).
+    let config = session_config();
+    let state = session_state(&config);
+    let chain = synthesize_chain(&config, SESSION_START_MS).expect("synthesise");
+    state
+        .materialize_session(&chain)
+        .await
+        .expect("materialise");
+    for _ in 0..3 {
+        state.step_session().await;
+    }
+    settle_journal(&state, "BTC").await;
+
+    // Export the venue journal and replay it offline into a fresh registry.
+    let bundle = state
+        .export_bundle()
+        .await
+        .expect("export the session bundle");
+    let report = state
+        .replay_bundle(&bundle)
+        .await
+        .expect("replay the session");
+
+    let replay = report.underlying("BTC").expect("BTC replay");
+    // No cascade: the reconstructed event count equals the journaled command count
+    // (the driver replays the journaled requotes, never re-deriving them).
+    let journaled_commands = state
+        .journal_snapshot("BTC")
+        .await
+        .expect("snapshot")
+        .records
+        .iter()
+        .filter(|record| record.kind() == RecordKind::Command)
+        .count();
+    assert_eq!(
+        replay.events.len(),
+        journaled_commands,
+        "replay reproduces exactly the journaled commands — no cascading requote"
+    );
+    assert!(
+        replay.events.len() >= 4,
+        "the session journaled a non-trivial stream"
+    );
+
+    // The reconstructed top-of-book for the ATM call matches the live venue's — the
+    // maker's synthetic liquidity is reproduced from the journal.
+    let atm = chain
+        .strikes
+        .iter()
+        .find(|s| s.strike == 50_000)
+        .expect("ATM strike");
+    let live = state
+        .journal_snapshot("BTC")
+        .await
+        .expect("snapshot")
+        .records
+        .iter()
+        .filter(|r| r.kind() == RecordKind::Command)
+        .count();
+    assert_eq!(live, journaled_commands);
+    // The reconstructed book has resting maker liquidity on the ATM call.
+    let top = replay.top_of_book(&atm.call);
+    assert!(
+        top.best_bid.is_some() || top.best_ask.is_some(),
+        "the ATM call carries reconstructed maker liquidity"
+    );
+}
+
+#[tokio::test]
+async fn test_stepped_session_client_order_matches_synthetic_liquidity() {
+    // After chain synthesis the venue is LIVE: a client order matches against the
+    // maker's synthesised liquidity and fills.
+    let config = session_config();
+    let state = session_state(&config);
+    let chain = synthesize_chain(&config, SESSION_START_MS).expect("synthesise");
+    state
+        .materialize_session(&chain)
+        .await
+        .expect("materialise");
+    settle_journal(&state, "BTC").await;
+
+    let atm = chain
+        .strikes
+        .iter()
+        .find(|s| s.strike == 50_000)
+        .expect("ATM strike");
+
+    // An aggressive client BUY crosses the maker's resting ask on the ATM call.
+    let client_buy = VenueCommand::AddOrder {
+        symbol: atm.call.clone(),
+        order_id: VenueOrderId::new("client-1"),
+        account: AccountId::new("client"),
+        owner: Hash32([0x42; 32]),
+        client_order_id: None,
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(100_000_000)), // far above theo → crosses any ask
+        quantity: 1,
+        time_in_force: TimeInForce::Gtc,
+        stp_mode: fauxchange::exchange::STPMode::None,
+    };
+    state.submit(client_buy).await.expect("client buy routes");
+
+    // The client filled against the maker's synthetic liquidity.
+    use fauxchange::exchange::ExecutionFilter;
+    let fills = state
+        .executions()
+        .list(&AccountId::new("client"), &ExecutionFilter::default())
+        .expect("client executions");
+    assert!(
+        !fills.is_empty(),
+        "the client order matched the maker's synthetic liquidity and filled"
+    );
+    assert_eq!(fills[0].instrument, atm.call, "filled on the ATM call");
+    assert!(fills[0].quantity >= 1, "at least one contract filled");
 }
 
 // ============================================================================
