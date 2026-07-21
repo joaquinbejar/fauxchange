@@ -442,4 +442,60 @@ mod tests {
         let error = toml::from_str::<ContractSpecsConfig>("tick_size_cent = 5\n");
         assert!(error.is_err(), "an unknown spec field must be rejected");
     }
+
+    /// Rejection-matrix entry (#49): every out-of-range `[instruments."X".specs]`
+    /// knob is refused at load with a typed [`MicrostructureConfigError`] (folded
+    /// into `ConfigError::Microstructure` at the config seam) — a zero tick, a zero
+    /// lot, and a `max_price_cents` below the `min_price_cents` floor. A degenerate
+    /// spec never reaches a leaf.
+    #[test]
+    fn test_config_rejects_out_of_range_contract_specs() {
+        // A zero tick — an increment must be at least one cent.
+        assert_eq!(
+            ContractSpecsConfig {
+                tick_size_cents: Some(0),
+                ..ContractSpecsConfig::default()
+            }
+            .resolve_over(ResolvedContractSpecs::baseline()),
+            Err(MicrostructureConfigError::SpecKnobZero {
+                field: "tick_size_cents"
+            })
+        );
+
+        // A zero lot — a quantity increment must be at least one contract.
+        assert_eq!(
+            ContractSpecsConfig {
+                lot_size: Some(0),
+                ..ContractSpecsConfig::default()
+            }
+            .resolve_over(ResolvedContractSpecs::baseline()),
+            Err(MicrostructureConfigError::SpecKnobZero { field: "lot_size" })
+        );
+
+        // A `max_price_cents` cap below the `min_price_cents` floor — an empty band.
+        assert_eq!(
+            ContractSpecsConfig {
+                min_price_cents: Some(1_000),
+                max_price_cents: Some(500),
+                ..ContractSpecsConfig::default()
+            }
+            .resolve_over(ResolvedContractSpecs::baseline()),
+            Err(MicrostructureConfigError::MaxPriceBelowMin {
+                min: 1_000,
+                max: 500,
+            })
+        );
+
+        // A zero max order quantity — a per-order cap must admit at least one contract.
+        assert_eq!(
+            ContractSpecsConfig {
+                max_order_qty: Some(0),
+                ..ContractSpecsConfig::default()
+            }
+            .resolve_over(ResolvedContractSpecs::baseline()),
+            Err(MicrostructureConfigError::SpecKnobZero {
+                field: "max_order_qty"
+            })
+        );
+    }
 }

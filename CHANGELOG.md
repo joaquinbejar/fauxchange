@@ -11,6 +11,29 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Scenario failure-mode determinism + the out-of-range knob rejection matrix —
+  the v0.5 capstone** (#49,
+  [05 §11](docs/05-microstructure-config.md#11-determinism-of-microstructure)).
+  Tests-only, no public-surface change. The new `tests/scenario_failure_modes.rs`
+  composes the already-built knobs (#44–#47) into three documented failure modes
+  and proves each reproduces for a fixed descriptor, asserting equality only over
+  the **journaled** artifacts (fills / events / book state per underlying) with
+  mark prices asserted **out of scope as exclusions**: **throttling** (the real
+  `RateLimiter` over a `RateLimitConfig`-derived budget on a fixed venue clock
+  yields the byte-identical allow/deny stream and the `429`/`Retry-After`,
+  reproducibly and seed-independently — it is a gateway boundary control, not a
+  journaled artifact); **halt** (a journaled `SetInstrumentStatus(Halted)` control
+  plus an order into the halted strike is the journaled `Rejected` that replays,
+  reproduced across two independent runs via `export_bundle` → `replay_bundle`);
+  and **wide-spread starvation** (a seeded `wide_skewed` persona rests a finite,
+  wide ladder that starves a taker which a `tight` persona would have filled — the
+  same seed regenerates the identical journaled command stream and starved
+  outcome). Plus a **rejection matrix**: co-located `test_config_rejects_out_of_range_*`
+  unit tests for every microstructure knob (fee bps + the checked-fee-proof bound;
+  latency NaN/negative/`min > max`; the three persona clamps + NaN; tick/lot/
+  `max_price_cents`; non-positive rate-limit window/budget), each a typed
+  `ConfigError` at load, and an extension of the `config_validate_rejects_out_of_range`
+  property test over the full v0.5 knob space (accept **iff** genuinely in range).
 - **DoS-control security-gate suite — the five DoS bounds proven as security
   controls, not merely fairness knobs — the v0.5 security gate** (#48,
   [08 §5](docs/08-threat-model.md#5-denial-of-service-posture)). Tests-only, no

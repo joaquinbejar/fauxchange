@@ -33,7 +33,9 @@
 //!   up here for v0.5 (#44–#47) to extend
 //!   ([022](../milestones/v0.2-packaging/022-config-surface.md)).
 
-use fauxchange::config::{ClockMode, Config, ConfigError, LogFormat};
+use fauxchange::config::{
+    ClockMode, Config, ConfigError, LogFormat, RATE_LIMIT_MAX_WINDOW_SECS, RateLimitConfig,
+};
 use fauxchange::exchange::{
     ActorConfig, CancelReason, CancelledLeg, Cents, CommandExecutor, EventTimestamp,
     ExecutionContext, Fill as VenueFill, FixedClock, InMemoryPositionsStore, InMemoryVenueJournal,
@@ -56,7 +58,13 @@ use fauxchange::gateway::fix::price::{
 };
 use fauxchange::gateway::fix::{DecodedMessage, decode};
 use fauxchange::gateway::rest::support::add_order_command;
-use fauxchange::market_maker::{QuoteInput, Quoter};
+use fauxchange::market_maker::{
+    DIRECTIONAL_SKEW_MAX, DIRECTIONAL_SKEW_MIN, PersonaConfig, QuoteInput, Quoter, SIZE_SCALAR_MAX,
+    SIZE_SCALAR_MIN, SPREAD_MULTIPLIER_MAX, SPREAD_MULTIPLIER_MIN,
+};
+use fauxchange::microstructure::{
+    ContractSpecsConfig, FeeConfig, FileLatency, LatencyModel, ResolvedContractSpecs,
+};
 use fauxchange::simulation::{JournalStream, replay_streams};
 use fauxchange::subscription::OrderbookSubscriptionManager;
 use fauxchange::{
@@ -1004,24 +1012,51 @@ proptest! {
 // Layered config validation (#022)
 // ============================================================================
 //
-// - `config_validate_rejects_out_of_range` — for the v0.2 config knobs (clock
-//   mode, log format, run seed, bind address), the layered validator accepts a
-//   value IFF it is genuinely valid; every other value fails fast with the
-//   matching typed `ConfigError` (never a silent default). Each knob is exercised
-//   independently through the public `Config::load_from` CLI seam (the others
-//   keep their defaults), so a single knob's out-of-range value is isolated from
-//   the fixed validation order. The harness stands up here for v0.5 (#44–#47) to
-//   extend with the microstructure ranges.
+// - `config_validate_rejects_out_of_range` — the config validator accepts a value
+//   IFF it is genuinely valid; every other value fails fast with a typed error,
+//   never a silent default. The v0.2 knobs (clock mode, log format, run seed, bind
+//   address) are exercised through the public `Config::load_from` CLI seam; the
+//   v0.5 microstructure knobs (#44–#47) — fee rates + the checked-fee-proof bound,
+//   latency (delay / sigma / band), the three persona clamps, contract specs
+//   (tick / lot / price band), and rate limits (window / budget) — are exercised
+//   through their public config validators, each of which returns a typed error
+//   (`MicrostructureConfigError` / `LatencyConfigError` / `PersonaError` /
+//   `ConfigError::BadRateLimitValue`) that the config seam folds into the startup
+//   `ConfigError` (#49). Each knob is isolated, so a single out-of-range value is
+//   attributable to that knob alone.
 
 proptest! {
     #![proptest_config(ProptestConfig { cases: 1024, max_shrink_iters: 50_000, ..ProptestConfig::default() })]
 
     #[test]
+    #[allow(clippy::too_many_arguments)]
     fn config_validate_rejects_out_of_range(
         clock_token in "[a-zA-Z]{0,12}",
         log_token in "[a-zA-Z]{0,12}",
         seed_token in "[A-Za-z0-9 +-]{0,24}",
         addr_token in "[A-Za-z0-9.:]{0,24}",
+        maker_bps in any::<i32>(),
+        taker_bps in any::<i32>(),
+        sigma in prop_oneof![Just(f64::NAN), Just(f64::INFINITY), -5.0f64..5.0],
+        band_min in -100i64..100,
+        band_max in -100i64..100,
+        fixed_us in -100i64..100,
+        spread in prop_oneof![Just(f64::NAN), Just(f64::INFINITY), -2.0f64..12.0],
+        size in prop_oneof![Just(f64::NAN), -0.5f64..1.5],
+        skew in prop_oneof![Just(f64::NAN), -2.0f64..2.0],
+        tick in 0u64..8,
+        lot in 0u64..8,
+        max_qty in 0u64..8,
+        min_price in 0u64..2_000,
+        max_price in 0u64..2_000,
+        window_secs in prop_oneof![
+            Just(0u64),
+            1u64..100,
+            Just(RATE_LIMIT_MAX_WINDOW_SECS),
+            (RATE_LIMIT_MAX_WINDOW_SECS + 1)..=(RATE_LIMIT_MAX_WINDOW_SECS + 100),
+            any::<u64>(),
+        ],
+        budget in 0u32..200,
     ) {
         // The env layer is always empty; each knob is overridden via one CLI flag
         // so the others keep their valid defaults and cannot mask this knob.
@@ -1108,6 +1143,102 @@ proptest! {
                     )));
                 }
             },
+        }
+
+        // ---- #049 v0.5 microstructure knobs: accept IFF genuinely in range ----
+        // Each validator returns a typed error, so `is_ok() == valid` proves both
+        // "accepts no out-of-range value" and "reject is a typed error".
+
+        // Fee rate: `validate` accepts IFF the taker rate is non-negative.
+        let fee = FeeConfig { maker_bps, taker_bps };
+        prop_assert_eq!(fee.validate().is_ok(), taker_bps >= 0);
+        // Checked-fee proof: the widest admissible notional (u128::MAX) is provable
+        // IFF the schedule charges nothing — any nonzero rate crosses the bound.
+        prop_assert_eq!(
+            fee.validate_notional_bound(u128::MAX).is_ok(),
+            fee.max_abs_bps() == 0,
+        );
+
+        // Latency sigma (normal): accepts IFF finite and non-negative.
+        let normal = FileLatency {
+            model: LatencyModel::Normal,
+            us: None,
+            min_us: None,
+            max_us: None,
+            mean_us: Some(100),
+            median_us: None,
+            sigma: Some(sigma),
+        };
+        prop_assert_eq!(normal.resolve().is_ok(), sigma.is_finite() && sigma >= 0.0);
+
+        // Latency uniform band: accepts IFF both delays non-negative and min <= max.
+        let uniform = FileLatency {
+            model: LatencyModel::Uniform,
+            us: None,
+            min_us: Some(band_min),
+            max_us: Some(band_max),
+            mean_us: None,
+            median_us: None,
+            sigma: None,
+        };
+        prop_assert_eq!(
+            uniform.resolve().is_ok(),
+            band_min >= 0 && band_max >= 0 && band_min <= band_max,
+        );
+
+        // Latency fixed delay: accepts IFF non-negative.
+        let fixed = FileLatency {
+            model: LatencyModel::Fixed,
+            us: Some(fixed_us),
+            min_us: None,
+            max_us: None,
+            mean_us: None,
+            median_us: None,
+            sigma: None,
+        };
+        prop_assert_eq!(fixed.resolve().is_ok(), fixed_us >= 0);
+
+        // Persona clamps: accepts IFF all three knobs in range (`contains` rejects
+        // NaN/±Inf, matching `validate_control_value` exactly).
+        let persona_valid = (SPREAD_MULTIPLIER_MIN..=SPREAD_MULTIPLIER_MAX).contains(&spread)
+            && (SIZE_SCALAR_MIN..=SIZE_SCALAR_MAX).contains(&size)
+            && (DIRECTIONAL_SKEW_MIN..=DIRECTIONAL_SKEW_MAX).contains(&skew);
+        prop_assert_eq!(
+            PersonaConfig::try_new(100, 10, spread, size, skew).is_ok(),
+            persona_valid,
+        );
+
+        // Contract specs: accepts IFF tick/lot/max_qty >= 1 and max_price >= min_price >= 1.
+        let specs = ContractSpecsConfig {
+            tick_size_cents: Some(tick),
+            lot_size: Some(lot),
+            min_price_cents: Some(min_price),
+            max_price_cents: Some(max_price),
+            max_order_qty: Some(max_qty),
+        };
+        prop_assert_eq!(
+            specs.resolve_over(ResolvedContractSpecs::baseline()).is_ok(),
+            tick >= 1 && lot >= 1 && max_qty >= 1 && min_price >= 1 && max_price >= min_price,
+        );
+
+        // Rate limits: accepts IFF 1 <= window <= ceiling and budget >= 1; every
+        // reject is the crate-level typed `ConfigError::BadRateLimitValue`.
+        let rate_limits = RateLimitConfig {
+            window_secs,
+            read_per_window: budget,
+            trade_per_window: budget,
+            admin_per_window: budget,
+        };
+        let rate_limits_valid =
+            (1..=RATE_LIMIT_MAX_WINDOW_SECS).contains(&window_secs) && budget >= 1;
+        match rate_limits.validate() {
+            Ok(()) => prop_assert!(rate_limits_valid),
+            Err(ConfigError::BadRateLimitValue { .. }) => prop_assert!(!rate_limits_valid),
+            Err(other) => {
+                return Err(TestCaseError::fail(format!(
+                    "a rate-limit reject must be BadRateLimitValue, got {other:?}"
+                )));
+            }
         }
     }
 }

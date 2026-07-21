@@ -270,4 +270,55 @@ mod tests {
             other => panic!("expected FeeBoundUnprovable, got {other:?}"),
         }
     }
+
+    /// Rejection-matrix entry (#49): the `[microstructure.fees]` knobs are refused
+    /// at load for every out-of-range shape — a negative taker rate, a fee whose
+    /// widest notional would reach the upstream saturating branch (beyond the
+    /// checked-fee-proof bound), and a fee whose worst-case magnitude would not fit
+    /// the persisted `i64` cents. Each is a typed [`MicrostructureConfigError`]
+    /// (folded into `ConfigError::Microstructure` at the config seam), never a
+    /// silent acceptance.
+    #[test]
+    fn test_config_rejects_out_of_range_fee_bps() {
+        // A negative taker rate — the upstream `FeeSchedule` contract forbids it.
+        assert_eq!(
+            FeeConfig {
+                maker_bps: -10,
+                taker_bps: -1,
+            }
+            .validate(),
+            Err(MicrostructureConfigError::TakerFeeNegative { taker_bps: -1 })
+        );
+
+        // A fee rate so large the widest notional passes the checked-fee-proof
+        // bound (part A): the saturating branch would be reachable — refused.
+        let saturating = FeeConfig {
+            maker_bps: 0,
+            taker_bps: i32::MAX,
+        };
+        match saturating.validate_notional_bound(u128::MAX) {
+            Err(MicrostructureConfigError::FeeBoundUnprovable { .. }) => {}
+            other => {
+                panic!(
+                    "beyond the checked-fee-proof bound must be FeeBoundUnprovable, got {other:?}"
+                )
+            }
+        }
+
+        // A small rate but a notional whose worst-case fee exceeds `i64::MAX`
+        // (part B): the persisted cents column could not record it — refused.
+        let over_persist = (i64::MAX as u128) * BPS_DENOMINATOR + BPS_DENOMINATOR;
+        let tiny_rate = FeeConfig {
+            maker_bps: 0,
+            taker_bps: 1,
+        };
+        match tiny_rate.validate_notional_bound(over_persist) {
+            Err(MicrostructureConfigError::FeePersistOverflow { .. }) => {}
+            other => {
+                panic!(
+                    "a fee past the persisted-i64 bound must be FeePersistOverflow, got {other:?}"
+                )
+            }
+        }
+    }
 }
