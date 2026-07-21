@@ -1,0 +1,1 @@
+{"schema":"scenario-bundle.v1","manifest":{"seed":0,"clock_mode":"realtime"},"streams":[{"underlying":"BTC","header":{"schema_version":"venue.v1","lineage_id":"run-1"},"records":[{"Command":{"sequence":0,"venue_ts":1700000000000,"command":{"CancelOrder":{"symbol":"NOT-A-SYMBOL","order_id":"o-1","account":"a"}}}}]}]}

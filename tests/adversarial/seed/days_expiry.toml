@@ -1,0 +1,4 @@
+[instruments.BTC]
+opening_price_cents = 5000000
+expirations = ["30"]
+strikes = [50000]

@@ -61,7 +61,11 @@ use crate::db::error::DbError;
 use crate::db::pool::DatabasePool;
 use crate::exchange::event::SequenceNumber;
 use crate::exchange::identity::{JournalHeader, LineageId};
-use crate::exchange::journal::{JournalError, JournalRecord, RecordKind, VenueJournal};
+use crate::exchange::journal::{
+    JournalError, JournalRecord, MAX_JOURNAL_RECORD_BYTES, MAX_JOURNAL_RECORDS,
+    MAX_JOURNAL_STREAM_BYTES, RecordKind, VenueJournal, decode_journal_record,
+    enforce_stream_bytes_ceiling, enforce_stream_ceiling,
+};
 
 // ============================================================================
 // The durable store
@@ -203,6 +207,28 @@ impl PgVenueJournal {
         let payload = serde_json::to_string(record)
             .map_err(|_| JournalError::AppendFailed("journal record serialise".to_string()))?;
 
+        // Write-side per-record ceiling (the write ≤ read symmetry invariant): a
+        // record over `MAX_JOURNAL_RECORD_BYTES` is refused AT write — confirmed
+        // not committed — so no durably-written record can ever trip the read
+        // `record_bytes` refusal (which then fires only on external tampering). The
+        // actor surfaces this via its existing turn semantics: an over-ceiling
+        // write-ahead command reuses `N`; an over-ceiling post-mutation event seals
+        // the underlying loudly ([ADR-0006 §3]).
+        if payload.len() > MAX_JOURNAL_RECORD_BYTES {
+            tracing::error!(
+                underlying = %self.underlying,
+                sequence = seq_i64,
+                found = payload.len(),
+                ceiling = MAX_JOURNAL_RECORD_BYTES,
+                "durable journal append refuses an over-ceiling record; not committed"
+            );
+            return Err(JournalError::ResourceLimit {
+                limit: "record_bytes",
+                found: payload.len(),
+                ceiling: MAX_JOURNAL_RECORD_BYTES,
+            });
+        }
+
         // Write-ahead insert: DO NOTHING on the (underlying, N, kind) key so a
         // re-append of the SAME record is a no-op (idempotent), never a duplicate.
         let result = sqlx::query!(
@@ -254,6 +280,26 @@ impl PgVenueJournal {
     }
 
     /// The async body behind the synchronous [`VenueJournal::read_from`].
+    ///
+    /// **Bounded, no-unbounded-allocation deserialiser** (#034,
+    /// [08 §4](../../docs/08-threat-model.md#4-untrusted-input-hardening)): the read
+    /// is bounded on **both** axes so a hostile / pathologically large durable stream
+    /// (the semi-trusted-operator A-7 surface) cannot OOM a restart —
+    ///
+    /// - **per-record**: an oversized `payload` is not transferred at all — the
+    ///   `CASE` returns `NULL` for a row whose `octet_length(payload)` exceeds
+    ///   [`MAX_JOURNAL_RECORD_BYTES`], so the huge blob never leaves Postgres, and the
+    ///   read fails with a typed [`JournalError::ResourceLimit`] (`record_bytes`);
+    /// - **per-read (pre-fetch)**: a cheap `count(*)` + `sum(octet_length(payload))`
+    ///   **bounding query runs BEFORE the row fetch**, refusing a stream over
+    ///   [`MAX_JOURNAL_RECORDS`] rows (`stream_records`) or [`MAX_JOURNAL_STREAM_BYTES`]
+    ///   bytes (`stream_bytes`) **before** `fetch_all` allocates — closing the
+    ///   compounded gap where the fetch buffered rows before any per-row / count
+    ///   check ran. The `LIMIT` + the per-row `CASE` remain as defense-in-depth. A
+    ///   stream that long is **refused** (never truncated — a truncated read would be
+    ///   a silent partial recovery); a paged/streaming reader is the named forward
+    ///   seam. This closes an unbounded-`fetch_all` OOM vector in #029's shipped read
+    ///   path, found during #034's threat-surface mapping.
     async fn read_from_async(
         &self,
         from: SequenceNumber,
@@ -261,14 +307,78 @@ impl PgVenueJournal {
         let from_i64 = i64::try_from(from.get()).map_err(|_| JournalError::Backend {
             operation: "journal read_from bound out of range",
         })?;
-        let payloads = sqlx::query_scalar!(
+        let record_ceiling =
+            i32::try_from(MAX_JOURNAL_RECORD_BYTES).map_err(|_| JournalError::Backend {
+                operation: "journal record ceiling out of range",
+            })?;
+        // Fetch one more than the ceiling so an over-ceiling stream is detected, not
+        // silently truncated.
+        let read_limit = i64::try_from(MAX_JOURNAL_RECORDS).map_err(|_| JournalError::Backend {
+            operation: "journal read ceiling out of range",
+        })? + 1;
+
+        // Pre-fetch bounding: a cheap aggregate (no payloads transferred) refuses an
+        // over-budget stream BEFORE `fetch_all` allocates its result set — the
+        // primary allocation bound (the LIMIT + per-row CASE below are
+        // defense-in-depth).
+        let bounds = sqlx::query!(
             r#"
-            SELECT payload FROM journal_records
+            SELECT
+                count(*) AS "count!",
+                COALESCE(sum(octet_length(payload)), 0) AS "bytes!"
+            FROM journal_records
             WHERE underlying = $1 AND underlying_sequence >= $2
-            ORDER BY id
             "#,
             self.underlying,
             from_i64,
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| {
+            tracing::error!(error = %error, "durable journal read bounding query failed");
+            JournalError::Backend {
+                operation: "journal read bounds",
+            }
+        })?;
+        let stream_count = usize::try_from(bounds.count).map_err(|_| JournalError::Backend {
+            operation: "journal read count out of range",
+        })?;
+        let stream_bytes = usize::try_from(bounds.bytes).map_err(|_| JournalError::Backend {
+            operation: "journal read bytes out of range",
+        })?;
+        if let Err(error) = enforce_stream_ceiling(stream_count) {
+            tracing::error!(
+                underlying = %self.underlying,
+                found = stream_count,
+                ceiling = MAX_JOURNAL_RECORDS,
+                "durable journal read exceeds the per-read record-count ceiling; refusing pre-fetch"
+            );
+            return Err(error);
+        }
+        if let Err(error) = enforce_stream_bytes_ceiling(stream_bytes) {
+            tracing::error!(
+                underlying = %self.underlying,
+                found = stream_bytes,
+                ceiling = MAX_JOURNAL_STREAM_BYTES,
+                "durable journal read exceeds the per-read byte ceiling; refusing pre-fetch"
+            );
+            return Err(error);
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                octet_length(payload) AS "len!",
+                CASE WHEN octet_length(payload) <= $3 THEN payload END AS payload
+            FROM journal_records
+            WHERE underlying = $1 AND underlying_sequence >= $2
+            ORDER BY id
+            LIMIT $4
+            "#,
+            self.underlying,
+            from_i64,
+            record_ceiling,
+            read_limit,
         )
         .fetch_all(&self.pool)
         .await
@@ -279,17 +389,47 @@ impl PgVenueJournal {
             }
         })?;
 
-        payloads
-            .into_iter()
-            .map(|payload| {
-                serde_json::from_str::<JournalRecord>(&payload).map_err(|error| {
-                    tracing::error!(error = %error, "durable journal record decode failed");
-                    JournalError::Backend {
-                        operation: "journal record decode",
-                    }
-                })
-            })
-            .collect()
+        // Defense-in-depth: the pre-fetch bounding query already refused an
+        // over-ceiling stream; this re-checks the fetched row count (bounded by the
+        // `LIMIT`) so a concurrent grow between the two queries still cannot yield a
+        // silent partial read. (A live export CAN race the single-writer actor's
+        // appends between the two queries; the growth in that window is a handful
+        // of rows — negligible next to the ceilings — and this recheck plus the
+        // `LIMIT` keep the no-silent-partial-read property regardless.)
+        if let Err(error) = enforce_stream_ceiling(rows.len()) {
+            tracing::error!(
+                underlying = %self.underlying,
+                ceiling = MAX_JOURNAL_RECORDS,
+                "durable journal read exceeds the per-read record ceiling; refusing"
+            );
+            return Err(error);
+        }
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            match row.payload {
+                // Within the per-record ceiling: decode through the bounded helper
+                // (a cheap re-check of the same ceiling, then a well-formedness parse).
+                Some(payload) => records.push(decode_journal_record(&payload)?),
+                // The `CASE` returned NULL: `octet_length(payload)` is over the
+                // ceiling, so the payload was never transferred — a typed reject.
+                None => {
+                    let found = usize::try_from(row.len).unwrap_or(usize::MAX);
+                    tracing::error!(
+                        underlying = %self.underlying,
+                        found,
+                        ceiling = MAX_JOURNAL_RECORD_BYTES,
+                        "durable journal record exceeds the per-record byte ceiling; refusing"
+                    );
+                    return Err(JournalError::ResourceLimit {
+                        limit: "record_bytes",
+                        found,
+                        ceiling: MAX_JOURNAL_RECORD_BYTES,
+                    });
+                }
+            }
+        }
+        Ok(records)
     }
 
     /// The async body behind the synchronous [`VenueJournal::last_sequence`].

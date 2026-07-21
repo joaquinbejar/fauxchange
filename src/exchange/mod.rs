@@ -86,8 +86,9 @@ pub use self::executor::{
 pub use self::identity::{JournalHeader, LineageId, VENUE_ENVELOPE_SCHEMA};
 pub use self::instrument::Instrument;
 pub use self::journal::{
-    InMemoryVenueJournal, JournalCommand, JournalError, JournalRecord, RecordKind,
-    SnapshotRestored, VenueJournal,
+    InMemoryVenueJournal, JournalCommand, JournalError, JournalRecord, MAX_JOURNAL_RECORD_BYTES,
+    MAX_JOURNAL_RECORDS, MAX_JOURNAL_STREAM_BYTES, RecordKind, SnapshotRestored, VenueJournal,
+    check_record_size, decode_journal_record, enforce_stream_bytes_ceiling, enforce_stream_ceiling,
 };
 pub use self::mm_identity::{
     MARKET_MAKER_ACCOUNT, MARKET_MAKER_OWNER, is_market_maker_account, is_market_maker_command,
