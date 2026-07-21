@@ -10,7 +10,26 @@ repository = "https://github.com/joaquinbejar/fauxchange"
 homepage = "https://github.com/joaquinbejar/fauxchange"
 keywords = ["finance", "exchange", "simulator", "trading", "testing"]
 categories = ["finance", "simulation", "development-tools::testing"]
-include = ["src/**/*", "Cargo.toml", "README.md", "LICENSE"]
+include = [
+    "src/**/*",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    # `sqlx::migrate!("./migrations")` (src/db/pool.rs) is a COMPILE-TIME
+    # macro that canonicalizes this directory when the crate is built from
+    # ANY source tree, including a `cargo publish`-repackaged one — omitting
+    # it breaks `cargo publish --dry-run` / `cargo install fauxchange` with
+    # "error canonicalizing migration directory ... No such file or
+    # directory" (found and fixed during the #55 release-readiness pass).
+    "/migrations/**/*",
+    # `sqlx::query!`/`query_as!` (src/db/journal.rs, src/db/executions.rs,
+    # ...) resolve against this committed OFFLINE query cache at compile
+    # time when `DATABASE_URL` is unset (`SQLX_OFFLINE`, matching CI) —
+    # omitting it breaks the SAME published-source build with "set
+    # DATABASE_URL ... or run cargo sqlx prepare" (found and fixed
+    # alongside the migrations gap above).
+    "/.sqlx/**/*",
+]
 
 [dependencies]
 # Upstream matching stack. `option-chain-orderbook` re-exports the boundary

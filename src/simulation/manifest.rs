@@ -87,8 +87,13 @@ impl DependencyVersions {
 
     /// The first field that differs from the running binary, as
     /// `(field, expected, found)` — `expected` is the running binary's value and
-    /// `found` is this recorded value — or `None` when the sets match. Used to
-    /// build a precise typed version-mismatch reject.
+    /// `found` is this recorded value — or `None` when the sets match. This is the
+    /// **exact bit-reproducibility** predicate (paired with [`matches_current`]): a
+    /// difference in *any* field means the run is not guaranteed bit-for-bit
+    /// reproducible, and it drives the honest non-blocking WARN on the replay load
+    /// path. It is **not** the load-admission gate — see [`first_incompatibility`].
+    ///
+    /// [`first_incompatibility`]: Self::first_incompatibility
     #[must_use]
     pub fn first_mismatch(&self) -> Option<(&'static str, String, String)> {
         let current = Self::current();
@@ -109,6 +114,104 @@ impl DependencyVersions {
             .into_iter()
             .find(|(_, expected, found)| expected != found)
             .map(|(field, expected, found)| (field, expected.clone(), found.clone()))
+    }
+
+    /// The **load-admission** compatibility check — the gate the replay/recovery
+    /// path runs to decide whether a recorded journal may be re-executed **at all**,
+    /// distinct from the exact bit-reproducibility predicate [`first_mismatch`].
+    ///
+    /// Returns the first field that makes this recorded set **incompatible** with the
+    /// running binary, as `(field, expected, found)`, or `None` when the set is
+    /// load-compatible. Per [SEMVER.md](../../docs/SEMVER.md) the **schema tag is the
+    /// primary version pin, the crate version secondary**, so the rule is:
+    ///
+    /// - [`envelope_schema`](Self::envelope_schema) must match **exactly** — a bump is
+    ///   a major SemVer event and a forward-incompatible journal is refused, mirroring
+    ///   the per-stream recovery schema gate
+    ///   ([`JournalError::SchemaTooNew`](crate::exchange::JournalError)).
+    /// - [`fauxchange`](Self::fauxchange) must be **SemVer-compatible, directionally**:
+    ///   for a `>= 1.0.0` binary, the **same MAJOR** and `recorded_minor <= running_minor`
+    ///   (a `v1.x` journal replays on any *later-or-equal* `v1.y`, the SEMVER promise —
+    ///   but a *future*-minor bundle is refused, not admitted); for a `0.x` binary, the
+    ///   same `(MAJOR, MINOR)` exactly (SemVer treats a `0.MINOR` bump as breaking). A
+    ///   version that does not parse as a full `MAJOR.MINOR.PATCH` (`1.2`, `1.2.3.4`) is
+    ///   treated as incompatible — refused, never a panic.
+    /// - [`optionstratlib`](Self::optionstratlib) is a **secondary** dependency and is
+    ///   **not** a load gate — a difference does not refuse the load (the integrity
+    ///   oracle is the backstop). [`first_mismatch`] still reports it for the WARN.
+    ///
+    /// [`first_mismatch`]: Self::first_mismatch
+    #[must_use]
+    pub fn first_incompatibility(&self) -> Option<(&'static str, String, String)> {
+        let current = Self::current();
+        if self.envelope_schema != current.envelope_schema {
+            return Some((
+                "envelope_schema",
+                current.envelope_schema,
+                self.envelope_schema.clone(),
+            ));
+        }
+        if !fauxchange_versions_compatible(&current.fauxchange, &self.fauxchange) {
+            return Some(("fauxchange", current.fauxchange, self.fauxchange.clone()));
+        }
+        None
+    }
+}
+
+/// Parses and **validates a full `MAJOR.MINOR.PATCH` SemVer** string, returning the
+/// `(major, minor)` the load-admission gate keys on. A pre-release (`-…`) and/or build
+/// (`+…`) suffix attaches to the **patch** (the third component) and is stripped before
+/// parsing, so it never affects `MAJOR` / `MINOR`.
+///
+/// The core must be **exactly three** numeric dot-separated components — a version with
+/// a missing or extra component (`1.2`, `1.2.3.4`) is malformed and yields `None`, which
+/// the caller treats as incompatible (refused). This is full-structure validation, not a
+/// lenient "read the first two numbers" scan: a `1.2.3.4` bundle can no longer slip
+/// through as `(1, 2)`. Never panics.
+#[must_use]
+pub(crate) fn parse_major_minor(version: &str) -> Option<(u64, u64)> {
+    // Build metadata (`+…`) then pre-release (`-…`) both hang off the patch; strip them
+    // so the remaining core is bare `MAJOR.MINOR.PATCH`.
+    let core = version.split('+').next()?.split('-').next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    // A numeric PATCH must be present (rejects `1.2`) …
+    let _patch = parts.next()?.parse::<u64>().ok()?;
+    // … and nothing may follow it (rejects `1.2.3.4`).
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor))
+}
+
+/// Whether a `recorded` `fauxchange` version is load-compatible with the `running`
+/// binary, **directionally from recorded to running**. An unparseable / malformed
+/// version on either side is incompatible (refused, never a panic). This is admission
+/// only — it does not assert bit-reproducibility.
+///
+/// - Same `MAJOR` is always required (a cross-major journal is refused).
+/// - `>= 1.x`: a recorded journal replays on any **later-or-equal** running minor
+///   (`recorded_minor <= running_minor`) — the SEMVER.md "a `v1.x` journal replays on
+///   any later `v1.y`" promise, read **directionally**. A bundle recorded by a *future*
+///   minor (e.g. a `1.99` bundle on a `1.0` runtime) is **refused**, not admitted — the
+///   older runtime cannot prove it understands a newer minor's records.
+/// - `0.x`: every `0.MINOR` bump is a breaking boundary (SemVer 0.x), so the
+///   `(MAJOR, MINOR)` must match **exactly** (direction is moot under equality).
+#[must_use]
+fn fauxchange_versions_compatible(running: &str, recorded: &str) -> bool {
+    let (Some((run_major, run_minor)), Some((rec_major, rec_minor))) =
+        (parse_major_minor(running), parse_major_minor(recorded))
+    else {
+        return false;
+    };
+    if run_major != rec_major {
+        return false;
+    }
+    if run_major == 0 {
+        run_minor == rec_minor
+    } else {
+        rec_minor <= run_minor
     }
 }
 
@@ -248,6 +351,135 @@ mod tests {
         assert_eq!(versions.optionstratlib, optionstratlib::VERSION);
         assert_eq!(versions.envelope_schema, VENUE_ENVELOPE_SCHEMA);
         assert!(versions.first_mismatch().is_none());
+    }
+
+    #[test]
+    fn test_parse_major_minor_handles_prerelease_and_rejects_malformed() {
+        assert_eq!(parse_major_minor("0.0.1"), Some((0, 0)));
+        assert_eq!(parse_major_minor("1.2.3"), Some((1, 2)));
+        // A pre-release / build suffix attaches to the patch, never major/minor.
+        assert_eq!(parse_major_minor("0.0.0-attacker"), Some((0, 0)));
+        assert_eq!(parse_major_minor("0.1.0-mismatch"), Some((0, 1)));
+        // Malformed / truncated versions are `None` (the caller refuses them).
+        assert_eq!(parse_major_minor("garbage"), None);
+        assert_eq!(parse_major_minor(""), None);
+        assert_eq!(parse_major_minor("1"), None);
+        // A missing PATCH or an EXTRA component is malformed — full-structure
+        // validation, so `1.2.3.4` can no longer slip through as `(1, 2)`.
+        assert_eq!(parse_major_minor("1.2"), None);
+        assert_eq!(parse_major_minor("1.2.3.4"), None);
+        assert_eq!(parse_major_minor("1.2.x"), None);
+    }
+
+    #[test]
+    fn test_fauxchange_versions_compatible_is_directional_at_v1() {
+        // `>= 1.x` admits an older-or-equal recorded minor on a newer running binary…
+        assert!(fauxchange_versions_compatible("1.5.0", "1.2.0"));
+        assert!(fauxchange_versions_compatible("1.5.0", "1.5.9"));
+        // …but REFUSES a future-minor bundle on an older runtime (the finding's case:
+        // a `1.99` bundle must not load on a `1.0` binary).
+        assert!(!fauxchange_versions_compatible("1.0.0", "1.99.0"));
+        // A different major is always refused, either direction.
+        assert!(!fauxchange_versions_compatible("2.0.0", "1.0.0"));
+        assert!(!fauxchange_versions_compatible("1.0.0", "2.0.0"));
+        // A malformed version on either side is refused, never a panic.
+        assert!(!fauxchange_versions_compatible("1.2.3.4", "1.2.0"));
+        assert!(!fauxchange_versions_compatible("1.2.0", "1.2.3.4"));
+        // `0.x` stays exact-minor in both directions.
+        assert!(fauxchange_versions_compatible("0.7.3", "0.7.0"));
+        assert!(!fauxchange_versions_compatible("0.7.0", "0.8.0"));
+        assert!(!fauxchange_versions_compatible("0.8.0", "0.7.0"));
+    }
+
+    #[test]
+    fn test_first_incompatibility_admits_a_compatible_differing_patch() {
+        // A recorded set differing ONLY in the crate PATCH (same major.minor) and
+        // carrying the current envelope schema is LOAD-compatible — but NOT
+        // bit-identical, so it drives the honest WARN (`matches_current` is false).
+        let current = DependencyVersions::current();
+        let (major, minor) = parse_major_minor(&current.fauxchange).expect("current parses");
+        let mut recorded = current.clone();
+        recorded.fauxchange = format!("{major}.{minor}.99");
+        assert_ne!(
+            recorded.fauxchange, current.fauxchange,
+            "the patch genuinely differs"
+        );
+        assert!(
+            recorded.first_incompatibility().is_none(),
+            "a same-(major,minor) differing-patch set loads"
+        );
+        assert!(
+            !recorded.matches_current(),
+            "but it is not bit-identical (the WARN path)"
+        );
+    }
+
+    #[test]
+    fn test_first_incompatibility_refuses_a_different_major() {
+        let current = DependencyVersions::current();
+        let (major, _) = parse_major_minor(&current.fauxchange).expect("current parses");
+        let mut recorded = current.clone();
+        recorded.fauxchange = format!("{}.0.0", major + 1);
+        match recorded.first_incompatibility() {
+            Some((field, expected, found)) => {
+                assert_eq!(field, "fauxchange");
+                assert_eq!(expected, current.fauxchange);
+                assert_eq!(found, recorded.fauxchange);
+            }
+            None => panic!("a different major must be a load incompatibility"),
+        }
+    }
+
+    #[test]
+    fn test_first_incompatibility_refuses_a_different_minor_at_zero_major() {
+        // At the current `0.x` base a `0.MINOR` bump is a breaking boundary; a
+        // `>= 1.x` binary instead treats a minor bump as compatible (asserted by the
+        // major test above), so this clause only applies at major 0.
+        let current = DependencyVersions::current();
+        let (major, minor) = parse_major_minor(&current.fauxchange).expect("current parses");
+        if major != 0 {
+            return;
+        }
+        let mut recorded = current.clone();
+        recorded.fauxchange = format!("0.{}.0", minor + 1);
+        assert!(
+            matches!(recorded.first_incompatibility(), Some(("fauxchange", _, _))),
+            "a differing minor at 0.x is refused"
+        );
+    }
+
+    #[test]
+    fn test_first_incompatibility_refuses_a_differing_envelope_schema() {
+        // The envelope schema tag is the PRIMARY pin — an exact-match gate.
+        let mut recorded = DependencyVersions::current();
+        recorded.envelope_schema = "venue.v2".to_string();
+        assert!(matches!(
+            recorded.first_incompatibility(),
+            Some(("envelope_schema", _, _))
+        ));
+    }
+
+    #[test]
+    fn test_first_incompatibility_admits_a_differing_optionstratlib() {
+        // optionstratlib is a SECONDARY dep — a difference does NOT refuse the load
+        // (the integrity oracle is the backstop), though `matches_current` reports it.
+        let mut recorded = DependencyVersions::current();
+        recorded.optionstratlib = "0.0.0-different".to_string();
+        assert!(
+            recorded.first_incompatibility().is_none(),
+            "optionstratlib is not a load-admission gate"
+        );
+        assert!(!recorded.matches_current());
+    }
+
+    #[test]
+    fn test_first_incompatibility_refuses_an_unparseable_fauxchange_version() {
+        let mut recorded = DependencyVersions::current();
+        recorded.fauxchange = "not-a-version".to_string();
+        assert!(
+            matches!(recorded.first_incompatibility(), Some(("fauxchange", _, _))),
+            "an unparseable version is refused, never a panic"
+        );
     }
 
     #[test]

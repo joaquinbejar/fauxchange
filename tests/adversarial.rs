@@ -348,12 +348,14 @@ fn test_bundle_deser_refuses_newer_schema() {
 
 #[test]
 fn test_bundle_corpus_hostile_manifest_version_is_typed_reject() {
-    // A bundle whose manifest pins a fauxchange version this binary is not — refused
-    // (a different version set is not a reproducible oracle).
+    // A bundle whose manifest pins a fauxchange version INCOMPATIBLE with this binary
+    // under the SemVer-major load rule (a differing MINOR at the 0.x base is a breaking
+    // boundary) — refused before re-execution. A benign patch bump would instead
+    // replay; this fixture is a genuine incompatibility, not a mere version tweak.
     let bytes = corpus("bundle/hostile_manifest_version.json", || {
         let lineage = LineageId::new("run-1");
         let mut manifest = RunManifest::new(0, ClockMode::Realtime);
-        manifest.versions.fauxchange = "0.0.0-attacker".to_string();
+        manifest.versions.fauxchange = "0.1.0-attacker".to_string();
         pretty(&ScenarioBundle::new(
             manifest,
             vec![record_stream(UNDERLYING, &crossing(&lineage), &lineage)],
@@ -362,7 +364,7 @@ fn test_bundle_corpus_hostile_manifest_version_is_typed_reject() {
     match load_and_replay(&bytes) {
         Err(ReplayError::VersionMismatch { kind, found, .. }) => {
             assert_eq!(kind, "fauxchange");
-            assert_eq!(found, "0.0.0-attacker");
+            assert_eq!(found, "0.1.0-attacker");
         }
         other => panic!("expected a manifest VersionMismatch, got {other:?}"),
     }
