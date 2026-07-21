@@ -82,6 +82,28 @@ utoipa = "5"
 # and HS256 confusion before any crypto runs). MIT, maintained by the
 # Keats/jsonwebtoken project (widely used, actively maintained).
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+# Argon2id password hashing for the venue account registry (#012): the FIX
+# shared-secret is stored only as an Argon2id PHC string at the pinned OWASP
+# baseline (m = 19456 KiB, t = 2, p = 1) with an optional server-side pepper, and
+# verified in constant time. Default features (`alloc` + `password-hash` + `rand`)
+# are exactly what the registry needs — `password-hash` for the PHC parse/format
+# and `PasswordHasher`/`PasswordVerifier` traits, `rand` (→ `password-hash/rand_core`)
+# for `SaltString::generate`. `argon2` 0.5.3 is a pure-Rust RustCrypto crate (NO
+# `ring`/C), adding `argon2` + `blake2` + `base64ct` + `password-hash` NEW to the
+# tree (all RustCrypto, MIT/Apache-2.0, widely used); `cargo audit` / `cargo deny`
+# (#019) gate them. The pinned parameters ARE `argon2`'s own documented defaults,
+# so `Params::DEFAULT` equals the OWASP baseline. Argon2**id** is selected
+# explicitly (never Argon2i/Argon2d).
+argon2 = "0.5"
+# The OS CSPRNG (`rand_core::OsRng`) that seeds each Argon2 salt via
+# `SaltString::generate` (#012). `rand_core` 0.6.4 is ALREADY resolved in the tree
+# (via `rand` 0.8 ← `optionstratlib`), so this direct dependency adds NO new crate
+# version (verified: the Cargo.lock diff introduces only argon2/blake2/base64ct/
+# password-hash); feature unification already has `getrandom` active at HEAD, so
+# this just names `rand_core` directly for `OsRng`. `default-features = false` keeps it
+# minimal. It is the SAME `rand_core` `password-hash` uses, so `OsRng` satisfies
+# the `CryptoRngCore` bound. MIT/Apache-2.0, maintained by the rust-random project.
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 
 [dev-dependencies]
 proptest = "1"
