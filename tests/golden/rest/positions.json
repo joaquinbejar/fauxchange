@@ -1,0 +1,24 @@
+[
+  {
+    "account": "maker-acct",
+    "avg_price": 50000,
+    "current_price": 50500,
+    "delta_exposure": 0.0,
+    "net_quantity": -2,
+    "realized_pnl": 10,
+    "symbol": "BTC-20240329-50000-C",
+    "underlying": "BTC",
+    "unrealized_pnl": -1000
+  },
+  {
+    "account": "taker-acct",
+    "avg_price": 50000,
+    "current_price": 50500,
+    "delta_exposure": 0.0,
+    "net_quantity": 2,
+    "realized_pnl": -15,
+    "symbol": "BTC-20240329-50000-C",
+    "underlying": "BTC",
+    "unrealized_pnl": 1000
+  }
+]

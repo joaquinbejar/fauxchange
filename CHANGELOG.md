@@ -11,6 +11,54 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- In-memory executions + positions stores + the backend-agnostic store contract
+  (#8) in `src/exchange/` (`stores.rs`) — the authoritative fill log and the
+  per-`(account, symbol)` position fold, both derived from committed `VenueEvent`
+  fills through the actor's post-journal `FanOut` seam #6 left open
+  ([01 §7](docs/01-domain-model.md),
+  [02 §6](docs/02-matching-architecture.md)). Adds `StoreFanOut`, the #8
+  replacement for `NoopFanOut`: it runs **only after** a `VenueEvent` is
+  journaled (step 5), projecting each committed fill **leg** into an
+  authoritative `ExecutionRecord` and folding it into a `Position`, so the
+  executions log stays a **deterministic function of the journal** (same journal
+  → same executions). Both legs of one match are recorded (shared `execution_id`,
+  distinct account / side / liquidity / fee — a maker rebate is negative), keyed
+  `(execution_id, liquidity)` so the key stays unique even for a same-account
+  self-trade. Positions fold with **exact integer-cents** accounting: `i128`
+  checked accumulators (`checked_*`, never `saturating_*` / `wrapping_*`) give a
+  signed `net_quantity`, a volume-weighted `avg_price`, and a `realized_pnl`, with
+  the realized/unrealized split computed from one exact cost basis so
+  `realized + unrealized == net_cash − fees + net_quantity × mark` holds
+  **exactly** as an arithmetic identity — distinct from the ADR-0006 bounded
+  replay oracle, and it even folds in the live mark (the truncated `avg_price`
+  is never used in the P&L).
+  `unrealized_pnl` is marked at **read time** against a `MarkSource` — the
+  production `MarkPriceBook` wraps the upstream
+  `option_chain_orderbook::MarkPriceCalculator` (verified present in the locked
+  0.7.0) — and is a **live-only** projection: not journaled, not asserted across
+  replays ([02 §5.5](docs/02-matching-architecture.md)); the read API takes the
+  mark as an explicit argument to keep that boundary visible, and `delta_exposure`
+  is `0.0` (Greeks not wired yet). The key deliverable is the backend-agnostic
+  `ExecutionsStore` / `PositionsStore` **contract**: the in-memory
+  `InMemoryExecutionsStore` / `InMemoryPositionsStore` here and the durable
+  PostgreSQL stores (#23) implement the **same** traits, so the REST reads (#13)
+  don't change when the backend swaps (the in-memory insertion order is a
+  surrogate for the durable `SERIAL` id an SQL store would `ORDER BY`). The
+  projected `ExecutionRecord` is the #4 wire DTO unchanged; without a pricer /
+  latency injector wired in #8, `theo_value_cents` defaults to the fill price
+  (so `edge_cents` is `0`) and `latency_us` is `0` — both documented live-only
+  analytics per [01 §7](docs/01-domain-model.md) that later issues supply without
+  a wire-shape change. New dependency: `dashmap` 6 (over `Arc<RwLock<HashMap<>>>`
+  per `rules/global_rules.md` Concurrency), already resolved transitively via the
+  upstream matching stack — no new tree version. New tests: unit executions
+  both-leg insertion + account-scoped ordered listing, positions fold (signed
+  net, volume-weighted avg, partial close, flip, both counterparties) and the
+  upstream mark-book wiring (`stores.rs`); the
+  `position_pnl_stays_consistent_across_fills` property (`tests/property.rs`); the
+  `rest/execution_report.json` + `rest/positions.json` per-leg goldens
+  (`tests/golden.rs`); and the orders → matching → stores integration, the
+  store-projection-vs-golden assertions, and the executions-log determinism test
+  through the public actor surface (`tests/stores.rs`).
 - Real order path onto upstream matching (#7) in `src/exchange/`
   (`executor.rs`) — the `CommandExecutor` seam #6 left open, now driving the
   upstream `option-chain-orderbook` matching **unchanged** and capturing the
