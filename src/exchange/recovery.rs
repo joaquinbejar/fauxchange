@@ -430,7 +430,13 @@ fn reduce_into_executor(
         // here only AFTER the event is oracle-verified (already journaled), so the
         // recovered correlations are byte-for-byte the ones the live venue exposed.
         if let Some(index) = clordid_index {
-            apply_committed_correlation(index, underlying, &derived.command, &derived.outcome);
+            apply_committed_correlation(
+                index,
+                underlying,
+                derived.underlying_sequence,
+                &derived.command,
+                &derived.outcome,
+            );
         }
         events.push(derived);
     }

@@ -27,6 +27,19 @@
 //! fills plus the time-in-force (`limit_status`) so a killed `IOC`/`FOK` also
 //! reports `Rejected` (#099). The `underlying_sequence` remains on every response
 //! for cross-surface correlation.
+//!
+//! **Pre-submit idempotency (#103).** A byte-identical `(account, client_order_id)`
+//! retry is deduplicated on the venue-shared, account-scoped `(account, ClOrdID) →
+//! order` index (#098) **before** an id is minted or a command submitted — exactly
+//! as the FIX gateway dedups (#039) — so a *sequential* retry consumes **no**
+//! `underlying_sequence` and never reaches the single-writer actor, aligning the
+//! REST sequence progression with FIX. It renders the STORED terminal from the
+//! original order's committed taker legs. Two *concurrent* retries can both miss the
+//! (post-journal-published) index and submit; the actor's idempotency map then
+//! dedups the loser to `VenueOutcome::Duplicate`, which the post-submit path renders
+//! with the canonical identity — correct, just consuming a sequence in that rare
+//! window. A same-key **conflicting** reuse (differing `symbol`/`side`/`quantity`)
+//! is not fast-pathed; it submits and the actor's full-fingerprint guard rejects it.
 
 use std::sync::Arc;
 
@@ -40,8 +53,8 @@ use crate::exchange::{
 use crate::gateway::rest::extract::Json;
 use crate::gateway::rest::middleware::require;
 use crate::gateway::rest::support::{
-    add_order_command, build_symbol, mint_order_id, owner_for, parse_style, seam_side, seam_tif,
-    vwap_cents,
+    add_order_command, build_symbol, mint_order_id, owner_for, parse_style, replay_terminal,
+    seam_side, seam_tif, vwap_cents,
 };
 use crate::models::{
     BulkCancelRequest, BulkCancelResponse, BulkCancelResultItem, BulkOrderRequest,
@@ -150,6 +163,50 @@ pub async fn place_limit_order(
     let style = parse_style(&style)?;
     let symbol = build_symbol(&underlying, &expiration, strike, style)?;
     let account = auth.claims.account().clone();
+
+    // Pre-submit idempotency fast path (#103): a byte-identical `(account,
+    // client_order_id)` retry dedups on the venue-shared, account-scoped index
+    // (#098) BEFORE minting an id or submitting — exactly as the FIX gateway does
+    // (#039) — so it consumes NO `underlying_sequence` and never reaches the
+    // single-writer actor (aligning the REST sequence progression with FIX,
+    // [03 §7](../../../docs/03-protocol-surfaces.md)). The correlation is published
+    // POST-journal (after the original placement durably committed), so a
+    // *sequential* retry always observes it here; two *concurrent* retries can both
+    // miss it and submit, where the actor's idempotency map dedups the loser to
+    // `VenueOutcome::Duplicate` and the post-submit path below renders the canonical
+    // identity — the race is still correct, it just consumes a sequence in that rare
+    // window. Only a CONFIRMED hit whose `symbol`/`side`/`quantity` match takes this
+    // path; a differing-economics reuse of the same key falls through to submit,
+    // where the actor's full-fingerprint idempotency map rejects it as a conflicting
+    // reuse (the index stores no price/TIF, so a price/TIF-only reuse under a
+    // matching symbol/side/quantity is treated as an idempotent replay — a
+    // documented, deliberately-minimal-index limitation).
+    if let Some(cl_ord_id) = request.client_order_id.as_ref()
+        && let Some(record) = state.resolve_client_order_id(&account, cl_ord_id)
+        && record.symbol == symbol
+        && record.side == seam_side(request.side)
+        && record.quantity == request.quantity
+    {
+        let (_fills, filled) = replay_terminal(&state, &account, &record.order_id)?;
+        // The FULL canonical identity: the ORIGINAL order id AND its committed
+        // placement sequence (from the index record), so even a purely-resting
+        // (zero-fill) retry echoes the original `sequence`, never a fabricated 0.
+        let sequence = record.sequence;
+        let (status, message) = limit_status(
+            request.time_in_force.unwrap_or_default(),
+            filled,
+            request.quantity,
+        );
+        return Ok(Json(PlaceLimitOrderResponse {
+            order_id: record.order_id,
+            status,
+            filled_quantity: filled,
+            remaining_quantity: remaining(request.quantity, filled),
+            sequence,
+            message: message.to_string(),
+        }));
+    }
+
     let owner = owner_for(&state, &account)?;
     let tif = seam_tif(
         request.time_in_force.unwrap_or_default(),
@@ -261,6 +318,46 @@ pub async fn place_market_order(
     let style = parse_style(&style)?;
     let symbol = build_symbol(&underlying, &expiration, strike, style)?;
     let account = auth.claims.account().clone();
+
+    // Pre-submit idempotency fast path (#103) — identical to the limit path: a
+    // byte-identical `(account, client_order_id)` retry dedups on the venue-shared
+    // index BEFORE minting/submitting, so it consumes no sequence and matches FIX. A
+    // committed market (`IOC`) placement is indexed as `Market`, so its retry
+    // resolves here and renders the STORED fills; a concurrent race falls through to
+    // the actor's `Duplicate` guard below.
+    if let Some(cl_ord_id) = request.client_order_id.as_ref()
+        && let Some(record) = state.resolve_client_order_id(&account, cl_ord_id)
+        && record.symbol == symbol
+        && record.side == seam_side(request.side)
+        && record.quantity == request.quantity
+    {
+        let (fills, filled) = replay_terminal(&state, &account, &record.order_id)?;
+        // The FULL canonical identity: the ORIGINAL order id AND its committed
+        // placement sequence (from the index record), never a fabricated 0.
+        let sequence = record.sequence;
+        let status = if filled == 0 {
+            MarketOrderStatus::Rejected
+        } else if filled >= request.quantity {
+            MarketOrderStatus::Filled
+        } else {
+            MarketOrderStatus::Partial
+        };
+        let average_price = vwap_cents(&fills)?;
+        let fill_prints = fills
+            .into_iter()
+            .map(|(price, quantity)| FillPrint { price, quantity })
+            .collect();
+        return Ok(Json(PlaceMarketOrderResponse {
+            order_id: record.order_id,
+            status,
+            filled_quantity: filled,
+            remaining_quantity: remaining(request.quantity, filled),
+            average_price,
+            sequence,
+            fills: fill_prints,
+        }));
+    }
+
     let owner = owner_for(&state, &account)?;
     let order_id = mint_order_id(state.lineage_id(), &underlying);
 
