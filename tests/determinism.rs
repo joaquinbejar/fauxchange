@@ -92,12 +92,12 @@ use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
 use fauxchange::gateway::fix::order::NewOrderSingle;
 use fauxchange::gateway::fix::order_flow::to_add_command;
 use fauxchange::microstructure::{
-    ContractSpecsConfig, FeeConfig, FileMicrostructure, LatencyConfig, MicrostructureConfig,
-    StpConfig, StpMode,
+    ContractSpecsConfig, FeeConfig, FileLatency, FileMicrostructure, IngressStamp, LatencyConfig,
+    LatencyModel, MicrostructureConfig, StpConfig, StpMode,
 };
 use fauxchange::simulation::{
     ClockMode, JournalStream, ReplayError, RunManifest, ScenarioBundle, SessionConfig,
-    WalkTypeConfig, replay_bundle, replay_streams, synthesize_chain,
+    VenueClockConfig, WalkTypeConfig, replay_bundle, replay_streams, synthesize_chain,
 };
 use fauxchange::state::{AppState, AppStateConfig};
 use fauxchange::{AccountId, ClientOrderId, LiquidityFlag, OrderType, VenueError, VenueOrderId};
@@ -3907,5 +3907,406 @@ fn test_replay_refuses_an_unprovable_fee_config_in_a_bundle() {
         other => {
             panic!("an unprovable fee config must be refused with ConfigRejected, got {other:?}")
         }
+    }
+}
+
+// ============================================================================
+// #111: the deterministic ingress-reorder buffer (LatencyOffset at the edge)
+// ============================================================================
+//
+// The reorder is a LIVE ingress transformation BEFORE the sequencer: the actor
+// assigns `underlying_sequence` in receipt order (post-reorder) and journals THAT
+// order, so replay (which replays the journal in `underlying_sequence` order) is
+// deterministic without re-running the reorder. The obligation proved here is that
+// the LIVE reorder is a pure, reproducible function of `(run_seed, config, input
+// stream)`: same seed ⇒ same reorder ⇒ same journal. A latency-injected order loses
+// the queue race by DEADLINE, not wall-clock arrival, and a fixed/zero-latency run
+// is byte-identical to plain FIFO.
+
+/// The uniform latency band (microseconds) the #111 reorder tests draw against —
+/// wide enough that distinct message identities draw distinct offsets, so the
+/// deadline order genuinely differs from the arrival order.
+const ING_LAT_MIN_US: i64 = 1_000_000;
+const ING_LAT_MAX_US: i64 = 5_000_000;
+/// The seeded run the #111 reorder is a pure function of.
+const ING_SEED: u64 = 0xA5A5_1234_DEAD_BEEF;
+/// A DateTime-expiry BTC leaf the reorder tests rest orders on.
+const ING_LEAF: &str = "BTC-20260626-50000-C";
+/// The virtual epoch the stepped/held clock starts at, in ms.
+const ING_START_MS: u64 = 1_000_000;
+
+/// A microstructure config carrying the wide uniform latency band — distinct
+/// `(session, msg_seq)` identities draw distinct offsets.
+fn uniform_latency_micro() -> MicrostructureConfig {
+    let file = FileMicrostructure {
+        latency: Some(FileLatency {
+            model: LatencyModel::Uniform,
+            us: None,
+            min_us: Some(ING_LAT_MIN_US),
+            max_us: Some(ING_LAT_MAX_US),
+            mean_us: None,
+            median_us: None,
+            sigma: None,
+        }),
+        ..FileMicrostructure::default()
+    };
+    MicrostructureConfig::resolve(&file, &BTreeMap::new()).expect("uniform latency resolves")
+}
+
+/// A microstructure config carrying a large **fixed** latency — every message is
+/// held for the same offset (no reorder), used to fill the bounded buffer.
+fn fixed_latency_micro(us: i64) -> MicrostructureConfig {
+    let file = FileMicrostructure {
+        latency: Some(FileLatency {
+            model: LatencyModel::Fixed,
+            us: Some(us),
+            min_us: None,
+            max_us: None,
+            mean_us: None,
+            median_us: None,
+            sigma: None,
+        }),
+        ..FileMicrostructure::default()
+    };
+    MicrostructureConfig::resolve(&file, &BTreeMap::new()).expect("fixed latency resolves")
+}
+
+/// A seeded single-underlying venue whose clock starts **held** at [`ING_START_MS`]
+/// in the given mode — no clock advances until a test drives one, so buffered orders
+/// stay held (their deadlines are in the future) and release only on an explicit
+/// advance.
+fn ingress_state(micro: MicrostructureConfig, clock: VenueClockConfig) -> Arc<AppState> {
+    let config = AppStateConfig::new([UNDERLYING])
+        .with_lineage(LineageId::new("run-111"))
+        .with_seed(ING_SEED)
+        .with_clock(clock)
+        .with_microstructure(micro);
+    match AppState::new(config) {
+        Ok(state) => state,
+        Err(error) => panic!("ingress AppState must build with dev auth: {error}"),
+    }
+}
+
+/// Buffers a large-offset order (`slow_session`) FIRST, then a small-offset order
+/// (`fast_session`) SECOND, onto a held clock; then advances the clock past both
+/// deadlines and returns each order's committed sequence `(slow_seq, fast_seq)`.
+///
+/// Runs identically in every clock mode — `advance_clock_to` moves the **virtual**
+/// clock and releases in deadline order regardless of mode.
+async fn run_queue_race(
+    slow_session: &'static str,
+    fast_session: &'static str,
+    clock: VenueClockConfig,
+) -> (u64, u64) {
+    let state = ingress_state(uniform_latency_micro(), clock);
+
+    // Order A (slow, larger offset) "arrives" first in wall order.
+    let slow_cmd = ms_add(
+        ING_LEAF,
+        "slow-ord",
+        "slow-acct",
+        0x11,
+        Side::Sell,
+        50_000,
+        1,
+    );
+    let slow_stamp = IngressStamp::new(slow_session, 1);
+    let slow_state = Arc::clone(&state);
+    let slow_task =
+        tokio::spawn(async move { slow_state.submit_with_ingress(slow_cmd, slow_stamp).await });
+    // Held clock ⇒ its deadline is in the future ⇒ it stays buffered.
+    while state.ingress_pending() < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    // Order B (fast, smaller offset) "arrives" second.
+    let fast_cmd = ms_add(
+        ING_LEAF,
+        "fast-ord",
+        "fast-acct",
+        0x22,
+        Side::Sell,
+        51_000,
+        1,
+    );
+    let fast_stamp = IngressStamp::new(fast_session, 1);
+    let fast_state = Arc::clone(&state);
+    let fast_task =
+        tokio::spawn(async move { fast_state.submit_with_ingress(fast_cmd, fast_stamp).await });
+    while state.ingress_pending() < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    // Advance the VIRTUAL clock well past both deadlines (max offset 5 s) → release
+    // in deadline order: the smaller-offset (fast) command first.
+    state.advance_clock_to(ING_START_MS + 10_000).await;
+
+    let slow_seq = slow_task
+        .await
+        .expect("slow task joins")
+        .expect("slow order commits")
+        .underlying_sequence
+        .get();
+    let fast_seq = fast_task
+        .await
+        .expect("fast task joins")
+        .expect("fast order commits")
+        .underlying_sequence
+        .get();
+    (slow_seq, fast_seq)
+}
+
+/// THE ACCEPTANCE TEST. A live latency-injected order **loses the queue race**: an
+/// order that arrived earlier in wall order but drew a larger `LatencyOffset` reaches
+/// the sequencer AFTER a later-arriving lower-offset order — the journaled arrival
+/// order changes — and the reorder is **seed-reproducible** (same seed ⇒ same
+/// reorder). This is the #111 live application of the #45 seeded draw.
+#[tokio::test]
+async fn test_live_latency_injected_order_loses_the_queue_race_and_is_seed_reproducible() {
+    // Pick two identities where "slow" draws a strictly larger offset than "fast",
+    // so "slow" (submitted first) SHOULD lose the race to "fast" (submitted second).
+    let latency = uniform_latency_micro().latency();
+    let off_a = latency.draw(ING_SEED, "sess-a", 1).micros();
+    let off_b = latency.draw(ING_SEED, "sess-b", 1).micros();
+    assert_ne!(off_a, off_b, "distinct sessions draw distinct offsets");
+    let (slow, fast) = if off_a > off_b {
+        ("sess-a", "sess-b")
+    } else {
+        ("sess-b", "sess-a")
+    };
+
+    let stepped = VenueClockConfig::stepped(ING_START_MS, 60_000);
+    let first = run_queue_race(slow, fast, stepped).await;
+    let second = run_queue_race(slow, fast, stepped).await;
+
+    // Seed-reproducible: the same seed + config + input stream reorders identically.
+    assert_eq!(
+        first, second,
+        "same seed ⇒ identical reorder (the live reorder is seed-reproducible)"
+    );
+
+    // The later-arriving lower-offset order reached the sequencer FIRST (lower
+    // `underlying_sequence`) — the slow order lost the queue race.
+    let (slow_seq, fast_seq) = first;
+    assert!(
+        fast_seq < slow_seq,
+        "the lower-offset order that arrived SECOND wins the race \
+         (fast_seq {fast_seq} < slow_seq {slow_seq})"
+    );
+}
+
+/// The reorder → journaled `underlying_sequence` order is identical across two runs
+/// with the same seed + config + input stream (`tests/determinism.rs`). Several
+/// distinct-offset orders are all buffered, then released; the resulting
+/// `(order_id → sequence)` map — the journaled post-reorder order — must match
+/// byte-for-byte across runs.
+#[tokio::test]
+async fn test_ingress_reorder_is_deterministic_across_two_runs() {
+    // Distinct identities ⇒ distinct offsets ⇒ a non-trivial reorder to reproduce.
+    let identities: [(&'static str, u64); 5] =
+        [("c0", 7), ("c1", 11), ("c2", 13), ("c3", 17), ("c4", 19)];
+
+    async fn run(identities: &[(&'static str, u64)]) -> Vec<(String, u64)> {
+        let state = ingress_state(
+            uniform_latency_micro(),
+            VenueClockConfig::stepped(ING_START_MS, 60_000),
+        );
+        let mut labelled = Vec::new();
+        for (index, (session, msg_seq)) in identities.iter().enumerate() {
+            let order_id = format!("ord-{index}");
+            let cmd = ms_add(
+                ING_LEAF,
+                &order_id,
+                &format!("acct-{index}"),
+                index as u8,
+                Side::Sell,
+                50_000 + index as u64,
+                1,
+            );
+            let stamp = IngressStamp::new(*session, *msg_seq);
+            let task_state = Arc::clone(&state);
+            let task =
+                tokio::spawn(async move { task_state.submit_with_ingress(cmd, stamp).await });
+            // Each order is held (future deadline) until we advance the clock.
+            while state.ingress_pending() < index + 1 {
+                tokio::task::yield_now().await;
+            }
+            labelled.push((order_id, task));
+        }
+        // Release all at once, in deadline order.
+        state.advance_clock_to(ING_START_MS + 10_000).await;
+        let mut result = Vec::new();
+        for (order_id, task) in labelled {
+            let seq = task
+                .await
+                .expect("task joins")
+                .expect("order commits")
+                .underlying_sequence
+                .get();
+            result.push((order_id, seq));
+        }
+        result.sort_by_key(|(_, seq)| *seq);
+        result
+    }
+
+    let first = run(&identities).await;
+    let second = run(&identities).await;
+    assert_eq!(
+        first, second,
+        "the journaled post-reorder sequence order is identical across two seeded runs"
+    );
+    // The reorder is non-trivial: the released order is NOT the submission order
+    // (otherwise the test would prove nothing about reordering).
+    let submission_order: Vec<String> = (0..identities.len()).map(|i| format!("ord-{i}")).collect();
+    let released_order: Vec<String> = first.iter().map(|(id, _)| id.clone()).collect();
+    assert_ne!(
+        released_order, submission_order,
+        "the seeded offsets actually permuted arrival order (a real reorder occurred)"
+    );
+}
+
+/// No regression: with latency injection **off**, `submit_with_ingress` is
+/// byte-identical to plain FIFO `submit` — the same command stream produces the same
+/// journal (commands, sequences, and captured events) on both paths.
+#[tokio::test]
+async fn test_disabled_latency_ingress_matches_plain_fifo_journal() {
+    // A crossing scenario (a resting sell + a marketable buy) so a FILL is captured,
+    // proving parity on fills too, not just resting adds.
+    fn stream() -> Vec<VenueCommand> {
+        vec![
+            ms_add(ING_LEAF, "mk", "mkr", 0x11, Side::Sell, 50_000, 3),
+            ms_add(ING_LEAF, "tk", "tkr", 0x22, Side::Buy, 50_000, 2),
+        ]
+    }
+
+    // Path A: plain FIFO `submit`.
+    let fifo = ingress_state(
+        MicrostructureConfig::default(),
+        VenueClockConfig::stepped(ING_START_MS, 60_000),
+    );
+    for command in stream() {
+        fifo.submit(command).await.expect("fifo submit commits");
+    }
+    let fifo_journal = fifo
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("fifo journal");
+
+    // Path B: `submit_with_ingress` with latency DISABLED (delegates to FIFO).
+    let ingress = ingress_state(
+        MicrostructureConfig::default(),
+        VenueClockConfig::stepped(ING_START_MS, 60_000),
+    );
+    for (index, command) in stream().into_iter().enumerate() {
+        ingress
+            .submit_with_ingress(command, IngressStamp::new("rest", index as u64))
+            .await
+            .expect("ingress submit commits");
+    }
+    let ingress_journal = ingress
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("ingress journal");
+
+    assert_eq!(
+        fifo_journal.last_sequence, ingress_journal.last_sequence,
+        "disabled-latency ingress consumes the same sequence range as plain FIFO"
+    );
+    assert_eq!(
+        fifo_journal.records, ingress_journal.records,
+        "disabled-latency ingress journals byte-identically to plain FIFO (no regression)"
+    );
+}
+
+/// Bounded (a DoS control): a flood of held orders (a large fixed offset, a frozen
+/// clock) fills the bounded ingress buffer to capacity and the next order is a typed
+/// **drop** ([`VenueError::RateLimited`]) — never unbounded growth ([08 §5]).
+#[tokio::test]
+async fn test_ingress_buffer_is_bounded_under_flood() {
+    const CAPACITY: usize = 4;
+    // Every order is held for 5 virtual seconds; the clock never advances, so none
+    // release and the buffer fills.
+    let config = AppStateConfig::new([UNDERLYING])
+        .with_lineage(LineageId::new("run-111-flood"))
+        .with_seed(ING_SEED)
+        .with_clock(VenueClockConfig::stepped(ING_START_MS, 60_000))
+        .with_microstructure(fixed_latency_micro(5_000_000))
+        .with_ingress_buffer_capacity(CAPACITY);
+    let state = match AppState::new(config) {
+        Ok(state) => state,
+        Err(error) => panic!("flood AppState must build: {error}"),
+    };
+
+    // Fill the buffer to capacity with held (never-released) orders.
+    let mut held = Vec::new();
+    for index in 0..CAPACITY {
+        let cmd = ms_add(
+            ING_LEAF,
+            &format!("held-{index}"),
+            &format!("acct-{index}"),
+            index as u8,
+            Side::Sell,
+            50_000,
+            1,
+        );
+        let stamp = IngressStamp::new("flooder", index as u64);
+        let task_state = Arc::clone(&state);
+        held.push(tokio::spawn(async move {
+            task_state.submit_with_ingress(cmd, stamp).await
+        }));
+        while state.ingress_pending() < index + 1 {
+            tokio::task::yield_now().await;
+        }
+    }
+    assert_eq!(state.ingress_pending(), CAPACITY, "the buffer is full");
+
+    // The next order overflows the bound → a typed drop, immediately (the insert
+    // fails before any await), never growing the buffer.
+    let overflow = ms_add(ING_LEAF, "overflow", "acct-x", 0xFF, Side::Sell, 50_000, 1);
+    let result = state
+        .submit_with_ingress(overflow, IngressStamp::new("flooder", 999))
+        .await;
+    assert!(
+        matches!(result, Err(VenueError::RateLimited)),
+        "a flood past the bounded buffer is a typed drop, got {result:?}"
+    );
+    assert_eq!(
+        state.ingress_pending(),
+        CAPACITY,
+        "the dropped order did NOT grow the buffer past capacity"
+    );
+
+    // Release the held tasks (drop the venue) so the runtime tears them down cleanly.
+    for task in held {
+        task.abort();
+    }
+}
+
+/// The reorder orders by the **virtual deadline** in all three clock modes: realtime,
+/// accelerated, and stepped. `advance_clock_to` drives the virtual clock and releases
+/// in deadline order regardless of mode, so the queue-race outcome is identical.
+#[tokio::test]
+async fn test_ingress_reorder_orders_by_virtual_deadline_in_all_clock_modes() {
+    let latency = uniform_latency_micro().latency();
+    let off_a = latency.draw(ING_SEED, "sess-a", 1).micros();
+    let off_b = latency.draw(ING_SEED, "sess-b", 1).micros();
+    let (slow, fast) = if off_a > off_b {
+        ("sess-a", "sess-b")
+    } else {
+        ("sess-b", "sess-a")
+    };
+
+    for clock in [
+        VenueClockConfig::realtime(ING_START_MS),
+        VenueClockConfig::accelerated(ING_START_MS, 60),
+        VenueClockConfig::stepped(ING_START_MS, 60_000),
+    ] {
+        let (slow_seq, fast_seq) = run_queue_race(slow, fast, clock).await;
+        assert!(
+            fast_seq < slow_seq,
+            "in mode {:?} the lower-offset order wins by virtual deadline \
+             (fast_seq {fast_seq} < slow_seq {slow_seq})",
+            clock.mode
+        );
     }
 }

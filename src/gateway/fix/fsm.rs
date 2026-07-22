@@ -50,6 +50,7 @@ use crate::exchange::{
 use crate::gateway::rest::support::{
     immediate_execution_records, mint_order_id, owner_for, taker_legs_for_order,
 };
+use crate::microstructure::IngressStamp;
 use crate::models::{AccountId, ClientOrderId, ExecutionId, Permission, VenueOrderId};
 use crate::state::{AppState, SweptLeg};
 
@@ -2251,11 +2252,19 @@ impl VenueFixSession {
         message: DecodedMessage,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
+        // #111: stamp the message's `(SenderCompID, MsgSeqNum)` identity BEFORE the
+        // match consumes it, so an order-entry command carries the seeded
+        // latency-draw key onto the deterministic ingress-reorder buffer.
+        let stamp = self.ingress_stamp(&message);
         match message {
-            DecodedMessage::NewOrderSingle(order) => self.route_new_order(order, now_ms).await,
-            DecodedMessage::OrderCancelRequest(cancel) => self.route_cancel(cancel, now_ms).await,
+            DecodedMessage::NewOrderSingle(order) => {
+                self.route_new_order(order, stamp, now_ms).await
+            }
+            DecodedMessage::OrderCancelRequest(cancel) => {
+                self.route_cancel(cancel, stamp, now_ms).await
+            }
             DecodedMessage::OrderCancelReplaceRequest(replace) => {
-                self.route_replace(replace, now_ms).await
+                self.route_replace(replace, stamp, now_ms).await
             }
             DecodedMessage::OrderMassCancelRequest(request) => {
                 self.route_mass_cancel(request, now_ms).await
@@ -2267,14 +2276,27 @@ impl VenueFixSession {
         }
     }
 
+    /// The message's `(SenderCompID, MsgSeqNum)` ingress identity (#111) — the key
+    /// the seeded latency draw and the deadline tie-break consume when the venue has
+    /// latency injection configured. The `MsgSeqNum` is read from the frame header
+    /// (its stable per-message id); the `SenderCompID` is the resolved client comp.
+    fn ingress_stamp(&self, message: &DecodedMessage) -> IngressStamp {
+        let session_id = self.fsm.client_comp.as_ref().map_or("fix", CompId::as_str);
+        let msg_seq = header_of(message).msg_seq_num.value();
+        IngressStamp::new(session_id, msg_seq)
+    }
+
     /// `NewOrderSingle (D)` → the identical [`VenueCommand::AddOrder`] REST
-    /// produces, submitted through the same [`AppState::submit`] seam, with the
-    /// committed fills rendered as `ExecutionReport (8)`. Any pre-submit or
-    /// runtime failure is a context-correct `8 Rejected` with the reason from the
-    /// error seam.
+    /// produces, submitted through the same order-path seam, with the committed fills
+    /// rendered as `ExecutionReport (8)`. Order entry passes through the deterministic
+    /// ingress-reorder buffer ([`AppState::submit_with_ingress`], #111) so a
+    /// latency-injected venue reshapes arrival order; with no latency it is plain
+    /// FIFO, identical to REST. Any pre-submit or runtime failure is a context-correct
+    /// `8 Rejected` with the reason from the error seam.
     async fn route_new_order(
         &mut self,
         order: NewOrderSingle,
+        stamp: IngressStamp,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
         let Some(account) = self.fsm.account.clone() else {
@@ -2343,7 +2365,7 @@ impl VenueFixSession {
                 Ok(command) => command,
                 Err(error) => return self.reject_new_order(&order, &error, now_ms),
             };
-        match self.state.submit(command).await {
+        match self.state.submit_with_ingress(command, stamp).await {
             Ok(receipt) => {
                 // Render the OBSERVED outcome (#118), never a false accept: a place into
                 // a halted / `Settling` / `Expired` instrument (or another journaled
@@ -2586,6 +2608,7 @@ impl VenueFixSession {
     async fn route_cancel(
         &mut self,
         cancel: OrderCancelRequest,
+        stamp: IngressStamp,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
         let Some(account) = self.fsm.account.clone() else {
@@ -2617,7 +2640,7 @@ impl VenueFixSession {
             );
         };
         let command = order_flow::to_cancel_command(&cancel, account, resolved.order_id.clone());
-        match self.state.submit(command).await {
+        match self.state.submit_with_ingress(command, stamp).await {
             Ok(receipt) => {
                 // Render the OBSERVED outcome (#118), never a false `Canceled`: a cancel
                 // of an unowned / already-gone order (including a STALE cross-session
@@ -2682,6 +2705,7 @@ impl VenueFixSession {
     async fn route_replace(
         &mut self,
         replace: OrderCancelReplaceRequest,
+        stamp: IngressStamp,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
         let Some(account) = self.fsm.account.clone() else {
@@ -2719,7 +2743,7 @@ impl VenueFixSession {
             resolved.order_id.clone(),
             new_order_id.clone(),
         );
-        match self.state.submit(command).await {
+        match self.state.submit_with_ingress(command, stamp).await {
             Ok(receipt) => {
                 // Render the OBSERVED outcome (#118), never a false `Replaced`. A replace has
                 // TWO distinct failure shapes the order path captures losslessly, and each

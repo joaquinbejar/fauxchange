@@ -214,19 +214,26 @@ pub async fn place_limit_order(
     )?;
     let order_id = mint_order_id(state.lineage_id(), &underlying);
 
+    // #111: stamp the request's `(account, request-seq)` ingress identity so a
+    // latency-injected venue reshapes arrival order at the edge; with no latency
+    // configured this is plain FIFO (identical to a bare submit).
+    let stamp = state.next_rest_ingress_stamp(&account)?;
     let receipt = state
-        .submit(add_order_command(
-            symbol,
-            order_id.clone(),
-            account.clone(),
-            owner,
-            request.client_order_id.clone(),
-            seam_side(request.side),
-            OrderType::Limit,
-            Some(request.price),
-            request.quantity,
-            tif,
-        ))
+        .submit_with_ingress(
+            add_order_command(
+                symbol,
+                order_id.clone(),
+                account.clone(),
+                owner,
+                request.client_order_id.clone(),
+                seam_side(request.side),
+                OrderType::Limit,
+                Some(request.price),
+                request.quantity,
+                tif,
+            ),
+            stamp,
+        )
         .await?;
 
     // On an idempotent resend the canonical identity is the ORIGINAL placement's
@@ -361,19 +368,25 @@ pub async fn place_market_order(
     let owner = owner_for(&state, &account)?;
     let order_id = mint_order_id(state.lineage_id(), &underlying);
 
+    // #111: stamp the request's `(account, request-seq)` ingress identity (see the
+    // limit path). No latency configured ⇒ plain FIFO.
+    let stamp = state.next_rest_ingress_stamp(&account)?;
     let receipt = state
-        .submit(add_order_command(
-            symbol,
-            order_id.clone(),
-            account.clone(),
-            owner,
-            request.client_order_id.clone(),
-            seam_side(request.side),
-            OrderType::Market,
-            None,
-            request.quantity,
-            crate::exchange::TimeInForce::Ioc,
-        ))
+        .submit_with_ingress(
+            add_order_command(
+                symbol,
+                order_id.clone(),
+                account.clone(),
+                owner,
+                request.client_order_id.clone(),
+                seam_side(request.side),
+                OrderType::Market,
+                None,
+                request.quantity,
+                crate::exchange::TimeInForce::Ioc,
+            ),
+            stamp,
+        )
         .await?;
 
     // On an idempotent resend echo the ORIGINAL placement's order id + terminal
@@ -462,12 +475,18 @@ pub async fn cancel_order(
     // The client's OWN referenced order id — safe to log (never a cross-account leak).
     let order_id_for_log = order_id.clone();
 
+    // #111: stamp the request's `(account, request-seq)` ingress identity before the
+    // account moves into the command. No latency configured ⇒ plain FIFO.
+    let stamp = state.next_rest_ingress_stamp(&account)?;
     let receipt = state
-        .submit(VenueCommand::CancelOrder {
-            symbol,
-            order_id: crate::models::VenueOrderId::new(order_id),
-            account,
-        })
+        .submit_with_ingress(
+            VenueCommand::CancelOrder {
+                symbol,
+                order_id: crate::models::VenueOrderId::new(order_id),
+                account,
+            },
+            stamp,
+        )
         .await?;
 
     // Render the OBSERVED outcome (#118): `success` is true only for a `Cancelled`

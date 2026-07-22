@@ -66,6 +66,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use option_chain_orderbook::{InstrumentRegistry, SymbolIndex, SymbolParser};
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
@@ -87,7 +88,10 @@ use crate::exchange::{
     spawn_underlying_actor_with_clordid_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
-use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
+use crate::microstructure::{
+    DEFAULT_INGRESS_BUFFER_CAPACITY, IngressReorderBuffer, IngressStamp, MicrostructureConfig,
+    MicrostructureConfigError, ReleaseKey, release_deadline_us,
+};
 use crate::models::{AccountId, ClientOrderId};
 use crate::simulation::{
     AssetConfig, ClockMode, CorrelationId, ExpiryPhase, ExpirySchedule, JournalStream,
@@ -378,6 +382,12 @@ pub struct AppStateConfig {
     /// venue-owned price band admitted at order entry. Defaults to the neutral
     /// [`MicrostructureConfig::default`] (zero fee, STP off, baseline specs).
     pub microstructure: MicrostructureConfig,
+    /// The bounded depth of each per-underlying **ingress reorder buffer** (#111) —
+    /// a DoS control on the deadline-ordered arrival buffer, never unbounded
+    /// ([08 §5](../docs/08-threat-model.md#5-resource-exhaustion)). Defaults to
+    /// [`DEFAULT_INGRESS_BUFFER_CAPACITY`]; only consulted when latency injection is
+    /// configured (an empty buffer costs nothing on the FIFO fast path).
+    pub ingress_buffer_capacity: usize,
 }
 
 impl AppStateConfig {
@@ -399,6 +409,7 @@ impl AppStateConfig {
             db: None,
             start_serving: true,
             microstructure: MicrostructureConfig::default(),
+            ingress_buffer_capacity: DEFAULT_INGRESS_BUFFER_CAPACITY,
         }
     }
 
@@ -476,6 +487,14 @@ impl AppStateConfig {
     #[must_use]
     pub fn with_microstructure(mut self, microstructure: MicrostructureConfig) -> Self {
         self.microstructure = microstructure;
+        self
+    }
+
+    /// Overrides the bounded per-underlying ingress-reorder-buffer depth (#111) —
+    /// the DoS cap on the deadline-ordered arrival buffer.
+    #[must_use]
+    pub fn with_ingress_buffer_capacity(mut self, capacity: usize) -> Self {
+        self.ingress_buffer_capacity = capacity;
         self
     }
 }
@@ -625,6 +644,26 @@ pub struct AppState {
     /// account-scoped, so a resolution can only ever return an order the
     /// authenticated account placed.
     clordid_index: Arc<ClOrdIdIndex>,
+    /// The per-underlying **ingress reorder buffers** (#111), keyed by underlying —
+    /// the deadline-ordered arrival buffers that apply the seeded
+    /// [`LatencyOffset`](crate::microstructure::LatencyOffset) **before** the
+    /// sequencer. Empty and untouched on the FIFO fast path (latency injection off);
+    /// the actor still assigns `underlying_sequence` in receipt order, so the journal
+    /// records the post-reorder order and replay reproduces it without re-running the
+    /// reorder. Immutable after construction (a point lookup per submit, never an
+    /// iteration on the sequenced path).
+    ingress: HashMap<Arc<str>, Arc<IngressChannel>>,
+    /// The venue-wide **monotonic per-arrival counter** stamped at ingress admission
+    /// (#111) — the `arrival_sequence` half of the deterministic
+    /// `(session_id, arrival_sequence)` tie-break. Advanced by a **checked** CAS
+    /// ([`AppState::next_arrival_sequence`]); never wrapped (a wrapped counter would
+    /// corrupt the tie-break total order).
+    arrival_counter: AtomicU64,
+    /// A venue-wide monotonic counter minting the `msg_seq` of a **REST** ingress
+    /// stamp (#111) — REST carries no native per-message sequence, so the gateway
+    /// edge stamps `(account, rest-seq)`. Advanced by a checked CAS; a fixed request
+    /// order mints a fixed sequence, so a REST run's latency draws are reproducible.
+    rest_ingress_counter: AtomicU64,
 }
 
 /// The result of a venue-control clock advance fanned across the underlyings —
@@ -833,6 +872,77 @@ fn rebuild_stores_from_events<E: ExecutionsStore, P: PositionsStore>(
     Ok(())
 }
 
+/// Whether `command` is **bufferable ingress** — a client order-entry command
+/// (`AddOrder` / `CancelOrder` / `Replace`) that carries a `(session_id, msg_seq)`
+/// identity and is subject to the deterministic ingress-reorder buffer (#111). Every
+/// other command (venue-global controls, `Clock`, `SimStep`, instrument status, a
+/// scoped mass cancel) enters the sequencer directly on the FIFO path — it carries
+/// no client latency and must not be held behind an arrival deadline.
+#[must_use]
+fn is_bufferable_ingress(command: &VenueCommand) -> bool {
+    matches!(
+        command,
+        VenueCommand::AddOrder { .. }
+            | VenueCommand::CancelOrder { .. }
+            | VenueCommand::Replace { .. }
+    )
+}
+
+/// Resolves the target underlying ticker of a **bufferable** ingress command by
+/// parsing its symbol through the upstream [`SymbolParser`] grammar (#111). A
+/// non-parsing symbol is an [`VenueError::InvalidOrder`]; a non-bufferable command
+/// never reaches here (its caller guards with [`is_bufferable_ingress`]).
+fn bufferable_underlying(command: &VenueCommand) -> Result<String, VenueError> {
+    let symbol = match command {
+        VenueCommand::AddOrder { symbol, .. }
+        | VenueCommand::CancelOrder { symbol, .. }
+        | VenueCommand::Replace { symbol, .. } => symbol,
+        _ => {
+            return Err(VenueError::InvalidOrder(
+                "command is not bufferable ingress".to_string(),
+            ));
+        }
+    };
+    let parsed = SymbolParser::parse(symbol.as_str())
+        .map_err(|error| VenueError::InvalidOrder(error.to_string()))?;
+    Ok(parsed.underlying().to_string())
+}
+
+// ============================================================================
+// Ingress reorder buffer wiring (#111)
+// ============================================================================
+
+/// One buffered client order awaiting release into its underlying's actor: the
+/// journaled [`VenueCommand`] and the [`oneshot`] the caller of
+/// [`AppState::submit_with_ingress`] is awaiting. The reply carries the actor's
+/// [`Receipt`] once the command is released (the clock strictly passed its deadline)
+/// and sequenced.
+struct PendingIngress {
+    /// The command to release onto the sequenced order path in deadline order.
+    command: VenueCommand,
+    /// The reply the buffered caller awaits — filled when the command is released
+    /// and the actor returns its [`Receipt`].
+    reply: oneshot::Sender<Result<Receipt, VenueError>>,
+}
+
+/// The per-underlying ingress-reorder channel (#111): the bounded deadline-ordered
+/// buffer, a release lock serializing releases into the actor (so it **receives**
+/// commands in deadline order), and the actor handle releases are forwarded onto.
+///
+/// The buffer is guarded by a **std** mutex held only for the O(log n) insert/drain —
+/// never across an `.await`. The `release_lock` is a **tokio** mutex held across the
+/// forward `.await` on purpose: it is off the sequenced path and guards ingress
+/// **ordering** (not a book or the matching hot path), so at most one release runs
+/// per underlying and the actor's FIFO mailbox preserves deadline order.
+struct IngressChannel {
+    /// The bounded, deadline-ordered arrival buffer for this underlying.
+    buffer: std::sync::Mutex<IngressReorderBuffer<PendingIngress>>,
+    /// Serializes releases so the actor receives released commands in deadline order.
+    release_lock: AsyncMutex<()>,
+    /// The single-writer actor released commands are forwarded onto.
+    handle: ActorHandle,
+}
+
 impl AppState {
     /// Assembles an [`AppState`] behind an `Arc`, spawning **one single-writer
     /// actor per configured underlying** and wiring the real order path
@@ -883,6 +993,7 @@ impl AppState {
             db,
             start_serving,
             microstructure,
+            ingress_buffer_capacity,
         } = config;
 
         // The one shared venue microstructure (#044): the SAME resolved config is
@@ -1251,6 +1362,29 @@ impl AppState {
             handles.insert(ticker, handle);
         }
 
+        // The per-underlying ingress reorder buffers (#111): one bounded,
+        // deadline-ordered arrival buffer per actor, each holding a clone of that
+        // underlying's handle so a released command is forwarded onto the SAME
+        // sequenced order path client orders take. Built from the completed `handles`
+        // map (one channel per hosted underlying) BEFORE the map is cloned into the
+        // market-maker / simulator sinks. On the FIFO fast path (latency injection
+        // off) these buffers stay empty and untouched.
+        let ingress: HashMap<Arc<str>, Arc<IngressChannel>> = handles
+            .iter()
+            .map(|(ticker, handle)| {
+                (
+                    Arc::clone(ticker),
+                    Arc::new(IngressChannel {
+                        buffer: std::sync::Mutex::new(IngressReorderBuffer::new(
+                            ingress_buffer_capacity,
+                        )),
+                        release_lock: AsyncMutex::new(()),
+                        handle: handle.clone(),
+                    }),
+                )
+            })
+            .collect();
+
         // The market-maker engine (#015): its requotes enter the SAME per-underlying
         // actors as client orders, through an `ActorCommandSink` over cloned actor
         // handles — so generated liquidity is journaled and replayable, never a
@@ -1328,6 +1462,9 @@ impl AppState {
             expiry_phases: std::sync::Mutex::new(std::collections::HashMap::new()),
             recovered: recovered_set,
             clordid_index,
+            ingress,
+            arrival_counter: AtomicU64::new(0),
+            rest_ingress_counter: AtomicU64::new(0),
         }))
     }
 
@@ -1386,6 +1523,261 @@ impl AppState {
         }
         let handle = self.route(&command)?;
         handle.submit(command).await
+    }
+
+    /// Submits a client order-entry command through the **deterministic
+    /// ingress-reorder buffer** (#111) — the gateway-edge entry point that applies
+    /// the seeded [`LatencyOffset`](crate::microstructure::LatencyOffset) *before*
+    /// the sequencer, so a slow client (a large drawn offset) can lose the queue
+    /// race to a later-arriving fast one
+    /// ([03 §6.1](../docs/03-protocol-surfaces.md#61-deterministic-ingress-ordering)).
+    ///
+    /// `stamp` is the message's `(session_id, msg_seq)` identity (FIX
+    /// `(SenderCompID, MsgSeqNum)`, REST `(account, request-seq)`), which keys the
+    /// #45 seeded draw — the same identity always draws the same offset, so the
+    /// reorder is reproducible for a fixed seed + config + input stream.
+    ///
+    /// **Fast path.** When latency injection is off (the default) or `command` is not
+    /// a bufferable client order, this is byte-identical to [`submit`](Self::submit):
+    /// plain FIFO onto the actor, no buffering, no reorder, no regression. The
+    /// reorder buffer is engaged **only** when latency is configured **and** the
+    /// command is an `AddOrder` / `CancelOrder` / `Replace`.
+    ///
+    /// # Errors
+    ///
+    /// The same typed rejections as [`submit`](Self::submit), plus
+    /// [`VenueError::RateLimited`] when the bounded ingress buffer is at capacity (a
+    /// flood / hostile-offset **drop**, never unbounded growth), and
+    /// [`VenueError::JournalUnavailable`] if the venue shuts down while the command
+    /// is still buffered awaiting release.
+    pub async fn submit_with_ingress(
+        &self,
+        command: VenueCommand,
+        stamp: IngressStamp,
+    ) -> Result<Receipt, VenueError> {
+        if self.microstructure.latency().is_enabled() && is_bufferable_ingress(&command) {
+            self.submit_reordered(command, stamp).await
+        } else {
+            // FIFO fast path: no latency injection or a non-order-entry command. The
+            // ingress metadata is unused here (it only keys the seeded draw + the
+            // deadline tie-break, both of which are the reorder path's concern).
+            let _ = stamp;
+            self.submit(command).await
+        }
+    }
+
+    /// The buffered ingress path: admit the price band, draw the seeded offset,
+    /// compute the release deadline, hold the command in its underlying's
+    /// deadline-ordered buffer, and await the actor's [`Receipt`] once the venue
+    /// clock strictly passes that deadline and the command is released in order.
+    ///
+    /// The **ordering decision reads no wall clock and no unseeded state**: the
+    /// deadline is `venue_now_at_arrival + clamped LatencyOffset`, and the tie-break
+    /// is `(session_id, arrival_sequence)` on a checked monotonic counter.
+    async fn submit_reordered(
+        &self,
+        command: VenueCommand,
+        stamp: IngressStamp,
+    ) -> Result<Receipt, VenueError> {
+        // Admit the venue price band at the gateway edge, BEFORE buffering — an
+        // over-band order is rejected here and never buffered, never journaled
+        // (mirrors `submit`'s admission; a released command bypasses that seam).
+        self.admit_command_price(&command)?;
+        let underlying = bufferable_underlying(&command)?;
+        let channel = self
+            .ingress
+            .get(underlying.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                VenueError::NotFound(format!(
+                    "underlying '{underlying}' is not hosted by this venue"
+                ))
+            })?;
+
+        // The seeded per-message draw (#45) — a pure function of
+        // `(run_seed, session_id, msg_seq)`; NOT a fresh RNG here.
+        let offset = self.microstructure.latency().draw(
+            self.manifest.seed,
+            &stamp.session_id,
+            stamp.msg_seq,
+        );
+        // The release deadline on the VIRTUAL clock — the venue instant read at
+        // admission plus the clamped offset (checked; a hostile offset is bounded to
+        // the horizon so the buffer cannot hold a command forever).
+        let now_ms = self.clock.now_ms().get();
+        let deadline_us = release_deadline_us(now_ms, offset);
+        // The checked monotonic arrival counter — the tie-break's total-order key.
+        let arrival_sequence = self.next_arrival_sequence()?;
+        let key = ReleaseKey::new(deadline_us, Arc::clone(&stamp.session_id), arrival_sequence);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut buffer = channel
+                .buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            buffer
+                .insert(
+                    key,
+                    PendingIngress {
+                        command,
+                        reply: reply_tx,
+                    },
+                )
+                // Bounded DoS drop: a flood / hostile offset that fills the buffer is
+                // a typed throttle, never unbounded growth ([08 §5]).
+                .map_err(|_full| {
+                    tracing::warn!(
+                        underlying = %underlying,
+                        session = %stamp.session_id,
+                        "ingress reorder buffer at capacity; dropping order (throttled)"
+                    );
+                    VenueError::RateLimited
+                })?;
+        }
+        tracing::debug!(
+            underlying = %underlying,
+            session = %stamp.session_id,
+            msg_seq = stamp.msg_seq,
+            offset_us = offset.micros(),
+            deadline_us,
+            arrival_sequence,
+            "order buffered at the ingress edge; awaiting deadline release"
+        );
+
+        // Release anything the clock has already made due (e.g. an earlier advance
+        // passed a deadline while this caller was mid-admission). This never releases
+        // the just-buffered entry (its deadline is >= now, and release is strict).
+        self.release_ingress(&channel).await;
+
+        // Await the committed receipt — filled by whichever release pump (this kick,
+        // a clock advance, or the realtime cadence driver) forwards the command once
+        // the clock strictly passes its deadline. A dropped sender means the venue is
+        // shutting down.
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(VenueError::JournalUnavailable),
+        }
+    }
+
+    /// Releases every buffered command in one underlying's ingress channel whose
+    /// deadline the venue clock has **strictly passed**, forwarding them onto the
+    /// actor in deadline order (#111).
+    ///
+    /// The `release_lock` serializes releases per underlying so the actor's FIFO
+    /// mailbox receives the commands in exactly the drained order — the tokio mutex
+    /// is held across the forward `.await` on purpose (it is off the sequenced path
+    /// and guards ingress **ordering**, not a book). The **std** buffer mutex is
+    /// dropped before any `.await` (never held across it). No book is mutated here;
+    /// the actor assigns `underlying_sequence` in receipt order and journals it.
+    async fn release_ingress(&self, channel: &IngressChannel) {
+        let _release = channel.release_lock.lock().await;
+        // Snapshot the virtual instant ONCE: the drained batch is exactly the set of
+        // entries due at this instant, in strict key order (the release horizon).
+        let now_us = self.ingress_now_us();
+        let due = {
+            let mut buffer = channel
+                .buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            buffer.drain_below(now_us)
+        };
+        for (_key, pending) in due {
+            // Forward onto the SAME per-underlying actor client orders take, in
+            // deadline order. A closed reply just means the caller went away.
+            let receipt = channel.handle.submit(pending.command).await;
+            let _ = pending.reply.send(receipt);
+        }
+    }
+
+    /// Releases due ingress across **every** underlying, in the deterministic sorted
+    /// order (#111) — the pump a clock advance (stepped) or the realtime/accelerated
+    /// cadence driver runs after the venue clock moves. Each underlying's journal is
+    /// independent, so cross-underlying order is immaterial; sorted iteration keeps
+    /// it tidy and free of hash-map order. A no-op when every buffer is empty (the
+    /// FIFO fast path).
+    async fn release_all_ingress(&self) {
+        // Clone the channel handles out first so no borrow of `self.ingress` is held
+        // across the `.await` in `release_ingress`.
+        let channels: Vec<Arc<IngressChannel>> = self
+            .underlyings()
+            .iter()
+            .filter_map(|ticker| self.ingress.get(*ticker).cloned())
+            .collect();
+        for channel in channels {
+            self.release_ingress(&channel).await;
+        }
+    }
+
+    /// The current venue instant in **microseconds** — the release-horizon clock read
+    /// (a pure atomic load promoted `ms → µs`, checked, never a wall-clock read on the
+    /// ordering decision). The explicit `checked_mul(..).unwrap_or(u64::MAX)` is the
+    /// form the repo rules require over a banned `saturating_*` (mirrors
+    /// [`crate::simulation::SimClock::step`]); the clamp is an unreachable fail-safe on
+    /// an absurd instant, never a silent wrap.
+    #[allow(clippy::manual_saturating_arithmetic)]
+    #[inline]
+    fn ingress_now_us(&self) -> u64 {
+        self.clock
+            .now_ms()
+            .get()
+            .checked_mul(1_000)
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Mints the next **checked** monotonic arrival sequence (#111) — the
+    /// `arrival_sequence` tie-break key. A CAS loop over the venue-wide counter using
+    /// `checked_add`, so the counter is never wrapped (a wrapped sequence would
+    /// corrupt the tie-break's total order).
+    ///
+    /// # Errors
+    ///
+    /// [`VenueError::SequenceExhausted`] at `u64::MAX` arrivals — astronomically
+    /// unreachable, but surfaced rather than wrapped, per the checked-arithmetic rule.
+    fn next_arrival_sequence(&self) -> Result<u64, VenueError> {
+        let mut current = self.arrival_counter.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(1) else {
+                return Err(VenueError::SequenceExhausted);
+            };
+            match self.arrival_counter.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(current),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    /// Mints a **REST** ingress stamp (#111) for `account`: the session id is the
+    /// account, the `msg_seq` a checked monotonic venue-wide REST counter (REST
+    /// carries no native per-message sequence). A fixed request order mints a fixed
+    /// stamp sequence, so a REST run's seeded latency draws are reproducible.
+    ///
+    /// # Errors
+    ///
+    /// [`VenueError::SequenceExhausted`] at `u64::MAX` REST requests (unreachable;
+    /// surfaced rather than wrapped).
+    pub fn next_rest_ingress_stamp(&self, account: &AccountId) -> Result<IngressStamp, VenueError> {
+        let mut current = self.rest_ingress_counter.load(Ordering::Relaxed);
+        let msg_seq = loop {
+            let Some(next) = current.checked_add(1) else {
+                return Err(VenueError::SequenceExhausted);
+            };
+            match self.rest_ingress_counter.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break current,
+                Err(observed) => current = observed,
+            }
+        };
+        Ok(IngressStamp::new(account.as_str(), msg_seq))
     }
 
     /// Submits a [`VenueCommand::SetInstrumentStatus`] transition onto the
@@ -1796,7 +2188,12 @@ impl AppState {
     /// wired today.)
     pub async fn advance_clock_step(&self) -> ClockAdvance {
         let now_ms = self.clock.step();
-        self.fan_clock(now_ms).await
+        let advance = self.fan_clock(now_ms).await;
+        // #111: the clock just advanced — release every ingress command the advance
+        // made due, in deadline order, after the journaled `Clock` marker. A no-op
+        // when no latency is injected (empty buffers).
+        self.release_all_ingress().await;
+        advance
     }
 
     /// Advances the shared venue clock **monotonically** to `target_ms` (a no-op if
@@ -1808,7 +2205,11 @@ impl AppState {
     /// enforce that.
     pub async fn advance_clock_to(&self, target_ms: u64) -> ClockAdvance {
         let now_ms = self.clock.advance_to(target_ms);
-        self.fan_clock(now_ms).await
+        let advance = self.fan_clock(now_ms).await;
+        // #111: release ingress the advance made due, in deadline order (no-op when
+        // no latency is injected).
+        self.release_all_ingress().await;
+        advance
     }
 
     /// Fans a `Clock { now_ms }` to every hosted underlying (in the deterministic
@@ -1997,6 +2398,24 @@ impl AppState {
         let mut tickers: Vec<&str> = self.recovered.iter().map(AsRef::as_ref).collect();
         tickers.sort_unstable();
         tickers
+    }
+
+    /// The number of client orders currently **held** across every per-underlying
+    /// ingress reorder buffer (#111) — awaiting the venue clock to pass their release
+    /// deadline. Zero on the FIFO fast path (no latency injected). An observability
+    /// read of the bounded DoS control, not a sequenced-path read.
+    #[must_use]
+    pub fn ingress_pending(&self) -> usize {
+        self.ingress
+            .values()
+            .map(|channel| {
+                channel
+                    .buffer
+                    .lock()
+                    .map(|buffer| buffer.len())
+                    .unwrap_or_else(|poisoned| poisoned.into_inner().len())
+            })
+            .sum()
     }
 
     /// The JWT auth service (real as of #012) — JWT verification, the venue-clock
@@ -2430,6 +2849,12 @@ pub(crate) fn spawn_clock_cadence_driver_with_cadence(
                 // instant is intentionally discarded. No book mutation, no journal.
                 Some(state) => {
                     let _ = state.clock().tick();
+                    // #111: the clock advanced — release any ingress command it made
+                    // due, in deadline order. Off the sequenced path; a no-op when no
+                    // latency is injected (empty buffers). The RELEASE INSTANT tracks
+                    // the wall clock here (realtime), but the release ORDER is the
+                    // deterministic deadline order, never wall order.
+                    state.release_all_ingress().await;
                 }
                 // The last strong `Arc<AppState>` dropped: shut the driver down.
                 None => break,

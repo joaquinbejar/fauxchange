@@ -446,6 +446,15 @@ impl LatencyOffset {
     /// A zero offset (no delay).
     pub const ZERO: LatencyOffset = LatencyOffset(0);
 
+    /// A latency offset of exactly `micros` microseconds — the constructor the
+    /// ingress-reorder buffer ([#111](https://github.com/joaquinbejar/fauxchange/issues/111))
+    /// and its tests use to build a known offset without going through a draw.
+    #[must_use]
+    #[inline]
+    pub const fn from_micros(micros: u64) -> Self {
+        LatencyOffset(micros)
+    }
+
     /// The delay in microseconds.
     #[must_use]
     #[inline]

@@ -226,6 +226,44 @@ The full versioning and release-process policy lives in the design docs
     is now an unconditional venue-wide admission invariant (gateway
     order-admission + REST `insert_price` + replay + both internal producers),
     which makes the checked-fee proof unconditional.
+- **Deterministic ingress-reorder buffer — `LatencyOffset` applied at the
+  gateway edge** (#111). #45 landed the latency subsystem (seeded per-`(session_id,
+  msg_seq)` `LatencyOffset` draw, config, the reordering-preserves-fills proof)
+  but not its live application — `AppState::submit` was plain FIFO to the
+  single-writer actor, so an injected offset was seed-reproducible but did not
+  yet reshape arrival order. This wires the docs/03 §6.1 mechanism:
+  - A new `src/microstructure/ingress.rs` `IngressReorderBuffer` (a bounded
+    `BTreeMap` keyed on `ReleaseKey { deadline_us, session_id, arrival_sequence }`
+    — exactly the doc's `(deadline, session_id, arrival_sequence)` total order).
+    The FIX/REST edges stamp each admitted `AddOrder`/`Cancel`/`Replace` with its
+    `(session_id, msg_seq)`; `AppState::submit_with_ingress` computes the release
+    deadline `venue_now + clamp(LatencyOffset)` (the #45 seeded draw, no fresh
+    RNG) and releases commands into the actor in **deadline order**, equal-deadline
+    ties broken deterministically on `(session_id, arrival_sequence)` — never on
+    wall-clock, map order, or task scheduling.
+  - **The release horizon falls out of the invariant**: offsets are non-negative
+    and the venue clock is monotonic, so any not-yet-arrived command has a
+    deadline ≥ now; draining `deadline < now` in key order reproduces the exact
+    global order without a separate horizon parameter, identically across all
+    three clock modes (only *when* the clock passes a deadline differs).
+  - **Bounded** (two DoS controls, [08 §5]): the offset is clamped to
+    `MAX_INGRESS_OFFSET_US` and the per-underlying buffer depth is capped (a
+    flood is a typed `RateLimited` drop, never unbounded growth).
+  - **Determinism**: the reorder is a live ingress transformation **before** the
+    sequencer — the actor still assigns `underlying_sequence` in receipt order
+    and journals it, so **replay replays the journaled post-reorder order and the
+    reorder is never re-run** (replay determinism is automatic). Live run-to-run
+    reproducibility of the reorder holds under a controlled/stepped clock (arrival
+    timestamps deterministic); under a realtime clock the *ordering* is still by
+    virtual deadline but the release *instant* tracks wall time, so live
+    run-to-run reproducibility is not claimed there — replay stays deterministic
+    regardless. A zero/absent offset is byte-identical to plain FIFO (no
+    regression).
+  - Tests: a live latency-injected order loses the queue race (its
+    `underlying_sequence` ends up higher than a later-arriving lower-offset order)
+    and two same-seed runs reorder identically; disabled-latency journal is
+    byte-identical to FIFO; the buffer is bounded under flood; all three clock
+    modes order by virtual deadline.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;
