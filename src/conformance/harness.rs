@@ -38,6 +38,7 @@ use crate::gateway::fix::{
     VenueFixSessionFactory,
 };
 use crate::gateway::rest::create_router;
+use crate::microstructure::MicrostructureConfig;
 use crate::models::{AccountId, Permission};
 use crate::state::{AppState, AppStateConfig, AuthConfig};
 
@@ -179,8 +180,10 @@ fn parity_accounts() -> Vec<AccountProvision> {
         .collect()
 }
 
-/// Builds one identically-seeded, **serving** parity venue.
-fn build_parity_state() -> Result<Arc<AppState>, ConformanceError> {
+/// Builds one identically-seeded, **serving** parity venue carrying `micro` — the
+/// venue-config seam through which a case configures STP / fees / specs so a live
+/// order flow exercises them (per-account STP is venue config, not a wire field).
+fn build_parity_state_with(micro: MicrostructureConfig) -> Result<Arc<AppState>, ConformanceError> {
     let auth = AuthConfig::dev()
         .map_err(|e| ConformanceError::Setup(format!("dev auth: {e}")))?
         .with_bootstrap_secret(SECRET)
@@ -189,7 +192,8 @@ fn build_parity_state() -> Result<Arc<AppState>, ConformanceError> {
     AppState::new(
         AppStateConfig::new([UNDERLYING])
             .with_serving(true)
-            .with_auth(auth),
+            .with_auth(auth)
+            .with_microstructure(micro),
     )
     .map_err(|e| ConformanceError::Setup(format!("app state: {e}")))
 }
@@ -221,7 +225,15 @@ impl VenueServer {
     /// Assembles a fresh parity venue and binds its REST + FIX gateways on
     /// ephemeral loopback ports.
     pub async fn start() -> Result<Self, ConformanceError> {
-        let state = build_parity_state()?;
+        Self::start_with_microstructure(MicrostructureConfig::default()).await
+    }
+
+    /// Like [`start`](Self::start), but the venue carries `micro` — the config seam
+    /// a case uses to drive a live STP / fee / spec flow through the real gateways.
+    pub async fn start_with_microstructure(
+        micro: MicrostructureConfig,
+    ) -> Result<Self, ConformanceError> {
+        let state = build_parity_state_with(micro)?;
 
         // The REST gateway: a real ephemeral server over the true router.
         let rest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -538,6 +550,44 @@ impl WsClient {
         .await
     }
 
+    /// Subscribes to `channel`/`symbol` (optional `depth`) and reads until the
+    /// baseline reply lands — the `orderbook_snapshot` for the orderbook channel,
+    /// the `subscribed` ack otherwise, or an `error`.
+    pub async fn subscribe(
+        &mut self,
+        channel: &str,
+        symbol: &str,
+        depth: Option<u32>,
+    ) -> Result<Vec<String>, String> {
+        let action = match depth {
+            Some(d) => format!(
+                r#"{{"action":"subscribe","channel":"{channel}","symbol":"{symbol}","depth":{d}}}"#
+            ),
+            None => {
+                format!(r#"{{"action":"subscribe","channel":"{channel}","symbol":"{symbol}"}}"#)
+            }
+        };
+        self.write_text(&action).await?;
+        self.read_frames_until(REPLY_TIMEOUT, |frames| {
+            frames.iter().any(|f| {
+                ws_type_of(f)
+                    .is_some_and(|t| t == "orderbook_snapshot" || t == "subscribed" || t == "error")
+            })
+        })
+        .await
+    }
+
+    /// Reads server text frames until `done` is satisfied by the accumulated set or
+    /// `window` elapses — the public wait a case drives an on-the-wire delta /
+    /// resnapshot assertion through.
+    pub async fn read_until(
+        &mut self,
+        window: Duration,
+        done: impl Fn(&[String]) -> bool,
+    ) -> Result<Vec<String>, String> {
+        self.read_frames_until(window, done).await
+    }
+
     async fn write_text(&mut self, text: &str) -> Result<(), String> {
         let payload = text.as_bytes();
         let len = payload.len();
@@ -665,6 +715,23 @@ pub fn ws_find_type(frames: &[String], ty: &str) -> Option<Value> {
             None
         }
     })
+}
+
+/// The `data` object of **every** WS text frame whose `type` equals `ty`, in
+/// arrival order — the on-the-wire delta / resnapshot stream a case asserts over.
+#[must_use]
+pub fn ws_data_of_type(frames: &[String], ty: &str) -> Vec<Value> {
+    frames
+        .iter()
+        .filter_map(|text| {
+            let value: Value = serde_json::from_str(text).ok()?;
+            if value.get("type")?.as_str()? == ty {
+                value.get("data").cloned()
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -859,6 +926,34 @@ async fn recv_frames(stream: &mut TcpStream, timeout: Duration) -> Vec<Vec<u8>> 
         }
     }
     split_frames(&buf)
+}
+
+/// Like [`recv_frames`], but keeps accumulating frames across reads until one
+/// satisfies `wanted` or `timeout` elapses. A single [`recv_frames`] returns on
+/// the first complete frame, so a terminal report that lands a read-gap after an
+/// earlier ack (a `Trade (150=F)` after a `New`) can race it under load; this
+/// waits for the awaited frame while the overall `timeout` still bounds it.
+async fn recv_frames_until(
+    stream: &mut TcpStream,
+    timeout: Duration,
+    wanted: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut all = Vec::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let batch = recv_frames(stream, deadline - now).await;
+        let matched = batch.iter().any(|frame| wanted(frame));
+        let empty = batch.is_empty();
+        all.extend(batch);
+        if matched || empty {
+            break;
+        }
+    }
+    all
 }
 
 /// The value of scalar `tag` in a FIX frame.
@@ -1056,9 +1151,15 @@ impl FixClient {
         self.round_trip(frame).await
     }
 
-    /// Drains any further buffered frames (best effort, short timeout).
-    pub async fn drain(&mut self) -> Vec<Vec<u8>> {
-        recv_frames(&mut self.stream, Duration::from_millis(300)).await
+    /// Reads reply frames until one satisfies `wanted` or `timeout` elapses — the
+    /// deterministic wait for a terminal report (e.g. a `Trade (150=F)` that lands
+    /// a read-gap after the `New` ack), replacing a fixed number of blind drains.
+    pub async fn read_until(
+        &mut self,
+        timeout: Duration,
+        wanted: impl Fn(&[u8]) -> bool,
+    ) -> Vec<Vec<u8>> {
+        recv_frames_until(&mut self.stream, timeout, wanted).await
     }
 }
 
