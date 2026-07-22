@@ -1169,8 +1169,14 @@ mod tests {
             }
             serde_json::to_string(&all).expect("VenueCommand stream serializes")
         }
+        let first = run();
+        assert!(
+            !first.is_empty(),
+            "the requote must actually emit commands — guards against a vacuous \
+             empty-vs-empty pass if the sink wiring ever regresses"
+        );
         assert_eq!(
-            run(),
+            first,
             run(),
             "the interned requote path must produce a byte-identical command stream"
         );
