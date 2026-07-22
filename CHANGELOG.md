@@ -22,13 +22,14 @@ The full versioning and release-process policy lives in the design docs
     an over-domain config fails fast instead of a fill being rejected by the
     `BIGINT` store with `ValueRange`.
   - **Net-of-fee edge on `ExecutionRecord`.** `project_execution` no longer
-    hardcodes `edge_cents = 0`: it computes the signed edge with **checked**
-    integer arithmetic — `notional = price × quantity` (`checked_mul`, `u128`) →
-    `FeeSchedule::try_calculate_fee(notional, is_maker)` (the same upstream
-    checked call the matching seam uses) → `edge = -fee`. A maker **rebate** ⇒ a
-    **positive** edge, a taker **fee** ⇒ a **negative** edge. `theo_value_cents`
-    stays the fill price (no pricer at this seam, documented). It remains a
-    **live-only analytic** — not journaled, excluded from the replay oracle.
+    hardcodes `edge_cents = 0`: with `theo_value_cents` kept at the fill price,
+    the net edge is exactly the **negation of the leg's already-journaled
+    authoritative signed fee** (`edge = -fill.fee`, a **checked** `i64`
+    negation — no `f64`, no recompute). A maker **rebate** ⇒ a **positive** edge,
+    a taker **fee** ⇒ a **negative** edge. Using the journaled fee directly keeps
+    it exact by construction (no fan-out fee-schedule to diverge from the leg).
+    It remains a **live-only analytic** — not journaled, excluded from the
+    replay oracle.
   - **Cross-protocol fee-observation parity.** A test proves one committed
     fill's fee renders consistently as REST `fee_cents` and FIX `Commission(12)`
     (`CommType(13)=3`, equal, non-zero) while the WS `fill` **omits** the

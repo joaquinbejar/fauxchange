@@ -1,7 +1,7 @@
 [
   {
     "account": "maker-acct",
-    "edge_cents": 0,
+    "edge_cents": 10,
     "executed_at": 1700000000000,
     "execution_id": "run-1:BTC:7:0",
     "fee_cents": -10,
@@ -18,7 +18,7 @@
   },
   {
     "account": "taker-acct",
-    "edge_cents": 0,
+    "edge_cents": -15,
     "executed_at": 1700000000000,
     "execution_id": "run-1:BTC:7:0",
     "fee_cents": 15,

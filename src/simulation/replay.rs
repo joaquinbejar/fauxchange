@@ -641,9 +641,6 @@ fn replay_streams_inner(
             Arc::clone(&positions),
             Arc::clone(&marks),
         );
-        if let Some(config) = microstructure {
-            fan_out = fan_out.with_fee_schedule(config.fee_schedule());
-        }
         for event in &events {
             // A store projection failure during reconstruction means the journal
             // cannot be faithfully re-projected — halt at the exact sequence rather

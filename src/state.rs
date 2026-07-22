@@ -1245,12 +1245,7 @@ impl AppState {
                     Arc::clone(&executions),
                     Arc::clone(&positions),
                     Arc::clone(&marks),
-                )
-                // The venue fee schedule feeds the executions store's net-of-fee
-                // `edge_cents` analytic (#114 item 3) — the SAME schedule the leaf
-                // applied to the fill, so the recomputed edge is exact. A live-only
-                // projection input, excluded from the replay oracle.
-                .with_fee_schedule(microstructure.fee_schedule()),
+                ),
                 WsFanOut::new(Arc::clone(&subscriptions)),
             );
             let header = JournalHeader::new(lineage_id.clone());

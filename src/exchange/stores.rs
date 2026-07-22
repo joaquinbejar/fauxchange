@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use option_chain_orderbook::{FeeSchedule, MarkPriceCalculator};
+use option_chain_orderbook::MarkPriceCalculator;
 
 use crate::exchange::actor::{FanOut, FanOutSealed};
 use crate::exchange::boundary::{Side as SeamSide, SymbolParser};
@@ -979,11 +979,6 @@ pub struct StoreFanOut<E, P> {
     /// Set once a projection write fails: the fan-out is fail-stopped and drops
     /// every subsequent event until the projections are rebuilt from the journal.
     sealed: bool,
-    /// The venue fee schedule the net-of-fee `edge_cents` analytic is derived from
-    /// (#114 item 3). Defaults to zero-fee (`FeeSchedule::new(0, 0)`), so a fan-out
-    /// wired without one records a zero edge; the live venue sets the resolved
-    /// venue schedule via [`with_fee_schedule`](Self::with_fee_schedule).
-    fee_schedule: FeeSchedule,
 }
 
 impl<E, P> StoreFanOut<E, P>
@@ -991,9 +986,10 @@ where
     E: ExecutionsStore,
     P: PositionsStore,
 {
-    /// Wires a fan-out over shared executions / positions stores and a mark book,
-    /// with the neutral zero-fee schedule (a fee-agnostic `edge_cents` of `0` until
-    /// [`with_fee_schedule`](Self::with_fee_schedule) sets the venue schedule).
+    /// Wires a fan-out over shared executions / positions stores and a mark book.
+    /// The net-of-fee `edge_cents` analytic (#114 item 3) is the negation of each
+    /// fill's already-journaled authoritative `fee`, so the fan-out needs no fee
+    /// schedule of its own.
     #[must_use]
     #[inline]
     pub fn new(executions: Arc<E>, positions: Arc<P>, marks: Arc<MarkPriceBook>) -> Self {
@@ -1002,7 +998,6 @@ where
             positions,
             marks,
             sealed: false,
-            fee_schedule: FeeSchedule::new(0, 0),
         }
     }
 
@@ -1036,19 +1031,6 @@ where
             projection,
             detail: error.to_string(),
         }
-    }
-
-    /// Sets the venue [`FeeSchedule`] the net-of-fee `edge_cents` analytic is derived
-    /// from (#114 item 3) — the **same** schedule the matching seam applied to the
-    /// fill, so the recomputed edge is exact. A **live-only** projection input: the
-    /// edge is not journaled and is excluded from the replay oracle, so setting it on
-    /// the (deterministic) fan-out is safe — its output is simply not asserted across
-    /// replays.
-    #[must_use]
-    #[inline]
-    pub fn with_fee_schedule(mut self, fee_schedule: FeeSchedule) -> Self {
-        self.fee_schedule = fee_schedule;
-        self
     }
 
     /// The shared executions store handle — the snapshot cut reads/replaces it
@@ -1107,7 +1089,7 @@ where
         // the next leg, which is what would let the two stores (and the journal)
         // diverge. The mark is advanced only after every leg projected cleanly.
         for fill in fills {
-            let record = project_execution(event, symbol, &underlying, fill, &self.fee_schedule);
+            let record = project_execution(event, symbol, &underlying, fill);
             if let Err(error) = self.executions.record(record) {
                 return Err(self.seal(event, "executions", &error));
             }
@@ -1209,7 +1191,6 @@ fn project_execution(
     symbol: &Symbol,
     underlying: &str,
     fill: &Fill,
-    fee_schedule: &FeeSchedule,
 ) -> ExecutionRecord {
     ExecutionRecord {
         execution_id: fill.execution_id.clone(),
@@ -1223,7 +1204,7 @@ fn project_execution(
         price_cents: fill.price,
         fee_cents: fill.fee,
         theo_value_cents: fill.price,
-        edge_cents: net_of_fee_edge(fee_schedule, fill),
+        edge_cents: net_of_fee_edge(fill),
         underlying_sequence: event.underlying_sequence,
         latency_us: 0,
         executed_at: event.venue_ts,
@@ -1233,49 +1214,25 @@ fn project_execution(
 /// The signed **net-of-fee edge** in cents for one fill leg — a live-only analytic
 /// ([01 §7](../../../docs/01-domain-model.md), #114 item 3).
 ///
-/// With `theo_value_cents` kept at the fill price the gross theo-edge is zero, so
-/// the net edge is exactly the **negation** of the leg's signed fee: a maker rebate
+/// With `theo_value_cents` kept at the fill price the gross theo-edge is zero, so the
+/// net edge is exactly the **negation of the leg's already-authoritative signed fee**
+/// (`fill.fee` — the value the matching seam computed and journaled): a maker rebate
 /// (negative fee) yields a **positive** edge, a taker fee (positive fee) a
-/// **negative** edge. The fee is recomputed from the venue [`FeeSchedule`] + this
-/// leg's liquidity + its `price × quantity` notional through the upstream **checked**
-/// [`FeeSchedule::try_calculate_fee`] — the same call the matching seam used, so for
-/// a config that passed the checked-fee proof the result equals `-fill.fee` exactly.
+/// **negative** edge. Using the journaled fee directly (rather than recomputing it
+/// from a fan-out [`FeeSchedule`]) keeps this exact by construction and removes any
+/// surface where a fan-out schedule could diverge from the leg that produced the fee.
 ///
-/// Every step is checked integer arithmetic (no `f64`): the notional multiply, the
-/// fee negation, and the narrowing to the persisted `i64` cents. The `Err` /
-/// overflow arms are seal-class fail-safes made unreachable by the resolver's
-/// checked-fee proof (which bounds the widest notional and keeps the worst-case fee
-/// inside `i64`); they log and fall back to a zero edge rather than panic, so a
-/// misconfigured fan-out never poisons the executions log.
+/// The one arithmetic step is a **checked** negation of the persisted `i64` cents (no
+/// `f64`); the only unreachable edge is negating `i64::MIN`, a seal-class fail-safe
+/// that logs and records a zero edge rather than panic.
 #[must_use]
-fn net_of_fee_edge(fee_schedule: &FeeSchedule, fill: &Fill) -> SignedCents {
-    let Some(notional) = u128::from(fill.price.get()).checked_mul(u128::from(fill.quantity)) else {
-        tracing::error!(
-            price = fill.price.get(),
-            quantity = fill.quantity,
-            "fill notional overflowed u128 computing net-of-fee edge; recording 0"
-        );
-        return SignedCents::new(0);
-    };
-    let is_maker = matches!(fill.liquidity, LiquidityFlag::Maker);
-    let fee = match fee_schedule.try_calculate_fee(notional, is_maker) {
-        Ok(fee) => fee,
-        Err(_) => {
-            tracing::error!(
-                notional,
-                is_maker,
-                "fee saturated computing net-of-fee edge (config bypassed the checked-fee proof); recording 0"
-            );
-            return SignedCents::new(0);
-        }
-    };
-    // edge = -fee, checked negation then a checked narrow to the persisted i64 cents.
-    match fee.checked_neg().and_then(|edge| i64::try_from(edge).ok()) {
+fn net_of_fee_edge(fill: &Fill) -> SignedCents {
+    match fill.fee.get().checked_neg() {
         Some(edge) => SignedCents::new(edge),
         None => {
             tracing::error!(
-                fee,
-                "net-of-fee edge did not fit i64 cents (config bypassed the checked-fee proof); recording 0"
+                fee = fill.fee.get(),
+                "fill fee negation overflowed i64 computing net-of-fee edge; recording 0"
             );
             SignedCents::new(0)
         }
@@ -1401,10 +1358,11 @@ mod tests {
         assert_eq!(taker.instrument, sym());
         assert_eq!(maker.side, Side::Sell);
         assert_eq!(taker.side, Side::Buy);
-        // No pricer / latency wired: theo defaults to the fill price. This fan-out
-        // carries the neutral zero-fee schedule, so the net-of-fee edge is 0.
+        // No pricer / latency wired: theo defaults to the fill price. The net-of-fee
+        // edge is the negation of the leg's journaled fee (#114 item 3), so the
+        // taker's +15 fee is a -15 edge.
         assert_eq!(taker.theo_value_cents, Cents::new(50_000));
-        assert_eq!(taker.edge_cents, SignedCents::new(0));
+        assert_eq!(taker.edge_cents, SignedCents::new(-15));
         assert_eq!(taker.latency_us, 0);
     }
 
@@ -1423,11 +1381,9 @@ mod tests {
             Arc::new(store),
             Arc::new(InMemoryPositionsStore::new()),
             Arc::new(MarkPriceBook::new()),
-        )
-        .with_fee_schedule(FeeSchedule::new(-10, 15));
-        // Build a crossing whose per-leg fees agree with the schedule (as the
-        // matching seam would journal them), so fee_cents and edge_cents are
-        // consistent.
+        );
+        // Set the per-leg fees the matching seam would have journaled, so the
+        // `edge_cents = -fill.fee` analytic derives directly from them.
         let (mut maker, mut taker) = match_legs(1, 50_000, 2);
         maker.fee = SignedCents::new(-100);
         taker.fee = SignedCents::new(150);
