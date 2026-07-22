@@ -57,8 +57,8 @@ use dashmap::DashMap;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 
 use crate::exchange::{
-    AddOutcome, Cents, EventTimestamp, FanOut, Fill as SeamFill, MassCancelScope, Side as SeamSide,
-    SignedCents, Symbol, SymbolParser, VenueCommand, VenueEvent, VenueOutcome,
+    AddOutcome, Cents, EventTimestamp, FanOut, FanOutSealed, Fill as SeamFill, MassCancelScope,
+    Side as SeamSide, SignedCents, Symbol, SymbolParser, VenueCommand, VenueEvent, VenueOutcome,
 };
 use crate::models::{
     BookSide, ExecutionId, LiquidityFlag, PriceLevelChange, PriceLevelData, Side as DtoSide,
@@ -650,10 +650,13 @@ impl WsFanOut {
 
 impl FanOut for WsFanOut {
     #[inline]
-    fn emit(&mut self, event: &VenueEvent) {
+    fn emit(&mut self, event: &VenueEvent) -> Result<(), FanOutSealed> {
         // O(1) enqueue onto a bounded broadcast (after an O(log n) L2 fold); never
-        // blocks the order path — a slow consumer lags and re-snapshots.
+        // blocks the order path — a slow consumer lags and re-snapshots. The WS feed
+        // is BEST-EFFORT (a lagging subscriber re-snapshots), so it NEVER seals the
+        // actor: it always returns `Ok` (#131).
         let _ = self.manager.on_committed_event(event);
+        Ok(())
     }
 }
 

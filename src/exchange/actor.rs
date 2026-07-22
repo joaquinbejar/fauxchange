@@ -167,7 +167,26 @@ impl CommandExecutor for PlaceholderExecutor {
 /// failure. #006 ships the [`NoopFanOut`]; #008 wires the real consumers.
 pub trait FanOut: Send {
     /// Emits one committed event to the fan-out consumers.
-    fn emit(&mut self, event: &VenueEvent);
+    ///
+    /// Returns `Err(`[`FanOutSealed`]`)` when an **authoritative** projection (the
+    /// executions/positions stores) failed and the fan-out fail-stopped: the served
+    /// stores would otherwise diverge from the committed journal. The actor
+    /// **seals** the underlying on that error so no further command is
+    /// matched/journaled/served on a divergent store; recovery rebuilds the stores
+    /// from the journal (#131). A **best-effort** consumer (the WS broadcast) never
+    /// seals — a lagging subscriber re-snapshots — so it returns `Ok`.
+    fn emit(&mut self, event: &VenueEvent) -> Result<(), FanOutSealed>;
+}
+
+/// The signal an **authoritative** [`FanOut`] projection raises when it fail-stops
+/// on a store write failure — the actor seals the underlying on it so the served
+/// executions/positions stores can never diverge from the journal (#131).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanOutSealed {
+    /// Which authoritative projection failed (`"executions"` / `"positions"`).
+    pub projection: &'static str,
+    /// The store error detail (already logged at `ERROR` by the projection).
+    pub detail: String,
 }
 
 /// The #006 no-op fan-out — the consumers land in #008.
@@ -176,7 +195,9 @@ pub struct NoopFanOut;
 
 impl FanOut for NoopFanOut {
     #[inline]
-    fn emit(&mut self, _event: &VenueEvent) {}
+    fn emit(&mut self, _event: &VenueEvent) -> Result<(), FanOutSealed> {
+        Ok(())
+    }
 }
 
 /// A **tee** [`FanOut`]: emits one committed event to two consumers in order.
@@ -210,9 +231,13 @@ where
     B: FanOut,
 {
     #[inline]
-    fn emit(&mut self, event: &VenueEvent) {
-        self.first.emit(event);
-        self.second.emit(event);
+    fn emit(&mut self, event: &VenueEvent) -> Result<(), FanOutSealed> {
+        // `first` is the AUTHORITATIVE #008 StoreFanOut: if it seals, propagate so
+        // the actor fail-stops and never feeds the best-effort `second` (WS) an
+        // event whose authoritative projection failed (#131). `second` (WS) is
+        // best-effort and never seals.
+        self.first.emit(event)?;
+        self.second.emit(event)
     }
 }
 
@@ -333,6 +358,10 @@ enum SealReason {
     /// A post-mutation event append failed; the actor must not build the next
     /// command on unjournaled state.
     JournalUnavailable,
+    /// An authoritative store projection (executions/positions) failed during
+    /// fan-out; the served stores diverged from the committed journal, so the
+    /// underlying fail-stops until the stores are rebuilt from the journal (#131).
+    ProjectionFailed,
 }
 
 impl SealReason {
@@ -342,7 +371,7 @@ impl SealReason {
     fn as_error(self) -> VenueError {
         match self {
             Self::SequenceExhausted => VenueError::SequenceExhausted,
-            Self::JournalUnavailable => VenueError::JournalUnavailable,
+            Self::JournalUnavailable | Self::ProjectionFailed => VenueError::JournalUnavailable,
         }
     }
 }
@@ -527,8 +556,23 @@ where
             return Err(VenueError::JournalUnavailable);
         }
 
-        // Step 5: fan-out ONLY after the paired event is journaled.
-        self.fan_out.emit(&event);
+        // Step 5: fan-out ONLY after the paired event is journaled. An authoritative
+        // projection failure (executions/positions) fail-stops the whole underlying:
+        // the event is committed to the journal, but a served store now diverges from
+        // it, so seal and refuse further commands rather than keep matching/serving on
+        // a divergent store — recovery rebuilds the stores from the journal (#131).
+        if let Err(sealed) = self.fan_out.emit(&event) {
+            self.sealed = Some(SealReason::ProjectionFailed);
+            tracing::error!(
+                underlying = %self.underlying,
+                sequence = sequence.get(),
+                projection = sealed.projection,
+                detail = %sealed.detail,
+                "authoritative store projection failed on fan-out; sealing underlying — \
+                 the served stores diverged from the journal and must be rebuilt from it"
+            );
+            return Err(VenueError::JournalUnavailable);
+        }
 
         // Advance the venue-owned counter per COMMITTED command — checked, never
         // wrapping. Exhaustion at u64::MAX seals the underlying.
@@ -701,7 +745,9 @@ where
         if let Some(reason) = self.sealed {
             return Err(match reason {
                 SealReason::SequenceExhausted => SnapshotError::SequenceExhausted,
-                SealReason::JournalUnavailable => SnapshotError::JournalUnavailable,
+                SealReason::JournalUnavailable | SealReason::ProjectionFailed => {
+                    SnapshotError::JournalUnavailable
+                }
             });
         }
 
@@ -1070,8 +1116,22 @@ mod tests {
     }
 
     impl FanOut for CountingFanOut {
-        fn emit(&mut self, _event: &VenueEvent) {
+        fn emit(&mut self, _event: &VenueEvent) -> Result<(), FanOutSealed> {
             self.emits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A [`FanOut`] whose authoritative projection FAILS on the first emit — the
+    /// #131 fault the actor must fail-stop on.
+    struct SealingFanOut;
+
+    impl FanOut for SealingFanOut {
+        fn emit(&mut self, _event: &VenueEvent) -> Result<(), FanOutSealed> {
+            Err(FanOutSealed {
+                projection: "executions",
+                detail: "store write failed".to_string(),
+            })
         }
     }
 
@@ -1196,6 +1256,45 @@ mod tests {
                 .journal()
                 .contains(SequenceNumber::new(0), RecordKind::Event)
         );
+    }
+
+    // ---- projection-failure fail-stop (#131) -----------------------------
+
+    #[test]
+    fn test_handle_seals_the_actor_when_an_authoritative_projection_fails() {
+        // The review 🔴: a StoreFanOut seal must reach the OWNING ACTOR, not stay
+        // local — else the actor keeps journaling/matching and returning successful
+        // receipts while the served stores diverge from the journal. Now an
+        // authoritative projection failure fail-stops the whole underlying (#131).
+        let mut actor = UnderlyingActor::new(
+            config(16),
+            journal(),
+            PlaceholderExecutor,
+            SealingFanOut,
+            CLOCK,
+        );
+
+        // The command IS committed to the journal (fan-out is post-journal), but the
+        // projection failed — the actor seals and returns an error, never a
+        // success receipt on a divergent store.
+        match actor.handle(cancel("a")) {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("a projection failure must fail-stop the command, got {other:?}"),
+        }
+        // The command + its paired event ARE journaled (the journal is the source of
+        // truth a rebuild replays).
+        assert!(
+            actor
+                .journal()
+                .contains(SequenceNumber::new(0), RecordKind::Event)
+        );
+
+        // The actor is now SEALED: every subsequent command is refused, so no further
+        // matching/journaling/serving happens on the divergent store.
+        match actor.handle(cancel("b")) {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("a sealed actor must refuse further commands, got {other:?}"),
+        }
     }
 
     // ---- checked-add monotonicity ----------------------------------------

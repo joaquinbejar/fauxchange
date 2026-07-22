@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use option_chain_orderbook::MarkPriceCalculator;
 
-use crate::exchange::actor::FanOut;
+use crate::exchange::actor::{FanOut, FanOutSealed};
 use crate::exchange::boundary::{Side as SeamSide, SymbolParser};
 use crate::exchange::envelope::{AddOutcome, Fill, VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::money::{Cents, SignedCents};
@@ -1010,7 +1010,12 @@ where
     /// Seals the fan-out on a projection failure: records the seal, logs the cause
     /// at `ERROR` (observable), and — from here on — [`emit`](FanOut::emit) drops
     /// every event. `projection` names which store failed.
-    fn seal(&mut self, event: &VenueEvent, projection: &'static str, error: &StoreError) {
+    fn seal(
+        &mut self,
+        event: &VenueEvent,
+        projection: &'static str,
+        error: &StoreError,
+    ) -> FanOutSealed {
         self.sealed = true;
         tracing::error!(
             sequence = event.underlying_sequence.get(),
@@ -1019,6 +1024,10 @@ where
             "store projection failed; sealing the fan-out — the executions/positions \
              projections diverged from the journal and must be rebuilt from it"
         );
+        FanOutSealed {
+            projection,
+            detail: error.to_string(),
+        }
     }
 
     /// The shared executions store handle — the snapshot cut reads/replaces it
@@ -1043,19 +1052,22 @@ where
     E: ExecutionsStore,
     P: PositionsStore,
 {
-    fn emit(&mut self, event: &VenueEvent) {
+    fn emit(&mut self, event: &VenueEvent) -> Result<(), FanOutSealed> {
         // A prior projection failure fail-stopped the fan-out: the projections
-        // diverged from the journal and must be rebuilt from it, so drop every
-        // further event rather than compound the divergence.
+        // diverged from the journal and must be rebuilt from it, so refuse every
+        // further event (the actor is already sealed) rather than compound it.
         if self.sealed {
-            return;
+            return Err(FanOutSealed {
+                projection: "store",
+                detail: "fan-out already sealed by a prior projection failure".to_string(),
+            });
         }
         let Some(symbol) = command_symbol(&event.command) else {
-            return;
+            return Ok(());
         };
         let fills = outcome_fills(&event.outcome);
         if fills.is_empty() {
-            return;
+            return Ok(());
         }
         let Some(underlying) = underlying_of(symbol) else {
             // The symbol was already validated on the way in, so this is
@@ -1066,7 +1078,7 @@ where
                 sequence = event.underlying_sequence.get(),
                 "could not resolve the underlying from a validated symbol; skipping fan-out"
             );
-            return;
+            return Ok(());
         };
 
         // Project each leg into BOTH authoritative stores. On the FIRST failure,
@@ -1076,8 +1088,7 @@ where
         for fill in fills {
             let record = project_execution(event, symbol, &underlying, fill);
             if let Err(error) = self.executions.record(record) {
-                self.seal(event, "executions", &error);
-                return;
+                return Err(self.seal(event, "executions", &error));
             }
             let leg = PositionLeg {
                 account: &fill.account,
@@ -1089,8 +1100,7 @@ where
                 fee: fill.fee,
             };
             if let Err(error) = self.positions.apply(&leg) {
-                self.seal(event, "positions", &error);
-                return;
+                return Err(self.seal(event, "positions", &error));
             }
         }
 
@@ -1105,6 +1115,7 @@ where
                 self.marks.on_trade(symbol, fill.price);
             }
         }
+        Ok(())
     }
 }
 
@@ -1279,7 +1290,7 @@ mod tests {
             Arc::new(InMemoryPositionsStore::new()),
             Arc::new(MarkPriceBook::new()),
         );
-        fan.emit(&event);
+        let _ = fan.emit(&event);
 
         let exec = &fan.executions;
         assert_eq!(exec.len(), 2, "one match records two legs");
@@ -1322,8 +1333,8 @@ mod tests {
             Arc::new(InMemoryPositionsStore::new()),
             Arc::new(MarkPriceBook::new()),
         );
-        fan.emit(&added_event(1, 50_000, 2));
-        fan.emit(&added_event(2, 50_100, 1));
+        let _ = fan.emit(&added_event(1, 50_000, 2));
+        let _ = fan.emit(&added_event(2, 50_100, 1));
 
         let taker_list = match fan
             .executions
@@ -1480,7 +1491,7 @@ mod tests {
             Arc::clone(&positions),
             Arc::new(MarkPriceBook::new()),
         );
-        fan.emit(&added_event(1, 50_000, 2));
+        let _ = fan.emit(&added_event(1, 50_000, 2));
 
         let symbol = sym();
         let maker = match positions.get(&AccountId::new("maker"), &symbol, None) {
@@ -1516,7 +1527,7 @@ mod tests {
         );
 
         // First placement folds both legs once.
-        fan.emit(&added_event(1, 50_000, 2));
+        let _ = fan.emit(&added_event(1, 50_000, 2));
         assert_eq!(executions.len(), 2, "the fresh placement records two legs");
 
         // The retry event carries the SAME command with a `Duplicate` outcome.
@@ -1531,7 +1542,7 @@ mod tests {
                 terminal: Box::new(first.outcome.clone()),
             },
         );
-        fan.emit(&duplicate);
+        let _ = fan.emit(&duplicate);
 
         assert_eq!(
             executions.len(),
@@ -1624,7 +1635,7 @@ mod tests {
                 stp_cancelled: vec![],
             },
         );
-        fan.emit(&event);
+        let _ = fan.emit(&event);
         assert!(executions.is_empty());
         assert!(
             positions
@@ -1654,7 +1665,7 @@ mod tests {
             Arc::clone(&marks),
         );
         // One 2-leg match at 50_000 — a single `execution_id`.
-        fan.emit(&added_event(1, 50_000, 2));
+        let _ = fan.emit(&added_event(1, 50_000, 2));
 
         // Reference books built from the SAME seed: one advance vs two advances.
         let once = MarkPriceBook::new();
@@ -1766,7 +1777,12 @@ mod tests {
             Arc::clone(&positions),
             Arc::new(MarkPriceBook::new()),
         );
-        fan.emit(&added_event(1, 50_000, 2));
+        let sealed = fan.emit(&added_event(1, 50_000, 2));
+        assert_eq!(
+            sealed.err().map(|s| s.projection),
+            Some("executions"),
+            "the sealing emit surfaces the failed projection to the actor (#131)"
+        );
 
         assert!(fan.is_sealed(), "a projection failure seals the fan-out");
         assert!(
@@ -1782,9 +1798,12 @@ mod tests {
         );
 
         // A subsequent healthy event is dropped while sealed: positions would fold
-        // cleanly if the loop were reached, but the seal short-circuits emit, so
-        // the projection never advances — no compounding divergence.
-        fan.emit(&added_event(2, 50_100, 1));
+        // cleanly if the loop were reached, but the seal short-circuits emit (still
+        // erroring), so the projection never advances — no compounding divergence.
+        assert!(
+            fan.emit(&added_event(2, 50_100, 1)).is_err(),
+            "a sealed fan-out keeps erroring so the actor stays fail-stopped"
+        );
         assert!(
             positions
                 .get(&AccountId::new("taker"), &sym(), None)
@@ -1809,7 +1828,10 @@ mod tests {
             Arc::clone(&positions),
             Arc::new(MarkPriceBook::new()),
         );
-        fan.emit(&added_event(1, 50_000, 2));
+        assert!(
+            fan.emit(&added_event(1, 50_000, 2)).is_err(),
+            "a positions-fold failure surfaces a seal to the actor"
+        );
 
         assert!(
             fan.is_sealed(),
@@ -1819,7 +1841,7 @@ mod tests {
         assert_eq!(executions.len(), 1, "only the pre-seal leg was recorded");
 
         // The sealed fan-out drops every subsequent event.
-        fan.emit(&added_event(2, 50_100, 1));
+        assert!(fan.emit(&added_event(2, 50_100, 1)).is_err());
         assert_eq!(
             executions.len(),
             1,
@@ -1836,8 +1858,8 @@ mod tests {
             Arc::new(InMemoryPositionsStore::new()),
             Arc::new(MarkPriceBook::new()),
         );
-        fan.emit(&added_event(1, 50_000, 2));
-        fan.emit(&added_event(2, 50_100, 1));
+        let _ = fan.emit(&added_event(1, 50_000, 2));
+        let _ = fan.emit(&added_event(2, 50_100, 1));
         let captured = fan.executions().capture_for("BTC");
         assert_eq!(captured.len(), 4, "two matches record four legs");
 
@@ -1896,7 +1918,7 @@ mod tests {
             Arc::new(InMemoryPositionsStore::new()),
             Arc::new(MarkPriceBook::new()),
         );
-        fan.emit(&added_event(1, 50_000, 2));
+        let _ = fan.emit(&added_event(1, 50_000, 2));
         let cut = fan.executions().capture_for("BTC");
 
         // A different store whose only content is other BTC legs is fully replaced
@@ -1906,7 +1928,7 @@ mod tests {
             Arc::new(InMemoryPositionsStore::new()),
             Arc::new(MarkPriceBook::new()),
         );
-        other.emit(&added_event(9, 40_000, 5));
+        let _ = other.emit(&added_event(9, 40_000, 5));
         other.executions().restore_for("BTC", cut);
         assert_eq!(
             other.executions().len(),

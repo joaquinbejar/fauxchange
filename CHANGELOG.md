@@ -2293,10 +2293,12 @@ The full versioning and release-process policy lives in the design docs
     `NaN` / `±Inf` / out-of-range at the envelope decode boundary via
     `deserialize_with` range guards, so a corrupt journal record can't poison
     replay; valid values decode unchanged (no golden churn).
-  - The store fan-out **seals** on the first executions/positions projection
-    failure (fail-stop, logged at `ERROR`) instead of silently continuing, so
-    the two authoritative projections can no longer diverge from the committed
-    journal — a rebuild is the recovery.
+  - An executions/positions projection failure **fail-stops the owning actor**,
+    not just the fan-out: `FanOut::emit` surfaces a typed seal that the actor
+    seals the underlying on (logged at `ERROR`), so it stops matching, journaling,
+    and returning success receipts once a served store would diverge from the
+    committed journal — a journal-backed rebuild is the recovery (the WS feed
+    stays best-effort and never seals).
   - A journal read failure while building an actor **snapshot** now
     **propagates** as a typed error instead of collapsing into a false-empty
     `records` vec while `last_sequence` still reports records present — the

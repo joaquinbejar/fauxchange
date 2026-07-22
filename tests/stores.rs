@@ -244,7 +244,7 @@ async fn test_store_projection_matches_execution_report_golden() {
         Arc::new(InMemoryPositionsStore::new()),
         Arc::new(MarkPriceBook::new()),
     );
-    fan.emit(&golden_match_event());
+    let _ = fan.emit(&golden_match_event());
 
     let execution_id = ExecutionId::new("run-1:BTC:7:0");
     let maker = executions
@@ -273,7 +273,7 @@ async fn test_store_projection_matches_positions_golden() {
         Arc::clone(&positions),
         Arc::new(MarkPriceBook::new()),
     );
-    fan.emit(&golden_match_event());
+    let _ = fan.emit(&golden_match_event());
 
     let symbol = sym();
     let mark = Some(Cents::new(50_500));
@@ -317,7 +317,7 @@ fn executions_from(commands: &[VenueCommand], lineage: &LineageId) -> Vec<Execut
             command,
         });
         let event = VenueEvent::new(sequence, CLOCK.now_ms(), command.clone(), outcome);
-        fan.emit(&event);
+        let _ = fan.emit(&event);
     }
     let mut all = Vec::new();
     for account in ["m1", "m2", "t1", "b1"] {
