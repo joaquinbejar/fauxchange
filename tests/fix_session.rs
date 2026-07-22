@@ -924,6 +924,183 @@ async fn test_market_data_duplicate_md_req_id_is_a_market_data_reject() {
 }
 
 #[tokio::test]
+async fn test_market_data_mixed_trade_entry_is_rejected_not_silently_served() {
+    // #101 (task 3): a mixed `V` (a book side AND a Trade entry type, 269=0,1,2) is
+    // NOT silently served with the Trade entry dropped — the whole request is
+    // rejected `Y` (MDReqRejReason=8, Unsupported MDEntryType), never a `W`.
+    let harness = Harness::start().await;
+    let mut reader = logon_as(harness.addr, READER_USER, READER_PW, READER_SENDER).await;
+    reader
+        .write_all(&market_data_request_frame(
+            READER_SENDER,
+            VENUE,
+            2,
+            "MDR-MIX",
+            "1",
+            0,
+            &["0", "1", "2"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("mixed subscribe");
+    let reply = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    assert!(
+        !any_msg_type(&reply, "W"),
+        "a mixed Trade V is never silently served as a W: {reply:?}"
+    );
+    assert!(
+        !any_msg_type(&reply, "3"),
+        "never a bare Reject(3): {reply:?}"
+    );
+    let y = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("Y"))
+        .expect("a MarketDataRequestReject Y");
+    assert_eq!(field(y, "262").as_deref(), Some("MDR-MIX"));
+    assert_eq!(
+        field(y, "281").as_deref(),
+        Some("8"),
+        "Trade entry type is Unsupported MDEntryType(281=8)"
+    );
+}
+
+#[tokio::test]
+async fn test_market_data_resubscribe_of_a_live_symbol_is_rejected_and_keeps_the_original() {
+    // #101 (task 2, security P3): a second `V` (a NEW MDReqID) naming a symbol
+    // already subscribed on this session must NOT silently overwrite the prior
+    // subscription — the original MDReqID must stay live. The re-subscribe is
+    // rejected `Y` (MDReqRejReason=1, duplicate subscription); the original keeps
+    // streaming (its `X` still echoes the original MDReqID).
+    let harness = Harness::start().await;
+    let mut reader = logon_as(harness.addr, READER_USER, READER_PW, READER_SENDER).await;
+    // V #1 subscribes symbol S under MDR-ORIG → a W.
+    reader
+        .write_all(&market_data_request_frame(
+            READER_SENDER,
+            VENUE,
+            2,
+            "MDR-ORIG",
+            "1",
+            0,
+            &["0", "1"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("first subscribe");
+    let first = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    assert!(any_msg_type(&first, "W"), "the first V is a W: {first:?}");
+
+    // V #2 re-subscribes the SAME symbol under a NEW MDReqID → rejected, no overwrite.
+    reader
+        .write_all(&market_data_request_frame(
+            READER_SENDER,
+            VENUE,
+            3,
+            "MDR-NEW",
+            "1",
+            0,
+            &["0", "1"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("re-subscribe");
+    let reject = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    let y = reject
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("Y"))
+        .expect("a MarketDataRequestReject Y for the re-subscribe");
+    assert_eq!(
+        field(y, "262").as_deref(),
+        Some("MDR-NEW"),
+        "the reject echoes the NEW (rejected) MDReqID"
+    );
+    assert_eq!(
+        field(y, "281").as_deref(),
+        Some("1"),
+        "a re-subscribe of a live symbol is a duplicate subscription (281=1)"
+    );
+    assert!(
+        !any_msg_type(&reject, "W"),
+        "the re-subscribe never emits a second W: {reject:?}"
+    );
+
+    // The ORIGINAL subscription is untouched: a book delta streams an `X` that still
+    // echoes MDR-ORIG (the earlier MDReqID was not orphaned or overwritten).
+    let mut trader = logon_trader(harness.addr).await;
+    trader
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "mm-orig-1",
+            "2",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("resting order");
+    let _ = recv_frames(&mut trader, Duration::from_secs(3)).await;
+
+    let incremental = recv_frames_until(&mut reader, Duration::from_secs(3), |f| {
+        msg_type(f).as_deref() == Some("X")
+    })
+    .await;
+    let x = incremental
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("X"))
+        .expect("an X on the still-live original subscription");
+    assert_eq!(
+        field(x, "262").as_deref(),
+        Some("MDR-ORIG"),
+        "the original MDReqID still streams — it was not orphaned by the re-subscribe"
+    );
+    assert!(
+        !incremental
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("X")
+                && field(f, "262").as_deref() == Some("MDR-NEW")),
+        "the rejected MDReqID never streams an X: {incremental:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_market_data_top_of_book_quotes_are_the_depth_bounded_book_projection() {
+    // #101 (task 1, quotes): best-bid/offer "quotes" are not a separate FIX channel
+    // — they are the depth-bounded (MarketDepth=1) orderbook projection. A `V` with
+    // Bid/Offer (269=0,1) and depth 1 is SERVED (a `W`), never a `Y`.
+    let harness = Harness::start().await;
+    let mut reader = logon_as(harness.addr, READER_USER, READER_PW, READER_SENDER).await;
+    reader
+        .write_all(&market_data_request_frame(
+            READER_SENDER,
+            VENUE,
+            2,
+            "MDR-QUOTE",
+            "1",
+            1,
+            &["0", "1"],
+            "BTC-20240329-50000-C",
+        ))
+        .await
+        .expect("quotes subscribe");
+    let reply = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    assert!(
+        !any_msg_type(&reply, "Y"),
+        "a depth-1 Bid/Offer quotes request is served, not rejected: {reply:?}"
+    );
+    let w = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("W"))
+        .expect("a W snapshot for the depth-1 quotes request");
+    assert_eq!(
+        field(w, "262").as_deref(),
+        Some("MDR-QUOTE"),
+        "W echoes MDReqID"
+    );
+    assert!(field(w, "83").is_some(), "W carries RptSeq(83)");
+}
+
+#[tokio::test]
 async fn test_cancel_of_unknown_order_is_order_cancel_reject_9() {
     let harness = Harness::start().await;
     let mut client = logon_trader(harness.addr).await;

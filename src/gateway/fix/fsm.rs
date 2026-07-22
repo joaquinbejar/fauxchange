@@ -103,9 +103,17 @@ const CXL_REJ_REASON_NOT_AUTHORIZED: u16 = 2;
 /// message — safe to echo in a `Text (58)` (it names a policy, not a credential).
 const TEXT_NOT_AUTHORIZED: &str = "insufficient permission";
 
-/// `MDReqRejReason (281) = 1` — Duplicate `MDReqID (262)`: a snapshot request
-/// reusing the id of an already-active subscription (FIX 4.4).
-const MD_REJ_REASON_DUPLICATE_REQ_ID: u16 = 1;
+/// `MDReqRejReason (281) = 1` — Duplicate subscription: a `V` (Subscribe) whose
+/// `MDReqID (262)` already backs a live subscription, **or** whose `Symbol (55)` is
+/// already subscribed on this session under any `MDReqID`. FIX 4.4 defines `1` as
+/// "Duplicate MDReqID"; the venue extends it to the symbol-duplicate case (a
+/// re-subscribe of an already-live symbol) because both are the same error class —
+/// the client asked for a subscription it already holds — and FIX 4.4 carries no
+/// distinct "duplicate symbol subscription" reason. A symbol re-subscribe is
+/// rejected whole (never a silent overwrite of the prior [`MdSymbolSub`], which
+/// would orphan the earlier `MDReqID`); the redacted `Text (58)` disambiguates the
+/// two cases ([fix-dialect §2.3](../../../docs/specs/fix-dialect.md#23-market-data-subscription-surfaces-03-54)).
+const MD_REJ_REASON_DUPLICATE: u16 = 1;
 
 /// `MDReqRejReason (281) = 2` — Insufficient bandwidth: the per-session
 /// market-data subscription set is at its [`MAX_MD_SYMBOLS_PER_SESSION`] ceiling.
@@ -116,10 +124,15 @@ const MD_REJ_REASON_INSUFFICIENT_BANDWIDTH: u16 = 2;
 /// (`Trade`/`Admin` imply it), so this only fires for an empty permission set.
 const MD_REJ_REASON_INSUFFICIENT_PERMISSIONS: u16 = 3;
 
-/// `MDReqRejReason (281) = 8` — Unsupported `MDEntryType (269)`: the request asked
-/// for no book side (a Trade-tape-only `V`), which the FIX MD orderbook surface
-/// does not serve (the trade-tape / quote projection over FIX MD is deferred,
-/// [fix-dialect §2.3](../../../docs/specs/fix-dialect.md#23-market-data-subscription-surfaces-03-54)).
+/// `MDReqRejReason (281) = 8` — Unsupported `MDEntryType (269)`: the request
+/// carried a Trade entry type (`269 = 2`) — alone (a trade-tape-only `V`) **or**
+/// mixed with a book side — which the FIX MD orderbook surface does not serve. The
+/// trade tape is **permanently out** of FIX MD (a trade print has no book snapshot
+/// or `instrument_sequence` for `RptSeq (83)`); the whole `V` is rejected, never a
+/// silent serve of the book side with the Trade entry type dropped
+/// ([fix-dialect §2.3](../../../docs/specs/fix-dialect.md#23-market-data-subscription-surfaces-03-54)).
+/// Best-bid/offer "quotes" are the depth-bounded (`MarketDepth (264) = 1`) book
+/// projection — the same `269 = 0/1` `W`/`X`, not a separate channel.
 const MD_REJ_REASON_UNSUPPORTED_ENTRY_TYPE: u16 = 8;
 
 /// The ceiling on the per-session market-data subscription set — a memory DoS
@@ -2961,17 +2974,38 @@ impl VenueFixSession {
     }
 
     /// Subscribes the request's symbols (`SubscriptionRequestType = 1`), emitting
-    /// one `W` snapshot baseline per symbol. Validates the request first — a
-    /// no-book-side (trade-tape-only) request, a duplicate `MDReqID`, or a request
-    /// past the per-session subscription ceiling is a `Y`, never a partial subscribe.
+    /// one `W` snapshot baseline per symbol. Validates the request first, whole,
+    /// never a partial subscribe — each of a Trade entry type (`269 = 2`, the
+    /// permanently-out trade tape), a duplicate `MDReqID`, a re-subscribe of an
+    /// already-live symbol, or a request past the per-session subscription ceiling
+    /// is a `Y`.
     fn subscribe_market_data(
         &mut self,
         request: MarketDataRequest,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
         let sides = RequestedSides::from_entry_types(&request.entry_types);
-        // A `V` that requests no book side (only a Trade tape) is not served by the
-        // FIX MD orderbook surface — reject with `Y`, never silently drop it.
+        // A `V` carrying a Trade entry type (`269 = 2`) — a trade-tape-only request
+        // OR a mixed request pairing Trade with a book side — is not served by the
+        // FIX MD orderbook surface: the trade tape is permanently out (no book
+        // snapshot / `instrument_sequence` for `RptSeq`, #101). Reject the whole
+        // request with `Y`, never silently serving the book side while dropping the
+        // Trade entry type; per-fill detail reaches a FIX client via
+        // `ExecutionReport (8)`.
+        if md_projection::requests_trade_tape(&request.entry_types) {
+            return self.fsm.emit_md_request_reject(
+                request.md_req_id,
+                MD_REJ_REASON_UNSUPPORTED_ENTRY_TYPE,
+                Some(
+                    "Trade (269=2) market data is not served over FIX; request only Bid/Offer"
+                        .to_string(),
+                ),
+                now_ms,
+            );
+        }
+        // Defensive: with Trade rejected above and every decoded `MDEntryType` one of
+        // Bid/Offer/Trade over a non-empty group, a book side is always present here —
+        // but guard the empty case explicitly rather than emit an empty subscription.
         if !sides.any() {
             return self.fsm.emit_md_request_reject(
                 request.md_req_id,
@@ -2984,8 +3018,36 @@ impl VenueFixSession {
         if self.md_req_id_active(&request.md_req_id) {
             return self.fsm.emit_md_request_reject(
                 request.md_req_id,
-                MD_REJ_REASON_DUPLICATE_REQ_ID,
+                MD_REJ_REASON_DUPLICATE,
                 Some("duplicate MDReqID".to_string()),
+                now_ms,
+            );
+        }
+        // Re-subscribe of an already-live symbol (security P3, #101): a second `V`
+        // (a NEW `MDReqID`) naming a symbol already subscribed on this session — under
+        // this or ANY other `MDReqID` — must NOT silently overwrite the prior
+        // [`MdSymbolSub`], which would orphan the earlier `MDReqID` with no `Y` or
+        // signal. Reject the whole request with `Y`, leaving the existing
+        // subscription (and its `MDReqID`) live and untouched; a client that wants to
+        // change a subscription unsubscribes (`263 = 2`) first, then re-subscribes.
+        if let Some(existing) = self.market_data.as_ref()
+            && let Some(duplicate) = request
+                .symbols
+                .iter()
+                .find(|symbol| existing.symbols.contains_key(*symbol))
+        {
+            tracing::debug!(
+                peer = %self.peer,
+                symbol = duplicate.as_str(),
+                "fix market-data re-subscribe of an already-subscribed symbol; rejecting (no silent overwrite)"
+            );
+            return self.fsm.emit_md_request_reject(
+                request.md_req_id,
+                MD_REJ_REASON_DUPLICATE,
+                Some(
+                    "symbol already subscribed on this session; unsubscribe (263=2) before re-subscribing"
+                        .to_string(),
+                ),
                 now_ms,
             );
         }

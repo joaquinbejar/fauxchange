@@ -177,6 +177,29 @@ The full versioning and release-process policy lives in the design docs
   (`encode∘decode`), goldens regenerated, `docs/specs/fix-dialect.md` §2.2
   updated. (Tag 60 is now a required field on the report's decode path — the
   `fix_decode` fuzz target was rebuilt.)
+- **FIX market-data hardening — re-subscribe semantics + trades/quotes
+  boundary** (#101). Closes the three gaps #40's orderbook-only FIX MD left:
+  - **Re-subscribe no longer silently orphans an `MDReqID` (security P3).** A
+    second `MarketDataRequest(V)` (new `MDReqID`) naming a `Symbol(55)` already
+    subscribed on the session is now rejected whole with a
+    `MarketDataRequestReject(Y)` `MDReqRejReason=1` (redacted `Text(58)`
+    disambiguates duplicate-symbol from duplicate-`MDReqID`), leaving the prior
+    subscription and its `MDReqID` **live and untouched** — instead of silently
+    overwriting it and orphaning the old id with no signal.
+  - **A mixed `V` carrying a `Trade` entry (`269=2`) no longer silently drops
+    it.** A `V` requesting a trade tape — alone or mixed with a book side — is
+    rejected whole with `Y` `MDReqRejReason=8` (unsupported `MDEntryType`), via
+    a `requests_trade_tape` gate.
+  - **Trades/quotes decision documented as a coherent boundary.** Top-of-book
+    "quotes" are already served as the depth-bounded (`MarketDepth=1`) orderbook
+    projection (`269=0/1` `W`/`X`) — no separate channel is needed or minted. A
+    **trade tape** (`269=2`) is **permanently out** of FIX MD: a trade print has
+    no book snapshot and no per-instrument `instrument_sequence`, so it cannot
+    ride the `W`/`X` `RptSeq(83)` model without a second sequence namespace that
+    breaks the "orderbook is the only on-the-wire `instrument_sequence`"
+    invariant; per-fill detail already reaches a FIX client via
+    `ExecutionReport(8)`. Documented in `docs/specs/fix-dialect.md` §2.3 +
+    `docs/03` §5.4.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;
