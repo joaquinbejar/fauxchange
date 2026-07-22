@@ -3025,6 +3025,33 @@ impl VenueFixSession {
                 now_ms,
             );
         }
+        // Intra-request duplicate symbols (#101): a single `V` that names the SAME
+        // symbol twice would emit duplicate `W` snapshots, overwrite its own map
+        // entry, and double-count the symbol against the per-session ceiling. Validate
+        // uniqueness ACROSS `request.symbols` BEFORE the live-set check below (the live
+        // check only catches a symbol already subscribed under a prior `MDReqID`, not a
+        // self-duplicate). Reject the whole request with `Y`, exactly like the
+        // already-live-symbol case.
+        {
+            let mut seen = HashSet::with_capacity(request.symbols.len());
+            if let Some(duplicate) = request
+                .symbols
+                .iter()
+                .find(|symbol| !seen.insert((*symbol).clone()))
+            {
+                tracing::debug!(
+                    peer = %self.peer,
+                    symbol = duplicate.as_str(),
+                    "fix market-data request names a symbol more than once; rejecting (no duplicate snapshot / double-count)"
+                );
+                return self.fsm.emit_md_request_reject(
+                    request.md_req_id,
+                    MD_REJ_REASON_DUPLICATE,
+                    Some("duplicate symbol within the market-data request".to_string()),
+                    now_ms,
+                );
+            }
+        }
         // Re-subscribe of an already-live symbol (security P3, #101): a second `V`
         // (a NEW `MDReqID`) naming a symbol already subscribed on this session — under
         // this or ANY other `MDReqID` — must NOT silently overwrite the prior

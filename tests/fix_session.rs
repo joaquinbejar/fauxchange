@@ -257,6 +257,31 @@ fn market_data_request_frame(
     frame_with_body(body.as_bytes())
 }
 
+/// A `MarketDataRequest (V)` naming an explicit list of `symbols` in the
+/// `NoRelatedSym (146)` group (so a test can name the same symbol twice).
+fn market_data_request_frame_symbols(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    md_req_id: &str,
+    entry_types: &[&str],
+    symbols: &[&str],
+) -> Vec<u8> {
+    let mut group = String::new();
+    for entry_type in entry_types {
+        group.push_str(&format!("269={entry_type}\x01"));
+    }
+    let mut sym_group = format!("146={}\x01", symbols.len());
+    for symbol in symbols {
+        sym_group.push_str(&format!("55={symbol}\x01"));
+    }
+    let body = format!(
+        "35=V\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x01262={md_req_id}\x01263=1\x01264=0\x01267={count}\x01{group}{sym_group}",
+        count = entry_types.len(),
+    );
+    frame_with_body(body.as_bytes())
+}
+
 /// A well-formed application message with an unsupported `MsgType` (`R`,
 /// QuoteRequest — recognised by FIX 4.4, unhandled by the venue dialect).
 fn unsupported_app_frame(sender: &str, target: &str, seq: u64) -> Vec<u8> {
@@ -1060,6 +1085,43 @@ async fn test_market_data_resubscribe_of_a_live_symbol_is_rejected_and_keeps_the
             .any(|f| msg_type(f).as_deref() == Some("X")
                 && field(f, "262").as_deref() == Some("MDR-NEW")),
         "the rejected MDReqID never streams an X: {incremental:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_market_data_request_naming_the_same_symbol_twice_is_rejected() {
+    // #101 review: a single `V` that names the SAME symbol twice in NoRelatedSym(146)
+    // bypassed the already-live-symbol rule (which only checks the existing map),
+    // so it would emit duplicate `W` snapshots, overwrite its own map entry, and
+    // double-count against the ceiling. The whole request is now rejected `Y`
+    // (duplicate subscription, 281=1) and NO `W` is emitted.
+    let harness = Harness::start().await;
+    let mut reader = logon_as(harness.addr, READER_USER, READER_PW, READER_SENDER).await;
+    reader
+        .write_all(&market_data_request_frame_symbols(
+            READER_SENDER,
+            VENUE,
+            2,
+            "MDR-DUP",
+            &["0", "1"],
+            &["BTC-20240329-50000-C", "BTC-20240329-50000-C"],
+        ))
+        .await
+        .expect("duplicate-symbol subscribe");
+    let reply = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    let y = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("Y"))
+        .expect("a MarketDataRequestReject Y for the intra-request duplicate");
+    assert_eq!(field(y, "262").as_deref(), Some("MDR-DUP"));
+    assert_eq!(
+        field(y, "281").as_deref(),
+        Some("1"),
+        "a duplicate symbol within the request is a duplicate subscription (281=1)"
+    );
+    assert!(
+        !any_msg_type(&reply, "W"),
+        "a duplicate-symbol request emits NO W snapshot: {reply:?}"
     );
 }
 
