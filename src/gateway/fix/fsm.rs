@@ -45,8 +45,7 @@ use crate::auth::{AccountStore, RateLimitKey, RateLimitTier, RevocationOracle};
 use crate::error::{FixReject, FixRejectContext, FixRejectReason, VenueError};
 use crate::exchange::{
     AddOutcome, Cents, FanoutSummary, MassCancelScope, MassCancelType, RejectKind, Symbol,
-    SymbolParser,
-    TimeInForce as SeamTif, VenueCommand, VenueOutcome,
+    SymbolParser, TimeInForce as SeamTif, VenueCommand, VenueOutcome,
 };
 use crate::gateway::rest::support::{
     immediate_execution_records, mint_order_id, owner_for, taker_legs_for_order,
