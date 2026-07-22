@@ -98,7 +98,7 @@ pub use self::mm_identity::{
 };
 pub use self::money::{Cents, MoneyError, Notional, SignedCents};
 pub(crate) use self::recovery::check_price_band;
-pub use self::recovery::{Recovered, recover, recover_with_microstructure};
+pub use self::recovery::{Recovered, recover, recover_into, recover_with_microstructure};
 pub use self::snapshot::{
     ExecutionCapture, ExecutorState, IdempotencyEntry, IdempotencyFingerprint, IdempotencyKey,
     IdempotencyMap, IdempotencyRecord, PositionCapture, RestingOrderCapture, SnapshotError,

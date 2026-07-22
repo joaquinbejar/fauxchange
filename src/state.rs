@@ -78,11 +78,12 @@ use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
     ActorConfig, ActorHandle, CancelledLeg, EventTimestamp, ExecutionsStore, ExpirationDate,
-    FanoutSummary, InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal,
-    InstrumentStatus, JournalHeader, JournalSnapshot, LineageId, MarkPriceBook,
-    MarketMakerControlSink, MassCancelScope, Receipt, SequenceNumber, StoreFanOut, Symbol,
-    TeeFanOut, VenueCommand, VenueOutcome, check_price_band,
-    spawn_matching_actor_with_registry_and_index,
+    FanOut, FanOutSealed, FanoutSummary, InMemoryExecutionsStore, InMemoryPositionsStore,
+    InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader, JournalSnapshot,
+    LineageId, MarkPriceBook, MarketMakerControlSink, MassCancelScope, MatchingExecutor,
+    PositionsStore, Receipt, Recovered, SequenceNumber, StoreFanOut, Symbol, TeeFanOut,
+    VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_price_band, recover_into,
+    spawn_matching_actor_with_registry_and_index, spawn_underlying_actor,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
 use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
@@ -152,6 +153,74 @@ pub enum AppStateError {
     /// rather than unwrapped.
     #[error(transparent)]
     Microstructure(#[from] MicrostructureConfigError),
+    /// Boot-time journal recovery (#85) failed for an underlying whose durable
+    /// journal is **non-empty** — a **fail-stop** refusal to serve rather than a
+    /// silent fresh start over durable history (ADR-0004 restart recovery, ADR-0006
+    /// §recovery). The carried [`JournalError`] names the exact cause — corruption at
+    /// a precise `(underlying, sequence)`, a newer-than-binary envelope schema, a
+    /// tampered record, or a durable read failure — and this variant adds the
+    /// `underlying` whose stream could not be resumed. Only reachable when
+    /// `DATABASE_URL` is set and the stream has rows.
+    #[error("boot journal recovery failed for underlying '{underlying}': {source}")]
+    Recovery {
+        /// The underlying whose durable stream could not be recovered.
+        underlying: String,
+        /// The typed recovery failure (naming the exact sequence for a corruption).
+        #[source]
+        source: JournalError,
+    },
+    /// Two recovered underlyings carry **disagreeing** persisted run lineages — a
+    /// contradictory durable manifest that cannot resolve to one venue run identity.
+    /// The venue refuses to resume with a split id namespace (every venue-minted id
+    /// is namespaced by `lineage_id`, #85). Carries only the **non-secret** run
+    /// lineage tokens (derived from the run seed) and the underlyings — never a
+    /// credential or the `DATABASE_URL`.
+    #[error(
+        "contradictory durable manifest: underlying '{underlying}' resumes lineage \
+         '{lineage}' but '{first_underlying}' already resumed lineage '{first_lineage}'"
+    )]
+    RecoveryLineageConflict {
+        /// The first recovered underlying, whose lineage fixed the venue run.
+        first_underlying: String,
+        /// The lineage token the first recovered underlying resumed.
+        first_lineage: String,
+        /// The recovered underlying whose lineage disagrees.
+        underlying: String,
+        /// The conflicting lineage token.
+        lineage: String,
+    },
+    /// A recovered underlying's durable stream already occupies the **entire**
+    /// `underlying_sequence` space (its last sequence is `u64::MAX`), so no continued
+    /// sequence can be assigned. Fail-stop rather than reuse a sequence or wrap it —
+    /// a wrapped sequence corrupts gap detection and replay (#85). Astronomically
+    /// unreachable (2^64 sequences on one underlying); surfaced typed, not
+    /// `unwrap`ped.
+    #[error(
+        "boot journal recovery cannot continue underlying '{underlying}': \
+         underlying_sequence space exhausted at {sequence}"
+    )]
+    RecoverySequenceExhausted {
+        /// The underlying whose sequence space is exhausted.
+        underlying: String,
+        /// The last (maximal) sequence present in the durable stream.
+        sequence: u64,
+    },
+    /// Rebuilding the authoritative executions/positions stores from a recovered
+    /// underlying's events hit a projection failure (the #131 `StoreFanOut` seal).
+    /// The venue **refuses to serve** rather than start with stores that do not
+    /// match the recovered journal — a journal-backed rebuild is the recovery (#85).
+    #[error(
+        "boot store rebuild failed for underlying '{underlying}': the {projection} \
+         projection failed ({detail}) — refusing to serve a partially-rebuilt store"
+    )]
+    RecoveryProjectionFailed {
+        /// The underlying whose store rebuild failed.
+        underlying: String,
+        /// Which authoritative projection failed (`executions` / `positions`).
+        projection: &'static str,
+        /// The store-error detail.
+        detail: String,
+    },
 }
 
 // ============================================================================
@@ -536,6 +605,15 @@ pub struct AppState {
     /// `SetInstrumentStatus`). Live-only driver state; the sequenced commands it
     /// issues are journaled and replay without it.
     expiry_phases: std::sync::Mutex<std::collections::HashMap<(String, i64), ExpiryPhase>>,
+    /// The underlyings this venue **resumed** from a non-empty durable journal at
+    /// boot (#85): their book / executions / positions state was reconstructed by
+    /// re-execution and their actor continues the journaled `underlying_sequence`.
+    /// **Recover wins over seed** — the bounded seeding phase must **not** re-seed a
+    /// recovered underlying (a re-seed would journal a duplicate opening `SimStep`
+    /// onto the resumed stream), so it consults [`is_recovered`](Self::is_recovered).
+    /// Read off the sequenced path only (a point-lookup `contains`, never iterated on
+    /// a hot path). Empty on a fresh boot or the fully in-memory path.
+    recovered: std::collections::HashSet<Arc<str>>,
 }
 
 /// The result of a venue-control clock advance fanned across the underlyings —
@@ -710,6 +788,40 @@ fn swept_legs_of(receipt: &Receipt) -> Vec<SweptLeg> {
     }
 }
 
+/// Rebuilds the shared executions / positions / mark state for a **recovered**
+/// underlying (#85) by replaying its re-derived [`VenueEvent`] stream through the
+/// **same** [`StoreFanOut`] projection the live post-journal fan-out uses.
+///
+/// [`recover_into`] re-executes onto the reconstruction executor **without** a
+/// fan-out (it rebuilds only the book), so the shared executions log and positions
+/// fold start empty; this replays each recovered event once — exactly as the live
+/// path emits each committed event once — so the folds match a never-restarted run.
+/// Only the store fan-out is driven (executions / positions / marks); the WS tee is
+/// **not**, because boot has no subscribers and historical events are not live
+/// market data. `marks` warms to the last recovered trade (a live-only, recomputed
+/// value, never journaled — outside the determinism oracle).
+///
+/// **Fallible (#85 review).** A projection failure during this rebuild is surfaced
+/// (`Err(FanOutSealed)`), not swallowed, so [`AppState::new`] fails startup on a
+/// partially-rebuilt store rather than begin serving authoritative stores that do
+/// not match the recovered journal (#131 made `StoreFanOut::emit` fallible).
+fn rebuild_stores_from_events<E: ExecutionsStore, P: PositionsStore>(
+    executions: &Arc<E>,
+    positions: &Arc<P>,
+    marks: &Arc<MarkPriceBook>,
+    events: &[VenueEvent],
+) -> Result<(), FanOutSealed> {
+    let mut store_fan_out = StoreFanOut::new(
+        Arc::clone(executions),
+        Arc::clone(positions),
+        Arc::clone(marks),
+    );
+    for event in events {
+        store_fan_out.emit(event)?;
+    }
+    Ok(())
+}
+
 impl AppState {
     /// Assembles an [`AppState`] behind an `Arc`, spawning **one single-writer
     /// actor per configured underlying** and wiring the real order path
@@ -831,23 +943,149 @@ impl AppState {
         let mm_control_hub = MarketMakerControlHub::new();
         let mm_control_sink: Arc<dyn MarketMakerControlSink> = Arc::clone(&mm_control_hub) as _;
 
-        let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::with_capacity(underlyings.len());
+        // ==================================================================
+        // Boot-time journal recovery (#85)
+        // ==================================================================
+        //
+        // Pass 1 — PROBE + RECONSTRUCT. For each configured underlying (deduped),
+        // read its durable journal header; a **non-empty** stream is reconstructed
+        // HERE by re-execution ([`recover_into`], the SAME single reducer the replay
+        // driver uses — stored event = integrity oracle) into a shared-registry
+        // executor, so recovered leaves vivify onto the venue-wide symbol index
+        // exactly as a live underlying's do. An absent/empty stream is a fresh boot
+        // (today's path, unchanged). Recovery runs BEFORE any actor is spawned so the
+        // venue can (a) resolve ONE rehydrated run lineage from the persisted
+        // stream(s) and (b) **fail-stop** on a corrupt / newer-schema / unreadable
+        // journal rather than silently start fresh over durable history
+        // (ADR-0004 restart recovery, ADR-0006 §recovery, docs/02 §9).
+        struct RecoveredUnderlying {
+            recovered: Recovered,
+            persisted_lineage: LineageId,
+        }
+        let mut ordered: Vec<Arc<str>> = Vec::with_capacity(underlyings.len());
+        let mut seen: std::collections::HashSet<Arc<str>> =
+            std::collections::HashSet::with_capacity(underlyings.len());
+        let mut recovered_map: HashMap<Arc<str>, RecoveredUnderlying> = HashMap::new();
         for underlying in underlyings {
             let ticker: Arc<str> = Arc::from(underlying);
-            if handles.contains_key(&ticker) {
+            if !seen.insert(Arc::clone(&ticker)) {
                 tracing::warn!(
                     underlying = %ticker,
                     "duplicate underlying in AppStateConfig; skipping (no second writer)"
                 );
                 continue;
             }
+            ordered.push(Arc::clone(&ticker));
 
+            // Recovery is only possible on the durable path — the in-memory journal
+            // never outlives the process, so a fresh in-memory venue is always a
+            // fresh boot.
+            let Some(pool) = db.as_ref() else {
+                continue;
+            };
+            match PgVenueJournal::open_for_recovery(pool, ticker.as_ref()) {
+                Ok(recovery_journal) => {
+                    // Build the reconstruction book with the SHARED venue registry +
+                    // index and the venue microstructure applied at creation — the
+                    // SAME wiring the live/fresh path uses — so recovered instruments
+                    // are venue-visible and re-execution reproduces the recorded
+                    // fees/fills/events (no market-maker control sink: recovery runs
+                    // WITHOUT it, so a `MarketMakerControl` re-derives an identical
+                    // `ControlApplied` with no live engine).
+                    let executor = MatchingExecutor::new_with_registry_and_index(
+                        ticker.as_ref(),
+                        Arc::clone(&registry),
+                        Arc::clone(&symbol_index),
+                        &microstructure,
+                    )?;
+                    let recovered =
+                        recover_into(&recovery_journal, executor, Some(&*microstructure)).map_err(
+                            |source| AppStateError::Recovery {
+                                underlying: ticker.to_string(),
+                                source,
+                            },
+                        )?;
+                    // A header row with NO records is an earlier fresh open (or a
+                    // crash before the first command) — treated as a fresh boot (seed
+                    // applies, actor at `SequenceNumber::START`), preserving today's
+                    // empty-journal behavior.
+                    if recovered.last_sequence.is_some() {
+                        let persisted_lineage = recovery_journal.header().lineage_id.clone();
+                        tracing::info!(
+                            underlying = %ticker,
+                            last_sequence = recovered.last_sequence.map(SequenceNumber::get),
+                            events = recovered.events.len(),
+                            "resumed underlying from a non-empty durable journal"
+                        );
+                        recovered_map.insert(
+                            Arc::clone(&ticker),
+                            RecoveredUnderlying {
+                                recovered,
+                                persisted_lineage,
+                            },
+                        );
+                    }
+                }
+                // No header row → nothing durable to recover → fresh boot.
+                Err(DbError::ValueRange {
+                    field: "journal header",
+                }) => {}
+                // Any other durable read failure at boot is fatal — refuse to serve
+                // rather than start fresh over a stream that could not be read.
+                Err(other) => return Err(AppStateError::Db(other)),
+            }
+        }
+
+        // Resolve ONE venue run lineage: the persisted lineage every recovered
+        // underlying agrees on (rehydrated so continued + market-maker + simulator
+        // ids all stay in the recovered run's namespace), or the config lineage on a
+        // fresh boot. Disagreeing persisted lineages are a contradictory durable
+        // manifest — fail-stop, never a split id namespace. Iterates the ordered
+        // ticker list (deterministic), point-looking-up the map (never iterating it).
+        let mut resolved_lineage: Option<(Arc<str>, LineageId)> = None;
+        for ticker in &ordered {
+            if let Some(entry) = recovered_map.get(ticker) {
+                match &resolved_lineage {
+                    None => {
+                        resolved_lineage =
+                            Some((Arc::clone(ticker), entry.persisted_lineage.clone()));
+                    }
+                    Some((first_ticker, first_lineage))
+                        if *first_lineage != entry.persisted_lineage =>
+                    {
+                        return Err(AppStateError::RecoveryLineageConflict {
+                            first_underlying: first_ticker.to_string(),
+                            first_lineage: first_lineage.as_str().to_string(),
+                            underlying: ticker.to_string(),
+                            lineage: entry.persisted_lineage.as_str().to_string(),
+                        });
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        let lineage_id = match resolved_lineage {
+            Some((_, persisted)) => {
+                tracing::info!(
+                    lineage = %persisted.as_str(),
+                    "rehydrated run lineage from the durable journal"
+                );
+                persisted
+            }
+            None => lineage_id,
+        };
+
+        // Pass 2 — SPAWN. One single-writer actor per underlying: RECOVERED
+        // (continuing the journaled `underlying_sequence` over the reconstructed
+        // book) or FRESH (at `SequenceNumber::START`).
+        let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::with_capacity(ordered.len());
+        let mut recovered_set: std::collections::HashSet<Arc<str>> =
+            std::collections::HashSet::new();
+        for ticker in ordered {
             // The fan-out tees the committed event into BOTH the shared stores
             // (`StoreFanOut`, #008) and the WS market-data broadcast (`WsFanOut`,
             // #014) — one post-journal event, two consumers, neither on the
-            // order-path critical section. The store fan-out clones the shared
-            // store `Arc`s (the actor writes into the very instances `AppState`
-            // exposes for reads); the WS fan-out clones the shared manager `Arc`.
+            // order-path critical section.
             let fan_out = TeeFanOut::new(
                 StoreFanOut::new(
                     Arc::clone(&executions),
@@ -856,55 +1094,109 @@ impl AppState {
                 ),
                 WsFanOut::new(Arc::clone(&subscriptions)),
             );
-            let actor_config =
-                ActorConfig::new(Arc::clone(&ticker), lineage_id.clone(), mailbox_capacity);
             let header = JournalHeader::new(lineage_id.clone());
 
-            // Swap the STORE, not the contract: when `DATABASE_URL` is set the actor
-            // writes its append-only journal through the durable `PgVenueJournal`
-            // (#029); otherwise through the in-memory `InMemoryVenueJournal`. Both
-            // implement the SAME `VenueJournal` trait, so the actor's write-ahead
-            // turn discipline is identical. Each stream is keyed on the shared
-            // lineage so re-derived ids stay in one namespace. Boot-time resume of a
-            // non-empty durable journal is NOT yet wired: this actor starts at
-            // `SequenceNumber::START`, so a restart against a non-empty durable
-            // journal fails **loud** on the `(underlying, N, kind)` unique key
-            // (a Conflict, never a silent overwrite). The boot-recovery wiring
-            // (`ActorConfig::start_sequence` + a recover-per-underlying in
-            // `AppState::new`) is tracked in #85; the #030 replay driver replays a
-            // journal/bundle **offline** into a fresh registry, not into this venue.
-            // The venue microstructure (#044) is applied to this underlying's book at
-            // creation, BEFORE any leaf is vivified — the SAME apply a replay/recovery
-            // reconstruction performs, so a fee/STP-sensitive scenario replays exactly.
-            let (handle, join) = match db.as_ref() {
-                Some(pool) => {
+            let (handle, join) = match recovered_map.remove(&ticker) {
+                Some(RecoveredUnderlying { recovered, .. }) => {
+                    let Recovered {
+                        events,
+                        executor,
+                        last_sequence,
+                    } = recovered;
+                    // Only non-empty streams were inserted, so `last_sequence` is
+                    // `Some`; a defensive `ok_or` keeps the prod path free of
+                    // `unwrap`/`expect`.
+                    let last = last_sequence.ok_or_else(|| AppStateError::Recovery {
+                        underlying: ticker.to_string(),
+                        source: JournalError::Backend {
+                            operation: "recovery last_sequence missing on a non-empty stream",
+                        },
+                    })?;
+                    // Continue PAST the last journaled sequence — never reset, never
+                    // wrap (a wrapped sequence corrupts gap detection and replay).
+                    let start = last.checked_next().ok_or_else(|| {
+                        AppStateError::RecoverySequenceExhausted {
+                            underlying: ticker.to_string(),
+                            sequence: last.get(),
+                        }
+                    })?;
+                    // Rebuild the shared executions / positions / mark state from the
+                    // recovered events: recovery re-executes onto the executor WITHOUT
+                    // fan-out, so the stores start empty until we replay the events
+                    // through the SAME projection the live post-journal fan-out uses.
+                    // Only the store fan-out is driven — NOT the WS tee: boot has no
+                    // subscribers and historical events are not live market data.
+                    // A projection failure here means the rebuilt stores would not
+                    // match the recovered journal — fail startup rather than begin
+                    // serving a partially-rebuilt authoritative store (#85 review /
+                    // #131).
+                    rebuild_stores_from_events(&executions, &positions, &marks, &events).map_err(
+                        |sealed| AppStateError::RecoveryProjectionFailed {
+                            underlying: ticker.to_string(),
+                            projection: sealed.projection,
+                            detail: sealed.detail,
+                        },
+                    )?;
+                    // Install the live market-maker control seam now that recovery
+                    // (which runs WITHOUT it) is done, so a post-resume
+                    // `MarketMakerControl` takes effect on the sequenced path.
+                    let executor = executor.with_mm_control_sink(Arc::clone(&mm_control_sink));
+                    // Open the durable WRITE journal with the REHYDRATED header — the
+                    // persisted lineage matches the stored one, so `open` verifies the
+                    // header rather than conflicting on it (#112). The recovered arm is
+                    // only reachable on the durable path, but resolve `db` typed rather
+                    // than `unwrap`.
+                    let pool = db.as_ref().ok_or(AppStateError::Db(DbError::Unavailable))?;
                     let journal = PgVenueJournal::open(pool, ticker.as_ref(), header)?;
-                    spawn_matching_actor_with_registry_and_index(
-                        actor_config,
-                        journal,
-                        fan_out,
-                        clock.clone(),
-                        Arc::clone(&registry),
-                        Arc::clone(&symbol_index),
-                        &microstructure,
-                        // The market-maker control apply seam (#047): a committed
-                        // `MarketMakerControl` pushes its knobs onto the engine
-                        // through the late-bound hub, inside the actor turn.
-                        Some(Arc::clone(&mm_control_sink)),
-                    )?
+                    let actor_config =
+                        ActorConfig::new(Arc::clone(&ticker), lineage_id.clone(), mailbox_capacity)
+                            .with_start_sequence(start);
+                    recovered_set.insert(Arc::clone(&ticker));
+                    // Spawn with the reconstructed executor directly (its registry /
+                    // index / microstructure were wired at recovery-build time).
+                    spawn_underlying_actor(actor_config, journal, executor, fan_out, clock.clone())
                 }
                 None => {
-                    let journal = InMemoryVenueJournal::new(header);
-                    spawn_matching_actor_with_registry_and_index(
-                        actor_config,
-                        journal,
-                        fan_out,
-                        clock.clone(),
-                        Arc::clone(&registry),
-                        Arc::clone(&symbol_index),
-                        &microstructure,
-                        Some(Arc::clone(&mm_control_sink)),
-                    )?
+                    // Fresh boot (today's path, unchanged): swap the STORE, not the
+                    // contract — durable `PgVenueJournal` (#029) when `DATABASE_URL` is
+                    // set, in-memory otherwise; both are the SAME `VenueJournal` trait,
+                    // so the write-ahead turn discipline is identical. The venue
+                    // microstructure (#044) is applied at book creation, before any leaf
+                    // is vivified.
+                    let actor_config =
+                        ActorConfig::new(Arc::clone(&ticker), lineage_id.clone(), mailbox_capacity);
+                    match db.as_ref() {
+                        Some(pool) => {
+                            let journal = PgVenueJournal::open(pool, ticker.as_ref(), header)?;
+                            spawn_matching_actor_with_registry_and_index(
+                                actor_config,
+                                journal,
+                                fan_out,
+                                clock.clone(),
+                                Arc::clone(&registry),
+                                Arc::clone(&symbol_index),
+                                &microstructure,
+                                // The market-maker control apply seam (#047): a
+                                // committed `MarketMakerControl` pushes its knobs onto
+                                // the engine through the late-bound hub, inside the
+                                // actor turn.
+                                Some(Arc::clone(&mm_control_sink)),
+                            )?
+                        }
+                        None => {
+                            let journal = InMemoryVenueJournal::new(header);
+                            spawn_matching_actor_with_registry_and_index(
+                                actor_config,
+                                journal,
+                                fan_out,
+                                clock.clone(),
+                                Arc::clone(&registry),
+                                Arc::clone(&symbol_index),
+                                &microstructure,
+                                Some(Arc::clone(&mm_control_sink)),
+                            )?
+                        }
+                    }
                 }
             };
             // Detach: the actor's shutdown is its mailbox closing when this handle
@@ -949,6 +1241,7 @@ impl AppState {
 
         tracing::info!(
             underlyings = handles.len(),
+            recovered = recovered_set.len(),
             accounts = account_registry.account_count(),
             durable = db.is_some(),
             manifest = %manifest.summary(),
@@ -977,6 +1270,7 @@ impl AppState {
             recording: RecordingController::default(),
             microstructure,
             expiry_phases: std::sync::Mutex::new(std::collections::HashMap::new()),
+            recovered: recovered_set,
         }))
     }
 
@@ -1619,6 +1913,31 @@ impl AppState {
     #[must_use]
     pub fn underlyings(&self) -> Vec<&str> {
         let mut tickers: Vec<&str> = self.underlyings.keys().map(AsRef::as_ref).collect();
+        tickers.sort_unstable();
+        tickers
+    }
+
+    /// Whether `underlying` was **resumed** from a non-empty durable journal at boot
+    /// (#85) — its book / executions / positions state was reconstructed by
+    /// re-execution and its actor continues the journaled `underlying_sequence`.
+    ///
+    /// **Seed-vs-recover precedence:** the bounded seeding phase consults this so a
+    /// recovered underlying is **not** re-seeded — recover wins for underlyings with
+    /// journal history; seed applies only to genuinely fresh ones. Re-seeding a
+    /// recovered underlying would journal a duplicate opening `SimStep` onto the
+    /// resumed stream. A point-lookup, never iterated on the sequenced path.
+    #[must_use]
+    #[inline]
+    pub fn is_recovered(&self, underlying: &str) -> bool {
+        self.recovered.contains(underlying)
+    }
+
+    /// The underlyings resumed from a durable journal at boot (#85), **sorted** for a
+    /// deterministic order regardless of set iteration order — the recovered-set
+    /// companion to [`underlyings`](Self::underlyings), for the boot log and tests.
+    #[must_use]
+    pub fn recovered_underlyings(&self) -> Vec<&str> {
+        let mut tickers: Vec<&str> = self.recovered.iter().map(AsRef::as_ref).collect();
         tickers.sort_unstable();
         tickers
     }
@@ -2911,6 +3230,106 @@ mod tests {
             state.clock().now_ms().get(),
             start + 500,
             "an explicit Clock advance still moves a stepped clock"
+        );
+    }
+
+    // ---- boot-recovery store rebuild is fallible (#85 review) -------------
+
+    /// An executions store whose `record` always fails — the projection fault boot
+    /// recovery must fail-stop on rather than serve a partially-rebuilt store.
+    struct FaultyExec;
+
+    impl ExecutionsStore for FaultyExec {
+        fn record(
+            &self,
+            _record: crate::models::ExecutionRecord,
+        ) -> Result<(), crate::exchange::StoreError> {
+            Err(crate::exchange::StoreError::Backend("injected".to_string()))
+        }
+        fn get(
+            &self,
+            _execution_id: &crate::models::ExecutionId,
+            _account: &AccountId,
+        ) -> Result<Option<crate::models::ExecutionRecord>, crate::exchange::StoreError> {
+            Ok(None)
+        }
+        fn list(
+            &self,
+            _account: &AccountId,
+            _filter: &crate::exchange::ExecutionFilter,
+        ) -> Result<Vec<crate::models::ExecutionRecord>, crate::exchange::StoreError> {
+            Ok(Vec::new())
+        }
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_stores_from_events_surfaces_a_projection_failure() {
+        // #85 review: boot recovery must FAIL STARTUP (never serve a partial store)
+        // when a projection fails during the store rebuild. `rebuild_stores_from_events`
+        // surfaces the #131 `StoreFanOut` seal as `Err`, which `AppState::new` maps to
+        // a fatal `AppStateError::RecoveryProjectionFailed`.
+        let state = new_state(config(&["BTC"]));
+        // A crossing match → a fill-bearing event in the journal.
+        state
+            .submit(add(
+                "BTC-20240329-50000-C",
+                "mk",
+                "maker",
+                0x11,
+                Side::Sell,
+                50_000,
+                2,
+            ))
+            .await
+            .expect("maker rests");
+        state
+            .submit(add(
+                "BTC-20240329-50000-C",
+                "tk",
+                "taker",
+                0x22,
+                Side::Buy,
+                50_000,
+                2,
+            ))
+            .await
+            .expect("taker crosses");
+        let snap = state.journal_snapshot("BTC").await.expect("BTC snapshot");
+        let events: Vec<VenueEvent> = snap
+            .records
+            .into_iter()
+            .filter_map(|r| match r {
+                JournalRecord::Event(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.outcome,
+                VenueOutcome::Added { fills, .. } if !fills.is_empty()
+            )),
+            "the crossing produced a fill-bearing event to rebuild"
+        );
+
+        // Happy path: in-memory stores rebuild cleanly.
+        let exec_ok = Arc::new(InMemoryExecutionsStore::new());
+        let pos_ok = Arc::new(InMemoryPositionsStore::new());
+        rebuild_stores_from_events(&exec_ok, &pos_ok, &Arc::new(MarkPriceBook::new()), &events)
+            .expect("a clean rebuild returns Ok");
+        assert!(exec_ok.len() >= 2, "the crossing's two legs were rebuilt");
+
+        // Faulty executions store: the rebuild surfaces the seal, projection named.
+        let exec_bad = Arc::new(FaultyExec);
+        let pos = Arc::new(InMemoryPositionsStore::new());
+        let sealed =
+            rebuild_stores_from_events(&exec_bad, &pos, &Arc::new(MarkPriceBook::new()), &events);
+        assert_eq!(
+            sealed.err().map(|s| s.projection),
+            Some("executions"),
+            "a projection failure fails the rebuild rather than serving a partial store"
         );
     }
 }

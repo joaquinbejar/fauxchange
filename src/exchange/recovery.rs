@@ -176,6 +176,54 @@ where
     recover_inner(journal, underlying, Some(microstructure))
 }
 
+/// Recovers a journal into a **caller-provided** [`MatchingExecutor`] — the
+/// boot-time [`AppState`](crate::state::AppState) resume seam (#85). The venue
+/// builds the fresh reconstruction book with its **shared** venue-wide
+/// `InstrumentRegistry` + `SymbolIndex` and microstructure applied (via
+/// `MatchingExecutor::new_with_registry_and_index`), then hands it here so
+/// re-execution vivifies the recovered leaves onto the **same** venue index every
+/// fresh underlying shares — so a recovered instrument is visible to venue-wide
+/// reads, exactly as a live one is. This is the **same** reducer as [`recover`] /
+/// [`recover_with_microstructure`] (one algorithm; stored event = integrity
+/// oracle); only the executor's provenance differs.
+///
+/// The `underlying` is taken from [`MatchingExecutor::underlying`], so the caller
+/// must build the executor for the stream being recovered. `microstructure` is used
+/// **only** to re-run the live price-band admission check on the re-execution path
+/// (a tampered durable record is refused before it re-executes); the executor
+/// already carries its own fee/STP/specs, so pass the venue config that built it, or
+/// `None` for a bare reconstruction with no admission check.
+///
+/// # Errors
+///
+/// [`JournalError::SchemaTooNew`] / [`JournalError::Corruption`] (naming the exact
+/// `(underlying, N)`) / [`JournalError::Backend`] / [`JournalError::ResourceLimit`]
+/// / [`JournalError::PriceOutOfBand`] exactly as the sibling entry points.
+pub fn recover_into<J>(
+    journal: &J,
+    executor: MatchingExecutor,
+    microstructure: Option<&MicrostructureConfig>,
+) -> Result<Recovered, JournalError>
+where
+    J: VenueJournal + ?Sized,
+{
+    // Refuse a forward-incompatible journal BEFORE replaying anything (the header is
+    // read first so re-derived ids land in the same namespace), mirroring
+    // `recover_inner`.
+    let header = journal.header();
+    if !header.is_current_schema() {
+        return Err(JournalError::SchemaTooNew {
+            found: header.schema_version.clone(),
+        });
+    }
+    let lineage = header.lineage_id.clone();
+    // The reconstruction stream is the executor's own underlying — the caller built
+    // it for the stream being recovered.
+    let underlying = executor.underlying().to_string();
+    let records = journal.read_from(SequenceNumber::START)?;
+    reduce_into_executor(&records, executor, &underlying, &lineage, microstructure)
+}
+
 /// The shared recovery core behind [`recover`] (bare) and
 /// [`recover_with_microstructure`] (config-scoped): reads + schema-checks the header,
 /// then re-executes the command stream into a fresh executor built with `None` (bare)
@@ -216,7 +264,7 @@ fn recover_from_records(
     // The fresh reconstruction book: bare, or with the venue microstructure applied
     // BEFORE any leaf is vivified — the same apply the live book-creation path
     // performs, so a config-scoped scenario replays exactly.
-    let mut executor = match microstructure {
+    let executor = match microstructure {
         None => MatchingExecutor::new(underlying),
         Some(config) => {
             MatchingExecutor::new_with_microstructure(underlying, config).map_err(|error| {
@@ -226,6 +274,24 @@ fn recover_from_records(
             })?
         }
     };
+    reduce_into_executor(records, executor, underlying, lineage, microstructure)
+}
+
+/// The pure reducer over an already-read record slice **and a pre-built executor**:
+/// re-executes the command records in `N` order and oracle-compares against the
+/// stored events. Factored out so the standalone-executor entry points
+/// ([`recover`] / [`recover_with_microstructure`]) and the shared-registry
+/// [`recover_into`] boot seam share **one** algorithm. `microstructure` is `None`
+/// for no admission check, or `Some(config)` to re-run the live venue price-band
+/// admission on the re-execution path (a tampered record is refused before it
+/// re-executes).
+fn reduce_into_executor(
+    records: &[JournalRecord],
+    mut executor: MatchingExecutor,
+    underlying: &str,
+    lineage: &LineageId,
+    microstructure: Option<&MicrostructureConfig>,
+) -> Result<Recovered, JournalError> {
     let mut events = Vec::new();
 
     for command in command_records_in_order(records) {

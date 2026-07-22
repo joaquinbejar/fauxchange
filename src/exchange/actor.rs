@@ -423,6 +423,20 @@ impl ActorConfig {
             start_sequence: SequenceNumber::START,
         }
     }
+
+    /// Sets the first sequence this actor will assign, so it can be spawned
+    /// **continuing** an existing journaled stream (boot-time journal recovery,
+    /// #85) rather than at [`SequenceNumber::START`]. Boot recovery passes
+    /// `last_journaled_sequence + 1` here so the resumed underlying's
+    /// `underlying_sequence` continues — it never resets — and pairs it with the
+    /// stream's **rehydrated** `lineage_id` (via [`new`](Self::new)) so continued
+    /// ids stay in the recovered run's namespace.
+    #[must_use]
+    #[inline]
+    pub fn with_start_sequence(mut self, start_sequence: SequenceNumber) -> Self {
+        self.start_sequence = start_sequence;
+        self
+    }
 }
 
 // ============================================================================
