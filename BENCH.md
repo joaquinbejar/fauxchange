@@ -2,7 +2,7 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), and the v1.0 stability soak (`#054`, §14, v1.0); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
+| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
 | Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`), on routinely-rebased working trees at those dates |
 | Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
@@ -109,7 +109,12 @@ depth. The DESIGN TARGET is not yet reliably met once an underlying has
 accumulated tens of thousands of records in a single run; a follow-up (an
 index-backed uniqueness check — e.g. a `HashSet<(SequenceNumber, RecordKind)>`
 alongside the `Vec`, sized to make the check O(1)) is worth `matching-expert`
-/ `architect` evaluating against this exact measured baseline.
+/ `architect` evaluating against this exact measured baseline. **Update
+(`#091`): that follow-up has since landed** — the O(1) index-backed uniqueness
+check plus a size-check fast path removed both this scan and `#34`'s
+per-append serialization; the same-machine before/after in §3.7 restores the
+append `p50` to 125 ns and the full-turn `p99`/`p99.9`/`p99.99` to well inside
+the 1 ms target at this same journal depth.
 **Run-to-run variance, disclosed:** a repeat run at the identical
 configuration on this same host produced p50 306 175 ns / p99 1 049 599 ns /
 p99.9 1 477 631 ns / p99.99 2 036 735 ns — i.e. p99 straddles the 1 ms line
@@ -299,10 +304,89 @@ index-backed `(SequenceNumber, RecordKind)` uniqueness check —
 `matching-expert` / `architect` should now evaluate it against BOTH the
 original linear-scan cost AND this added serialization cost together, since
 the two are now compounding on the same code path). **Both tail-cost sources
-are now tracked as [issue #91](https://github.com/joaquinbejar/fauxchange/issues/91)**
+were tracked as [issue #91](https://github.com/joaquinbejar/fauxchange/issues/91)**
 (a size-check fast path preserving the #34 symmetry invariant + the
-index-backed uniqueness check), scheduled to land before #53 arms the CI
+index-backed uniqueness check), which **has now landed and is measured in §3.7
+below** — both costs are removed and the HP-1 append tail is restored to well
+inside the sub-millisecond DESIGN TARGET, ahead of #53 arming the CI
 bench-regression gate over HP-1.
+
+### 3.7 `#091` — index-backed uniqueness + size-check fast path (the append tail-latency fix)
+
+`#091` replaced the two measured in-memory-append tail-latency costs §3.1/§3.6
+diagnosed with equal-guarantee accelerators (`src/exchange/journal.rs`):
+
+1. the **`O(journal-depth)` uniqueness linear scan** (`self.records.iter().find(...)`
+   over every prior record) → an **`O(1)`** `HashMap<(SequenceNumber, RecordKind), usize>`
+   index alongside the ordered `Vec` (the `Vec` stays the source of truth; the
+   index is a uniqueness accelerator only, never iterated for output, so no
+   map-iteration order enters any journal output and determinism is untouched);
+2. `#34`'s **unconditional `serde_json::to_string` size check on every append** →
+   a **size-check fast path**: a cheap conservative UPPER-BOUND estimate of the
+   serialized size (from the record's field byte-sizes + fill/leg count, no
+   allocation) skips the exact serialize for records clearly under the ceiling,
+   falling back to the exact `check_record_size` only when the estimate
+   approaches the ceiling. The estimate never under-estimates past the ceiling
+   (worst-case JSON string-escape expansion ×6, generous per-element and base
+   structural constants), so the `#34` write ≤ read symmetry invariant stays
+   **exact** — any over-ceiling record still falls through to the exact check
+   and is refused (proven by a new same-key soundness test:
+   `estimate ≥ serde_json::to_string(record).len()` across a spread of record
+   shapes, plus the unchanged size-ceiling refusal test).
+
+Neither change alters the journal's output, ordering, uniqueness/conflict
+semantics, or recovery re-execution — the determinism + golden + adversarial
+suites are untouched and green. This is a pure tail-latency optimization.
+
+**Same-machine before/after (the honest A/B).** Because the committed §3.6/§020
+baseline was measured on an earlier, moving working tree, the "before" column
+here was reproduced **on this same machine in the same session** by temporarily
+reverting *only* the two `append` changes (the linear scan + the unconditional
+serialize) — a genuine A/B, not a cross-machine comparison. It closely
+reproduces the committed §3.6 post-`#34` baseline (`hp1_command_append` p50
+158 µs here vs §3.6's 160 µs; full-turn p99 1.11 ms vs §3.6's 1.24 ms), which
+validates the "before" as a faithful stand-in for the shipped pre-`#091` code.
+Two runs each (same `HP1_WARMUP_OPS=5000 HP1_MEASURED_OPS=100000` config, same
+seed, same toolchain), reported run 1 with run 2 in parentheses for run-to-run
+variance, per this document's "disclose variance, don't hide it" convention.
+
+| | Before — pre-`#091` (run 1 / run 2) | After — `#091` (run 1 / run 2) | Δ (run 1) |
+|---|---|---|---|
+| `hp1_command_append` p50    | 158 335 ns / 148 223 ns | **125 ns** / 125 ns   | −99.9 % (~1 267×) |
+| `hp1_command_append` p99    | 537 599 ns / 546 815 ns | **1 541 ns** / 1 458 ns | −99.7 % (~349×) |
+| `hp1_command_append` p99.9  | 764 415 ns / 1 200 127 ns | **2 375 ns** / 3 209 ns | −99.7 % (~322×) |
+| `hp1_command_append` p99.99 | 1 572 863 ns / 3 115 007 ns | **25 711 ns** / 23 631 ns | −98.4 % (~61×) |
+| `hp1_event_append` p50    | 154 367 ns / 144 511 ns | **125 ns** / 125 ns   | −99.9 % (~1 235×) |
+| `hp1_event_append` p99    | 540 671 ns / 527 359 ns | **1 458 ns** / 1 416 ns | −99.7 % (~371×) |
+| `hp1_event_append` p99.9  | 762 367 ns / 998 911 ns | **2 167 ns** / 2 959 ns | −99.7 % (~352×) |
+| `hp1_event_append` p99.99 | 1 317 887 ns / 3 467 263 ns | **11 671 ns** / 13 839 ns | −99.1 % (~113×) |
+| `hp1_full_turn_closed_loop` p50    | 335 871 ns / 316 159 ns | **11 375 ns** / 11 671 ns | −96.6 % (~29.5×) |
+| `hp1_full_turn_closed_loop` p99    | 1 113 087 ns / 1 153 023 ns | **32 639 ns** / 35 071 ns | −97.1 % (~34×) |
+| `hp1_full_turn_closed_loop` p99.9  | 1 579 007 ns / 2 887 679 ns | **95 551 ns** / 98 175 ns | −93.9 % (~16.5×) |
+| `hp1_full_turn_closed_loop` p99.99 | 3 051 519 ns / 8 495 103 ns | **292 607 ns** / 203 519 ns | −90.4 % (~10.4×) |
+
+**Interpretation — DESIGN TARGET now met with margin, at journal depth.** After
+`#091`, both write-ahead appends collapse to a `p50` of **125 ns** — an
+`O(1)` `HashMap` insert + `Vec::push`, with no per-append serialization — at the
+same ~105 000-record journal depth where §3.1/§3.6 measured 148–160 µs. The
+full-turn `p99` (33 µs) is now **~34× inside** the sub-millisecond HP-1 DESIGN
+TARGET (docs/07 §3), and — the headline — **`p99.9` (96 µs) and `p99.99`
+(293 µs) are now BOTH comfortably inside 1 ms too**, where §3.1 had them *past*
+the ceiling (1.17 ms / 1.84 ms at the `#020` baseline, worse post-`#34`). The
+acceptance criterion "in-memory append `p99`/`p99.9` restored to (or better
+than) the `#020` baseline envelope" is met with large margin: `p99` 33 µs vs
+`#020` 932 µs, `p99.9` 96 µs vs `#020` 1.17 ms. The full turn is now dominated
+by the upstream match cost and the actor/mailbox round-trip (`hp1_venue_delta`
+p50 8.3 µs, of which the two appends are now ~0.25 µs), not the journal — the
+journal-depth-dependent tail §3.4 isolated is **eliminated**. **Disclosed
+honestly:** the paired `hp1_match_only` p50 differs between the before and after
+columns (5.6 µs before vs 2.9 µs after) even though it is the *same*
+`MatchingExecutor::execute` call — this is a whole-system load artifact, not a
+matching change: the pre-`#091` heavy per-append allocation + growing-scan
+pressure inflates even the paired inner timing (which shares the harness's
+`std::sync::Mutex` instrumentation, §3.3's disclosed instrumentation tax);
+removing that pressure lightens the whole process. The append numbers above are
+the direct, first-order measurement and are not subject to that confound.
 
 ## 4. HP-2 — WS broadcast fan-out isolation
 

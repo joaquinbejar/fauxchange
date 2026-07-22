@@ -45,9 +45,13 @@
 //! lock. The upstream ships only its own `InMemoryOptionChainJournal`, so the
 //! whole venue journal is `fauxchange` work.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::exchange::envelope::{VenueCommand, VenueEvent};
+use crate::exchange::envelope::{
+    AddOutcome, CancelledLeg, Fill, MassCancelScope, VenueCommand, VenueEvent, VenueOutcome,
+};
 use crate::exchange::event::{EventTimestamp, SequenceNumber};
 use crate::exchange::identity::{JournalHeader, LineageId, VENUE_ENVELOPE_SCHEMA};
 
@@ -468,6 +472,250 @@ pub fn check_record_size(record: &JournalRecord) -> Result<(), JournalError> {
     Ok(())
 }
 
+/// Worst-case per-byte expansion of a JSON-escaped string. `serde_json` escapes
+/// an ASCII control byte (`0x00`–`0x1F`) to a 6-byte `\u00XX` sequence at most,
+/// and passes non-ASCII UTF-8 through unescaped, so no source byte serialises to
+/// more than 6 bytes of string content. Used by
+/// [`estimated_max_serialized_len`] to bound a string field's serialized size
+/// from its byte length **without** serialising it.
+const JSON_STRING_ESCAPE_FACTOR: usize = 6;
+
+/// A conservative fixed upper bound on a single record's **structural**
+/// serialized bytes — every field name, punctuation byte, enum tag, integer
+/// (a `u64`/`i64` is ≤ 21 bytes), boolean, `null`, `schema` tag, and the one
+/// bounded upstream `ExpirationDate`/`Hash32` a command may carry — i.e.
+/// everything a record serialises that is **not** a variable-length string and
+/// **not** a per-element `Vec` entry. The largest such fixed shell (a
+/// [`VenueEvent`] wrapping an [`VenueCommand::AddOrder`] and a
+/// [`VenueOutcome::Added`]) is well under this value, so it never
+/// under-estimates.
+const RECORD_ESTIMATE_BASE_BYTES: usize = 4_096;
+
+/// A conservative upper bound on the **structural** serialized bytes of one
+/// `Vec` element (a [`Fill`], a [`CancelledLeg`], or an evicted
+/// [`crate::models::VenueOrderId`]) — its field names, punctuation, enum tags,
+/// integers, and the fixed 66-byte `Hash32` owner, **excluding** its
+/// variable-length string contents (those are counted once, with the
+/// [`JSON_STRING_ESCAPE_FACTOR`], in the string-byte total). A `Fill` — the
+/// largest element — serialises its fixed shell in ~280 bytes, comfortably under
+/// this bound.
+const PER_ELEMENT_ESTIMATE_BYTES: usize = 512;
+
+/// A cheap, conservative **upper bound** on a record's `venue.v1` serialized
+/// byte length — the in-memory [`InMemoryVenueJournal::append`] size-check fast
+/// path (#091).
+///
+/// [`check_record_size`] runs a full `serde_json::to_string` on **every**
+/// append purely to measure the byte length against [`MAX_JOURNAL_RECORD_BYTES`]
+/// — a measured tail-latency cost on the in-memory HP-1 path (the durable store
+/// reuses its INSERT serialization, so the cost is in-memory-only). This helper
+/// computes the same size *bounded from above* from the record's field byte
+/// sizes and fill/leg count alone — no allocation, no formatting — so the exact
+/// serialize can be skipped for the overwhelming majority of records that are
+/// clearly under the ceiling.
+///
+/// **Soundness (load-bearing — the write ≤ read symmetry invariant).** The bound
+/// **never under-estimates**: a record's true serialized size is
+/// `structural_bytes + Σ escaped-string-bytes`, and this returns
+/// `BASE + PER_ELEMENT × elements + FACTOR × Σ string-byte-lengths`, where
+/// `BASE ≥` any record's fixed structural shell, `PER_ELEMENT ≥` any element's
+/// structural shell, and `FACTOR = 6 ≥` the max JSON string expansion. Therefore
+/// `estimate ≥ true size` always, so `estimate ≤ ceiling ⇒ true size ≤ ceiling`
+/// (safe to skip the exact check), and any record that would exceed the ceiling
+/// has `estimate ≥ true size > ceiling`, so it falls through to the exact
+/// [`check_record_size`] and is refused. The estimate is a conservative
+/// over-estimate that at worst triggers the exact check needlessly (for a
+/// multi-thousand-leg single-turn sweep, far beyond realistic depth); it can
+/// never let an over-ceiling record through. Arithmetic saturates (never wraps)
+/// so a hostile huge input pins the estimate at `usize::MAX` — over the ceiling,
+/// exact check runs — rather than overflowing.
+#[must_use]
+fn estimated_max_serialized_len(record: &JournalRecord) -> usize {
+    let mut string_bytes: usize = 0;
+    let mut elements: usize = 0;
+    match record {
+        JournalRecord::Command(command) => {
+            accumulate_command_estimate(&command.command, &mut string_bytes, &mut elements);
+        }
+        JournalRecord::Event(event) => {
+            string_bytes = string_bytes.saturating_add(event.schema.len());
+            accumulate_command_estimate(&event.command, &mut string_bytes, &mut elements);
+            accumulate_outcome_estimate(&event.outcome, &mut string_bytes, &mut elements);
+        }
+        JournalRecord::Epoch(marker) => {
+            string_bytes = string_bytes
+                .saturating_add(marker.schema.len())
+                .saturating_add(marker.snapshot_id.len())
+                .saturating_add(marker.lineage_id.as_str().len());
+        }
+    }
+    RECORD_ESTIMATE_BASE_BYTES
+        .saturating_add(string_bytes.saturating_mul(JSON_STRING_ESCAPE_FACTOR))
+        .saturating_add(elements.saturating_mul(PER_ELEMENT_ESTIMATE_BYTES))
+}
+
+/// Adds a [`VenueCommand`]'s variable-length string byte lengths to
+/// `string_bytes` (a command carries no `Vec` elements, so `elements` is
+/// untouched here). Every non-string field — `Side`, `TimeInForce`, `STPMode`,
+/// integers, an `ExpirationDate`/`Hash32` — is fixed-size and covered by
+/// [`RECORD_ESTIMATE_BASE_BYTES`].
+fn accumulate_command_estimate(
+    command: &VenueCommand,
+    string_bytes: &mut usize,
+    _elements: &mut usize,
+) {
+    match command {
+        VenueCommand::AddOrder {
+            symbol,
+            order_id,
+            account,
+            client_order_id,
+            ..
+        } => {
+            *string_bytes = string_bytes
+                .saturating_add(symbol.as_str().len())
+                .saturating_add(order_id.as_str().len())
+                .saturating_add(account.as_str().len());
+            if let Some(client_order_id) = client_order_id {
+                *string_bytes = string_bytes.saturating_add(client_order_id.as_str().len());
+            }
+        }
+        VenueCommand::CancelOrder {
+            symbol,
+            order_id,
+            account,
+        } => {
+            *string_bytes = string_bytes
+                .saturating_add(symbol.as_str().len())
+                .saturating_add(order_id.as_str().len())
+                .saturating_add(account.as_str().len());
+        }
+        VenueCommand::Replace {
+            symbol,
+            order_id,
+            new_order_id,
+            account,
+            ..
+        } => {
+            *string_bytes = string_bytes
+                .saturating_add(symbol.as_str().len())
+                .saturating_add(order_id.as_str().len())
+                .saturating_add(new_order_id.as_str().len())
+                .saturating_add(account.as_str().len());
+        }
+        VenueCommand::MassCancel { scope, account, .. } => {
+            if let MassCancelScope::Book(symbol) = scope {
+                *string_bytes = string_bytes.saturating_add(symbol.as_str().len());
+            }
+            *string_bytes = string_bytes.saturating_add(account.as_str().len());
+        }
+        VenueCommand::SetInstrumentStatus { symbol, .. } => {
+            *string_bytes = string_bytes.saturating_add(symbol.as_str().len());
+        }
+        VenueCommand::SimStep { underlying, .. } => {
+            *string_bytes = string_bytes.saturating_add(underlying.len());
+        }
+        VenueCommand::EvictExpiredOrders { .. }
+        | VenueCommand::MarketMakerControl { .. }
+        | VenueCommand::Clock { .. } => {}
+    }
+}
+
+/// Adds a [`VenueOutcome`]'s variable-length string byte lengths and `Vec`
+/// element count to the running totals.
+fn accumulate_outcome_estimate(
+    outcome: &VenueOutcome,
+    string_bytes: &mut usize,
+    elements: &mut usize,
+) {
+    match outcome {
+        VenueOutcome::Added {
+            fills,
+            stp_cancelled,
+            ..
+        }
+        | VenueOutcome::Market {
+            fills,
+            stp_cancelled,
+            ..
+        } => {
+            accumulate_fills_estimate(fills, string_bytes, elements);
+            accumulate_legs_estimate(stp_cancelled, string_bytes, elements);
+        }
+        VenueOutcome::Cancelled { order_id } => {
+            *string_bytes = string_bytes.saturating_add(order_id.as_str().len());
+        }
+        VenueOutcome::Replace { add, .. } => {
+            accumulate_add_outcome_estimate(add, string_bytes, elements);
+        }
+        VenueOutcome::MassCancelled { affected } => {
+            accumulate_legs_estimate(affected, string_bytes, elements);
+        }
+        VenueOutcome::InstrumentStatusChanged { symbol, .. } => {
+            *string_bytes = string_bytes.saturating_add(symbol.as_str().len());
+        }
+        VenueOutcome::Evicted { evicted } => {
+            for order_id in evicted {
+                *elements = elements.saturating_add(1);
+                *string_bytes = string_bytes.saturating_add(order_id.as_str().len());
+            }
+        }
+        VenueOutcome::ControlApplied => {}
+        VenueOutcome::Rejected { reason } => {
+            *string_bytes = string_bytes.saturating_add(reason.len());
+        }
+    }
+}
+
+/// Adds the add-leg [`AddOutcome`]'s string byte lengths and element count to
+/// the running totals (the add half of a non-atomic [`VenueOutcome::Replace`]).
+fn accumulate_add_outcome_estimate(
+    add: &AddOutcome,
+    string_bytes: &mut usize,
+    elements: &mut usize,
+) {
+    match add {
+        AddOutcome::Filled {
+            fills,
+            stp_cancelled,
+        }
+        | AddOutcome::Rested {
+            fills,
+            stp_cancelled,
+            ..
+        } => {
+            accumulate_fills_estimate(fills, string_bytes, elements);
+            accumulate_legs_estimate(stp_cancelled, string_bytes, elements);
+        }
+        AddOutcome::Rejected { reason } => {
+            *string_bytes = string_bytes.saturating_add(reason.len());
+        }
+    }
+}
+
+/// Counts each [`Fill`] as one element and adds its three variable-length id
+/// strings' byte lengths (the fixed-size `owner`, `price`, `quantity`, `fee`,
+/// `side`, `liquidity` are covered by [`PER_ELEMENT_ESTIMATE_BYTES`]).
+fn accumulate_fills_estimate(fills: &[Fill], string_bytes: &mut usize, elements: &mut usize) {
+    for fill in fills {
+        *elements = elements.saturating_add(1);
+        *string_bytes = string_bytes
+            .saturating_add(fill.execution_id.as_str().len())
+            .saturating_add(fill.order_id.as_str().len())
+            .saturating_add(fill.account.as_str().len());
+    }
+}
+
+/// Counts each [`CancelledLeg`] as one element and adds its variable-length
+/// `order_id` string byte length (the fixed-size `owner` and `reason` are
+/// covered by [`PER_ELEMENT_ESTIMATE_BYTES`]).
+fn accumulate_legs_estimate(legs: &[CancelledLeg], string_bytes: &mut usize, elements: &mut usize) {
+    for leg in legs {
+        *elements = elements.saturating_add(1);
+        *string_bytes = string_bytes.saturating_add(leg.order_id.as_str().len());
+    }
+}
+
 /// Enforces the [`MAX_JOURNAL_RECORDS`] per-read record-count ceiling — a read whose
 /// stream holds more than the ceiling is **refused** (never truncated: a truncated
 /// read would be a silent partial recovery), closing the #029-deferred unbounded-read
@@ -573,10 +821,19 @@ pub trait VenueJournal {
 /// Records live in a single append-ordered `Vec`; the actor's turn order **is**
 /// the append order because it is the sole writer, so no external ordering is
 /// imposed here. The durable store (#029) replaces this behind [`VenueJournal`].
+///
+/// The `Vec` is the **ordered source of truth**. `index` is a
+/// `(sequence, kind) → Vec` position map maintained alongside it purely as an
+/// **O(1) uniqueness accelerator** for [`append`](Self::append) (#091), mirroring
+/// the durable store's unique-index semantics (ADR-0006). It is **never iterated
+/// for any output** — [`read_from`](Self::read_from), [`last_sequence`](Self::last_sequence),
+/// and recovery all read the `Vec` — so no map-iteration order enters any
+/// journal output and the determinism guarantee is untouched.
 #[derive(Debug, Clone)]
 pub struct InMemoryVenueJournal {
     header: JournalHeader,
     records: Vec<JournalRecord>,
+    index: HashMap<(SequenceNumber, RecordKind), usize>,
 }
 
 impl InMemoryVenueJournal {
@@ -587,6 +844,7 @@ impl InMemoryVenueJournal {
         Self {
             header,
             records: Vec::new(),
+            index: HashMap::new(),
         }
     }
 
@@ -618,22 +876,34 @@ impl VenueJournal for InMemoryVenueJournal {
         // actor surfaces this through its existing semantics — an over-ceiling
         // write-ahead command reuses `N`; an over-ceiling post-mutation event seals
         // the underlying (loud), never a silent write-then-brick.
-        check_record_size(&record)?;
+        //
+        // Size-check fast path (#091): `check_record_size` serialises the whole
+        // record only to measure its byte length. `estimated_max_serialized_len`
+        // bounds that length from above from the record's field sizes + fill/leg
+        // count with no allocation, so the exact serialize is skipped for the
+        // overwhelming majority of records that are clearly under the ceiling. The
+        // bound never under-estimates past the ceiling, so any record that would
+        // exceed it still falls through to the exact `check_record_size` and is
+        // refused — the write ≤ read symmetry invariant is exact.
+        if estimated_max_serialized_len(&record) > MAX_JOURNAL_RECORD_BYTES {
+            check_record_size(&record)?;
+        }
         let sequence = record.sequence();
         let kind = record.kind();
-        if let Some(existing) = self
-            .records
-            .iter()
-            .find(|candidate| candidate.sequence() == sequence && candidate.kind() == kind)
-        {
-            // Idempotent re-append of the identical record is a no-op; a differing
-            // payload at the same key is an integrity violation.
-            if *existing == record {
+        // O(1) uniqueness (#091): the index maps `(sequence, kind)` to its slot in
+        // `records`, which only ever grows (a no-op or a conflict never pushes), so
+        // the mapped slot always resolves — the checked `get` keeps the production
+        // path free of an unchecked index. An identical re-append is the idempotent
+        // no-op; a differing payload at the same key is the integrity `Conflict`.
+        if let Some(&existing_idx) = self.index.get(&(sequence, kind)) {
+            if self.records.get(existing_idx) == Some(&record) {
                 return Ok(());
             }
             return Err(JournalError::Conflict { sequence, kind });
         }
+        let idx = self.records.len();
         self.records.push(record);
+        self.index.insert((sequence, kind), idx);
         Ok(())
     }
 
@@ -654,10 +924,12 @@ impl VenueJournal for InMemoryVenueJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exchange::boundary::{Hash32, Side};
     use crate::exchange::envelope::VenueOutcome;
     use crate::exchange::identity::LineageId;
+    use crate::exchange::money::{Cents, SignedCents};
     use crate::exchange::symbol::Symbol;
-    use crate::models::AccountId;
+    use crate::models::{AccountId, LiquidityFlag};
 
     fn header() -> JournalHeader {
         JournalHeader::new(LineageId::new("run-1"))
@@ -1046,5 +1318,212 @@ mod tests {
         // A `venue.v1` record always serializes, so the fail-open path is unreachable
         // via the type; this documents the contract and exercises the ok path.
         assert!(check_record_size(&command_record(3)).is_ok());
+    }
+
+    // ---- index-backed uniqueness (#091) ----------------------------------
+
+    /// A deep journal: `pairs` fully-committed `(command, event)` pairs at
+    /// sequences `0..pairs`. Exercises the O(1) index at depth.
+    fn deep_journal(pairs: u64) -> InMemoryVenueJournal {
+        let mut journal = InMemoryVenueJournal::new(header());
+        for seq in 0..pairs {
+            assert!(journal.append(command_record(seq)).is_ok());
+            assert!(journal.append(event_record(seq)).is_ok());
+        }
+        journal
+    }
+
+    #[test]
+    fn test_deep_journal_append_stays_correct_with_the_index() {
+        // The index must give the SAME uniqueness + conflict semantics as the old
+        // O(depth) scan at journal depth — an identical re-append of a deep key is
+        // the idempotent no-op, a differing payload at that same deep key is a
+        // Conflict, and neither mutates the ordered `Vec` or its length.
+        let depth = 5_000u64;
+        let mut journal = deep_journal(depth);
+        let expected_len = (depth as usize) * 2;
+        assert_eq!(journal.len(), expected_len);
+        assert_eq!(
+            journal.last_sequence(),
+            Some(SequenceNumber::new(depth - 1))
+        );
+
+        // Identical re-append deep in the stream is a no-op (no growth).
+        let deep = depth - 1;
+        assert!(journal.append(command_record(deep)).is_ok());
+        assert!(journal.append(event_record(deep)).is_ok());
+        assert_eq!(
+            journal.len(),
+            expected_len,
+            "an identical re-append never grows the Vec"
+        );
+
+        // A differing payload at a deep, already-present (sequence, kind) key is a
+        // Conflict — refused, never overwritten, never appended.
+        let conflicting = JournalRecord::command(
+            SequenceNumber::new(deep),
+            EventTimestamp::new(424_242),
+            cancel(999),
+        );
+        match journal.append(conflicting) {
+            Err(JournalError::Conflict { sequence, kind }) => {
+                assert_eq!(sequence, SequenceNumber::new(deep));
+                assert_eq!(kind, RecordKind::Command);
+            }
+            other => panic!("expected a deep-key Conflict, got {other:?}"),
+        }
+        assert_eq!(
+            journal.len(),
+            expected_len,
+            "a conflict never grows the Vec"
+        );
+
+        // The ordered read is still driven by the `Vec`, in append order — the
+        // index is never a source of output, so ordering is unchanged.
+        let tail = match journal.read_from(SequenceNumber::new(deep)) {
+            Ok(records) => records,
+            Err(e) => panic!("read_from failed: {e}"),
+        };
+        assert_eq!(tail, vec![command_record(deep), event_record(deep)]);
+
+        // The new command at the tail still appends and indexes cleanly.
+        assert!(journal.append(command_record(depth)).is_ok());
+        assert_eq!(journal.len(), expected_len + 1);
+        assert!(journal.contains(SequenceNumber::new(depth), RecordKind::Command));
+    }
+
+    // ---- size-check fast path (#091) -------------------------------------
+
+    /// An `Added` event carrying `fills` fill legs — the fill-count-dominated
+    /// record shape the size ceiling exists for.
+    fn added_event_with_fills(seq: u64, fills: usize) -> JournalRecord {
+        let lineage = LineageId::new("run-1");
+        let underlying_seq = SequenceNumber::new(seq);
+        let legs: Vec<Fill> = (0..fills)
+            .flat_map(|i| {
+                let index = i as u32;
+                let execution_id = lineage.execution_id("BTC", underlying_seq, index);
+                let maker = Fill {
+                    execution_id: execution_id.clone(),
+                    order_id: lineage.venue_order_id("BTC", SequenceNumber::new(1), index),
+                    account: AccountId::new("maker-acct"),
+                    owner: Hash32([0x11; 32]),
+                    side: Side::Sell,
+                    liquidity: LiquidityFlag::Maker,
+                    price: Cents::new(50_000),
+                    quantity: 2,
+                    fee: SignedCents::new(-10),
+                };
+                let taker = Fill {
+                    execution_id,
+                    order_id: lineage.venue_order_id("BTC", underlying_seq, index),
+                    account: AccountId::new("taker-acct"),
+                    owner: Hash32([0x22; 32]),
+                    side: Side::Buy,
+                    liquidity: LiquidityFlag::Taker,
+                    price: Cents::new(50_000),
+                    quantity: 2,
+                    fee: SignedCents::new(15),
+                };
+                [maker, taker]
+            })
+            .collect();
+        JournalRecord::event(VenueEvent::new(
+            underlying_seq,
+            EventTimestamp::new(1),
+            cancel(seq),
+            VenueOutcome::Added {
+                fills: legs,
+                resting_quantity: 0,
+                stp_cancelled: vec![],
+            },
+        ))
+    }
+
+    /// The soundness invariant of the fast-path bound: for a spread of record
+    /// shapes (a tiny command, an event, a fill-heavy event, an epoch marker, and
+    /// a near-ceiling huge-string record), the cheap estimate is ALWAYS ≥ the
+    /// exact serialized byte length — it never under-estimates, so a record that
+    /// would exceed the ceiling can never slip past the fast path.
+    #[test]
+    fn test_estimated_len_never_under_estimates_actual_serialized_size() {
+        let mut records = vec![
+            command_record(7),
+            event_record(7),
+            added_event_with_fills(9, 1),
+            added_event_with_fills(9, 250),
+            JournalRecord::epoch(snapshot_restored(6, 1)),
+        ];
+        // A large-but-legal huge-string record near the ceiling — the estimate must
+        // still bound it from above.
+        let big = "a".repeat(MAX_JOURNAL_RECORD_BYTES / 2);
+        records.push(JournalRecord::command(
+            SequenceNumber::new(0),
+            EventTimestamp::new(1),
+            VenueCommand::CancelOrder {
+                symbol: sym("BTC-20240329-50000-C"),
+                order_id: crate::models::VenueOrderId::new(big),
+                account: AccountId::new("acct-1"),
+            },
+        ));
+        for record in &records {
+            let actual = match serde_json::to_string(record) {
+                Ok(json) => json.len(),
+                Err(e) => panic!("serialize failed: {e}"),
+            };
+            let estimate = estimated_max_serialized_len(record);
+            assert!(
+                estimate >= actual,
+                "estimate {estimate} must be >= actual {actual} for {record:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_estimated_len_fast_paths_small_records_and_flags_oversized() {
+        // A realistic small record's estimate is far under the ceiling, so the fast
+        // path skips the exact serialize.
+        let small = added_event_with_fills(3, 4);
+        assert!(estimated_max_serialized_len(&small) <= MAX_JOURNAL_RECORD_BYTES);
+        // An over-ceiling huge-string record's estimate is over the ceiling, so it
+        // falls through to the exact `check_record_size` — which refuses it.
+        let oversized = oversized_record(0);
+        assert!(estimated_max_serialized_len(&oversized) > MAX_JOURNAL_RECORD_BYTES);
+    }
+
+    #[test]
+    fn test_fast_path_preserves_write_ceiling_refusal_and_symmetry() {
+        // End-to-end through `append`: the fast path does not change the write-ceiling
+        // decision. An over-ceiling record is still refused (estimate over → exact
+        // check → refuse); a within-ceiling one still writes (estimate under → skip,
+        // or estimate over → exact check → accept).
+        let mut journal = InMemoryVenueJournal::new(header());
+        assert!(matches!(
+            journal.append(oversized_record(0)),
+            Err(JournalError::ResourceLimit {
+                limit: "record_bytes",
+                ..
+            })
+        ));
+        assert!(journal.is_empty());
+        // A near-ceiling but legal record whose estimate exceeds the ceiling still
+        // writes after the exact check confirms it is under.
+        let big = "a".repeat(MAX_JOURNAL_RECORD_BYTES / 2);
+        let near = JournalRecord::command(
+            SequenceNumber::new(0),
+            EventTimestamp::new(1),
+            VenueCommand::CancelOrder {
+                symbol: sym("BTC-20240329-50000-C"),
+                order_id: crate::models::VenueOrderId::new(big),
+                account: AccountId::new("acct-1"),
+            },
+        );
+        assert!(estimated_max_serialized_len(&near) > MAX_JOURNAL_RECORD_BYTES);
+        assert!(check_record_size(&near).is_ok());
+        assert!(journal.append(near.clone()).is_ok());
+        assert_eq!(
+            journal.read_from(SequenceNumber::START).ok(),
+            Some(vec![near])
+        );
     }
 }
