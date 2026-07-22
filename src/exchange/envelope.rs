@@ -363,7 +363,25 @@ pub enum VenueOutcome {
     /// [`VenueCommand::Clock`] / [`VenueCommand::SimStep`]) was applied. Its
     /// *derived* effects (e.g. market-maker requotes) are journaled as their own
     /// sequenced commands ([02 §4.1](../../../docs/02-matching-architecture.md)).
-    ControlApplied,
+    ///
+    /// For a market-maker **kill** (`MarketMakerControl { enabled: Some(false),
+    /// .. }`) the `swept` legs are the owner-scoped market-maker cancellations
+    /// captured **losslessly in the same turn as the control** — the sweep is
+    /// coupled into the kill control's own sequenced turn, per underlying, so it
+    /// is crash-consistent (one journal event that is both "control applied" AND
+    /// "these MM-owner orders cancelled", never a separate follow-on command a
+    /// crash could skip) and re-runs deterministically against the rebuilt
+    /// resting set on replay ([ADR-0009 §4](../../../docs/adr/0009-lossless-venue-envelope-outcomes.md)).
+    /// For every **other** control (a parameter change, `enabled: Some(true)`) and
+    /// for [`VenueCommand::Clock`] / [`VenueCommand::SimStep`], `swept` is
+    /// **empty**. Following the enum's empty-vec convention it is always serialised
+    /// (an empty array when nothing was swept) and required on decode.
+    ControlApplied {
+        /// The owner-scoped market-maker legs cancelled in the same turn as a
+        /// kill control, in the deterministic sweep order — empty for every
+        /// non-kill control and for `Clock` / `SimStep`.
+        swept: Vec<CancelledLeg>,
+    },
     /// The command was rejected; the book is untouched and no fill executed
     /// ([ADR-0009 §1](../../../docs/adr/0009-lossless-venue-envelope-outcomes.md)).
     Rejected {
@@ -1106,10 +1124,42 @@ mod tests {
         assert_serde_identity(&VenueOutcome::Evicted {
             evicted: vec![lineage.venue_order_id("BTC", SequenceNumber::new(1), 0)],
         });
-        assert_serde_identity(&VenueOutcome::ControlApplied);
+        assert_serde_identity(&VenueOutcome::ControlApplied { swept: vec![] });
         assert_serde_identity(&VenueOutcome::Rejected {
             reason: "instrument halted".to_string(),
         });
+    }
+
+    #[test]
+    fn test_control_applied_swept_follows_empty_vec_convention() {
+        // A non-kill control carries an empty `swept`, always serialised as [].
+        let outcome = VenueOutcome::ControlApplied { swept: vec![] };
+        assert_serde_identity(&outcome);
+        let value = match serde_json::to_value(&outcome) {
+            Ok(v) => v,
+            Err(e) => panic!("serialize failed: {e}"),
+        };
+        assert_eq!(value["ControlApplied"]["swept"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_control_applied_kill_records_swept_owner_scoped_legs() {
+        // A kill couples the owner-scoped MM sweep into the control's own turn:
+        // the cancelled MM legs are recorded losslessly on `ControlApplied`.
+        let lineage = LineageId::new("run-1");
+        let swept = vec![CancelledLeg {
+            order_id: lineage.venue_order_id("BTC", SequenceNumber::new(1), 0),
+            owner: owner(0xEE),
+            reason: CancelReason::MassCancel,
+        }];
+        let outcome = VenueOutcome::ControlApplied {
+            swept: swept.clone(),
+        };
+        if let VenueOutcome::ControlApplied { swept } = &outcome {
+            assert_eq!(swept.len(), 1);
+            assert_eq!(swept[0].reason, CancelReason::MassCancel);
+        }
+        assert_serde_identity(&outcome);
     }
 
     #[test]

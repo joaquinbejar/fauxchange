@@ -88,6 +88,7 @@ use crate::exchange::envelope::{
 use crate::exchange::event::{EventTimestamp, SequenceNumber};
 use crate::exchange::instrument_status::InstrumentStatusRegistry;
 use crate::exchange::journal::VenueJournal;
+use crate::exchange::mm_identity::MARKET_MAKER_OWNER;
 use crate::exchange::money::{Cents, MoneyError, SignedCents};
 use crate::exchange::snapshot::{
     ExecutorState, IdempotencyEntry, IdempotencyFingerprint, IdempotencyKey, IdempotencyMap,
@@ -1117,19 +1118,52 @@ impl MatchingExecutor {
     ) -> VenueOutcome {
         // Resolve the scope's expiration to its canonical `YYYYMMDD` once (an
         // `Expiration` / `Strike` scope); a malformed scope expiry is a rejected
-        // command (deterministic — a pure function of the command).
+        // command (deterministic — a pure function of the command). This
+        // rejection path is unique to `MassCancel` (the coupled kill sweep always
+        // uses the `Underlying` scope), so it stays here rather than in the shared
+        // sweep helper.
+        if let MassCancelScope::Expiration(expiry)
+        | MassCancelScope::Strike {
+            expiration: expiry, ..
+        } = scope
+            && let Err(error) = format_expiration_yyyymmdd(expiry)
+        {
+            return VenueOutcome::Rejected {
+                reason: format!("mass-cancel scope expiry is unresolvable: {error}"),
+            };
+        }
+
+        VenueOutcome::MassCancelled {
+            affected: self.sweep_matching(scope, cancel_type),
+        }
+    }
+
+    /// The reusable sweep body: cancels every resting order matching `scope` +
+    /// `cancel_type` through the **upstream** single-order cancel primitive
+    /// ([`OptionOrderBook::cancel_order`], never a reimplemented sweep) and returns
+    /// each removal as an ordered [`CancelledLeg`]
+    /// ([ADR-0009 §4](../../../docs/adr/0009-lossless-venue-envelope-outcomes.md)).
+    ///
+    /// Shared by [`execute_mass_cancel`](Self::execute_mass_cancel) and by the
+    /// coupled owner-scoped market-maker sweep a **kill** control runs inside its
+    /// own turn (`MarketMakerControl { enabled: Some(false), .. }`), so both record
+    /// the identical `(venue_order_id, owner, MassCancel)` triple. The affected list
+    /// is **sorted by venue order id**, a deterministic sweep order independent of
+    /// map-iteration order, so a replay reproduces it exactly — no wall-clock, no
+    /// RNG. The caller resolves any scope-expiry rejection before invoking this.
+    fn sweep_matching(
+        &mut self,
+        scope: &MassCancelScope,
+        cancel_type: &MassCancelType,
+    ) -> Vec<CancelledLeg> {
+        // Resolve the scope's expiration to its canonical `YYYYMMDD` for the
+        // `mass_cancel_matches` filter; an unresolvable expiry simply matches
+        // nothing here (the reject path lives in `execute_mass_cancel`).
         let scope_expiry = match scope {
             MassCancelScope::Expiration(expiry)
             | MassCancelScope::Strike {
                 expiration: expiry, ..
-            } => match format_expiration_yyyymmdd(expiry) {
-                Ok(yyyymmdd) => Some(yyyymmdd),
-                Err(error) => {
-                    return VenueOutcome::Rejected {
-                        reason: format!("mass-cancel scope expiry is unresolvable: {error}"),
-                    };
-                }
-            },
+            } => format_expiration_yyyymmdd(expiry).ok(),
             MassCancelScope::Underlying | MassCancelScope::Book(_) => None,
         };
 
@@ -1167,8 +1201,7 @@ impl MatchingExecutor {
                 });
             }
         }
-
-        VenueOutcome::MassCancelled { affected }
+        affected
     }
 
     /// Executes a [`VenueCommand::EvictExpiredOrders`] across this underlying:
@@ -1716,9 +1749,22 @@ impl CommandExecutor for MatchingExecutor {
             ),
             // A market-maker control change (#47): apply the knobs onto the market
             // maker through the sequenced apply seam (a live-only side effect — the
-            // requotes it induces are journaled as their own `AddOrder` commands),
-            // then capture the lossless `ControlApplied`. The replay/recovery path
-            // installs no sink, so re-execution derives the identical event.
+            // requotes it induces are journaled as their own `AddOrder` commands).
+            // The replay/recovery path installs no sink, so re-execution derives the
+            // identical event.
+            //
+            // A **kill** (`enabled: Some(false)`) additionally cancels the market
+            // maker's standing quotes — COUPLED into this control's own turn, per
+            // underlying, so the one journaled event is both "control applied" AND
+            // "these MM-owner orders cancelled" (#117). This is crash-consistent
+            // (no separate follow-on command a crash could skip between the two
+            // appends) and honours the determinism contract: cancelling existing
+            // resting orders is exactly what `sweep_matching` (shared with
+            // `execute_mass_cancel`) already does within one turn — it is NOT
+            // re-entering the sequencer or emitting new orders. Re-executing the
+            // kill on replay re-runs the owner-scoped sweep against the rebuilt
+            // resting set → an identical `swept`. Every non-kill control sweeps
+            // nothing (`swept` empty).
             VenueCommand::MarketMakerControl {
                 spread_multiplier,
                 size_scalar,
@@ -1733,12 +1779,20 @@ impl CommandExecutor for MatchingExecutor {
                         enabled: *enabled,
                     });
                 }
-                VenueOutcome::ControlApplied
+                let swept = if *enabled == Some(false) {
+                    self.sweep_matching(
+                        &MassCancelScope::Underlying,
+                        &MassCancelType::ByUser(MARKET_MAKER_OWNER),
+                    )
+                } else {
+                    Vec::new()
+                };
+                VenueOutcome::ControlApplied { swept }
             }
             // Clock / sim-step advances have no leaf effect on this path; their
             // derived effects are journaled as their own sequenced commands.
             VenueCommand::Clock { .. } | VenueCommand::SimStep { .. } => {
-                VenueOutcome::ControlApplied
+                VenueOutcome::ControlApplied { swept: Vec::new() }
             }
             // Lifecycle + hierarchy-sweep commands (#47): all sequenced + journaled.
             VenueCommand::SetInstrumentStatus { symbol, status } => {

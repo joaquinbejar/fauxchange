@@ -396,8 +396,11 @@ async fn test_venue_global_fanout_reports_full_delivery_on_the_receipt() {
         None => panic!("a venue-global control must carry a fan-out summary"),
     }
     // Every underlying's stream journaled the control (ControlApplied per underlying).
+    // No market maker is resting here, so the coupled kill sweep is empty.
     match &receipt.outcome {
-        Some(VenueOutcome::ControlApplied) => {}
+        Some(VenueOutcome::ControlApplied { swept }) => {
+            assert!(swept.is_empty(), "no MM orders rest, so nothing is swept");
+        }
         other => panic!("the representative outcome is ControlApplied, got {other:?}"),
     }
 }

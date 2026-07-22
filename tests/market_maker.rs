@@ -376,10 +376,11 @@ fn test_journaled_market_maker_control_replays_identically() {
         client_add("client-1", Side::Buy, 100, 1),
     ];
     let (outcomes_a, top_a) = replay(&commands);
-    assert_eq!(
-        outcomes_a[0],
-        VenueOutcome::ControlApplied,
-        "a sink-less replay derives ControlApplied without a live engine"
+    assert!(
+        matches!(&outcomes_a[0], VenueOutcome::ControlApplied { swept } if swept.is_empty()),
+        "a sink-less replay derives ControlApplied (no MM orders rest, so nothing is swept), \
+         got {:?}",
+        outcomes_a[0]
     );
     let (outcomes_b, top_b) = replay(&commands);
     assert_eq!(
@@ -691,15 +692,10 @@ fn state_add(
     }
 }
 
-#[tokio::test]
-async fn test_sequenced_kill_and_follow_on_mass_cancel_replay_identically() {
-    // #117 determinism: a sequenced kill journals the control AND a SEPARATE
-    // owner-scoped MassCancel. Exporting the journal and replaying it offline (the
-    // sink-less recovery driver) reproduces BOTH — and the same cancellation of the
-    // maker's standing quote — proving the follow-on is a replay-stable journaled
-    // command, not a live side effect that would vanish on replay.
-    let state = AppState::new(AppStateConfig::new([UNDERLYING])).expect("AppState");
-
+/// Rests a maker ask (owner = `MARKET_MAKER_OWNER`) and a client bid that must
+/// survive an owner-scoped sweep, then submits a sequenced kill. Shared by the
+/// coupled-sweep replay test and the crash-consistency journal test.
+async fn rest_maker_and_client_then_kill(state: &AppState) {
     // A resting maker ask (owner = MARKET_MAKER_OWNER) and a resting client bid that
     // must survive the owner-scoped sweep. They do not cross (40_000 < 50_000).
     state
@@ -725,8 +721,8 @@ async fn test_sequenced_kill_and_follow_on_mass_cancel_replay_identically() {
         .await
         .expect("client order rests");
 
-    // The sequenced kill: the control commits, then a follow-on MassCancel is enqueued
-    // as its own journaled command.
+    // The sequenced kill: the executor COUPLES the owner-scoped sweep into this
+    // control's own turn — no separate follow-on command.
     state
         .submit(VenueCommand::MarketMakerControl {
             spread_multiplier: None,
@@ -736,6 +732,18 @@ async fn test_sequenced_kill_and_follow_on_mass_cancel_replay_identically() {
         })
         .await
         .expect("kill fans out and is accepted");
+}
+
+#[tokio::test]
+async fn test_sequenced_kill_couples_owner_scoped_sweep_and_replays_identically() {
+    // #117 determinism: a sequenced kill journals ONE event per underlying whose
+    // outcome is `ControlApplied { swept }` — the owner-scoped sweep is coupled into
+    // the control's own turn, NOT a separate `MassCancel` command. Exporting the
+    // journal and replaying it offline (the sink-less recovery driver) reproduces the
+    // event AND the same cancellation of the maker's standing quote, proving the
+    // coupled sweep is a replay-stable, crash-consistent re-derivation.
+    let state = AppState::new(AppStateConfig::new([UNDERLYING])).expect("AppState");
+    rest_maker_and_client_then_kill(&state).await;
 
     // Export the venue journal and replay it offline into a fresh registry — `Ok`
     // proves every re-derived event equalled the stored one (the integrity oracle).
@@ -749,43 +757,44 @@ async fn test_sequenced_kill_and_follow_on_mass_cancel_replay_identically() {
         .expect("replay the journal");
     let replay = report.underlying(UNDERLYING).expect("BTC replay");
 
-    // The kill control replays to ControlApplied WITHOUT a live engine.
-    let control_replayed = replay.events.iter().any(|event| {
-        matches!(
-            &event.command,
-            VenueCommand::MarketMakerControl {
-                enabled: Some(false),
-                ..
-            }
-        ) && event.outcome == VenueOutcome::ControlApplied
-    });
-    assert!(control_replayed, "the kill control replays identically");
-
-    // The follow-on MassCancel replays and re-cancels exactly the maker's own quote.
-    let sweep = replay
+    // The kill control replays to `ControlApplied { swept }` WITHOUT a live engine,
+    // and its swept legs re-cancel exactly the maker's own quote (owner-scoped).
+    let swept = replay
         .events
         .iter()
         .find_map(|event| match (&event.command, &event.outcome) {
             (
-                VenueCommand::MassCancel { cancel_type, .. },
-                VenueOutcome::MassCancelled { affected },
-            ) => Some((cancel_type.clone(), affected.clone())),
+                VenueCommand::MarketMakerControl {
+                    enabled: Some(false),
+                    ..
+                },
+                VenueOutcome::ControlApplied { swept },
+            ) => Some(swept.clone()),
             _ => None,
-        });
-    let (cancel_type, affected) = sweep.expect("the follow-on MassCancel replays from the journal");
+        })
+        .expect("the kill control replays with its coupled sweep");
     assert_eq!(
-        cancel_type,
-        MassCancelType::ByUser(MARKET_MAKER_OWNER),
-        "the replayed sweep is owner-scoped to the market maker"
+        swept.len(),
+        1,
+        "the replayed kill re-sweeps the one maker quote in the same turn"
     );
     assert_eq!(
-        affected.len(),
-        1,
-        "the replayed sweep re-cancels the one maker quote"
+        swept[0].owner, MARKET_MAKER_OWNER,
+        "the coupled sweep is owner-scoped to the market maker"
     );
     assert!(
-        affected.iter().all(|leg| leg.owner == MARKET_MAKER_OWNER),
-        "only MARKET_MAKER_OWNER legs are cancelled on replay — the client survives"
+        swept.iter().all(|leg| leg.owner == MARKET_MAKER_OWNER),
+        "only MARKET_MAKER_OWNER legs are swept — the client bid's owner is NOT swept"
+    );
+
+    // There is NO separate `MassCancel` event produced by the kill — the only
+    // cancellation is the coupled `swept` on the control's own outcome.
+    assert!(
+        !replay
+            .events
+            .iter()
+            .any(|event| matches!(event.command, VenueCommand::MassCancel { .. })),
+        "a coupled kill journals NO separate MassCancel command"
     );
 
     // The reconstructed book proves the maker quote no longer rests; the client bid
@@ -793,12 +802,88 @@ async fn test_sequenced_kill_and_follow_on_mass_cancel_replay_identically() {
     let top = replay.top_of_book(&sym(CALL));
     assert_eq!(
         top.best_ask, None,
-        "the maker ask was cancelled — it no longer rests on the replayed book"
+        "the maker ask was swept — it no longer rests on the replayed book"
     );
     assert_eq!(
         top.best_bid,
         Some(Cents::new(40_000)),
         "the client bid is untouched by the owner-scoped sweep"
+    );
+}
+
+#[tokio::test]
+async fn test_sequenced_kill_journals_exactly_one_atomic_command_carrying_the_sweep() {
+    // #117 crash-consistency at the journal level: a sequenced kill over a venue with
+    // a resting MM quote appends exactly ONE command for the kill (the
+    // `MarketMakerControl`) whose paired event carries the sweep. There is NO separate
+    // `MassCancel` record — so no cross-command gap a crash could open between "control
+    // applied" and "quotes cancelled". Control + cancel are atomic in one turn.
+    let state = AppState::new(AppStateConfig::new([UNDERLYING])).expect("AppState");
+    rest_maker_and_client_then_kill(&state).await;
+
+    let snapshot = state
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("journal snapshot");
+
+    // Exactly ONE write-ahead command record is the kill control.
+    let kill_commands = snapshot
+        .records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record,
+                JournalRecord::Command(journaled)
+                    if matches!(
+                        journaled.command,
+                        VenueCommand::MarketMakerControl { enabled: Some(false), .. }
+                    )
+            )
+        })
+        .count();
+    assert_eq!(
+        kill_commands, 1,
+        "the kill is exactly one atomic journaled command"
+    );
+
+    // NO record (command write-ahead OR paired event) is a `MassCancel` — the sweep is
+    // not a separate command a crash could skip.
+    assert!(
+        !snapshot.records.iter().any(|record| match record {
+            JournalRecord::Command(journaled) =>
+                matches!(journaled.command, VenueCommand::MassCancel { .. }),
+            JournalRecord::Event(event) => matches!(event.command, VenueCommand::MassCancel { .. }),
+            JournalRecord::Epoch(_) => false,
+        }),
+        "a coupled kill journals NO separate MassCancel record"
+    );
+
+    // The kill's paired EVENT carries the coupled owner-scoped sweep.
+    let swept = snapshot
+        .records
+        .iter()
+        .find_map(|record| match record {
+            JournalRecord::Event(event) => match (&event.command, &event.outcome) {
+                (
+                    VenueCommand::MarketMakerControl {
+                        enabled: Some(false),
+                        ..
+                    },
+                    VenueOutcome::ControlApplied { swept },
+                ) => Some(swept.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the kill control event carries the coupled sweep");
+    assert_eq!(
+        swept.len(),
+        1,
+        "the kill's own event carries the one swept quote"
+    );
+    assert!(
+        swept.iter().all(|leg| leg.owner == MARKET_MAKER_OWNER),
+        "only MARKET_MAKER_OWNER legs are swept"
     );
 }
 

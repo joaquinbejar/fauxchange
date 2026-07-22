@@ -138,7 +138,7 @@ async fn test_simulated_session_journals_sim_steps_and_requotes() {
             }
             other => panic!("expected a SimStep, got {other:?}"),
         }
-        assert!(matches!(event.outcome, VenueOutcome::ControlApplied));
+        assert!(matches!(event.outcome, VenueOutcome::ControlApplied { .. }));
     }
 
     let mm_adds = events

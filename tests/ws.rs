@@ -513,7 +513,9 @@ fn test_control_event_never_emits_orderbook_delta() {
             directional_skew: None,
             enabled: Some(false),
         },
-        VenueOutcome::ControlApplied,
+        // No market-maker orders rest, so the coupled kill sweep is empty — the
+        // control emits no orderbook delta.
+        VenueOutcome::ControlApplied { swept: vec![] },
     );
     assert_eq!(manager.on_committed_event(&control), None);
     let deltas = drain(&mut rx)

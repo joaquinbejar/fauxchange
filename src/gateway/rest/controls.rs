@@ -317,7 +317,7 @@ mod tests {
         Receipt {
             underlying_sequence: SequenceNumber::new(0),
             venue_ts: EventTimestamp::new(0),
-            outcome: Some(VenueOutcome::ControlApplied),
+            outcome: Some(VenueOutcome::ControlApplied { swept: vec![] }),
             fanout,
         }
     }
