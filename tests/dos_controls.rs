@@ -144,6 +144,107 @@ fn test_dos_rate_limiter_key_space_bounded_under_flood_of_distinct_keys() {
     );
 }
 
+#[test]
+fn test_dos_rate_limiter_key_space_bounded_under_synchronized_concurrent_flood() {
+    use std::sync::Barrier;
+    use std::sync::atomic::AtomicUsize;
+
+    // The serial flood above can never expose a check-then-insert window: each
+    // `check_and_record_status` runs to completion before the next. Here N worker
+    // threads race a start barrier and hammer DISTINCT keys at once — the real
+    // adversarial condition, where several inserters would otherwise race the
+    // `len() < max_keys` capacity check before any of them inserts. New-key
+    // admission is serialized through the limiter's atomic new-key gate (a lock held
+    // across the capacity re-check AND the insert), so that race can never admit an
+    // over-ceiling bucket. The DoS bound to prove is therefore STRICT: the tracked
+    // key-space holds at `<= max_keys` both at its transient peak and once settled,
+    // so `max_keys` is a real resource ceiling that does NOT scale with the
+    // attacker-controlled concurrency, and never approaches the flood size.
+    let clock = FixedClock::new(EventTimestamp::new(0));
+    let max_keys: usize = 64;
+    let limiter = Arc::new(RateLimiter::with_capacity(clock, 100, 60_000, max_keys));
+
+    let task_count: usize = 16;
+    let per_task: u32 = 2_000;
+    let flood = task_count.saturating_mul(per_task as usize); // 32_000 >> max_keys
+    // The sampler joins the SAME start barrier as the workers (task_count + 1).
+    let barrier = Arc::new(Barrier::new(task_count + 1));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+
+    // A sampler thread records the max tracked-key count seen during the flood, so
+    // the PEAK (not just the settled count) is bounded — proving the key-space never
+    // even transiently balloons toward the flood size.
+    let sampler = {
+        let limiter = Arc::clone(&limiter);
+        let peak = Arc::clone(&peak);
+        let done = Arc::clone(&done);
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            while !done.load(Ordering::Relaxed) {
+                peak.fetch_max(limiter.tracked_keys(), Ordering::Relaxed);
+            }
+            peak.fetch_max(limiter.tracked_keys(), Ordering::Relaxed);
+        })
+    };
+
+    let workers: Vec<_> = (0..task_count)
+        .map(|t| {
+            let limiter = Arc::clone(&limiter);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait(); // every worker begins flooding at the same instant
+                for i in 0..per_task {
+                    // A distinct key per (worker, i): t < 16 and i < 2000 encode
+                    // uniquely into the low three octets, so the flood is 32_000
+                    // distinct attacker-controlled keys.
+                    let key = RateLimitKey::Peer(IpAddr::V4(Ipv4Addr::new(
+                        10,
+                        t as u8,
+                        (i >> 8) as u8,
+                        i as u8,
+                    )));
+                    let _ = limiter.check_and_record_status(&key);
+                }
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().expect("a flood worker must not panic");
+    }
+    done.store(true, Ordering::Relaxed);
+    sampler.join().expect("the sampler must not panic");
+
+    // New-key admission is serialized through the limiter's atomic new-key gate, so
+    // the capacity check and the insert are one indivisible step: no concurrent
+    // inserter can slip an over-ceiling bucket in. The ceiling therefore holds
+    // STRICTLY at `max_keys` — a real resource bound that does NOT scale with the
+    // attacker-controlled concurrency (there is no per-inserter overshoot).
+    let final_keys = limiter.tracked_keys();
+    let peak_keys = peak.load(Ordering::Relaxed);
+    assert!(
+        final_keys >= max_keys,
+        "the flood must fill the key-space to its ceiling (final {final_keys}, max_keys {max_keys})"
+    );
+    assert!(
+        peak_keys <= max_keys,
+        "the PEAK tracked key-space {peak_keys} must never exceed max_keys ({max_keys}): new-key \
+         admission is serialized, so the concurrent race admits no over-ceiling bucket and the \
+         key-space never approaches the {flood}-key flood"
+    );
+    assert!(
+        final_keys <= max_keys,
+        "the final tracked key-space {final_keys} must never exceed max_keys ({max_keys}) — the \
+         ceiling holds strictly under concurrency because the insert is atomic with the check"
+    );
+    assert!(
+        final_keys < flood / 10,
+        "the bounded key-space ({final_keys}) is far below the flood size ({flood}) — the atomic \
+         new-key gate never grows one bucket per attacker key"
+    );
+}
+
 // ============================================================================
 // Bound 1b — one `AccountId`'s budget is the SAME shared limiter across REST
 // and FIX: exhausting it on one surface throttles the other.
@@ -242,7 +343,10 @@ async fn test_dos_rate_limiter_one_budget_shared_across_rest_and_fix() {
         ))
         .await
         .expect("logon write");
-    let logon_reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    let logon_reply = recv_frames_until(&mut client, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("A")
+    })
+    .await;
     assert!(
         any_msg_type(&logon_reply, "A"),
         "the FIX logon succeeds independently of the (unrelated, peer-keyed) logon rate limit, \
@@ -262,7 +366,12 @@ async fn test_dos_rate_limiter_one_budget_shared_across_rest_and_fix() {
         ))
         .await
         .expect("order write");
-    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    // Wait for the ExecutionReport(8) itself rather than the first-arriving frame,
+    // so the throttle-reject assertion is deterministic under load.
+    let reply = recv_frames_until(&mut client, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
     let report = reply
         .iter()
         .find(|f| msg_type(f).as_deref() == Some("8"))
@@ -456,8 +565,11 @@ fn test_dos_bounded_broadcast_drops_a_laggard_and_never_grows_past_capacity_unde
          exceed the ring capacity ({capacity}), regardless of the {flood_size}-event flood"
     );
 
-    // Recovery: a fresh snapshot still reflects every folded mutation, even
-    // though the broadcast ring itself never held more than `capacity` at once.
+    // Recovery (manager-level unit): a fresh snapshot still reflects every folded
+    // mutation, even though the broadcast ring itself never held more than
+    // `capacity` at once. The RECOVERY-ON-THE-WIRE proof — that the real WS pump
+    // emits the resnapshot frame to a slow socket consumer — is the separate
+    // `test_dos_ws_laggard_recovers_via_resnapshot_on_the_wire` below.
     match manager.orderbook_snapshot(&dos_symbol(), None) {
         WsMessage::OrderbookSnapshot { asks, .. } => {
             assert_eq!(
@@ -468,6 +580,127 @@ fn test_dos_bounded_broadcast_drops_a_laggard_and_never_grows_past_capacity_unde
         }
         other => panic!("expected a snapshot, got {other:?}"),
     }
+}
+
+/// Reads server text frames into `buf`, draining consumed bytes, until `done` is
+/// satisfied by the accumulated set or `deadline` passes — the blocking wire read a
+/// laggard-recovery assertion drives.
+fn ws_read_until(
+    stream: &mut std::net::TcpStream,
+    buf: &mut Vec<u8>,
+    deadline: std::time::Instant,
+    done: impl Fn(&[String]) -> bool,
+) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    loop {
+        let (frames, consumed) = parse_ws_text_frames(buf);
+        if consumed > 0 {
+            buf.drain(..consumed);
+        }
+        all.extend(frames);
+        if done(&all) || std::time::Instant::now() >= deadline {
+            return all;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let poll = remaining
+            .min(Duration::from_millis(200))
+            .max(Duration::from_millis(1));
+        let _ = stream.set_read_timeout(Some(poll));
+        let mut scratch = [0u8; 16 * 1024];
+        match stream.read(&mut scratch) {
+            Ok(0) => return all,
+            Ok(n) => buf.extend_from_slice(&scratch[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return all,
+        }
+    }
+}
+
+/// Whether any accumulated WS text frame is an `orderbook_snapshot`.
+fn saw_snapshot(frames: &[String]) -> bool {
+    frames.iter().any(|f| f.contains("\"orderbook_snapshot\""))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dos_ws_laggard_recovers_via_resnapshot_on_the_wire() {
+    // Drive the lag through the REAL WS pump on a real socket: a `/ws` client
+    // subscribes, drains its baseline snapshot, then STOPS reading (a slow consumer)
+    // while the venue commits far past the bounded broadcast ring on the SAME manager
+    // the pump reads. The pump's receiver lags and recovers by emitting a fresh
+    // `orderbook_snapshot` ON THE WIRE — asserted off the socket, never via the
+    // manager's snapshot method. The count-based overflow makes the lag deterministic,
+    // not timed.
+    const SECRET: &str = "dos-ws-laggard-secret";
+    let accounts = vec![AccountProvision::new(
+        AccountId::new("dos-reader-1"),
+        Hash32([7; 32]),
+        vec![Permission::Read],
+    )];
+    let auth = AuthConfig::dev()
+        .expect("dev auth must build")
+        .with_bootstrap_secret(SECRET)
+        .with_accounts(accounts)
+        .with_rate_limit(10_000);
+    let state =
+        AppState::new(AppStateConfig::new(["BTC"]).with_auth(auth)).expect("AppState must build");
+    let bearer = state
+        .mint_token(&AccountId::new("dos-reader-1"), SECRET, now_secs(), 3_600)
+        .expect("minting must succeed");
+    let addr = spawn_ws_server(Arc::clone(&state)).await;
+
+    // Far past the ring (WS_BROADCAST_CAPACITY) plus any socket/tungstenite buffering,
+    // all folded at ONE ask level so each commit is a cheap single delta.
+    let flood = WS_BROADCAST_CAPACITY.saturating_mul(16);
+    let flood_state = Arc::clone(&state);
+    let saw_resnapshot = tokio::task::spawn_blocking(move || {
+        let (mut stream, leftover) = ws_upgrade(addr, &bearer);
+        let mut buf = leftover;
+
+        // Drain the connection welcome.
+        let welcome_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let _ = ws_read_until(&mut stream, &mut buf, welcome_deadline, |frames| {
+            frames.iter().any(|f| f.contains("\"connected\""))
+        });
+
+        // Subscribe to the orderbook channel and drain the BASELINE snapshot, so any
+        // later snapshot on the wire is unambiguously the laggard resnapshot.
+        ws_write_text(
+            &mut stream,
+            r#"{"action":"subscribe","channel":"orderbook","symbol":"BTC-20240329-50000-C","depth":5}"#,
+        );
+        let baseline_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let baseline = ws_read_until(&mut stream, &mut buf, baseline_deadline, saw_snapshot);
+        assert!(
+            saw_snapshot(&baseline),
+            "the subscribe must return a baseline snapshot before the flood"
+        );
+
+        // Flood WITHOUT reading (the slow consumer) — the pump forwards until the
+        // socket blocks, then the ring overflows behind it.
+        for i in 0..flood {
+            // `i` is a bounded loop index (< flood), so the +1 sequence cannot overflow.
+            let seq = i as u64 + 1;
+            flood_state
+                .subscriptions()
+                .on_committed_event(&dos_resting_add(seq, &format!("lag-{i}"), 50_100));
+        }
+
+        // Resume reading: the pump detects its lagged receiver and re-snapshots the
+        // subscription ON THE WIRE. Find that fresh snapshot after the baseline.
+        let recovery_deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let frames = ws_read_until(&mut stream, &mut buf, recovery_deadline, saw_snapshot);
+        saw_snapshot(&frames)
+    })
+    .await
+    .expect("the blocking WS laggard flow must not panic");
+
+    assert!(
+        saw_resnapshot,
+        "a slow WS consumer behind a broadcast flood must recover via a fresh \
+         orderbook_snapshot delivered on the wire by the real pump"
+    );
 }
 
 // ============================================================================
@@ -946,6 +1179,37 @@ async fn recv_frames(stream: &mut TcpStream, timeout: Duration) -> Vec<Vec<u8>> 
         }
     }
     split_frames(&buf)
+}
+
+/// Like [`recv_frames`], but keeps accumulating frames across reads until one
+/// satisfies `wanted` or `timeout` elapses, returning everything received.
+///
+/// A single [`recv_frames`] returns on the first complete frame; when the awaited
+/// reply is a specific message type that can arrive a read-gap after an earlier
+/// frame, a lone call can race it. This waits for the awaited frame instead — the
+/// deterministic replacement for a timing gap under a CPU-loaded test binary. The
+/// overall `timeout` still bounds it, so a genuinely-missing frame still fails.
+async fn recv_frames_until(
+    stream: &mut TcpStream,
+    timeout: Duration,
+    wanted: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut all = Vec::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let batch = recv_frames(stream, deadline - now).await;
+        let matched = batch.iter().any(|frame| wanted(frame));
+        let empty = batch.is_empty();
+        all.extend(batch);
+        if matched || empty {
+            break;
+        }
+    }
+    all
 }
 
 fn field(frame: &[u8], tag: &str) -> Option<String> {

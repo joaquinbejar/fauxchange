@@ -2681,21 +2681,26 @@ fn test_ws_is_excluded_from_order_entry_parity() {
 // ============================================================================
 
 /// Collects reply frames from `client` until a `Trade` `ExecutionReport (8)` is
-/// seen or a bounded number of drains elapse (the New + Trade reports may arrive in
-/// separate reads).
+/// seen or a bounded overall deadline elapses (the New + Trade reports may arrive
+/// in separate reads a gap apart). Waiting on the Trade predicate — not a fixed
+/// number of short drains — keeps the crossing-fill assertion deterministic under
+/// full-suite load while a genuinely-missing fill still fails at the deadline.
 async fn collect_until_trade(
     client: &mut cfix::FixClient,
     mut frames: Vec<Vec<u8>>,
 ) -> Vec<Vec<u8>> {
-    for _ in 0..5 {
-        if frames
-            .iter()
-            .any(|f| cfix::fix_report_projection(f).is_some())
-        {
-            break;
-        }
-        frames.extend(client.drain().await);
+    if frames
+        .iter()
+        .any(|f| cfix::fix_report_projection(f).is_some())
+    {
+        return frames;
     }
+    let more = client
+        .read_until(std::time::Duration::from_secs(10), |f| {
+            cfix::fix_report_projection(f).is_some()
+        })
+        .await;
+    frames.extend(more);
     frames
 }
 

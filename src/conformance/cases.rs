@@ -23,20 +23,21 @@ use serde_json::{Value, json};
 
 use crate::error::{VenueError, WsErrorCode};
 use crate::exchange::{
-    CancelReason, CancelledLeg, Cents, EventTimestamp, Hash32, STPMode, SequenceNumber, Side,
-    Symbol, TimeInForce, VenueCommand, VenueEvent, VenueOutcome,
+    CancelReason, Cents, EventTimestamp, Hash32, STPMode, SequenceNumber, Side, Symbol,
+    TimeInForce, VenueCommand, VenueEvent, VenueOutcome,
 };
+use crate::microstructure::{FileMicrostructure, MicrostructureConfig, StpConfig, StpMode};
 use crate::models::{AccountId, OrderType, Permission, VenueOrderId, WsMessage};
-use crate::subscription::OrderbookSubscriptionManager;
+use crate::subscription::{OrderbookSubscriptionManager, WS_BROADCAST_CAPACITY};
 
 use super::harness::{
     ADMIN, CALL, CONTRACT, FixClient, READER, Step, TRADER1, TRADER2, UNDERLYING, VenueServer,
     WsClient, any_msg_type, attempt_logon, drive_fix_orders, drive_rest_orders, field, find_msg,
-    find_report, http, journaled_events, msg_type, ws_find_type,
+    find_report, http, journaled_events, msg_type, ws_data_of_type, ws_find_type,
 };
 use super::parity::{
-    drain, execution_record_join_keys, find_taker_fill, fix_report_projection, normalize_event,
-    streams_parity, ws_fill_data, ws_fill_join_keys,
+    drain, execution_record_join_keys, find_taker_fill, fix_report_projection, streams_parity,
+    ws_fill_data, ws_fill_join_keys,
 };
 use super::report::{CaseOutcome, SuiteRecorder, SuiteReport, Surface};
 
@@ -79,40 +80,6 @@ fn resting_add(
             fills: vec![],
             resting_quantity: qty,
             stp_cancelled: vec![],
-        },
-    )
-}
-
-/// An `AddOrder` whose STP-configured book cancels one resting leg, parameterised
-/// by the aggressor / resting ids so two per-surface events differ only in the
-/// stripped ids.
-fn stp_event(symbol: Symbol, aggressor: &str, resting: &str) -> VenueEvent {
-    VenueEvent::new(
-        SequenceNumber::new(9),
-        EventTimestamp::new(1_700_000_000_000),
-        VenueCommand::AddOrder {
-            symbol: symbol.clone(),
-            order_id: VenueOrderId::new(aggressor),
-            account: AccountId::new("trader-1"),
-            owner: Hash32([0x22; 32]),
-            client_order_id: None,
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            limit_price: Some(Cents::new(50_000)),
-            quantity: 2,
-            time_in_force: TimeInForce::Gtc,
-            stp_mode: STPMode::CancelMaker,
-        },
-        VenueOutcome::Added {
-            fills: vec![],
-            resting_quantity: 0,
-            stp_cancelled: vec![CancelledLeg {
-                order_id: VenueOrderId::new(resting),
-                owner: Hash32([0x22; 32]),
-                symbol,
-                side: Side::Sell,
-                reason: CancelReason::SelfTradePrevention,
-            }],
         },
     )
 }
@@ -298,23 +265,93 @@ async fn case_cancel_replace() -> CaseOutcome {
     streams_parity("rest", &rest_events, "fix", &fix_events)
 }
 
+/// The venue microstructure that turns a same-owner self-cross into an STP cancel:
+/// `CancelMaker` removes the resting maker so the aggressor's committed event
+/// carries a `SelfTradePrevention` leg and prints no self-trade.
+fn stp_microstructure() -> Result<MicrostructureConfig, String> {
+    let file = FileMicrostructure {
+        stp: Some(StpConfig {
+            mode: StpMode::CancelMaker,
+        }),
+        ..FileMicrostructure::default()
+    };
+    MicrostructureConfig::resolve(&file, &std::collections::BTreeMap::new())
+        .map_err(|e| format!("STP microstructure config must resolve: {e}"))
+}
+
 async fn case_stp_outcome() -> CaseOutcome {
-    // A LIVE STP rejection is not wire-expressible at v1: neither the REST place DTO
-    // nor a FIX `D` carries an STP mode (per-account STP is venue config), so an
-    // STP-mode order is identically inexpressible. The packaged assertion is that the
-    // STP-cancelled OUTCOME normalizes identically across surfaces.
-    let symbol = sym()?;
-    let rest_like = stp_event(symbol.clone(), "rest-aggressor", "rest-resting");
-    let fix_like = stp_event(symbol, "fix-aggressor", "fix-resting");
-    let na = normalize_event(&rest_like)?;
-    let nb = normalize_event(&fix_like)?;
-    require(na == nb, "the STP-cancelled outcome must normalize equal")?;
-    let ra = serde_json::to_value(&rest_like).map_err(|e| e.to_string())?;
-    let rb = serde_json::to_value(&fix_like).map_err(|e| e.to_string())?;
+    // Per-account STP is venue config, not a wire field: configure the venue with
+    // `CancelMaker` STP, then drive a LIVE self-cross (trader-1 rests, trader-1
+    // aggresses — the SAME owner `Hash32`) through BOTH gateways. The book's
+    // configured STP governs (the per-command stp_mode is unused), so the same
+    // self-cross over REST and FIX must journal the same STP-cancelled outcome,
+    // with no self-trade printed — a live outcome, not two hand-built events.
+    let micro = stp_microstructure()?;
+    let rest = VenueServer::start_with_microstructure(micro.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    let fix = VenueServer::start_with_microstructure(micro)
+        .await
+        .map_err(|e| e.to_string())?;
+    let steps = [
+        Step::Place {
+            account: "trader-1",
+            side: "sell",
+            price: 50_000,
+            qty: 4,
+            tif: None,
+        },
+        Step::Place {
+            account: "trader-1",
+            side: "buy",
+            price: 50_000,
+            qty: 4,
+            tif: None,
+        },
+    ];
+    let rest_events = drive_rest_orders(&rest, &steps).await?;
+    let fix_events = drive_fix_orders(&fix, &steps).await?;
     require(
-        ra != rb,
-        "raw, the two events must differ in the stripped ids",
-    )
+        rest_events.len() == 2,
+        "place + self-cross journals two REST events",
+    )?;
+    require(
+        fix_events.len() == 2,
+        "place + self-cross journals two FIX events",
+    )?;
+
+    // The aggressor's committed outcome carries the STP cancel and prints no fill.
+    let stp_cancelled = match &fix_events[1].outcome {
+        VenueOutcome::Added {
+            fills,
+            stp_cancelled,
+            ..
+        } => {
+            require(
+                fills.is_empty(),
+                "an STP-prevented self-cross prints no fill",
+            )?;
+            stp_cancelled.clone()
+        }
+        other => {
+            return Err(format!(
+                "the aggressor outcome must be an Added, got {other:?}"
+            ));
+        }
+    };
+    require(
+        !stp_cancelled.is_empty(),
+        "the configured STP cancels a resting leg",
+    )?;
+    require(
+        stp_cancelled
+            .iter()
+            .all(|leg| leg.reason == CancelReason::SelfTradePrevention),
+        "the STP cancel reason must be SelfTradePrevention",
+    )?;
+
+    // The same live self-cross journals an identical normalized stream on both.
+    streams_parity("rest", &rest_events, "fix", &fix_events)
 }
 
 async fn case_per_leg_fees() -> CaseOutcome {
@@ -500,14 +537,9 @@ async fn drive_fix_crossing(server: &VenueServer) -> Result<(), String> {
     let _ = maker.place_limit("obs-maker", "2", 50_000, 5, "1").await?;
     let mut taker = FixClient::logon(server.fix_addr(), TRADER2).await?;
     let reports = taker.place_limit("obs-taker", "1", 50_000, 5, "1").await?;
-    // Drain until the taker's Trade report lands (New + Trade may arrive separately).
-    let mut reports = reports;
-    for _ in 0..5 {
-        if reports.iter().any(|f| fix_report_projection(f).is_some()) {
-            break;
-        }
-        reports.extend(taker.drain().await);
-    }
+    // Wait until the taker's Trade report lands (New + Trade may arrive a read-gap
+    // apart); a bounded deadline keeps a genuinely-missing fill a failure.
+    let reports = collect_fix_trade(&mut taker, reports).await;
     if reports
         .iter()
         .find_map(|f| fix_report_projection(f))
@@ -526,13 +558,8 @@ async fn case_one_fill_all_surfaces() -> CaseOutcome {
     let mut maker = FixClient::logon(server.fix_addr(), TRADER1).await?;
     let _ = maker.place_limit("obs-maker", "2", 50_000, 5, "1").await?;
     let mut taker = FixClient::logon(server.fix_addr(), TRADER2).await?;
-    let mut reports = taker.place_limit("obs-taker", "1", 50_000, 5, "1").await?;
-    for _ in 0..5 {
-        if reports.iter().any(|f| fix_report_projection(f).is_some()) {
-            break;
-        }
-        reports.extend(taker.drain().await);
-    }
+    let reports = taker.place_limit("obs-taker", "1", 50_000, 5, "1").await?;
+    let reports = collect_fix_trade(&mut taker, reports).await;
     let fix_keys = reports
         .iter()
         .find_map(|f| fix_report_projection(f))
@@ -963,14 +990,37 @@ async fn collect_reports(
     mut frames: Vec<Vec<u8>>,
     exec_type: &str,
 ) -> Vec<Vec<u8>> {
-    for _ in 0..5 {
-        if frames.iter().any(|f| {
+    let seen = |fs: &[Vec<u8>]| {
+        fs.iter().any(|f| {
             msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some(exec_type)
-        }) {
-            break;
-        }
-        frames.extend(client.drain().await);
+        })
+    };
+    if seen(&frames) {
+        return frames;
     }
+    let want = exec_type.to_string();
+    let more = client
+        .read_until(std::time::Duration::from_secs(10), move |f| {
+            msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some(&want)
+        })
+        .await;
+    frames.extend(more);
+    frames
+}
+
+/// Collects reply frames until the taker's `Trade` `ExecutionReport (8)` lands
+/// (the `New` + `Trade` may arrive a read-gap apart) or a bounded deadline
+/// elapses — the deterministic replacement for a fixed number of blind drains.
+async fn collect_fix_trade(client: &mut FixClient, mut frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    if frames.iter().any(|f| fix_report_projection(f).is_some()) {
+        return frames;
+    }
+    let more = client
+        .read_until(std::time::Duration::from_secs(10), |f| {
+            fix_report_projection(f).is_some()
+        })
+        .await;
+    frames.extend(more);
     frames
 }
 
@@ -1225,13 +1275,13 @@ pub async fn run_rest_ws_conformance() -> SuiteReport {
         "ws.subscribe_snapshot_then_sequenced_deltas",
         "deltas carry a strictly-increasing instrument_sequence and resulting-quantity",
         vec![Surface::Ws],
-        case_ws_sequenced_deltas(),
+        case_ws_sequenced_deltas().await,
     );
     r.record(
         "ws.laggard_recovers_by_fresh_snapshot",
         "a laggard lags rather than stalls and recovers by a fresh snapshot, not a resend",
         vec![Surface::Ws],
-        case_ws_laggard_resnapshot(),
+        case_ws_laggard_resnapshot().await,
     );
     r.finish()
 }
@@ -1305,25 +1355,65 @@ async fn case_mutating_permission() -> CaseOutcome {
     )
 }
 
-fn case_ws_sequenced_deltas() -> CaseOutcome {
-    let symbol = sym()?;
-    let manager = OrderbookSubscriptionManager::with_capacity(64);
-    let mut rx = manager.subscribe();
-    // Two sells at the same ask level: resulting totals 8 then 12.
-    manager.on_committed_event(&resting_add(symbol.clone(), 1, "r1", Side::Sell, 50_100, 8));
-    manager.on_committed_event(&resting_add(symbol.clone(), 2, "r2", Side::Sell, 50_100, 4));
+async fn case_ws_sequenced_deltas() -> CaseOutcome {
+    // Connect to the REAL `/ws` over a socket, subscribe, then mutate the venue over
+    // the live REST order path and assert the `orderbook_snapshot` baseline plus a
+    // strictly-increasing `orderbook_delta` stream ON THE WIRE (not an in-process
+    // subscription-manager receiver).
+    let server = VenueServer::start().await.map_err(|e| e.to_string())?;
+    let reader = server.token("reader-1")?;
+    let mut ws = WsClient::connect(server.rest_addr(), &reader).await?;
 
-    let mut deltas: Vec<(u64, u64)> = Vec::new();
-    while let Ok(message) = rx.try_recv() {
-        let value = serde_json::to_value(&message).map_err(|e| e.to_string())?;
-        if value.get("type").and_then(Value::as_str) != Some("orderbook_delta") {
-            continue;
-        }
-        let sequence = value["data"]["sequence"]
-            .as_u64()
+    // The subscribe baseline: an `orderbook_snapshot` with its instrument sequence.
+    let baseline = ws.subscribe("orderbook", CALL, Some(5)).await?;
+    let snapshot = ws_find_type(&baseline, "orderbook_snapshot")
+        .ok_or_else(|| "subscribe must return an orderbook_snapshot baseline".to_string())?;
+    let base_seq = snapshot
+        .get("sequence")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "the baseline snapshot must carry a sequence".to_string())?;
+
+    // Mutate: two resting sells at the same ask level → resulting totals 8 then 12.
+    let steps = [
+        Step::Place {
+            account: "trader-1",
+            side: "sell",
+            price: 50_100,
+            qty: 8,
+            tif: None,
+        },
+        Step::Place {
+            account: "trader-1",
+            side: "sell",
+            price: 50_100,
+            qty: 4,
+            tif: None,
+        },
+    ];
+    drive_rest_orders(&server, &steps).await?;
+
+    // Read the two deltas off the wire (wait for both; a bounded deadline still fails
+    // a genuinely-missing delta).
+    let frames = ws
+        .read_until(std::time::Duration::from_secs(10), |frames| {
+            ws_data_of_type(frames, "orderbook_delta").len() >= 2
+        })
+        .await?;
+    let deltas = ws_data_of_type(&frames, "orderbook_delta");
+    require(
+        deltas.len() == 2,
+        format!("each resting sell emits one delta, saw {}", deltas.len()),
+    )?;
+
+    let mut parsed: Vec<(u64, u64)> = Vec::with_capacity(2);
+    for delta in &deltas {
+        let sequence = delta
+            .get("sequence")
+            .and_then(Value::as_u64)
             .ok_or_else(|| "a delta must carry a sequence".to_string())?;
-        let change = value["data"]["changes"]
-            .get(0)
+        let change = delta
+            .get("changes")
+            .and_then(|c| c.get(0))
             .ok_or_else(|| "a delta must carry a change".to_string())?;
         require(
             change["side"] == json!("ask"),
@@ -1336,75 +1426,77 @@ fn case_ws_sequenced_deltas() -> CaseOutcome {
         let quantity = change["quantity"]
             .as_u64()
             .ok_or_else(|| "a change must carry a resulting quantity".to_string())?;
-        deltas.push((sequence, quantity));
+        parsed.push((sequence, quantity));
     }
-    require(deltas.len() == 2, "each user rest emits one delta")?;
     require(
-        deltas[1].0 > deltas[0].0,
-        "instrument_sequence must strictly increase",
+        parsed[0].0 > base_seq,
+        "the first delta's instrument_sequence is strictly after the snapshot baseline",
     )?;
-    require(deltas[0].1 == 8, "first delta shows the resulting total 8")?;
     require(
-        deltas[1].1 == 12,
-        "second delta shows the resulting total 12",
+        parsed[1].0 > parsed[0].0,
+        "instrument_sequence must strictly increase across deltas",
     )?;
-
-    match manager.orderbook_snapshot(&symbol, None) {
-        WsMessage::OrderbookSnapshot { asks, sequence, .. } => {
-            require(
-                sequence == deltas[1].0,
-                "the snapshot baselines at the last seq",
-            )?;
-            let ask = asks
-                .first()
-                .ok_or_else(|| "the snapshot must carry the folded ask".to_string())?;
-            require(ask.quantity == 12, "the folded resulting total must be 12")
-        }
-        _ => Err("expected a fresh snapshot".to_string()),
-    }
+    require(
+        parsed[0].1 == 8,
+        "the first delta shows the resulting total 8 (resulting-quantity semantics)",
+    )?;
+    require(
+        parsed[1].1 == 12,
+        "the second delta shows the resulting total 12",
+    )
 }
 
-fn case_ws_laggard_resnapshot() -> CaseOutcome {
-    use tokio::sync::broadcast::error::TryRecvError;
+async fn case_ws_laggard_resnapshot() -> CaseOutcome {
+    // Drive the lag through the REAL WS pump: a real `/ws` socket subscribes, then
+    // stops reading (a slow consumer) while the venue commits far past the bounded
+    // broadcast ring. The pump's receiver lags and recovers by emitting a fresh
+    // `orderbook_snapshot` ON THE WIRE — a gap is repaired by a resnapshot, never a
+    // replay, and never via the manager's snapshot method.
+    let server = VenueServer::start().await.map_err(|e| e.to_string())?;
+    let reader = server.token("reader-1")?;
+    let mut ws = WsClient::connect(server.rest_addr(), &reader).await?;
+    let baseline = ws.subscribe("orderbook", CALL, Some(5)).await?;
+    require(
+        ws_find_type(&baseline, "orderbook_snapshot").is_some(),
+        "the subscribe must return a baseline snapshot before the flood",
+    )?;
+
+    // Flood far past the ring (and any socket/tungstenite buffering) at one ask
+    // level, all on the SAME broadcast the pump reads, while the client does not
+    // read — the count-based overflow makes the lag deterministic, not timed.
     let symbol = sym()?;
-    let manager = OrderbookSubscriptionManager::with_capacity(2);
-    let mut rx = manager.subscribe();
-    for i in 0..6u64 {
+    let manager = server.state().subscriptions();
+    let flood = WS_BROADCAST_CAPACITY * 16;
+    for i in 0..flood {
+        // `i` is a bounded loop index (< flood), so the +1 sequence cannot overflow.
+        let seq = i as u64 + 1;
         manager.on_committed_event(&resting_add(
             symbol.clone(),
-            i + 1,
-            &format!("m{i}"),
+            seq,
+            &format!("lag-{i}"),
             Side::Sell,
-            50_000 + i,
+            50_100,
             1,
         ));
     }
-    let mut lagged = false;
-    loop {
-        match rx.try_recv() {
-            Ok(_) => {}
-            Err(TryRecvError::Lagged(_)) => {
-                lagged = true;
-                break;
-            }
-            Err(_) => break,
-        }
-    }
-    require(lagged, "a slow consumer must lag on a bounded broadcast")?;
 
-    match manager.orderbook_snapshot(&symbol, None) {
-        WsMessage::OrderbookSnapshot { asks, sequence, .. } => {
-            require(
-                asks.len() == 6,
-                "the fresh snapshot must have every folded level",
-            )?;
-            require(
-                sequence == 6,
-                "the snapshot must re-baseline at the current seq",
-            )
-        }
-        _ => Err("expected a fresh snapshot".to_string()),
-    }
+    // Resume reading: among the frames on the wire there is a fresh
+    // `orderbook_snapshot` (the resnapshot) after the initial baseline was drained.
+    let frames = ws
+        .read_until(std::time::Duration::from_secs(15), |frames| {
+            !ws_data_of_type(frames, "orderbook_snapshot").is_empty()
+        })
+        .await?;
+    let resnapshot = ws_data_of_type(&frames, "orderbook_snapshot")
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            "the laggard must recover via a fresh orderbook_snapshot on the wire".to_string()
+        })?;
+    require(
+        resnapshot.get("sequence").and_then(Value::as_u64).is_some(),
+        "the recovery snapshot must re-baseline at an instrument sequence",
+    )
 }
 
 /// The documented REST route inventory (`(path, methods)` with `{param}`

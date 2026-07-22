@@ -21,21 +21,33 @@
 //! reproduced stream — reproduced, not treated as static config (#47, #49).
 
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axum::Router;
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode, header};
+use serde_json::json;
+use tower::ServiceExt;
 
 use fauxchange::auth::{
-    RateLimitBudgets, RateLimitDecision, RateLimitKey, RateLimitTier, RateLimiter,
+    AccountProvision, RateLimitBudgets, RateLimitDecision, RateLimitKey, RateLimitTier, RateLimiter,
 };
 use fauxchange::config::RateLimitConfig;
 use fauxchange::exchange::{
-    Cents, CommandExecutor, EventTimestamp, ExecutionContext, FixedClock, Hash32, InstrumentStatus,
-    LineageId, MarkSource, MatchingExecutor, STPMode, SequenceNumber, Side, Symbol, TimeInForce,
-    TopOfBook, VenueCommand, VenueOutcome,
+    ActorConfig, Cents, EventTimestamp, ExecutionFilter, ExecutionsStore, FixedClock, Hash32,
+    InMemoryVenueJournal, InstrumentStatus, JournalHeader, JournalRecord, LineageId, MarkSource,
+    MatchingExecutor, NoopFanOut, STPMode, SequenceNumber, Side, Symbol, TimeInForce, TopOfBook,
+    UnderlyingActor, VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
 };
+use fauxchange::gateway::rest::create_router;
 use fauxchange::market_maker::{CommandSink, MarketMakerEngine, PersonaConfig, Quoter};
 use fauxchange::microstructure::MicrostructureConfig;
-use fauxchange::simulation::{VenueClockConfig, replay_bundle};
-use fauxchange::state::{AppState, AppStateConfig};
-use fauxchange::{AccountId, LiquidityFlag, OrderType, VenueOrderId};
+use fauxchange::simulation::{
+    ClockMode, JournalStream, ReplayReport, RunManifest, ScenarioBundle, VenueClockConfig,
+    replay_bundle,
+};
+use fauxchange::state::{AppState, AppStateConfig, AuthConfig};
+use fauxchange::{AccountId, LiquidityFlag, OrderType, Permission, VenueOrderId};
 
 /// The deterministic venue instant the sequenced path (and the fixed rate-limit
 /// clock) stamp from — a single fixed instant is enough because the venue clock is
@@ -117,6 +129,178 @@ fn test_scenario_throttling_reproduces_the_same_throttle_reject_for_a_fixed_conf
     assert!(
         first[budget as usize..].iter().all(|d| !d.allowed),
         "every request past the budget stays throttled within the window"
+    );
+}
+
+/// The bootstrap secret gating token minting on the throttle-scenario venues.
+const RL_SECRET: &str = "throttle-scenario-secret";
+/// The per-contract REST order path for the fixture contract (`BTC` call).
+const RL_ORDER_PATH: &str =
+    "/api/v1/underlyings/BTC/expirations/20240329/strikes/50000/options/call/orders";
+
+fn rl_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A fresh single-underlying venue whose Trade tier carries `budgets`, plus a
+/// `trader-1` Trade account and the bootstrap secret that gates token minting.
+fn rl_venue(budgets: RateLimitBudgets) -> Arc<AppState> {
+    let accounts = vec![AccountProvision::new(
+        AccountId::new("trader-1"),
+        Hash32([2; 32]),
+        vec![Permission::Trade],
+    )];
+    let auth = match AuthConfig::dev() {
+        Ok(auth) => auth
+            .with_bootstrap_secret(RL_SECRET)
+            .with_accounts(accounts)
+            .with_rate_limit_budgets(budgets),
+        Err(error) => panic!("dev auth must build: {error}"),
+    };
+    match AppState::new(AppStateConfig::new(["BTC"]).with_auth(auth)) {
+        Ok(state) => state,
+        Err(error) => panic!("AppState must build: {error}"),
+    }
+}
+
+/// Posts one order through the REAL router, returning `(status, [X-RateLimit-Limit,
+/// X-RateLimit-Remaining, X-RateLimit-Reset, Retry-After])`.
+async fn rl_post_order(state: &Arc<AppState>, bearer: &str) -> (StatusCode, [Option<String>; 4]) {
+    let body = match serde_json::to_vec(&json!({ "side": "buy", "price": 50_000, "quantity": 1 })) {
+        Ok(bytes) => bytes,
+        Err(e) => panic!("serialising the order body must succeed: {e}"),
+    };
+    let request = match Request::builder()
+        .method("POST")
+        .uri(RL_ORDER_PATH)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+    {
+        Ok(request) => request,
+        Err(e) => panic!("building the request must succeed: {e}"),
+    };
+    let router: Router = create_router(Arc::clone(state));
+    let response = match router.oneshot(request).await {
+        Ok(response) => response,
+        Err(e) => panic!("router must be infallible: {e}"),
+    };
+    let status = response.status();
+    let read = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let headers = [
+        read("x-ratelimit-limit"),
+        read("x-ratelimit-remaining"),
+        read("x-ratelimit-reset"),
+        read("retry-after"),
+    ];
+    // Drain the body so the connection is not left mid-response (never inspected).
+    let _ = to_bytes(response.into_body(), usize::MAX).await;
+    (status, headers)
+}
+
+#[tokio::test]
+async fn test_scenario_throttling_drives_a_real_rest_429_with_ratelimit_headers() {
+    // The SAME 3-request Trade budget config, now driven into a REAL REST 429 over the
+    // live router (not the RateLimiter directly). A 60 s window on a venue never
+    // advanced mid-run means the window never expires, so the wire status stream is a
+    // pure function of the config + request order — reproduced across two fresh venues.
+    let config = RateLimitConfig {
+        window_secs: 60,
+        read_per_window: 100,
+        trade_per_window: 3,
+        admin_per_window: 100,
+    };
+    config
+        .validate()
+        .expect("the rate-limit scenario config is valid at load");
+    let budgets = config.to_budgets();
+    let budget = budgets.trade();
+    let request_count = budget + 3;
+
+    async fn drive(
+        state: &Arc<AppState>,
+        bearer: &str,
+        count: u32,
+    ) -> Vec<(StatusCode, [Option<String>; 4])> {
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            out.push(rl_post_order(state, bearer).await);
+        }
+        out
+    }
+
+    let venue_a = rl_venue(budgets);
+    let token_a = venue_a
+        .mint_token(&AccountId::new("trader-1"), RL_SECRET, rl_now_secs(), 3_600)
+        .expect("minting must succeed");
+    let run_a = drive(&venue_a, &token_a, request_count).await;
+
+    let venue_b = rl_venue(budgets);
+    let token_b = venue_b
+        .mint_token(&AccountId::new("trader-1"), RL_SECRET, rl_now_secs(), 3_600)
+        .expect("minting must succeed");
+    let run_b = drive(&venue_b, &token_b, request_count).await;
+
+    // The wire status stream reproduces exactly across the two identically-configured
+    // venues (the deterministic failure mode, observed on the real surface).
+    let statuses = |run: &[(StatusCode, [Option<String>; 4])]| -> Vec<StatusCode> {
+        run.iter().map(|(status, _)| *status).collect()
+    };
+    assert_eq!(
+        statuses(&run_a),
+        statuses(&run_b),
+        "the REST status stream reproduces exactly for the same descriptor"
+    );
+
+    // Exactly the configured budget is admitted (200), then the client hits a 429.
+    let admitted = statuses(&run_a)
+        .iter()
+        .filter(|status| **status == StatusCode::OK)
+        .count();
+    assert_eq!(
+        admitted, budget as usize,
+        "exactly the configured Trade budget is admitted before the 429"
+    );
+
+    // The first over-budget request is a real HTTP 429 with the X-RateLimit-* context
+    // and a Retry-After (the 429 backoff signal).
+    let (status, headers) = &run_a[budget as usize];
+    assert_eq!(
+        *status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the first over-budget request is a real 429"
+    );
+    assert_eq!(
+        headers[0].as_deref(),
+        Some(budget.to_string().as_str()),
+        "X-RateLimit-Limit is the configured Trade budget"
+    );
+    assert_eq!(
+        headers[1].as_deref(),
+        Some("0"),
+        "X-RateLimit-Remaining is 0 at the throttle"
+    );
+    assert!(headers[2].is_some(), "X-RateLimit-Reset present on the 429");
+    assert!(
+        headers[3].is_some(),
+        "Retry-After present on the 429 (the backoff signal)"
+    );
+
+    // Every request past the budget stays a 429 within the window.
+    assert!(
+        run_a[budget as usize..]
+            .iter()
+            .all(|(status, _)| *status == StatusCode::TOO_MANY_REQUESTS),
+        "every over-budget request stays throttled within the window"
     );
 }
 
@@ -382,36 +566,61 @@ fn taker_buy(order_id: &str, price: u64, quantity: u64) -> VenueCommand {
     }
 }
 
-/// Replays a command stream through a fresh executor (the determinism-oracle read
-/// surface), returning every outcome and the reconstructed top-of-book.
-fn replay_stream(commands: &[VenueCommand]) -> (Vec<VenueOutcome>, TopOfBook) {
+/// Records `commands` into the production journal via the real single-writer
+/// actor, then replays the recorded [`ScenarioBundle`] through the production
+/// driver [`replay_bundle`] — the failure-mode replay path (never a direct
+/// `MatchingExecutor::execute`). Returns the recorded event stream and the replay
+/// report, so the oracle compares journaled events / reconstructed fills / book.
+fn record_and_replay(commands: &[VenueCommand]) -> (Vec<VenueEvent>, ReplayReport) {
     let lineage = LineageId::new("run-wide-scenario");
-    let mut executor = MatchingExecutor::new(WIDE_UNDERLYING);
-    let mut outcomes = Vec::with_capacity(commands.len());
-    for (index, command) in commands.iter().enumerate() {
-        outcomes.push(executor.execute(ExecutionContext {
-            underlying: WIDE_UNDERLYING,
-            lineage_id: &lineage,
-            sequence: SequenceNumber::new(index as u64),
-            venue_ts: EventTimestamp::new(CLOCK_MS),
-            command,
-        }));
+    let header = JournalHeader::new(lineage.clone());
+    let mut actor = UnderlyingActor::new(
+        ActorConfig::new(WIDE_UNDERLYING, lineage.clone(), 64),
+        InMemoryVenueJournal::new(header.clone()),
+        MatchingExecutor::new(WIDE_UNDERLYING),
+        NoopFanOut,
+        FixedClock::new(EventTimestamp::new(CLOCK_MS)),
+    );
+    for command in commands {
+        actor
+            .handle(command.clone())
+            .expect("the actor turn journals and commits");
     }
-    (outcomes, executor.top_of_book(&sym(WIDE_CALL)))
+    let records = actor
+        .journal()
+        .read_from(SequenceNumber::START)
+        .expect("read the recorded journal");
+    let recorded_events: Vec<VenueEvent> = records
+        .iter()
+        .filter_map(|record| match record {
+            JournalRecord::Event(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect();
+    let stream = JournalStream::new(WIDE_UNDERLYING, header, records);
+    let manifest = RunManifest::new(WIDE_SEED, ClockMode::Realtime)
+        .with_microstructure_fingerprint(MicrostructureConfig::default().fingerprint());
+    let bundle = ScenarioBundle::new(manifest, vec![stream]);
+    let report = replay_bundle(&bundle)
+        .expect("the recorded scenario replays through the production driver");
+    (recorded_events, report)
 }
 
-/// The taker's filled quantity (as taker) after replaying `commands` — the failure
-/// signal: `0` means starved.
-fn taker_filled(commands: &[VenueCommand]) -> u64 {
-    let (outcomes, _top) = replay_stream(commands);
-    match outcomes.last().expect("a taker outcome") {
-        VenueOutcome::Added { fills, .. } => fills
-            .iter()
-            .filter(|fill| fill.liquidity == LiquidityFlag::Taker)
-            .map(|fill| fill.quantity)
-            .sum(),
-        other => panic!("expected the taker add outcome, got {other:?}"),
-    }
+/// The taker's filled quantity (as taker) in a replay report's reconstructed
+/// executions store — the failure signal: `0` means starved.
+fn taker_filled_in(report: &ReplayReport, account: &str) -> u64 {
+    let filter = ExecutionFilter::default();
+    report
+        .executions
+        .list(&AccountId::new(account), &filter)
+        .map(|records| {
+            records
+                .iter()
+                .filter(|record| record.liquidity == LiquidityFlag::Taker)
+                .map(|record| record.quantity)
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 #[test]
@@ -440,23 +649,37 @@ fn test_scenario_wide_skewed_persona_starves_a_taker_and_reproduces_for_a_fixed_
     // liquidity, but WOULD cross the far-tighter tight-persona ask.
     let taker_limit = wide_ask - 1;
 
-    // Failure mode: against the wide_skewed persona's finite resting liquidity the
-    // taker is starved — zero fill — and rests unfilled.
+    // A taker priced just under the wide ask.
     let mut wide_scenario = wide_stream.clone();
     wide_scenario.push(taker_buy("starved-taker-order", taker_limit, TAKER_QTY));
+    let mut tight_scenario = persona_requote_stream(WIDE_SEED, "tight", tight);
+    tight_scenario.push(taker_buy("control-taker-order", taker_limit, TAKER_QTY));
+
+    // Failure mode, proven through the PRODUCTION replay driver: record the scenario
+    // into the real journal, replay the `ScenarioBundle` via `replay_bundle`, and read
+    // the starvation off the RECONSTRUCTED executions store — against the wide_skewed
+    // persona's finite resting liquidity the taker takes nothing (starved) and no fill
+    // prints anywhere.
+    let (wide_events, wide_report) = record_and_replay(&wide_scenario);
     assert_eq!(
-        taker_filled(&wide_scenario),
+        taker_filled_in(&wide_report, "starved-taker"),
         0,
-        "the wide spread starves the taker: zero fill against the unreachable wide ask"
+        "the wide spread starves the taker: zero taker fill in the replayed executions"
+    );
+    assert_eq!(
+        wide_report.executions.len(),
+        0,
+        "an unreachable wide ask prints no fill anywhere on the reconstructed run"
     );
 
     // Control (proves the WIDE SPREAD is the cause, not the taker's own price): the
-    // identical taker against the tight persona's liquidity DOES fill — bounded by
-    // that persona's finite resting slice (real matching, not a synthetic partial).
-    let mut tight_scenario = persona_requote_stream(WIDE_SEED, "tight", tight);
-    tight_scenario.push(taker_buy("control-taker-order", taker_limit, TAKER_QTY));
+    // identical taker against the tight persona's liquidity DOES fill on replay —
+    // bounded by that persona's finite resting slice (real matching, not synthetic).
+    // The taker account is `starved-taker` in both scenarios (`taker_buy`); only the
+    // resting persona differs, so a fill here isolates the wide spread as the cause.
+    let (_tight_events, tight_report) = record_and_replay(&tight_scenario);
     assert!(
-        taker_filled(&tight_scenario) > 0,
+        taker_filled_in(&tight_report, "starved-taker") > 0,
         "a tighter spread would have filled the same taker — the starvation is caused by the wide spread"
     );
 
@@ -469,16 +692,32 @@ fn test_scenario_wide_skewed_persona_starves_a_taker_and_reproduces_for_a_fixed_
         "the same seed reproduces the identical persona requote ladder"
     );
 
-    // Oracle reproduction: replaying the same journaled command stream twice
-    // reconstructs identical outcomes (fills/events) and book state per underlying.
-    let (outcomes_a, top_a) = replay_stream(&wide_scenario);
-    let (outcomes_b, top_b) = replay_stream(&wide_scenario);
+    // Oracle reproduction through the production driver: recording the same scenario
+    // and replaying it again reconstructs the IDENTICAL journaled event stream and
+    // book state per underlying (compared over journaled artifacts, not a direct
+    // executor re-run), and matches the events recorded on the first pass.
+    let (rerecorded_events, replay_again) = record_and_replay(&wide_scenario);
     assert_eq!(
-        outcomes_a, outcomes_b,
-        "the starved outcome reproduces exactly for the same descriptor"
+        rerecorded_events, wide_events,
+        "the recorded VenueEvent stream reproduces exactly for the same descriptor"
+    );
+    let first = wide_report
+        .underlying(WIDE_UNDERLYING)
+        .expect("the first replay carries the BTC underlying");
+    let again = replay_again
+        .underlying(WIDE_UNDERLYING)
+        .expect("the second replay carries the BTC underlying");
+    assert_eq!(
+        first.events, again.events,
+        "replay_bundle re-derives the identical ordered event stream"
     );
     assert_eq!(
-        top_a, top_b,
+        first.events, wide_events,
+        "the driver-replayed events equal the events recorded live"
+    );
+    assert_eq!(
+        first.top_of_book(&sym(WIDE_CALL)),
+        again.top_of_book(&sym(WIDE_CALL)),
         "the reconstructed book (the starved taker resting unfilled) reproduces exactly"
     );
 }

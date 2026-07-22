@@ -779,8 +779,13 @@ async fn test_market_data_subscribe_snapshots_then_streams_a_delta_with_rpt_seq(
         .expect("resting order");
     let _ = recv_frames(&mut trader, Duration::from_secs(3)).await;
 
-    // The reader receives the `X` on the session cadence tick.
-    let incremental = recv_frames(&mut reader, Duration::from_secs(3)).await;
+    // The reader receives the `X` on the session cadence tick. Wait for the `X`
+    // itself rather than returning on the first frame, so a slow cadence tick
+    // under load cannot race the delta off the wire.
+    let incremental = recv_frames_until(&mut reader, Duration::from_secs(10), |f| {
+        msg_type(f).as_deref() == Some("X")
+    })
+    .await;
     let x = incremental
         .iter()
         .find(|f| msg_type(f).as_deref() == Some("X"))
@@ -1774,7 +1779,13 @@ async fn test_idempotent_resend_of_the_same_clordid_does_not_open_a_second_order
         ))
         .await
         .expect("taker");
-    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
+    // Wait for the Trade (150=F): the fill legs are recorded before the report is
+    // rendered, so awaiting the fill frame — not the first-arriving New — makes
+    // the executions-count assertion below observe the settled state under load.
+    let _ = recv_frames_until(&mut client, Duration::from_secs(10), |f| {
+        msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("F")
+    })
+    .await;
     assert_eq!(
         harness.state.executions().len(),
         2,
@@ -1797,7 +1808,12 @@ async fn test_idempotent_resend_of_the_same_clordid_does_not_open_a_second_order
         ))
         .await
         .expect("resend");
-    let _ = recv_frames(&mut client, Duration::from_secs(3)).await;
+    // The idempotent resend re-renders the stored terminal outcome as an 8;
+    // await that report so the count assertion runs after the resend is handled.
+    let _ = recv_frames_until(&mut client, Duration::from_secs(10), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
     assert_eq!(
         harness.state.executions().len(),
         2,

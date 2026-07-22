@@ -9,6 +9,29 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+### Changed
+
+- **Conformance / DoS / scenario suites now drive assertions through the real
+  gateway + socket end-to-end** (#130). Test-quality only — no production
+  behavior changed. Several suites asserted against a component directly
+  (`RateLimiter`, the subscription manager, `MatchingExecutor::execute`,
+  hand-built events); they now flow through the live REST router, the FIX
+  acceptor over a real `TcpStream`, and `/ws` over a real socket, so drift in
+  decode/auth/dispatch/rendering can't pass unnoticed. Rewrote the DoS
+  `max_keys` flood (synchronized concurrent tasks racing a barrier; peak + final
+  key count bounded), the WS laggard resnapshot (on the wire), the throttling
+  scenario (a real REST `429` with `X-RateLimit-*` headers), the failure-mode
+  replay (record → `replay_bundle` through the production driver), the STP case
+  (live self-cross over both gateways), the WS observation case (wire snapshot +
+  monotonic delta), and the idempotency-parity case (full normalized
+  `VenueEvent` streams, asserting the documented REST-2/FIX-1 residual).
+  - **Flaky FIX harness fixed** (had intermittently red-flaked CI): the
+    read-gap-based `recv_frames` early-returned before all expected frames
+    arrived under concurrent load; multi-frame reads now wait on a count/type
+    predicate (`recv_frames_until`) with a bounded deadline. The
+    `requote_isolation` p99-tolerance backstop was widened (documented) to
+    absorb cross-binary scheduler noise while still catching a real regression.
+
 ### Added
 
 - **Microstructure completion — the remaining #44 follow-ups** (#114):

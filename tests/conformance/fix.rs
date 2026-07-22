@@ -580,6 +580,38 @@ pub async fn recv_all_frames(stream: &mut TcpStream, window: Duration) -> Vec<Ve
     split_frames(&buf)
 }
 
+/// Like [`recv_frames`], but keeps accumulating frames across reads until one
+/// satisfies `wanted` or `timeout` elapses, returning everything received.
+///
+/// A single [`recv_frames`] returns on the first complete frame. When a logical
+/// response arrives as several frames written with a gap — e.g. a `New (150=0)`
+/// ack followed by a `Trade (150=F)` fill — a lone call can return only the ack
+/// and race the fill under a CPU-loaded test binary. This waits for the awaited
+/// frame instead; the overall `timeout` still bounds it, so a genuinely-missing
+/// frame still fails rather than hangs.
+pub async fn recv_frames_until(
+    stream: &mut TcpStream,
+    timeout: Duration,
+    wanted: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut all = Vec::new();
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let batch = recv_frames(stream, deadline - now).await;
+        let matched = batch.iter().any(|frame| wanted(frame));
+        let empty = batch.is_empty();
+        all.extend(batch);
+        if matched || empty {
+            break;
+        }
+    }
+    all
+}
+
 /// The value of scalar `tag` in a FIX frame (`SOH`-delimited `tag=value`).
 #[must_use]
 pub fn field(frame: &[u8], tag: &str) -> Option<String> {
@@ -782,6 +814,18 @@ impl FixClient {
     /// Drains any further buffered frames (best effort, short timeout).
     pub async fn drain(&mut self) -> Vec<Vec<u8>> {
         recv_frames(&mut self.stream, Duration::from_millis(300)).await
+    }
+
+    /// Reads reply frames until one satisfies `wanted` or `timeout` elapses — the
+    /// deterministic wait for a terminal report (e.g. a `Trade (150=F)` fill that
+    /// lands a read-gap after the `New` ack), replacing a fixed number of blind
+    /// drains.
+    pub async fn read_until(
+        &mut self,
+        timeout: Duration,
+        wanted: impl Fn(&[u8]) -> bool,
+    ) -> Vec<Vec<u8>> {
+        recv_frames_until(&mut self.stream, timeout, wanted).await
     }
 }
 
