@@ -55,6 +55,22 @@ The full versioning and release-process policy lives in the design docs
     those `#[serde(transparent)]` DTOs needs a wire/schema change — a **tracked
     follow-up**, out of scope for this in-plumbing pass). 232 stays under the
     existing §13.3 gate ceiling. No fabricated "zero-alloc".
+- **Root-caused + corrected the actor-turn allocation baseline** (#126). BENCH.md
+  §6 carried **62–83 allocs/op** for `UnderlyingActor::handle`, but a fresh
+  re-measure gave **180–205** on the identical machine/code — an unexplained
+  ~2.3× divergence. Investigation (a new call-stack-attributed `dhat` profiler,
+  `benches/alloc_dhat.rs`, dev-only behind a `dhat-heap` feature) found the
+  62–83 was a **stale pre-#34 baseline**: it was measured when
+  `InMemoryVenueJournal::append` did no serialization, then carried over
+  unchanged. #34 added `check_record_size → serde_json::to_string` per append,
+  which serializes `owner: Hash32`, and the upstream `pricelevel::Hash32::to_hex`
+  allocates ~32 tiny `String`s per hash — **~111 allocs/op (57% of the turn)**,
+  exactly the divergence. No shipping code changed (the dominant term is upstream
+  `Hash32::to_hex` behind the #34 DoS control — wrap-not-fork; the reduction
+  levers are tracked in #165). BENCH.md §6/§13.3 are corrected to the true
+  ~180–205 (with the dhat call-site breakdown); the `bench_regression_gate.py`
+  ceilings were already grounded in the true numbers and are unchanged (the gate
+  was honestly armed against the fresh baseline).
 
 ### Added
 

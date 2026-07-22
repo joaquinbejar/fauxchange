@@ -10,3 +10,8 @@
 
 # JetBrains IDE metadata (local; must not ship)
 /.idea/
+
+# dhat heap-profile output from `benches/alloc_dhat.rs --features dhat-heap`
+# (#126); a generated per-run artifact, never committed.
+/dhat-alloc.json
+/dhat-heap.json

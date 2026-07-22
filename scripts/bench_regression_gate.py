@@ -107,8 +107,8 @@ LATENCY_CEILINGS_NS: dict[str, dict[str, int]] = {
     # would not). Tightened (review finding) from a prior 5,000,000/6,000,000
     # ns ceiling (~22x/18x the worst disclosed value — wider than the
     # documented 10x-once-above-~100us policy this table otherwise follows,
-    # with no disclosed baseline instability like #91/#126 to justify the
-    # extra slack) down to ~10x, matching every other >=100us series here:
+    # with no disclosed baseline instability like #91's HP-1 tail to justify
+    # the extra slack) down to ~10x, matching every other >=100us series here:
     # 229,503 * 10 ~ 2,295,030, rounded up to 2,500,000; 325,375 * 10 ~
     # 3,253,750, rounded up to 3,500,000.
     "hp2_fanout_n1": {"p99_ns": 2_500_000, "p999_ns": 3_500_000},
@@ -163,15 +163,15 @@ class AllocCeiling:
     `kind` and `note` are printed in every run's summary and verdict (not
     just this source comment) so a reader of the CI log never has to open
     this file to know whether a PASS here means "no regression" or merely
-    "no order-of-magnitude blowup" — see BENCH.md §13.3 / issue #126 for the
-    disclosed baseline-instability finding this distinction exists to be
-    honest about. This gate NEVER claims docs/07 §4's "zero steady-state
-    allocation" criterion is met for a `coarse-blowup-catcher-pending-#126`
-    section — only `tight-no-regression` sections carry that claim.
+    "no order-of-magnitude blowup" — see BENCH.md §6 / §13.3 (issue #126,
+    RESOLVED) for the root-caused baseline this distinction rests on. This gate
+    NEVER claims docs/07 §4's "zero steady-state allocation" criterion is met
+    for a `coarse-blowup-catcher` section — only `tight-no-regression` sections
+    carry that claim.
     """
 
     ceiling: float
-    kind: str  # "tight-no-regression" | "coarse-blowup-catcher-pending-#126"
+    kind: str  # "tight-no-regression" | "coarse-blowup-catcher"
     note: str
 
 
@@ -188,14 +188,16 @@ class AllocCeiling:
 # MULTI-X ALLOC-REGRESSION CATCHER, not a tight no-regression bound, and this
 # gate says so explicitly at run time (`kind`, printed in the summary and the
 # verdict) — it does NOT claim docs/07 §4's "zero steady-state allocation"
-# criterion is met for them. The ceiling sits ~2.2-2.5x above the freshly
-# re-verified baseline (BENCH.md §13.3 / #126: the baseline itself is
-# currently UNSTABLE, a disclosed ~2.3-2.6x divergence from the previously
-# committed §6 figure with no code change), so a real but modest regression
-# (e.g. 1.5x, to ~300-500 allocs/op) would still pass. It genuinely catches
-# an order-of-magnitude blowup, nothing finer, until #126 resolves which
-# baseline is the honest reference — gating the CURRENT accepted (disclosed)
-# budget, explicitly marked pending #126, not a fabricated tight bound. The
+# criterion is met for them. The ceiling sits ~2.2-2.5x above the true,
+# re-measured baseline (~180-205 allocs/op). #126 is RESOLVED (BENCH.md §6
+# Root cause / §13.3): the earlier ~2.3-2.6x "divergence with no code change"
+# was a stale pre-#34 figure carried over — #34's `check_record_size`
+# serialization (upstream `Hash32::to_hex`) added ~111 allocs/op afterward and
+# was never re-measured — so the coarse margin is now a deliberate
+# cross-machine / DashMap-hasher-noise buffer, NOT a hedge against an unknown
+# baseline. A real but modest regression (e.g. 1.5x, to ~300-500 allocs/op)
+# would still pass; the coarse catcher genuinely catches an order-of-magnitude
+# blowup, nothing finer, gating the CURRENT accepted (disclosed) budget. The
 # THIRD section below (`MarketMakerEngine::update_price`) is different in
 # kind: it is exactly reproducible (zero disclosed variance across every
 # run, historical and #053's own re-verification alike — ten total
@@ -205,43 +207,38 @@ class AllocCeiling:
 # real regression, not noise.
 ALLOC_CEILINGS_PER_OP: dict[str, AllocCeiling] = {
     # `UnderlyingActor::handle` direct — the exact "append -> match -> append
-    # -> enqueue" common actor turn docs/07 §4 names. BENCH.md §6's committed
-    # baseline (77.374, range 62.577-82.657 across 3 disclosed runs); this
-    # gate's own #053 re-verification measured a NEW, higher, reproducible
-    # cluster (180.355-202.160 across 5 fresh runs on the identical machine/
-    # code/Cargo.lock — see BENCH.md §13.3 / #126's disclosed, unresolved
-    # divergence). COARSE catcher, not tight no-regression: ~2.2x the higher,
-    # freshly-observed cluster (~202) — still fails a genuine multi-x
-    # regression, would NOT catch a 1.5x-2x one.
+    # -> enqueue" common actor turn docs/07 §4 names. True re-measured baseline
+    # ~180-205 allocs/op (BENCH.md §6, 10 runs; #126 root-caused the earlier
+    # stale 62-83 as pre-#34 code). COARSE catcher, not tight no-regression:
+    # ~2.2x the observed cluster's high end (~203) — still fails a genuine
+    # multi-x regression, would NOT catch a 1.5x-2x one.
     "UnderlyingActor::handle (direct": AllocCeiling(
         ceiling=450.0,
-        kind="coarse-blowup-catcher-pending-#126",
+        kind="coarse-blowup-catcher",
         note=(
-            "BENCH.md §6 committed baseline 77.374 allocs/op (range "
-            "62.577-82.657, 3 runs); this gate's #053 re-verification "
-            "measured a reproducible cluster of 180.355-202.160 across 5 "
-            "fresh runs, SAME machine/code/Cargo.lock (BENCH.md §13.3, "
-            "issue #126, UNRESOLVED). Ceiling ~2.2x the freshly-observed "
-            "cluster's high end. The docs/07 §4 'zero steady-state "
-            "allocation' criterion is NOT claimed met here, pending #126."
+            "True re-measured baseline ~180-205 allocs/op (BENCH.md §6, 10 "
+            "runs). #126 RESOLVED: the earlier committed 62-83 was pre-#34 "
+            "code carried over stale; #34's check_record_size serialization "
+            "(upstream Hash32::to_hex) added ~111 allocs/op afterward. Ceiling "
+            "~2.2x the observed cluster's high end (cross-machine + hasher "
+            "margin). The docs/07 §4 'zero steady-state allocation' criterion "
+            "is NOT claimed met here (the target is 0)."
         ),
     ),
     # `ActorHandle::submit` round-trip (async mailbox + oneshot reply) — the
     # production gateway-facing API, expected to allocate a bit more than the
     # direct section (a fresh oneshot channel + mpsc send slot per call).
-    # Baseline 82.657 (committed) / ~189.7-199.7 (#053 re-verification).
-    # COARSE catcher, same caveat as above: ~2.5x the freshly-observed
-    # cluster (~200).
+    # True re-measured baseline ~181-203 allocs/op (BENCH.md §6, 10 runs).
+    # COARSE catcher, same basis as above: ~2.5x the observed cluster.
     "ActorHandle::submit (async": AllocCeiling(
         ceiling=500.0,
-        kind="coarse-blowup-catcher-pending-#126",
+        kind="coarse-blowup-catcher",
         note=(
-            "BENCH.md §6 committed baseline 82.657 allocs/op; this gate's "
-            "#053 re-verification measured ~189.7-199.7 across fresh runs, "
-            "SAME machine/code/Cargo.lock (BENCH.md §13.3, issue #126, "
-            "UNRESOLVED). Ceiling ~2.5x the freshly-observed cluster. The "
-            "docs/07 §4 'zero steady-state allocation' criterion is NOT "
-            "claimed met here, pending #126."
+            "True re-measured baseline ~181-203 allocs/op (BENCH.md §6, 10 "
+            "runs). #126 RESOLVED (same root cause as the direct section). "
+            "Ceiling ~2.5x the observed cluster. The docs/07 §4 'zero "
+            "steady-state allocation' criterion is NOT claimed met here "
+            "(the target is 0)."
         ),
     ),
     # `MarketMakerEngine::update_price` steady-state requote (HP-4, #050) —
@@ -574,7 +571,7 @@ def print_summary(result: ParseResult) -> None:
     print(
         "\n-- Gated allocation series — docs/07 §4's 'zero steady-state "
         "allocation' criterion is NOT claimed met for any "
-        "[coarse-blowup-catcher-pending-#126] section below; only "
+        "[coarse-blowup-catcher] section below; only "
         "[tight-no-regression] sections carry that claim --"
     )
     for needle, alloc_ceiling in ALLOC_CEILINGS_PER_OP.items():
@@ -647,14 +644,14 @@ def main(argv: list[str]) -> int:
 
     # Explicit, machine-visible criterion status for the allocation gate —
     # never leave "zero steady-state allocation" ambiguous in a passing run's
-    # log. See ALLOC_CEILINGS_PER_OP / BENCH.md §13.3, issue #126.
+    # log. See ALLOC_CEILINGS_PER_OP / BENCH.md §6, §13.3 (issue #126, RESOLVED).
     coarse = [n for n, c in ALLOC_CEILINGS_PER_OP.items() if c.kind != "tight-no-regression"]
     tight = [n for n, c in ALLOC_CEILINGS_PER_OP.items() if c.kind == "tight-no-regression"]
     print(
         "\ndocs/07 §4 'zero steady-state allocation' criterion: NOT claimed "
-        f"met for {coarse} (coarse blowup catcher, pending issue #126's "
-        f"baseline-instability resolution — BENCH.md §13.3); enforced as a "
-        f"tight no-regression bound for {tight}."
+        f"met for {coarse} (coarse blowup catcher over the true re-measured "
+        f"~180-205 allocs/op baseline — BENCH.md §6, #126 root-caused); "
+        f"enforced as a tight no-regression bound for {tight}."
     )
 
     if violations:
