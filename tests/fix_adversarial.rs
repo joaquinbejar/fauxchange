@@ -12,7 +12,7 @@
 //! (`BoundedFrameDecoder::decode` — the framing layer — then
 //! [`fauxchange::gateway::fix::decode`] — the tag-value layer;
 //! `src/gateway/fix/acceptor.rs::dispatch`) and MUST produce the **correct
-//! typed reject** — asserted by the **specific** `FrameError` /
+//! typed reject** — asserted by the **specific** `CodecError` (framing layer) /
 //! [`FixDecodeError`] variant and its [`FixRejectRoute`] classification, never
 //! a blanket `is_err()` — with:
 //!
@@ -57,28 +57,34 @@
 //!
 //! ## A real fuzzer-found regression: `mid_body_checksum_overflow.fix`
 //!
-//! `cargo fuzz run fix_decode` found a genuine crash within ~90s of mutating
-//! `group_count_mismatch_delimiter_violation.fix` below: `MalformedChecksum` did
-//! not originally exist, and a mid-body injected `CheckSum (10) = 624` (before
-//! the real trailing `10=130`) overflowed `ironfix-tagvalue`'s `parse_checksum`
-//! `u8` fold (`d0*100 + d1*10 + d2`; `6*100` overflows) — `BoundedFrameDecoder`'s
-//! framing-layer precheck only inspects the positionally-trailing checksum, so
-//! this bypassed it. Closed by `reject_malformed_checksum` (`src/gateway/fix/mod.rs`,
-//! scans every `CheckSum (10)` occurrence, not only the trailing one) before the
-//! `ironfix-tagvalue` codec ever runs. `mid_body_checksum_overflow.fix` is the
-//! ACTUAL minimized crashing input (committed byte-for-byte, not reconstructed
-//! through [`frame_with_body`]) as a permanent regression seed.
+//! `cargo fuzz run fix_decode` once found a genuine crash within ~90s of mutating
+//! `group_count_mismatch_delimiter_violation.fix` below: a mid-body injected
+//! `CheckSum (10) = 624` (before the real trailing `10=130`) overflowed
+//! `ironfix-tagvalue` 0.3.0's `parse_checksum` `u8` fold (`d0*100 + d1*10 + d2`;
+//! `6*100` overflows). It was first closed by a venue `reject_malformed_checksum`
+//! pre-decode guard; as of `ironfix-tagvalue` 0.3.1 (#140) the fix lives UPSTREAM
+//! — `Decoder::decode` folds the FIRST `CheckSum (10)` it reaches with a CHECKED
+//! `parse_checksum` (u16, range-checked to `0..=255`), returning
+//! `DecodeError::InvalidFieldValue{tag:10}` (→ `FixDecodeError::Framing`, a typed
+//! session reject) instead of overflowing — so the venue guard was retired and
+//! this fixture now proves the UPSTREAM checked decoder rejects it with no panic.
+//! `mid_body_checksum_overflow.fix` is the ACTUAL minimized crashing input
+//! (committed byte-for-byte, not reconstructed through [`frame_with_body`]) as a
+//! permanent regression seed.
 
 use std::fs;
 use std::path::PathBuf;
 
 use bytes::BytesMut;
 use fauxchange::config::DEFAULT_FIX_MAX_FRAME_BYTES;
-use fauxchange::gateway::fix::acceptor::FrameError;
 use fauxchange::gateway::fix::limits::{MAX_FIELDS_PER_MESSAGE, MAX_GROUP_ENTRIES};
 use fauxchange::gateway::fix::{
     BoundedFrameDecoder, FixDecodeError, FixRejectRoute, SessionRejectReason, decode,
 };
+// #140: the framing layer's own hostile-arithmetic prechecks were retired; every
+// framing reject now surfaces as `ironfix_transport::CodecError` straight from the
+// checked `FixCodec`.
+use ironfix_transport::CodecError;
 
 // ============================================================================
 // Corpus file plumbing (read committed files; regenerate under UPDATE_CORPUS)
@@ -131,11 +137,15 @@ fn frame_with_body(body: &[u8]) -> Vec<u8> {
 // ============================================================================
 
 /// Oversized frame: the declared `BodyLength (9)` alone exceeds the configured
-/// cap — rejected before the frame is even complete, no unbounded allocation.
+/// cap — rejected before the full declared body arrives, no unbounded allocation.
+/// A single body field (`35=0`) follows the length field so the buffer clears
+/// `FixCodec`'s 20-byte minimum and the codec parses the (over-cap) declared
+/// length, firing `MessageTooLarge` *before* its completeness check.
 fn oversized_frame_declared_body_length_over_cap() -> Vec<u8> {
     let mut msg = Vec::new();
     msg.extend_from_slice(b"8=FIX.4.4\x01");
     msg.extend_from_slice(format!("9={}\x01", DEFAULT_FIX_MAX_FRAME_BYTES + 1).as_bytes());
+    msg.extend_from_slice(b"35=0\x01");
     msg
 }
 
@@ -153,8 +163,9 @@ fn truncated_incomplete_frame_no_trailer() -> Vec<u8> {
 }
 
 /// A complete, correctly-length-declared frame whose trailing `CheckSum (10)`
-/// digits are `999` — a value `> 255`, never a real `sum % 256` checksum, and
-/// the exact shape that overflows `ironfix-tagvalue`'s unchecked `u8` fold.
+/// digits are `999` — a value `> 255`, never a real `sum % 256` checksum, and the
+/// exact shape that once overflowed `ironfix-tagvalue`'s `u8` fold (now rejected
+/// by the checked `parse_checksum` in 0.3.1 → `CodecError::InvalidBodyLength`).
 fn malformed_checksum_value_out_of_range() -> Vec<u8> {
     let body = b"35=0\x0149=CLIENT\x0156=VENUE\x0134=1\x0152=20240329-12:00:00.000\x01";
     let mut msg = Vec::new();
@@ -267,10 +278,11 @@ fn fields_over_ceiling() -> Vec<u8> {
 /// The ACTUAL minimized `cargo fuzz run fix_decode` crashing input (141 bytes,
 /// committed byte-for-byte — see the module doc "A real fuzzer-found
 /// regression"): a `MarketDataRequest` carrying an injected mid-body `CheckSum
-/// (10) = 624` BEFORE the real trailing `CheckSum (10) = 130`. `624 > 255`
-/// overflows `ironfix-tagvalue`'s `parse_checksum` u8 fold; `Decoder::decode`
-/// folds the FIRST tag-10 occurrence it reaches, so the mid-body one crashes it,
-/// bypassing the framing-layer precheck (trailing-only). Deliberately NOT
+/// (10) = 624` BEFORE the real trailing `CheckSum (10) = 130`. `624 > 255` once
+/// overflowed `ironfix-tagvalue`'s `parse_checksum` u8 fold; `Decoder::decode`
+/// folds the FIRST tag-10 occurrence it reaches, so the mid-body one crashed the
+/// pre-0.3.1 unchecked fold. As of 0.3.1 (#140) that fold is checked, so this is
+/// now rejected as a typed `Framing` reject upstream. Deliberately NOT
 /// reconstructed through [`frame_with_body`] (which appends only one trailer) —
 /// this is the literal regression bytes.
 fn mid_body_checksum_overflow() -> Vec<u8> {
@@ -283,6 +295,10 @@ fn mid_body_checksum_overflow() -> Vec<u8> {
 
 #[test]
 fn test_oversized_frame_is_rejected_at_the_framing_layer_before_a_frame_completes() {
+    // #140: the by-policy byte cap `BoundedFrameDecoder` sets on `FixCodec`
+    // (`max_message_size = max_frame_bytes`) rejects an over-cap declared length as
+    // `MessageTooLarge` at the framing boundary — before the full body arrives and
+    // with no unbounded allocation. The checked frame-length add means no panic.
     let bytes = corpus(
         "oversized_frame_declared_body_length_over_cap.fix",
         oversized_frame_declared_body_length_over_cap,
@@ -290,11 +306,11 @@ fn test_oversized_frame_is_rejected_at_the_framing_layer_before_a_frame_complete
     let mut buf = BytesMut::from(bytes.as_slice());
     let mut decoder = BoundedFrameDecoder::new(DEFAULT_FIX_MAX_FRAME_BYTES);
     match decoder.decode(&mut buf) {
-        Err(FrameError::FrameTooLarge { declared, max }) => {
-            assert_eq!(declared, DEFAULT_FIX_MAX_FRAME_BYTES + 1);
-            assert_eq!(max, DEFAULT_FIX_MAX_FRAME_BYTES);
+        Err(CodecError::MessageTooLarge { size, max_size }) => {
+            assert!(size > DEFAULT_FIX_MAX_FRAME_BYTES);
+            assert_eq!(max_size, DEFAULT_FIX_MAX_FRAME_BYTES);
         }
-        other => panic!("expected FrameTooLarge, got {other:?}"),
+        other => panic!("expected MessageTooLarge, got {other:?}"),
     }
 }
 
@@ -314,6 +330,9 @@ fn test_truncated_message_is_buffered_not_rejected_and_never_panics() {
 
 #[test]
 fn test_malformed_checksum_value_is_rejected_at_the_framing_layer() {
+    // #140: a trailing `CheckSum (10) = 999` (> 255) makes `FixCodec`'s checked
+    // `parse_checksum` return None, which the codec maps to `InvalidBodyLength` — a
+    // typed framing reject, no u8-fold overflow and no panic.
     let bytes = corpus(
         "malformed_checksum_value_out_of_range.fix",
         malformed_checksum_value_out_of_range,
@@ -321,8 +340,8 @@ fn test_malformed_checksum_value_is_rejected_at_the_framing_layer() {
     let mut buf = BytesMut::from(bytes.as_slice());
     let mut decoder = BoundedFrameDecoder::new(DEFAULT_FIX_MAX_FRAME_BYTES);
     match decoder.decode(&mut buf) {
-        Err(FrameError::MalformedChecksum) => {}
-        other => panic!("expected MalformedChecksum, got {other:?}"),
+        Err(CodecError::InvalidBodyLength) => {}
+        other => panic!("expected InvalidBodyLength, got {other:?}"),
     }
 }
 
@@ -493,23 +512,26 @@ fn test_fields_over_ceiling_is_rejected_cheaply() {
 #[test]
 fn test_fuzzer_found_mid_body_checksum_overflow_is_a_typed_reject_not_a_panic() {
     // Regression for the #042 fuzzer-discovered crash (see the module doc "A real
-    // fuzzer-found regression"): a mid-body injected CheckSum(10)=624 (> 255)
-    // used to overflow `ironfix-tagvalue`'s u8 checksum fold inside
-    // `Decoder::decode`, bypassing the framing-layer's trailing-only precheck.
-    // The pre-codec `reject_malformed_checksum` guard now closes it with a typed
-    // reject before the codec ever runs — no panic, in debug OR release.
+    // fuzzer-found regression"): a mid-body injected CheckSum(10)=624 (> 255) used
+    // to overflow `ironfix-tagvalue`'s u8 checksum fold inside `Decoder::decode`.
+    // As of ironfix-tagvalue 0.3.1 (#140) `Decoder::decode` folds the FIRST tag-10
+    // it reaches with the CHECKED `parse_checksum` (u16, range-checked), returning
+    // `DecodeError::InvalidFieldValue{tag:10}` → `FixDecodeError::Framing` — a typed
+    // session reject, no panic in debug OR release. The reject CLASS matches the
+    // retired guard's (`SessionReject` / `IncorrectDataFormat`); the checked decoder
+    // does not carry the optional `RefTagID (371) = 10` hint the guard did.
     let bytes = corpus("mid_body_checksum_overflow.fix", mid_body_checksum_overflow);
     match decode(&bytes) {
-        Err(err @ FixDecodeError::MalformedChecksum { .. }) => {
+        Err(err @ FixDecodeError::Framing(_)) => {
             assert!(matches!(
                 err.reject_route(),
                 FixRejectRoute::SessionReject {
                     reason: SessionRejectReason::IncorrectDataFormat,
-                    ref_tag: Some(10),
+                    ..
                 }
             ));
         }
-        other => panic!("expected MalformedChecksum, got {other:?}"),
+        other => panic!("expected a Framing reject, got {other:?}"),
     }
 }
 

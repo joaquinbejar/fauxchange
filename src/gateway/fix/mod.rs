@@ -194,23 +194,19 @@ impl DecodedMessage {
 /// A [`FixDecodeError`] for any framing, header, requiredness, enum, group, or
 /// price-seam failure.
 pub fn decode(bytes: &[u8]) -> Result<DecodedMessage, FixDecodeError> {
-    // Guard BodyLength(9) BEFORE the ironfix codec: ironfix-tagvalue 0.3.0
-    // computes `body_start + body_length` UNCHECKED on the attacker-controlled
-    // BodyLength, which panics on an oversized declared value. Validating exact
-    // match here both closes that panic and is correct FIX (a BodyLength that
-    // disagrees with the real frame is malformed).
-    validate_body_length(bytes)?;
-
-    // Guard CheckSum(10) BEFORE the ironfix codec too: `ironfix-tagvalue` 0.3.0's
-    // `parse_checksum` folds the three checksum digits `d0*100 + d1*10 + d2` into a
-    // `u8`, which overflows (panics in debug, wraps in release) on any value > 255.
-    // `Decoder::decode` folds the FIRST `CheckSum (10)` field it reaches — wherever
-    // tag 10 occurs, not only the trailing field — so a duplicate / mid-body `10=`
-    // reaches that fold and crashes, bypassing the framing-layer precheck (which
-    // inspects only the positionally-trailing checksum). This scans every tag-10
-    // occurrence and rejects an out-of-domain value first.
-    reject_malformed_checksum(bytes)?;
-
+    // `BodyLength (9)` and `CheckSum (10)` are the two attacker-controlled numeric
+    // fields the decoder folds. As of ironfix-tagvalue 0.3.1 both are folded with
+    // CHECKED, non-wrapping arithmetic inside `Decoder::decode`: the frame-length
+    // add is a `checked_add` chain plus an exact declared-vs-actual body-length
+    // match (→ `DecodeError::InvalidBodyLength`), and `parse_checksum` folds the
+    // three digits in `u16` and range-checks to `0..=255` (→ the FIRST tag-10 it
+    // reaches yields `DecodeError::InvalidFieldValue`, covering a duplicate /
+    // mid-body `10=`), with numeric tag folding so a zero-padded `009=` / `010=`
+    // cannot bypass it. Both surface through `FixDecodeError::Framing` as a session
+    // `Reject (3)` with `IncorrectDataFormat` — no panic, in a debug or a release
+    // build. The venue's own pre-decode guards were therefore retired in #140 (the
+    // decoder now owns both checks); `BoundedFrameDecoder` stays only as the
+    // framing-layer byte-cap DoS ceiling.
     let raw = Decoder::new(bytes).decode()?;
 
     let begin_string = raw.begin_string();
@@ -316,204 +312,6 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedMessage, FixDecodeError> {
     }
 }
 
-/// Validates `BodyLength (9)` against the frame's actual body length, before the
-/// `ironfix-tagvalue` codec runs — the belt for its unchecked `body_start +
-/// body_length` add (which panics on an oversized declared value).
-///
-/// The check is deliberately narrow: it only acts when it can positively locate
-/// `BeginString (8)`, `BodyLength (9)`, and the trailing `CheckSum (10)` field.
-/// In every other case it defers to the ironfix codec's own framing errors —
-/// and those cases cannot reach the unchecked add, because ironfix returns
-/// `Incomplete` / `MissingBodyLength` / `ChecksumMismatch` first. When the
-/// structure IS locatable (the only path that reaches the panic — a
-/// valid-checksum frame), a declared length that differs from the actual body
-/// length is rejected.
-///
-/// Actual body length is, per the FIX spec, the number of bytes after the
-/// `9=<value>SOH` field up to and including the `SOH` immediately before the
-/// `10=` checksum field.
-/// Splits one `SOH`-delimited `tag=value` field into `(numeric tag, value)`.
-///
-/// The tag is the digit run before the first `=`, folded **numerically** —
-/// exactly as `ironfix-tagvalue`'s own `parse_tag` folds it — so a
-/// leading-zero encoding (`009`) yields the same tag `9` as the canonical
-/// `9`. This is what makes the [`validate_body_length`] guard complete: a
-/// literal `starts_with(b"9=")` locator misses `009=`, which ironfix still
-/// accepts and drives straight into its unchecked `BodyLength` addition
-/// (decoder.rs:145) — the leading-zero panic bypass. Folding the digits the
-/// way ironfix does means the guard recognises EXACTLY the tags ironfix will,
-/// with no open-ended parsing tolerance to fall out of sync with: a FIX tag is
-/// always a digit run before `=`, and `SOH` cannot appear inside a value (it
-/// is the field delimiter), so this fold is exhaustive for tag identification.
-/// Do NOT "simplify" this back to a byte-prefix compare — that reopens the
-/// bypass.
-///
-/// Returns `None` when there is no `=`, the tag has a non-digit byte, or the
-/// tag folds past `u64` (never a real `8`/`9`/`10`).
-fn split_field(field: &[u8]) -> Option<(u64, &[u8])> {
-    let eq = field.iter().position(|&b| b == b'=')?;
-    let (tag_bytes, rest) = field.split_at(eq);
-    if tag_bytes.is_empty() {
-        return None;
-    }
-    let mut tag: u64 = 0;
-    for &b in tag_bytes {
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        tag = tag.checked_mul(10)?.checked_add(u64::from(b - b'0'))?;
-    }
-    Some((tag, &rest[1..])) // skip the '='
-}
-
-fn validate_body_length(bytes: &[u8]) -> Result<(), FixDecodeError> {
-    /// SOH field delimiter.
-    const SOH: u8 = 0x01;
-    /// The FIX header/trailer tags this guard identifies, folded numerically.
-    const BEGIN_STRING_TAG: u64 = 8;
-    const BODY_LENGTH_TAG: u64 = 9;
-    const CHECKSUM_TAG: u64 = 10;
-
-    let find_soh = |from: usize| {
-        bytes
-            .get(from..)
-            .and_then(|s| s.iter().position(|&b| b == SOH))
-            .map(|p| from + p)
-    };
-
-    // Field 1 must be BeginString(8) — matched by NUMERIC tag fold, so `08=…`
-    // is recognised too (see `split_field`).
-    let Some(soh1) = find_soh(0) else {
-        return Ok(()); // ironfix → Incomplete
-    };
-    if !matches!(split_field(&bytes[0..soh1]), Some((BEGIN_STRING_TAG, _))) {
-        return Ok(()); // ironfix → InvalidBeginString
-    }
-
-    // Field 2 must be BodyLength(9).
-    let bl_start = soh1 + 1;
-    let Some(soh2) = find_soh(bl_start) else {
-        return Ok(());
-    };
-    let digits = match split_field(&bytes[bl_start..soh2]) {
-        Some((BODY_LENGTH_TAG, value)) => value,
-        _ => return Ok(()), // ironfix → MissingBodyLength
-    };
-    // Parse the declared length; a non-usize (non-digit or overflow) is malformed.
-    let declared = match std::str::from_utf8(digits)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(value) => value,
-        None => {
-            return Err(FixDecodeError::InvalidBodyLength {
-                declared: truncate_untrusted(&String::from_utf8_lossy(digits)),
-                actual: 0,
-            });
-        }
-    };
-    let body_start = soh2 + 1;
-
-    // The last field must be CheckSum(10) — again by numeric fold, so `010=…`
-    // is recognised (the trailer locator has the identical blind spot).
-    if bytes.last() != Some(&SOH) {
-        return Ok(()); // ironfix → Incomplete
-    }
-    let trailing_soh = bytes.len() - 1;
-    let Some(prev_soh) = bytes[..trailing_soh].iter().rposition(|&b| b == SOH) else {
-        return Ok(());
-    };
-    let checksum_tag_start = prev_soh + 1;
-    if !matches!(
-        split_field(&bytes[checksum_tag_start..trailing_soh]),
-        Some((CHECKSUM_TAG, _))
-    ) {
-        return Ok(()); // not the checksum field where expected; let ironfix handle
-    }
-
-    // actual body length = [body_start, checksum_tag_start).
-    let actual = match checksum_tag_start.checked_sub(body_start) {
-        Some(value) => value,
-        None => {
-            return Err(FixDecodeError::InvalidBodyLength {
-                declared: truncate_untrusted(&String::from_utf8_lossy(digits)),
-                actual: 0,
-            });
-        }
-    };
-    if declared != actual {
-        return Err(FixDecodeError::InvalidBodyLength {
-            declared: truncate_untrusted(&String::from_utf8_lossy(digits)),
-            actual,
-        });
-    }
-    Ok(())
-}
-
-/// Guards `CheckSum (10)` before the `ironfix-tagvalue` codec — the belt for its
-/// `parse_checksum` fold (`d0*100 + d1*10 + d2` into a `u8`), which overflows
-/// (panicking in a debug build, wrapping in release) on any three-digit value
-/// `> 255`.
-///
-/// [`ironfix_tagvalue::Decoder::decode`] folds the value of the **first**
-/// `CheckSum (10)` field it reaches — wherever tag 10 occurs, not only the
-/// trailing field — so a duplicate or mid-body `10=` reaches `parse_checksum` and
-/// crashes, bypassing the framing-layer [`BoundedFrameDecoder`] precheck (which
-/// inspects only the positionally-trailing checksum at `total_length - 4`). This
-/// guard scans **every** `SOH`-delimited field by the same NUMERIC tag fold as
-/// [`split_field`] (so `010=` is caught too) and rejects any `CheckSum (10)`
-/// whose value is exactly three ASCII digits with a magnitude `> 255` — the exact
-/// input space that overflows the `u8` fold — applied to all occurrences rather
-/// than the trailing one alone.
-///
-/// Like [`validate_body_length`] it is deliberately permissive: a fold-safe
-/// checksum (three digits `<= 255`, the real `sum % 256` domain) still flows to
-/// the codec's actual sum check, and any tag-10 value that is not exactly three
-/// digits is deferred to `ironfix` — its `parse_checksum` returns `None` for a
-/// wrong length / a non-digit, so no overflow. The guard's own digit fold widens
-/// to `u16`, so it cannot itself overflow.
-///
-/// # Errors
-///
-/// [`FixDecodeError::MalformedChecksum`] for a `CheckSum (10)` field whose
-/// three-digit value exceeds `255`.
-fn reject_malformed_checksum(bytes: &[u8]) -> Result<(), FixDecodeError> {
-    /// SOH field delimiter.
-    const SOH: u8 = 0x01;
-    /// The `CheckSum (10)` tag, folded numerically.
-    const CHECKSUM_TAG: u64 = 10;
-    /// The largest value the `u8` checksum fold represents without overflow — the
-    /// domain of a conformant `sum % 256`.
-    const MAX_CHECKSUM: u16 = 255;
-
-    for field in bytes.split(|&b| b == SOH) {
-        let Some((tag, value)) = split_field(field) else {
-            continue;
-        };
-        if tag != CHECKSUM_TAG {
-            continue;
-        }
-        // Only an exactly-three-ASCII-digit value reaches `parse_checksum`'s u8
-        // fold; a different length or a non-digit makes it return `None` (no
-        // overflow), so defer that to the codec.
-        let &[d0, d1, d2] = value else {
-            continue;
-        };
-        if !(d0.is_ascii_digit() && d1.is_ascii_digit() && d2.is_ascii_digit()) {
-            continue;
-        }
-        // Widen to `u16` so the guard's own fold cannot overflow (max `999`).
-        let magnitude =
-            u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0');
-        if magnitude > MAX_CHECKSUM {
-            return Err(FixDecodeError::MalformedChecksum {
-                reason: "checksum value exceeds 255",
-            });
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,86 +376,112 @@ mod tests {
     const HEARTBEAT_BODY: &[u8] =
         b"35=0\x0149=CLIENT\x0156=VENUE\x0134=1\x0152=20240329-12:00:00.000\x01";
 
+    /// The reject class every framing/body-length/checksum failure now routes to,
+    /// via `FixDecodeError::Framing` — a session `Reject (3)` with
+    /// `IncorrectDataFormat`. The pre-#140 guards additionally pinned `ref_tag`
+    /// (9 / 10); the checked decoder does not, but the reject CLASS is preserved
+    /// (`RefTagID` is optional in FIX), which is the parity contract that matters.
+    fn assert_framing_incorrect_data_format(err: &FixDecodeError) {
+        assert!(
+            matches!(err, FixDecodeError::Framing(_)),
+            "expected a Framing reject, got {err:?}"
+        );
+        assert!(
+            matches!(
+                err.reject_route(),
+                FixRejectRoute::SessionReject {
+                    reason: SessionRejectReason::IncorrectDataFormat,
+                    ..
+                }
+            ),
+            "expected SessionReject/IncorrectDataFormat, got {:?}",
+            err.reject_route()
+        );
+    }
+
     #[test]
     fn test_decode_rejects_oversized_body_length_without_panic() {
-        // PoC: a valid-checksum frame whose declared BodyLength is u64::MAX. The
-        // ironfix codec's unchecked `body_start + body_length` would panic; our
-        // guard rejects it first with a typed error (no panic).
+        // #140 regression: a valid-checksum frame whose declared BodyLength is
+        // u64::MAX. ironfix-tagvalue 0.3.1's `Decoder` folds `body_start +
+        // body_length` with `checked_add`, so the overflow is a typed
+        // `DecodeError::InvalidBodyLength` (→ Framing) — no panic, in debug OR
+        // release. This is the equivalent reject the retired `validate_body_length`
+        // guard produced (same class, minus the `ref_tag: Some(9)` hint).
         let hostile = frame_with_declared_body_length("18446744073709551615", HEARTBEAT_BODY);
         match decode(&hostile) {
-            Err(FixDecodeError::InvalidBodyLength { actual, .. }) => {
-                assert_eq!(actual, HEARTBEAT_BODY.len());
-            }
-            other => panic!("expected InvalidBodyLength, got {other:?}"),
+            Err(err) => assert_framing_incorrect_data_format(&err),
+            Ok(msg) => panic!("expected a Framing reject, decoded {msg:?}"),
         }
     }
 
     #[test]
     fn test_decode_rejects_wrong_small_body_length() {
-        // A small-but-wrong declared length is equally malformed.
+        // A small-but-wrong declared length is equally malformed — the decoder's
+        // exact declared-vs-actual body-length match rejects it (→ Framing).
         let wrong = frame_with_declared_body_length("5", HEARTBEAT_BODY);
-        assert!(matches!(
-            decode(&wrong),
-            Err(FixDecodeError::InvalidBodyLength { .. })
-        ));
+        match decode(&wrong) {
+            Err(err) => assert_framing_incorrect_data_format(&err),
+            Ok(msg) => panic!("expected a Framing reject, decoded {msg:?}"),
+        }
     }
 
     #[test]
     fn test_decode_rejects_non_numeric_body_length() {
+        // A non-numeric BodyLength fails the decoder's own parse (→ Framing).
         let bad = frame_with_declared_body_length("notanumber", HEARTBEAT_BODY);
-        assert!(matches!(
-            decode(&bad),
-            Err(FixDecodeError::InvalidBodyLength { .. })
-        ));
+        match decode(&bad) {
+            Err(err) => assert_framing_incorrect_data_format(&err),
+            Ok(msg) => panic!("expected a Framing reject, decoded {msg:?}"),
+        }
     }
 
     #[test]
     fn test_decode_rejects_leading_zero_body_length_tag_without_panic() {
-        // Bypass PoC: `009=` folds to tag 9 for ironfix but is not `9=` to a
-        // literal-prefix guard, so a byte-prefix guard would defer and ironfix
-        // would panic on the unchecked add. The numeric-fold guard rejects it.
+        // Bypass PoC (was a leading-zero panic path): `009=` folds to tag 9. The
+        // 0.3.1 decoder folds the tag numerically AND uses `checked_add` on the
+        // declared length, so `009=<u64::MAX>` is a typed reject (→ Framing), never
+        // a panic — the zero-padded bypass is closed upstream.
         for label in ["009", "0009", "00009"] {
             let hostile =
                 frame_with_tag_labels(label, "18446744073709551615", "10", HEARTBEAT_BODY);
             match decode(&hostile) {
-                Err(FixDecodeError::InvalidBodyLength { .. }) => {}
-                other => panic!("expected InvalidBodyLength for `{label}=`, got {other:?}"),
+                Err(err) => assert_framing_incorrect_data_format(&err),
+                Ok(msg) => panic!("expected a Framing reject for `{label}=`, decoded {msg:?}"),
             }
         }
     }
 
     #[test]
     fn test_decode_rejects_leading_zero_checksum_tag_without_panic() {
-        // The trailer locator has the identical blind spot: `010=` folds to 10.
-        // With a huge declared BodyLength, a `010=` checksum tag must still be
-        // located (numeric fold) so declared != actual is caught before ironfix.
+        // The trailer locator's identical blind spot: `010=` folds to 10. The 0.3.1
+        // decoder tracks the first tag-10 by folded tag, so a huge declared
+        // BodyLength with a `010=` checksum is still a typed reject (→ Framing).
         let hostile = frame_with_tag_labels("9", "18446744073709551615", "010", HEARTBEAT_BODY);
         match decode(&hostile) {
-            Err(FixDecodeError::InvalidBodyLength { .. }) => {}
-            other => panic!("expected InvalidBodyLength for `010=` checksum, got {other:?}"),
+            Err(err) => assert_framing_incorrect_data_format(&err),
+            Ok(msg) => panic!("expected a Framing reject for `010=` checksum, decoded {msg:?}"),
         }
     }
 
     #[test]
     fn test_decode_does_not_false_reject_leading_zero_tags_with_correct_length() {
-        // No false-reject: leading-zero tags with a CORRECT BodyLength must not
-        // trip the guard (declared == actual). ironfix's own downstream decode
-        // is its business; the guard just must not raise InvalidBodyLength.
+        // No false-reject: leading-zero tags with a CORRECT BodyLength and a valid
+        // checksum decode cleanly (the decoder folds `009=`/`010=` numerically).
         let ok = frame_with_tag_labels(
             "009",
             &HEARTBEAT_BODY.len().to_string(),
             "010",
             HEARTBEAT_BODY,
         );
-        assert!(!matches!(
-            decode(&ok),
-            Err(FixDecodeError::InvalidBodyLength { .. })
-        ));
+        match decode(&ok) {
+            Ok(DecodedMessage::Heartbeat(_)) => {}
+            other => panic!("expected Heartbeat (no false reject), got {other:?}"),
+        }
     }
 
     #[test]
     fn test_decode_accepts_frame_with_correct_body_length() {
-        // A correctly-framed heartbeat passes the guard and decodes.
+        // A correctly-framed heartbeat decodes.
         let bytes = frame_with_body(HEARTBEAT_BODY);
         match decode(&bytes) {
             Ok(DecodedMessage::Heartbeat(_)) => {}
@@ -666,9 +490,9 @@ mod tests {
     }
 
     #[test]
-    fn test_encoder_produced_frame_passes_the_body_length_guard() {
-        // An encoder-produced frame's BodyLength always matches the guard's
-        // computed actual length — no false reject.
+    fn test_encoder_produced_frame_round_trips_through_decode() {
+        // An encoder-produced frame's BodyLength + CheckSum always match, so it
+        // decodes cleanly — no false reject from the checked decoder.
         let header = StandardHeader::new(
             CompId::new("CLIENT").expect("comp"),
             CompId::new("VENUE").expect("comp"),
@@ -685,54 +509,41 @@ mod tests {
 
     #[test]
     fn test_decode_rejects_mid_body_checksum_injection_without_panic() {
-        // Fuzzer crash (P1): a MarketDataRequest carrying an injected mid-body
-        // `10=624` BEFORE the real trailing checksum. `ironfix_tagvalue::Decoder`
-        // folds the FIRST tag-10 it reaches (`624`) through `parse_checksum`'s u8
-        // fold — `6*100` overflows u8 (panics in a debug build, wraps in release).
-        // The framing-layer precheck inspects only the positionally-trailing
-        // checksum, so this bypasses it and reaches `decode`; the pre-codec guard
-        // rejects it first with a typed error (no panic). Built through
-        // `frame_with_body` so the BodyLength(9) and the trailing CheckSum(10) are
-        // both valid — ONLY the injected mid-body tag-10 can fire the guard.
+        // #140 regression (the fuzzer-found P1): a MarketDataRequest carrying an
+        // injected mid-body `10=624` BEFORE the real trailing checksum. The 0.3.1
+        // decoder folds the FIRST tag-10 it reaches (`624`) through the CHECKED
+        // `parse_checksum` (u16 fold, range-checked to 0..=255), which returns None
+        // → `DecodeError::InvalidFieldValue{tag:10}` (→ Framing) — no u8-fold
+        // overflow and no panic. Equivalent to the retired `reject_malformed_checksum`
+        // guard's reject (same class, minus the `ref_tag: Some(10)` hint).
         let body = b"35=V\x0149=CLIENT\x0156=VENUE\x0134=1\x0152=20240329-12:00:00.000\x01262=MDR-1\x01263=1\x01264=0\x01267=1\x01269=0\x0110=624\x0155=BTC-20240329-50000-C\x01";
         let frame = frame_with_body(body);
         match decode(&frame) {
-            Err(err @ FixDecodeError::MalformedChecksum { .. }) => {
-                assert!(matches!(
-                    err.reject_route(),
-                    FixRejectRoute::SessionReject {
-                        reason: SessionRejectReason::IncorrectDataFormat,
-                        ref_tag: Some(10),
-                    }
-                ));
-            }
-            other => panic!("expected MalformedChecksum, got {other:?}"),
+            Err(err) => assert_framing_incorrect_data_format(&err),
+            Ok(msg) => panic!("expected a Framing reject, decoded {msg:?}"),
         }
     }
 
     #[test]
     fn test_decode_rejects_trailing_checksum_over_255_without_panic() {
-        // The positionally-trailing overflow vector, closed at the decode layer too
-        // (defence-in-depth for a direct `decode` caller that does not run the
-        // framing-layer precheck): a correctly-length-declared frame whose trailing
-        // CheckSum(10) is `624` (> 255) overflows `parse_checksum`'s u8 fold. The
-        // guard rejects it before the codec runs.
+        // The positionally-trailing overflow vector, likewise owned by the checked
+        // decoder: a correctly-length-declared frame whose trailing CheckSum(10) is
+        // `624` (> 255) makes `parse_checksum` return None → Framing, no panic.
         let mut frame = Vec::new();
         frame.extend_from_slice(b"8=FIX.4.4\x01");
         frame.extend_from_slice(format!("9={}\x01", HEARTBEAT_BODY.len()).as_bytes());
         frame.extend_from_slice(HEARTBEAT_BODY);
         frame.extend_from_slice(b"10=624\x01"); // trailing checksum > 255
         match decode(&frame) {
-            Err(FixDecodeError::MalformedChecksum { .. }) => {}
-            other => panic!("expected MalformedChecksum, got {other:?}"),
+            Err(err) => assert_framing_incorrect_data_format(&err),
+            Ok(msg) => panic!("expected a Framing reject, decoded {msg:?}"),
         }
     }
 
     #[test]
     fn test_decode_accepts_single_trailing_checksum_in_domain() {
         // The parallel positive case: a well-formed frame with exactly one trailing
-        // checksum in `000..=255` passes the checksum guard and decodes to its
-        // typed struct (the guard must not false-reject a conformant frame).
+        // checksum in `000..=255` decodes to its typed struct (no false reject).
         let bytes = frame_with_body(HEARTBEAT_BODY);
         match decode(&bytes) {
             Ok(DecodedMessage::Heartbeat(_)) => {}
@@ -741,31 +552,22 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_malformed_checksum_is_exhaustively_magnitude_bounded_mid_body() {
+    fn test_decode_never_panics_across_mid_body_checksum_space() {
         // Exhaustive over the full 3-digit input space `000..=999` in the MID-BODY
-        // position (the position `ironfix` folds first, bypassing the trailing-only
-        // framing precheck). Every value `> 255` overflows `parse_checksum`'s u8
-        // fold and MUST be rejected as `MalformedChecksum`; every value `<= 255` is
-        // fold-safe (the real `sum % 256` domain) and must NOT be rejected — the
-        // valid trailing checksum `frame_with_body` appends stays decodable. The
-        // guard is tested directly (its own fold widens to u16, so no panic across
-        // the space). Mirrors the framing-layer sweep in `acceptor.rs`.
+        // position (the position the decoder folds first), driven through the REAL
+        // `decode` — the retired guard's magnitude sweep, moved to prove the
+        // upstream checked fold. A mid-body `10=` always truncates the frame early,
+        // so EVERY value is a typed reject (→ Framing): `> 255` via `parse_checksum`
+        // returning None, `<= 255` via the resulting checksum/body-length mismatch.
+        // The loop completing IS the no-panic assertion, in a debug OR release build.
         for value in 0u16..=999 {
             let body = format!(
                 "35=V\x0149=CLIENT\x0156=VENUE\x0134=1\x0152=20240329-12:00:00.000\x0110={value:03}\x0155=BTC-20240329-50000-C\x01"
             );
             let frame = frame_with_body(body.as_bytes());
-            let outcome = reject_malformed_checksum(&frame);
-            if value > 255 {
-                assert!(
-                    matches!(outcome, Err(FixDecodeError::MalformedChecksum { .. })),
-                    "mid-body `10={value:03}` (> 255) must be rejected, got {outcome:?}"
-                );
-            } else {
-                assert!(
-                    outcome.is_ok(),
-                    "mid-body `10={value:03}` (<= 255) must not be rejected, got {outcome:?}"
-                );
+            match decode(&frame) {
+                Err(FixDecodeError::Framing(_)) => {}
+                other => panic!("mid-body `10={value:03}` must be a Framing reject, got {other:?}"),
             }
         }
     }
