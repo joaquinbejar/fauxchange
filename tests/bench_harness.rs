@@ -181,3 +181,26 @@ fn test_hp3_execution_report_fixture_round_trips() {
         other => panic!("HP-3 8 fixture must round-trip through decode, got {other:?}"),
     }
 }
+
+/// HP-3 (#043) golden-equality: the reconstructed `NewOrderSingle (D)` fixture
+/// must encode byte-for-byte to the committed #036 golden that the bench's
+/// decode span consumes directly (`tests/golden/fix/new_order_single_D.txt`), so
+/// the fixture and the golden can never silently drift apart — the gap #115
+/// closes. `new_order_single_frame()` returns the golden bytes (and asserts this
+/// same equality off the bench's timed path); comparing here proves it under
+/// `cargo test`, independently of a bench run.
+#[test]
+fn test_hp3_new_order_single_fixture_matches_committed_golden() {
+    let reconstructed = FixBody::encode(&fix_fixtures::new_order_single_fixture());
+    assert_eq!(reconstructed, fix_fixtures::new_order_single_frame());
+}
+
+/// HP-3 (#043) golden-equality for the encode span: the reconstructed
+/// `ExecutionReport (8)` fixture must encode byte-for-byte to the committed #036
+/// golden (`tests/golden/fix/execution_report_8.txt`) that the encode bench pins
+/// its output against.
+#[test]
+fn test_hp3_execution_report_fixture_matches_committed_golden() {
+    let reconstructed = FixBody::encode(&fix_fixtures::execution_report_fixture());
+    assert_eq!(reconstructed, fix_fixtures::execution_report_golden_frame());
+}

@@ -7,9 +7,14 @@
 //! / `tests/golden/fix/execution_report_8.txt`) — docs/07 §3-HP3 asks the perf
 //! bench to share fixtures with the pinned dialect (#036) rather than invent a
 //! parallel shape that could silently drift from what the wire actually
-//! carries. Built once, outside any measured loop: construction cost (string
-//! allocation, header building) must never pollute the decode/encode
-//! histograms, mirroring `workload.rs`'s "build outside the loop" convention.
+//! carries. To make "no drift" *enforced* rather than merely intended, the
+//! decode span consumes the committed golden bytes **directly** (`include_str!`,
+//! `|` converted back to SOH) and both fixtures **assert** byte-for-byte
+//! equality against their goldens off the timed path, so a dialect change the
+//! fixtures miss fails loudly instead of silently measuring a stale shape.
+//! Built once, outside any measured loop: construction cost (string allocation,
+//! header building) must never pollute the decode/encode histograms, mirroring
+//! `workload.rs`'s "build outside the loop" convention.
 
 use fauxchange::exchange::{Cents, SequenceNumber, SignedCents, Symbol};
 use fauxchange::gateway::fix::enums::{
@@ -68,23 +73,47 @@ pub fn new_order_single_fixture() -> NewOrderSingle {
     }
 }
 
-/// The complete wire frame for [`new_order_single_fixture`] — the HP-3
-/// decode span's fixed input, built once outside any measured loop.
+/// Converts a committed FIX golden's diff-readable form (`|` standing in for the
+/// SOH byte, exactly one trailing newline — the shape `tests/golden_fix.rs`
+/// writes with `UPDATE_GOLDEN=1`) back to the raw wire bytes it pins.
+fn golden_frame(display: &str) -> Vec<u8> {
+    display
+        .trim_end_matches('\n')
+        .replace('|', "\u{1}")
+        .into_bytes()
+}
+
+/// The committed `NewOrderSingle (D)` golden (`tests/golden/fix/new_order_single_D.txt`)
+/// as raw wire bytes — the HP-3 decode span's fixed input, consumed **directly**
+/// from the #036 golden so the bench measures the exact bytes the pinned dialect
+/// carries, never a parallel construction that could silently drift. Built once
+/// outside any measured loop.
 ///
 /// # Panics
 ///
-/// Panics if the fixture fails to decode back to a `NewOrderSingle` — a
-/// broken fixture would otherwise let the bench silently measure a reject
-/// path instead of the real decode span (`tests/bench_harness.rs` asserts
-/// this same property under `cargo test`, independently of this guard).
+/// Panics if the reconstructed [`new_order_single_fixture`] no longer encodes
+/// byte-for-byte to this golden (a drift guard, off the timed path — a dialect
+/// change the fixture missed fails loudly here), or if the golden bytes fail to
+/// decode back to a `NewOrderSingle` (which would let the bench silently measure
+/// a reject path). `tests/bench_harness.rs` asserts both properties under
+/// `cargo test`, independently of this guard.
 #[must_use]
 pub fn new_order_single_frame() -> Vec<u8> {
-    let frame = FixBody::encode(&new_order_single_fixture());
-    match decode(&frame) {
+    let golden = golden_frame(include_str!(
+        "../../tests/golden/fix/new_order_single_D.txt"
+    ));
+    let reconstructed = FixBody::encode(&new_order_single_fixture());
+    assert_eq!(
+        reconstructed, golden,
+        "HP-3 D fixture drifted from tests/golden/fix/new_order_single_D.txt; \
+         regenerate the golden (UPDATE_GOLDEN=1 cargo test --test golden_fix) and \
+         re-check new_order_single_fixture"
+    );
+    match decode(&golden) {
         Ok(DecodedMessage::NewOrderSingle(_)) => {}
-        other => panic!("HP-3 D fixture does not decode to NewOrderSingle: {other:?}"),
+        other => panic!("HP-3 D golden does not decode to NewOrderSingle: {other:?}"),
     }
-    frame
+    golden
 }
 
 /// The exact `ExecutionReport (8)` shape golden-tested by
@@ -114,4 +143,28 @@ pub fn execution_report_fixture() -> ExecutionReport {
         ord_rej_reason: None,
         text: None,
     }
+}
+
+/// The committed `ExecutionReport (8)` golden (`tests/golden/fix/execution_report_8.txt`)
+/// as raw wire bytes — the exact frame HP-3's encode span must render. The encode
+/// span's input is the typed [`execution_report_fixture`] (you cannot "encode a
+/// byte string"), so the bench asserts, off the timed path, that
+/// `FixBody::encode(&execution_report_fixture())` equals these bytes — a dialect
+/// change the fixture missed fails loudly there instead of measuring a stale
+/// shape. `tests/bench_harness.rs` asserts the same equality under `cargo test`.
+///
+/// # Panics
+///
+/// Panics if the golden bytes fail to decode back to an `ExecutionReport` — the
+/// pinned encode target must itself be a valid `8`.
+#[must_use]
+pub fn execution_report_golden_frame() -> Vec<u8> {
+    let golden = golden_frame(include_str!(
+        "../../tests/golden/fix/execution_report_8.txt"
+    ));
+    match decode(&golden) {
+        Ok(DecodedMessage::ExecutionReport(_)) => {}
+        other => panic!("HP-3 8 golden does not decode to ExecutionReport: {other:?}"),
+    }
+    golden
 }

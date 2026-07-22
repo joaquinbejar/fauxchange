@@ -80,6 +80,23 @@ The full versioning and release-process policy lives in the design docs
   the untrusted parse path without churning on the disclosed `p99.99` scheduler
   noise (the "measure first, then set the target with headroom" discipline #020
   used for HP-1).
+- **HP-3 bench consumes the committed FIX goldens + checked openloop arithmetic**
+  (#115). Two #43-review follow-ups (bench-harness quality, no shipping code):
+  - The HP-3 FIX-parse bench no longer measures a **second, drift-prone**
+    reconstruction of the goldens. The **decode** span now consumes the committed
+    `tests/golden/fix/new_order_single_D.txt` bytes directly (`include_str!`), and
+    the **encode** span asserts — off the timed path — that
+    `execution_report_fixture().encode()` is byte-for-byte the committed
+    `execution_report_8.txt` golden. `tests/bench_harness.rs` gains two
+    golden-equality tests, so a fixture drift fails under `cargo test`
+    (plain `assert!`, not `debug_assert!`, since a bench builds `--release`).
+  - `benches/support/openloop.rs` replaces the lossy coordinated-omission
+    schedule math (`u32::try_from(i).unwrap_or(u32::MAX)` + `saturating_mul` +
+    unchecked `Instant` add) with **checked** arithmetic: an up-front
+    `validate_schedule` (does `interval × (ops-1)` and `start + span` fit a
+    `Duration`/`Instant`?) and per-op `checked_mul`/`checked_add`, panicking with
+    a descriptive message naming the overflow rather than silently clamping to a
+    wrong intended-send time (the repo checked-arithmetic rule).
 
 ### Added
 
