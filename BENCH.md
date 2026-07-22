@@ -1085,11 +1085,15 @@ the 10 slowest samples, so a single OS-scheduler preemption on this shared,
 un-pinned developer laptop (background process, GC-style pause, whatever) can
 move it by an order of magnitude without the underlying decode/encode code
 doing anything different; this is disclosed exactly as HP-1's own p99.99
-run-to-run variance is (§3.1, §3.5). **Stating the actual numeric HP-3
-budget in `docs/07-performance-budgets.md` §3-HP3 is an `architect` follow-up
-against this grounding data** — outside this bench's own scope (measure and
-report, not set the design-doc target), consistent with how #020 refined
-HP-1's target only once real quantiles existed.
+run-to-run variance is (§3.1, §3.5). **The numeric HP-3 DESIGN TARGET is now
+stated in `docs/07-performance-budgets.md` §3-HP3, grounded in this data
+(`#107`): decode p99 ≤ 5 µs and encode p99 ≤ 2 µs on dev-laptop-class
+hardware** — comfortable headroom (roughly 2–4×) over the measured decode
+`p99`/`p99.9` of 1.08–2.54 µs and encode of 0.58–0.75 µs, deliberately loose so
+it flags a real order-of-magnitude regression on the untrusted parse path
+without churning on the disclosed `p99.99` scheduler noise. This mirrors how
+#020 refined HP-1's target only once real quantiles existed; measuring set the
+grounding, `#107` set the target.
 
 ### 11.2 Open-loop, coordinated-omission corrected, 3 000 ops at a ~2 ms intended interval
 
@@ -1147,10 +1151,12 @@ comparable sample counts) and should not be read as a stable figure.
   acceptor code path (not a reimplementation), reusing the pinned #036 golden
   fixtures.
 - **Does not prove**: a production SLA (this is one un-pinned developer
-  laptop, §1's own disclosed limitation, not a dedicated bench rig); a stated
-  HP-3 numeric budget in `docs/07-performance-budgets.md` (an `architect`
-  follow-up against this data, §11.1); or a clean isolation of decode/encode
-  cost under open-loop dispatch (§11.2's harness-overhead disclosure).
+  laptop, §1's own disclosed limitation, not a dedicated bench rig); or a clean
+  isolation of decode/encode cost under open-loop dispatch (§11.2's
+  harness-overhead disclosure). (The HP-3 numeric budget it *grounds* — decode
+  p99 ≤ 5 µs / encode p99 ≤ 2 µs — was set from this data by `#107`, stated in
+  §11.1 above and `docs/07-performance-budgets.md` §3-HP3; this bench measures
+  and grounds it, it did not itself establish the target.)
 - **CI regression gate**: not armed by this change — `#043` is scope-limited
   to landing the measured baseline; the CI `bench-regression` gate arms
   before v1.0 (#053, [07 §6](docs/07-performance-budgets.md#6-ci-regression-gate)),
