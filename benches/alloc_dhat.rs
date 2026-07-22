@@ -36,8 +36,11 @@
 //! ## Gating and safety
 //!
 //! Everything here is behind the OFF-by-default `dhat-heap` feature: the default
-//! `cargo bench`/`cargo test` compile a no-op `main`, and the `dhat`
-//! dev-dependency is pulled in only under this feature (or `--all-features`).
+//! `cargo bench`/`cargo test` compile a no-op `main`, and `dhat` is an OPTIONAL
+//! dependency gated by that feature (`dhat-heap = ["dep:dhat"]`), so a default
+//! build never resolves or compiles it or its backtrace stack (Cargo forbids an
+//! optional *dev*-dependency, so it lives in `[dependencies]` as optional — the
+//! dhat crate's own documented pattern; still never in the shipped build).
 //! `dhat`'s `unsafe impl GlobalAlloc` is vendored inside that dev-only crate;
 //! this file, like every file in the crate, contains zero `unsafe` and
 //! `src/lib.rs` keeps `#![forbid(unsafe_code)]`. Never in the shipped build.
@@ -55,6 +58,20 @@ mod support;
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
+
+/// A **checked** `u64` sum that fails loudly on overflow — a release bench build
+/// would otherwise wrap a `.sum()` into a convincing-but-false total, and a
+/// wrapped profiling number is worse than none (rules/global_rules.md).
+#[cfg(feature = "dhat-heap")]
+fn checked_sum(values: impl Iterator<Item = u64>, what: &str) -> u64 {
+    values.fold(0u64, |acc, value| {
+        acc.checked_add(value).unwrap_or_else(|| {
+            panic!(
+                "[alloc-dhat] {what} overflowed u64 — refusing to report a wrapped, false breakdown"
+            );
+        })
+    })
+}
 
 #[cfg(feature = "dhat-heap")]
 fn main() {
@@ -211,14 +228,23 @@ fn main() {
         }
     };
 
-    let total_blocks: u64 = parsed.pps.iter().map(|p| p.tbk).sum();
-    let total_bytes: u64 = parsed.pps.iter().map(|p| p.tb).sum();
+    // CHECKED folds (rules/global_rules.md): a release bench build would WRAP a
+    // `u64` `.sum()`/`+=` overflow into a convincing-but-false allocs/op breakdown.
+    // Fail loudly instead — a wrapped profiling number is worse than none.
+    let total_blocks = checked_sum(parsed.pps.iter().map(|p| p.tbk), "total allocation blocks");
+    let total_bytes = checked_sum(parsed.pps.iter().map(|p| p.tb), "total allocation bytes");
 
     let mut by_site: BTreeMap<String, (u64, u64)> = BTreeMap::new();
     for pp in &parsed.pps {
         let entry = by_site.entry(signature(pp, &parsed.ftbl)).or_insert((0, 0));
-        entry.0 += pp.tbk;
-        entry.1 += pp.tb;
+        entry.0 = entry
+            .0
+            .checked_add(pp.tbk)
+            .expect("[alloc-dhat] per-call-site block count overflowed u64 (corrupt dhat profile)");
+        entry.1 = entry
+            .1
+            .checked_add(pp.tb)
+            .expect("[alloc-dhat] per-call-site byte count overflowed u64 (corrupt dhat profile)");
     }
     let mut ranked: Vec<(String, u64, u64)> = by_site
         .into_iter()
