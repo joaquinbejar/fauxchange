@@ -20,6 +20,7 @@
 //!   config error, not a hidden duplicate.
 
 use std::fmt;
+use std::sync::Arc;
 
 use option_chain_orderbook::utils::format_expiration_yyyymmdd;
 use option_chain_orderbook::{ParsedSymbol, SymbolParser};
@@ -72,17 +73,27 @@ pub enum SymbolError {
 
 /// A validated canonical venue symbol: `UNDERLYING-YYYYMMDD-STRIKE-STYLE`.
 ///
-/// The inner `String` is private and always the canonical, normalized form
+/// The inner string is private and always the canonical, normalized form
 /// produced by the upstream [`SymbolParser`] (e.g. a lowercase `c` style is
 /// normalized to `C`). Constructing a `Symbol` guarantees it re-parses to the
 /// same value, so it is safe to use as a map key and wire identity.
+///
+/// It is stored as an [`Arc<str>`](std::sync::Arc) so that a `Symbol::clone()`
+/// on a hot path — the market-maker requote fans one contract symbol across up
+/// to four `VenueCommand`s plus two internal tracking maps per tick (#122) — is
+/// a reference-count bump, not a heap allocation. This is a purely internal
+/// representation choice: the wire form is **unchanged** — `Symbol`'s serde
+/// projects through `String` (`try_from` / `into` below), never a transparent
+/// `Arc<str>` forward, so the JSON/FIX/journal bytes are byte-identical and no
+/// serde `rc` feature is required. The one owned `String` is materialised only
+/// at the serialize seam (`From<Symbol> for String`), exactly as before.
 ///
 /// On the wire it is a bare JSON string (`#[serde(try_from = "String", into =
 /// "String")]`), and deserialisation re-validates through `SymbolParser` — an
 /// invalid string cannot bypass the grammar.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
-pub struct Symbol(String);
+pub struct Symbol(Arc<str>);
 
 impl Symbol {
     /// Parses a canonical symbol string through the upstream [`SymbolParser`].
@@ -120,7 +131,7 @@ impl Symbol {
     /// without re-parsing.
     #[inline]
     pub(crate) fn from_parsed(parsed: &ParsedSymbol) -> Self {
-        Self(parsed.to_symbol())
+        Self(Arc::from(parsed.to_symbol()))
     }
 
     /// Returns the canonical symbol string.
@@ -150,7 +161,7 @@ impl TryFrom<String> for Symbol {
 impl From<Symbol> for String {
     #[inline]
     fn from(symbol: Symbol) -> Self {
-        symbol.0
+        symbol.0.to_string()
     }
 }
 

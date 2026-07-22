@@ -31,6 +31,30 @@ The full versioning and release-process policy lives in the design docs
     predicate (`recv_frames_until`) with a bounded deadline. The
     `requote_isolation` p99-tolerance backstop was widened (documented) to
     absorb cross-binary scheduler noise while still catching a real regression.
+- **Cut the HP-4 requote steady-state allocation count** (#122). `#50` measured
+  `MarketMakerEngine::update_price` requoting a 10-contract chain at **343
+  allocs/op, 6663 bytes/op** (the honest baseline, not a met target). This
+  reduces the genuinely-reducible **venue plumbing** to **232 allocs/op, 3513
+  bytes/op** (**−32% / −47%**, deterministic across runs) with three
+  **wire-form-preserving** representation changes (requote output asserted
+  byte-identical):
+  - `Symbol` now holds an `Arc<str>` — the ~7 `Symbol` clones a single-instrument
+    requote fans across the tracking maps + up to four `VenueCommand`s become
+    refcount bumps. Wire-safe: `Symbol` serializes via `#[serde(try_from =
+    "String", into = "String")]` (not a transparent `Arc<str>`), so JSON/FIX/
+    journal bytes are identical and **no serde `rc` feature is pulled**.
+  - The market-maker instrument's `underlying` is interned as `Arc<str>` (kills
+    two `to_string()` per instrument), and `requote_symbol` reuses a per-engine
+    scratch buffer instead of deep-cloning the whole instrument `Vec` each tick
+    (the `instruments` read lock is still released before the quote loop — no
+    lock across a sink enqueue/broadcast).
+  - **Honestly re-scoped residual** (BENCH.md §6/§12.4/§13.3, dated): the
+    remaining 232 is ~half the mandated `optionstratlib` Black-Scholes/Greeks eval
+    (a **named upstream-bound** cost — pricing is not reimplemented) and the
+    `AccountId`/`VenueOrderId` owned-`String` clones on emitted commands (interning
+    those `#[serde(transparent)]` DTOs needs a wire/schema change — a **tracked
+    follow-up**, out of scope for this in-plumbing pass). 232 stays under the
+    existing §13.3 gate ceiling. No fabricated "zero-alloc".
 
 ### Added
 
