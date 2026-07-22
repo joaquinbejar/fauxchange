@@ -526,32 +526,48 @@ const PER_ELEMENT_ESTIMATE_BYTES: usize = 512;
 /// [`check_record_size`] and is refused. The estimate is a conservative
 /// over-estimate that at worst triggers the exact check needlessly (for a
 /// multi-thousand-leg single-turn sweep, far beyond realistic depth); it can
-/// never let an over-ceiling record through. Arithmetic saturates (never wraps)
-/// so a hostile huge input pins the estimate at `usize::MAX` — over the ceiling,
-/// exact check runs — rather than overflowing.
+/// never let an over-ceiling record through. Arithmetic is **checked** (the repo
+/// forbids saturating arithmetic): an overflow yields `None`, which the caller
+/// treats exactly like an over-ceiling estimate — it forces the exact
+/// [`check_record_size`] (or reject), never a silent `usize::MAX` estimate.
+///
+/// # Returns
+///
+/// `Some(estimate)` (the conservative over-estimate) normally, or `None` if the
+/// estimate arithmetic overflows `usize` — an astronomically-huge input that could
+/// not fit in memory anyway; the caller runs the exact check on `None`.
 #[must_use]
-fn estimated_max_serialized_len(record: &JournalRecord) -> usize {
-    let mut string_bytes: usize = 0;
-    let mut elements: usize = 0;
+fn estimated_max_serialized_len(record: &JournalRecord) -> Option<usize> {
+    let mut string_bytes: Option<usize> = Some(0);
+    let mut elements: Option<usize> = Some(0);
     match record {
         JournalRecord::Command(command) => {
             accumulate_command_estimate(&command.command, &mut string_bytes, &mut elements);
         }
         JournalRecord::Event(event) => {
-            string_bytes = string_bytes.saturating_add(event.schema.len());
+            add_estimate(&mut string_bytes, event.schema.len());
             accumulate_command_estimate(&event.command, &mut string_bytes, &mut elements);
             accumulate_outcome_estimate(&event.outcome, &mut string_bytes, &mut elements);
         }
         JournalRecord::Epoch(marker) => {
-            string_bytes = string_bytes
-                .saturating_add(marker.schema.len())
-                .saturating_add(marker.snapshot_id.len())
-                .saturating_add(marker.lineage_id.as_str().len());
+            add_estimate(&mut string_bytes, marker.schema.len());
+            add_estimate(&mut string_bytes, marker.snapshot_id.len());
+            add_estimate(&mut string_bytes, marker.lineage_id.as_str().len());
         }
     }
+    let string_contribution = string_bytes?.checked_mul(JSON_STRING_ESCAPE_FACTOR)?;
+    let element_contribution = elements?.checked_mul(PER_ELEMENT_ESTIMATE_BYTES)?;
     RECORD_ESTIMATE_BASE_BYTES
-        .saturating_add(string_bytes.saturating_mul(JSON_STRING_ESCAPE_FACTOR))
-        .saturating_add(elements.saturating_mul(PER_ELEMENT_ESTIMATE_BYTES))
+        .checked_add(string_contribution)?
+        .checked_add(element_contribution)
+}
+
+/// Adds `n` to a running estimate, propagating a `usize` overflow as `None` — the
+/// checked accumulator behind [`estimated_max_serialized_len`] (the repo forbids
+/// saturating arithmetic; an overflowed estimate forces the exact size check).
+#[inline]
+fn add_estimate(acc: &mut Option<usize>, n: usize) {
+    *acc = acc.and_then(|value| value.checked_add(n));
 }
 
 /// Adds a [`VenueCommand`]'s variable-length string byte lengths to
@@ -561,8 +577,8 @@ fn estimated_max_serialized_len(record: &JournalRecord) -> usize {
 /// [`RECORD_ESTIMATE_BASE_BYTES`].
 fn accumulate_command_estimate(
     command: &VenueCommand,
-    string_bytes: &mut usize,
-    _elements: &mut usize,
+    string_bytes: &mut Option<usize>,
+    _elements: &mut Option<usize>,
 ) {
     match command {
         VenueCommand::AddOrder {
@@ -572,12 +588,11 @@ fn accumulate_command_estimate(
             client_order_id,
             ..
         } => {
-            *string_bytes = string_bytes
-                .saturating_add(symbol.as_str().len())
-                .saturating_add(order_id.as_str().len())
-                .saturating_add(account.as_str().len());
+            add_estimate(string_bytes, symbol.as_str().len());
+            add_estimate(string_bytes, order_id.as_str().len());
+            add_estimate(string_bytes, account.as_str().len());
             if let Some(client_order_id) = client_order_id {
-                *string_bytes = string_bytes.saturating_add(client_order_id.as_str().len());
+                add_estimate(string_bytes, client_order_id.as_str().len());
             }
         }
         VenueCommand::CancelOrder {
@@ -585,10 +600,9 @@ fn accumulate_command_estimate(
             order_id,
             account,
         } => {
-            *string_bytes = string_bytes
-                .saturating_add(symbol.as_str().len())
-                .saturating_add(order_id.as_str().len())
-                .saturating_add(account.as_str().len());
+            add_estimate(string_bytes, symbol.as_str().len());
+            add_estimate(string_bytes, order_id.as_str().len());
+            add_estimate(string_bytes, account.as_str().len());
         }
         VenueCommand::Replace {
             symbol,
@@ -597,23 +611,22 @@ fn accumulate_command_estimate(
             account,
             ..
         } => {
-            *string_bytes = string_bytes
-                .saturating_add(symbol.as_str().len())
-                .saturating_add(order_id.as_str().len())
-                .saturating_add(new_order_id.as_str().len())
-                .saturating_add(account.as_str().len());
+            add_estimate(string_bytes, symbol.as_str().len());
+            add_estimate(string_bytes, order_id.as_str().len());
+            add_estimate(string_bytes, new_order_id.as_str().len());
+            add_estimate(string_bytes, account.as_str().len());
         }
         VenueCommand::MassCancel { scope, account, .. } => {
             if let MassCancelScope::Book(symbol) = scope {
-                *string_bytes = string_bytes.saturating_add(symbol.as_str().len());
+                add_estimate(string_bytes, symbol.as_str().len());
             }
-            *string_bytes = string_bytes.saturating_add(account.as_str().len());
+            add_estimate(string_bytes, account.as_str().len());
         }
         VenueCommand::SetInstrumentStatus { symbol, .. } => {
-            *string_bytes = string_bytes.saturating_add(symbol.as_str().len());
+            add_estimate(string_bytes, symbol.as_str().len());
         }
         VenueCommand::SimStep { underlying, .. } => {
-            *string_bytes = string_bytes.saturating_add(underlying.len());
+            add_estimate(string_bytes, underlying.len());
         }
         VenueCommand::EvictExpiredOrders { .. }
         | VenueCommand::MarketMakerControl { .. }
@@ -625,8 +638,8 @@ fn accumulate_command_estimate(
 /// element count to the running totals.
 fn accumulate_outcome_estimate(
     outcome: &VenueOutcome,
-    string_bytes: &mut usize,
-    elements: &mut usize,
+    string_bytes: &mut Option<usize>,
+    elements: &mut Option<usize>,
 ) {
     match outcome {
         VenueOutcome::Added {
@@ -643,7 +656,7 @@ fn accumulate_outcome_estimate(
             accumulate_legs_estimate(stp_cancelled, string_bytes, elements);
         }
         VenueOutcome::Cancelled { order_id } => {
-            *string_bytes = string_bytes.saturating_add(order_id.as_str().len());
+            add_estimate(string_bytes, order_id.as_str().len());
         }
         VenueOutcome::Replace { add, .. } => {
             accumulate_add_outcome_estimate(add, string_bytes, elements);
@@ -652,17 +665,24 @@ fn accumulate_outcome_estimate(
             accumulate_legs_estimate(affected, string_bytes, elements);
         }
         VenueOutcome::InstrumentStatusChanged { symbol, .. } => {
-            *string_bytes = string_bytes.saturating_add(symbol.as_str().len());
+            add_estimate(string_bytes, symbol.as_str().len());
         }
         VenueOutcome::Evicted { evicted } => {
             for order_id in evicted {
-                *elements = elements.saturating_add(1);
-                *string_bytes = string_bytes.saturating_add(order_id.as_str().len());
+                add_estimate(elements, 1);
+                add_estimate(string_bytes, order_id.as_str().len());
             }
         }
-        VenueOutcome::ControlApplied => {}
-        VenueOutcome::Rejected { reason } => {
-            *string_bytes = string_bytes.saturating_add(reason.len());
+        // A kill's coupled owner-scoped sweep (#117) rides on `ControlApplied.swept`,
+        // so it carries the same per-leg `CancelledLeg` bytes a `MassCancelled` does.
+        VenueOutcome::ControlApplied { swept } => {
+            accumulate_legs_estimate(swept, string_bytes, elements);
+        }
+        VenueOutcome::Rejected { reason, .. } => {
+            add_estimate(string_bytes, reason.len());
+        }
+        VenueOutcome::Duplicate { terminal, .. } => {
+            accumulate_outcome_estimate(terminal, string_bytes, elements);
         }
     }
 }
@@ -671,8 +691,8 @@ fn accumulate_outcome_estimate(
 /// the running totals (the add half of a non-atomic [`VenueOutcome::Replace`]).
 fn accumulate_add_outcome_estimate(
     add: &AddOutcome,
-    string_bytes: &mut usize,
-    elements: &mut usize,
+    string_bytes: &mut Option<usize>,
+    elements: &mut Option<usize>,
 ) {
     match add {
         AddOutcome::Filled {
@@ -687,8 +707,8 @@ fn accumulate_add_outcome_estimate(
             accumulate_fills_estimate(fills, string_bytes, elements);
             accumulate_legs_estimate(stp_cancelled, string_bytes, elements);
         }
-        AddOutcome::Rejected { reason } => {
-            *string_bytes = string_bytes.saturating_add(reason.len());
+        AddOutcome::Rejected { reason, .. } => {
+            add_estimate(string_bytes, reason.len());
         }
     }
 }
@@ -696,23 +716,31 @@ fn accumulate_add_outcome_estimate(
 /// Counts each [`Fill`] as one element and adds its three variable-length id
 /// strings' byte lengths (the fixed-size `owner`, `price`, `quantity`, `fee`,
 /// `side`, `liquidity` are covered by [`PER_ELEMENT_ESTIMATE_BYTES`]).
-fn accumulate_fills_estimate(fills: &[Fill], string_bytes: &mut usize, elements: &mut usize) {
+fn accumulate_fills_estimate(
+    fills: &[Fill],
+    string_bytes: &mut Option<usize>,
+    elements: &mut Option<usize>,
+) {
     for fill in fills {
-        *elements = elements.saturating_add(1);
-        *string_bytes = string_bytes
-            .saturating_add(fill.execution_id.as_str().len())
-            .saturating_add(fill.order_id.as_str().len())
-            .saturating_add(fill.account.as_str().len());
+        add_estimate(elements, 1);
+        add_estimate(string_bytes, fill.execution_id.as_str().len());
+        add_estimate(string_bytes, fill.order_id.as_str().len());
+        add_estimate(string_bytes, fill.account.as_str().len());
     }
 }
 
 /// Counts each [`CancelledLeg`] as one element and adds its variable-length
-/// `order_id` string byte length (the fixed-size `owner` and `reason` are
-/// covered by [`PER_ELEMENT_ESTIMATE_BYTES`]).
-fn accumulate_legs_estimate(legs: &[CancelledLeg], string_bytes: &mut usize, elements: &mut usize) {
+/// `order_id`, `symbol`, and `side`-free id string byte lengths (the fixed-size
+/// `owner` and `reason` are covered by [`PER_ELEMENT_ESTIMATE_BYTES`]).
+fn accumulate_legs_estimate(
+    legs: &[CancelledLeg],
+    string_bytes: &mut Option<usize>,
+    elements: &mut Option<usize>,
+) {
     for leg in legs {
-        *elements = elements.saturating_add(1);
-        *string_bytes = string_bytes.saturating_add(leg.order_id.as_str().len());
+        add_estimate(elements, 1);
+        add_estimate(string_bytes, leg.order_id.as_str().len());
+        add_estimate(string_bytes, leg.symbol.as_str().len());
     }
 }
 
@@ -885,7 +913,10 @@ impl VenueJournal for InMemoryVenueJournal {
         // bound never under-estimates past the ceiling, so any record that would
         // exceed it still falls through to the exact `check_record_size` and is
         // refused — the write ≤ read symmetry invariant is exact.
-        if estimated_max_serialized_len(&record) > MAX_JOURNAL_RECORD_BYTES {
+        // `None` = the estimate arithmetic overflowed `usize` (an impossibly-huge
+        // input) — treat it exactly like an over-ceiling estimate and force the exact
+        // check, never a silent pass.
+        if estimated_max_serialized_len(&record).is_none_or(|est| est > MAX_JOURNAL_RECORD_BYTES) {
             check_record_size(&record)?;
         }
         let sequence = record.sequence();
@@ -1487,7 +1518,7 @@ mod tests {
                 Ok(json) => json.len(),
                 Err(e) => panic!("serialize failed: {e}"),
             };
-            let estimate = estimated_max_serialized_len(record);
+            let estimate = estimated_max_serialized_len(record).expect("estimate in range");
             assert!(
                 estimate >= actual,
                 "estimate {estimate} must be >= actual {actual} for {record:?}"
@@ -1500,11 +1531,17 @@ mod tests {
         // A realistic small record's estimate is far under the ceiling, so the fast
         // path skips the exact serialize.
         let small = added_event_with_fills(3, 4);
-        assert!(estimated_max_serialized_len(&small) <= MAX_JOURNAL_RECORD_BYTES);
+        assert!(
+            estimated_max_serialized_len(&small).expect("estimate in range")
+                <= MAX_JOURNAL_RECORD_BYTES
+        );
         // An over-ceiling huge-string record's estimate is over the ceiling, so it
         // falls through to the exact `check_record_size` — which refuses it.
         let oversized = oversized_record(0);
-        assert!(estimated_max_serialized_len(&oversized) > MAX_JOURNAL_RECORD_BYTES);
+        assert!(
+            estimated_max_serialized_len(&oversized).expect("estimate in range")
+                > MAX_JOURNAL_RECORD_BYTES
+        );
     }
 
     #[test]
@@ -1534,7 +1571,10 @@ mod tests {
                 account: AccountId::new("acct-1"),
             },
         );
-        assert!(estimated_max_serialized_len(&near) > MAX_JOURNAL_RECORD_BYTES);
+        assert!(
+            estimated_max_serialized_len(&near).expect("estimate in range")
+                > MAX_JOURNAL_RECORD_BYTES
+        );
         assert!(check_record_size(&near).is_ok());
         assert!(journal.append(near.clone()).is_ok());
         assert_eq!(
