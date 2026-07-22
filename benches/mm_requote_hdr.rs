@@ -84,6 +84,7 @@ use fauxchange::exchange::{
     MatchingExecutor, NoopFanOut, StoreFanOut, TeeFanOut, spawn_underlying_actor,
 };
 use fauxchange::market_maker::{ActorCommandSink, CommandSink};
+use fauxchange::microstructure::MicrostructureConfig;
 
 use support::hdr::{new_histogram, record_duration, report};
 use support::mm_workload::{CountingSink, MM_UNDERLYING, build_engine, chain_len};
@@ -130,7 +131,13 @@ fn spawn_mailbox_sink(capacity: usize) -> (Arc<ActorCommandSink>, ActorHandle) {
     drop(join);
     let mut handles = HashMap::new();
     handles.insert(Arc::from(MM_UNDERLYING), handle.clone());
-    let sink = ActorCommandSink::with_capacity(handles, capacity);
+    // The default baseline band admits the in-band bench workload prices; the sink
+    // admits each requote against it exactly as the live venue does (#109).
+    let sink = ActorCommandSink::with_capacity(
+        handles,
+        Arc::new(MicrostructureConfig::default()),
+        capacity,
+    );
     (sink, handle)
 }
 

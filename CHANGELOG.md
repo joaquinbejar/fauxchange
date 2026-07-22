@@ -201,6 +201,27 @@ The full versioning and release-process policy lives in the design docs
     is the only on-the-wire `RptSeq` on a FIX MD subscription" invariant;
     per-fill detail already reaches a FIX client via `ExecutionReport(8)`.
     Documented in `docs/specs/fix-dialect.md` §2.3 + `docs/03` §5.4.
+- **Venue price band enforced on the market-maker + simulation producer seams**
+  (#109). The venue-owned `min_price_cents` / `max_price_cents` admission band
+  (`MicrostructureConfig::admit_price`) was enforced at the user order seam
+  (`AppState::submit`) + the replay re-execution seam, but the **internal
+  producers** bypassed it — a band-unaware MM requote or a simulation price step
+  could rest **outside** the band. Both seams now enforce the SAME band (the
+  existing `admit_price` / `check_price_band`, not a forked check):
+  - **MM requote (`ActorCommandSink`) drops** a band-violating quote before it
+    is submitted or journaled (logged `debug`); each requote leg is its own
+    `VenueCommand`, so the out-of-band side drops while the in-band side still
+    posts, and a `CancelOrder` (no price) is never band-blocked.
+  - **Simulation step (`VenueStepSink`) rejects** an out-of-band reference price
+    at `apply_step` (returns `false`), so it is never sequenced, drives no
+    requote, and — honoring the journal-before-publish contract — publishes no
+    price.
+  - Both drops happen **before** the write-ahead journal append, so an
+    out-of-band item is simply never in the journal — replay reproduces the
+    identical admitted stream (proved by `test_band_drop_is_identical_across_two_runs`).
+    The band is now an unconditional venue-wide admission invariant (gateway +
+    replay + both internal producers), which makes the checked-fee proof
+    unconditional.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;
