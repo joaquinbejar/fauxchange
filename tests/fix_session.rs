@@ -215,6 +215,23 @@ fn cancel_frame(
     frame_with_body(body.as_bytes())
 }
 
+/// An `OrderCancelReplaceRequest (G)` re-pricing/re-sizing `orig_cl_ord_id`.
+#[allow(clippy::too_many_arguments)]
+fn replace_frame(
+    sender: &str,
+    target: &str,
+    seq: u64,
+    orig_cl_ord_id: &str,
+    cl_ord_id: &str,
+    price: &str,
+    qty: u64,
+) -> Vec<u8> {
+    let body = format!(
+        "35=G\x0149={sender}\x0156={target}\x0134={seq}\x0152=20240329-12:00:00.000\x0141={orig_cl_ord_id}\x0111={cl_ord_id}\x0155=BTC-20240329-50000-C\x0154=1\x0160=20240329-12:00:00.000\x0140=2\x0144={price}\x0138={qty}\x0159=1\x01"
+    );
+    frame_with_body(body.as_bytes())
+}
+
 /// A `MarketDataRequest (V)`: `sub_type` (`1`=snap+updates / `2`=unsubscribe),
 /// `depth` (`0`=full book), and the `MDEntryType (269)` group values (`0`=Bid /
 /// `1`=Offer / `2`=Trade) for one symbol.
@@ -935,6 +952,507 @@ async fn test_cancel_of_unknown_order_is_order_cancel_reject_9() {
         field(reject, "41").as_deref(),
         Some("never-placed"),
         "the OrigClOrdID is echoed"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_session_cancel_of_an_already_gone_order_is_masked_9_not_a_false_canceled() {
+    // #098 fix 3: a stale index entry that still RESOLVES (the AddOrder recorded it)
+    // but whose order is no longer resting — cancelled on a prior connection — makes
+    // the sequenced cancel capture a `VenueOutcome::Rejected`. The gateway MUST render
+    // the OBSERVED outcome as an indistinguishable masked `9`, NEVER a false `8
+    // Canceled`. Session 1 places then cancels `stale-1`; session 2 re-cancels it.
+    let harness = Harness::start().await;
+
+    let mut first = logon_trader(harness.addr).await;
+    first
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "stale-1",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("place");
+    let _ = recv_frames_until(&mut first, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
+    first
+        .write_all(&cancel_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            "stale-1",
+            "cxl-first",
+        ))
+        .await
+        .expect("cancel");
+    let canceled = recv_frames_until(&mut first, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("4")
+    })
+    .await;
+    assert!(
+        canceled
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("4")),
+        "session 1 cancels the order (8, ExecType 4), got {canceled:?}"
+    );
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Session 2 — a fresh connection. The venue index still resolves `stale-1` (the
+    // AddOrder recorded it; a cancel does not retire it), but the order is gone, so
+    // the sequenced cancel is `Rejected` → a masked `9`, never an `8 Canceled`.
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut second, Duration::from_secs(3)).await, "A"),
+        "the reconnect is admitted"
+    );
+    second
+        .write_all(&cancel_frame(
+            TRADER_SENDER,
+            VENUE,
+            5,
+            "stale-1",
+            "cxl-second",
+        ))
+        .await
+        .expect("re-cancel");
+    let reply = recv_frames_until(&mut second, Duration::from_secs(10), |f| {
+        matches!(msg_type(f).as_deref(), Some("8") | Some("9"))
+    })
+    .await;
+    assert!(
+        any_msg_type(&reply, "9")
+            && !reply
+                .iter()
+                .any(|f| msg_type(f).as_deref() == Some("8")
+                    && field(f, "150").as_deref() == Some("4")),
+        "a re-cancel of an already-gone order is a masked 9, never a false 8 Canceled, \
+         got {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_session_cancel_of_a_prior_session_order_succeeds() {
+    // #098: place a resting order on one FIX connection under a ClOrdID, drop the
+    // connection, then cancel that same OrigClOrdID on a NEW connection. Before
+    // #098 the new session's correlation map was empty → 9 Unknown order; now the
+    // account-scoped venue index resolves it cross-session → 8 Canceled.
+    let harness = Harness::start().await;
+
+    let mut first = logon_trader(harness.addr).await;
+    first
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "xsession-1",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("place");
+    let placed = recv_frames_until(&mut first, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
+    assert!(
+        placed
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("0")),
+        "the order rests (New) in session 1, got {placed:?}"
+    );
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Session 2 — a brand-new connection with an empty per-session map.
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    let ack = recv_frames(&mut second, Duration::from_secs(3)).await;
+    assert!(any_msg_type(&ack, "A"), "the reconnect is admitted");
+    second
+        .write_all(&cancel_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            "xsession-1",
+            "cxl-xs",
+        ))
+        .await
+        .expect("cancel");
+    let reply = recv_frames_until(&mut second, Duration::from_secs(10), |f| {
+        (msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("4"))
+            || msg_type(f).as_deref() == Some("9")
+    })
+    .await;
+    assert!(
+        !any_msg_type(&reply, "9"),
+        "a cross-session cancel is no longer 9 Unknown order, got {reply:?}"
+    );
+    assert!(
+        reply
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("4")),
+        "the prior-session order is Canceled (8, ExecType 4), got {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_session_replace_of_a_prior_session_order_succeeds() {
+    // #098: the replace (G) leg of the same cross-session correlation — place on
+    // one connection, replace that OrigClOrdID on a new one → 8 Replaced, not 9.
+    let harness = Harness::start().await;
+
+    let mut first = logon_trader(harness.addr).await;
+    first
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "xrepl-1",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("place");
+    let _ = recv_frames_until(&mut first, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    let ack = recv_frames(&mut second, Duration::from_secs(3)).await;
+    assert!(any_msg_type(&ack, "A"), "the reconnect is admitted");
+    second
+        .write_all(&replace_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            "xrepl-1",
+            "xrepl-2",
+            "450.00",
+            2,
+        ))
+        .await
+        .expect("replace");
+    let reply = recv_frames_until(&mut second, Duration::from_secs(10), |f| {
+        (msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("5"))
+            || msg_type(f).as_deref() == Some("9")
+    })
+    .await;
+    assert!(
+        !any_msg_type(&reply, "9"),
+        "a cross-session replace is no longer 9 Unknown order, got {reply:?}"
+    );
+    assert!(
+        reply
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("5")),
+        "the prior-session order is Replaced (8, ExecType 5), got {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_session_replace_rekeys_the_shared_index_new_id_cancels_old_id_masked() {
+    // #098 fix 4: a committed replace must update the JOURNAL-DERIVED shared index —
+    // publish `(account, new_ClOrdID) → new_order_id` and retire the stale
+    // `(account, OrigClOrdID)`. So on a THIRD, fresh connection: a cancel by the NEW
+    // ClOrdID succeeds (the replacement is cross-session correlatable), and a cancel
+    // by the OLD ClOrdID is an indistinguishable masked `9` (its entry was retired —
+    // the original was cancelled by the replace's cancel leg).
+    let harness = Harness::start().await;
+
+    // Session 1 — place a resting sell under `rk-1`.
+    let mut first = logon_trader(harness.addr).await;
+    first
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "rk-1",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("place");
+    let _ = recv_frames_until(&mut first, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Session 2 — replace `rk-1` → `rk-2` (rests at the new price).
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut second, Duration::from_secs(3)).await, "A"),
+        "the second logon is admitted"
+    );
+    second
+        .write_all(&replace_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            "rk-1",
+            "rk-2",
+            "450.00",
+            2,
+        ))
+        .await
+        .expect("replace");
+    let replaced = recv_frames_until(&mut second, Duration::from_secs(10), |f| {
+        (msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("5"))
+            || msg_type(f).as_deref() == Some("9")
+    })
+    .await;
+    assert!(
+        replaced
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("5")),
+        "the replace is Replaced (8, ExecType 5), got {replaced:?}"
+    );
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Session 3 — a fresh connection resolving ONLY through the shared venue index.
+    let mut third = connect(harness.addr).await;
+    third
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            5,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut third, Duration::from_secs(3)).await, "A"),
+        "the third logon is admitted"
+    );
+
+    // (a) The OLD ClOrdID was retired: a cancel by it is an indistinguishable masked
+    // `9` (never an `8 Canceled`) — it no longer resolves to a live order.
+    third
+        .write_all(&cancel_frame(TRADER_SENDER, VENUE, 6, "rk-1", "cxl-old"))
+        .await
+        .expect("cancel old");
+    let old = recv_frames_until(&mut third, Duration::from_secs(10), |f| {
+        matches!(msg_type(f).as_deref(), Some("8") | Some("9"))
+    })
+    .await;
+    assert!(
+        any_msg_type(&old, "9")
+            && !old
+                .iter()
+                .any(|f| msg_type(f).as_deref() == Some("8")
+                    && field(f, "150").as_deref() == Some("4")),
+        "a cancel by the RETIRED old ClOrdID is a masked 9, never an 8 Canceled, got {old:?}"
+    );
+
+    // (b) The NEW ClOrdID resolves cross-session to the live replacement: a cancel by
+    // it is `8 Canceled` (ExecType 4), not `9`.
+    third
+        .write_all(&cancel_frame(TRADER_SENDER, VENUE, 7, "rk-2", "cxl-new"))
+        .await
+        .expect("cancel new");
+    let new = recv_frames_until(&mut third, Duration::from_secs(10), |f| {
+        (msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("4"))
+            || msg_type(f).as_deref() == Some("9")
+    })
+    .await;
+    assert!(
+        !any_msg_type(&new, "9"),
+        "a cancel by the replacement ClOrdID is not 9 Unknown order, got {new:?}"
+    );
+    assert!(
+        new.iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("4")),
+        "the replacement order is Canceled (8, ExecType 4) via its new ClOrdID, got {new:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_account_isolation_a_colliding_clordid_cannot_cancel_another_account() {
+    // #098 security invariant: a cancel resolves a ClOrdID only WITHIN the
+    // authenticated account. Account A places under "shared-id"; account B, holding
+    // the SAME ClOrdID string, cannot resolve or cancel A's order — the lookup is a
+    // plain 9 Unknown order (masked, never a leak that another account owns it).
+    const TRADER2_USER: &str = "trader2-fix";
+    const TRADER2_PW: &str = "trader2-plaintext-pw-DoNotLog-654";
+    const TRADER2_SENDER: &str = "TRADER2CLIENT";
+
+    let accounts = vec![
+        AccountProvision::new(
+            AccountId::new("trader-1"),
+            Hash32([2; 32]),
+            vec![Permission::Trade],
+        )
+        .with_fix_login(TRADER_USER, TRADER_PW)
+        .with_comp_ids(CompIdBinding {
+            sender_comp_id: TRADER_SENDER.to_string(),
+            target_comp_id: VENUE.to_string(),
+        }),
+        AccountProvision::new(
+            AccountId::new("trader-2"),
+            Hash32([9; 32]),
+            vec![Permission::Trade],
+        )
+        .with_fix_login(TRADER2_USER, TRADER2_PW)
+        .with_comp_ids(CompIdBinding {
+            sender_comp_id: TRADER2_SENDER.to_string(),
+            target_comp_id: VENUE.to_string(),
+        }),
+    ];
+    let harness = Harness::start_with(accounts, u32::MAX).await;
+
+    // Account A places a resting order under the colliding id.
+    let mut client_a = logon_trader(harness.addr).await;
+    client_a
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "shared-id",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("A places");
+    let placed = recv_frames_until(&mut client_a, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
+    assert!(
+        placed
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("0")),
+        "A's order rests (New), got {placed:?}"
+    );
+
+    // Account B logs on and cancels the SAME ClOrdID string.
+    let mut client_b = connect(harness.addr).await;
+    client_b
+        .write_all(&logon_frame(
+            TRADER2_SENDER,
+            VENUE,
+            1,
+            TRADER2_USER,
+            TRADER2_PW,
+            false,
+        ))
+        .await
+        .expect("B logon");
+    let ack = recv_frames(&mut client_b, Duration::from_secs(3)).await;
+    assert!(any_msg_type(&ack, "A"), "B is admitted");
+    client_b
+        .write_all(&cancel_frame(
+            TRADER2_SENDER,
+            VENUE,
+            2,
+            "shared-id",
+            "b-cxl",
+        ))
+        .await
+        .expect("B cancel");
+    let reply = recv_frames_until(&mut client_b, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("9") || msg_type(f).as_deref() == Some("8")
+    })
+    .await;
+    assert!(
+        !reply
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("4")),
+        "B must NOT be able to cancel A's order via the colliding ClOrdID, got {reply:?}"
+    );
+    let reject = reply
+        .iter()
+        .find(|f| msg_type(f).as_deref() == Some("9"))
+        .unwrap_or_else(|| panic!("B's cross-account cancel is a masked 9, got {reply:?}"));
+    assert_eq!(
+        field(reject, "102").as_deref(),
+        Some("1"),
+        "masked as Unknown order — no leak that another account owns the id"
+    );
+
+    // A still owns and can cancel its order (B's probe changed nothing).
+    client_a
+        .write_all(&cancel_frame(TRADER_SENDER, VENUE, 3, "shared-id", "a-cxl"))
+        .await
+        .expect("A cancel");
+    let a_reply = recv_frames_until(&mut client_a, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("4")
+    })
+    .await;
+    assert!(
+        a_reply
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("4")),
+        "A cancels its own order (8 Canceled), got {a_reply:?}"
     );
 }
 

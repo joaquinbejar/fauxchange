@@ -77,14 +77,15 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use fauxchange::exchange::{
-    ActorConfig, AddOutcome, CancelReason, Cents, CommandExecutor, EventTimestamp,
+    ActorConfig, AddOutcome, CancelReason, Cents, ClOrdIdIndex, CommandExecutor, EventTimestamp,
     ExecutionContext, ExecutionFilter, ExecutionsStore, ExpirationDate, FanOut, FixedClock, Hash32,
     InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
     JournalCommand, JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook,
     MassCancelScope, MassCancelType, MatchingExecutor, NoopFanOut, PositionsStore, RecordKind,
     Recovered, RejectKind, STPMode, SequenceNumber, Side, SignedCents, StoreFanOut, Symbol,
     SymbolError, SymbolParser, TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand,
-    VenueEvent, VenueJournal, VenueOutcome, recover, recover_into, validate_venue_expiry,
+    VenueEvent, VenueJournal, VenueOutcome, recover, recover_into, recover_with_index,
+    validate_venue_expiry,
 };
 use fauxchange::gateway::fix::enums::{OrdType as FixOrdType, OrderSide, TimeInForce as FixTif};
 use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
@@ -180,6 +181,30 @@ fn add_keyed(
     }
 }
 
+/// A resting limit **buy** carrying a `client_order_id` — the #098 fixture whose
+/// `(account, ClOrdID) → order_id` mapping the recovery-rebuilt index must resolve.
+fn add_with_client_id(
+    lineage: &LineageId,
+    sequence: u64,
+    account: &str,
+    client_order_id: &str,
+    price: u64,
+) -> VenueCommand {
+    VenueCommand::AddOrder {
+        symbol: sym(CALL),
+        order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(sequence), 0),
+        account: AccountId::new(account),
+        owner: Hash32([sequence as u8; 32]),
+        client_order_id: Some(ClientOrderId::new(client_order_id)),
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        limit_price: Some(Cents::new(price)),
+        quantity: 2,
+        time_in_force: TimeInForce::Gtc,
+        stp_mode: STPMode::None,
+    }
+}
+
 fn market(
     lineage: &LineageId,
     sequence: u64,
@@ -228,10 +253,40 @@ fn replace(
         order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(target_seq), 0),
         new_order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(new_seq), 0),
         account: AccountId::new(account),
+        client_order_id: None,
+        orig_client_order_id: None,
         side,
         limit_price: limit_price.map(Cents::new),
         quantity,
         time_in_force: tif,
+        stp_mode: STPMode::None,
+    }
+}
+
+/// A `Replace` carrying the replacement + retired client-order ids — the #098 fix-4
+/// fixture whose journaled `Replace` lets recovery rebuild the cross-session
+/// correlation (publish `new_ClOrdID → new_order_id`, retire `OrigClOrdID`).
+#[allow(clippy::too_many_arguments)]
+fn replace_keyed(
+    lineage: &LineageId,
+    target_seq: u64,
+    new_seq: u64,
+    account: &str,
+    orig_client_order_id: &str,
+    new_client_order_id: &str,
+    limit_price: u64,
+) -> VenueCommand {
+    VenueCommand::Replace {
+        symbol: sym(CALL),
+        order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(target_seq), 0),
+        new_order_id: lineage.venue_order_id(UNDERLYING, SequenceNumber::new(new_seq), 0),
+        account: AccountId::new(account),
+        client_order_id: Some(ClientOrderId::new(new_client_order_id)),
+        orig_client_order_id: Some(ClientOrderId::new(orig_client_order_id)),
+        side: Side::Buy,
+        limit_price: Some(Cents::new(limit_price)),
+        quantity: 2,
+        time_in_force: TimeInForce::Gtc,
         stp_mode: STPMode::None,
     }
 }
@@ -994,6 +1049,137 @@ fn test_recovery_reexecutes_clean_journal_to_events_equal_to_stored() {
     }
 }
 
+/// #098: the cross-session `(account, ClOrdID) → order_id` index is a
+/// deterministic function of the journaled `AddOrder` stream, so #085 boot
+/// recovery rebuilds it from the journal alone — no separate durable copy. Two
+/// independent recoveries of the SAME journal populate identical resolutions (the
+/// "survives a restart, resolves the same ids" guarantee), account-scoped.
+#[test]
+fn test_recovery_rebuilds_the_clordid_index_deterministically_from_the_journal() {
+    let lineage = LineageId::new("run-1");
+    // Three resting buys at distinct prices (all rest → `Added`), two accounts, each
+    // carrying a client order id — the placements the index must resolve.
+    let placements = vec![
+        add_with_client_id(&lineage, 0, "acct-a", "cl-a1", 50_000),
+        add_with_client_id(&lineage, 1, "acct-b", "cl-b1", 49_000),
+        add_with_client_id(&lineage, 2, "acct-a", "cl-a2", 48_000),
+    ];
+    let recording = record(&placements, &lineage, &[]);
+    let expected = |seq: u64| lineage.venue_order_id(UNDERLYING, SequenceNumber::new(seq), 0);
+
+    // First "boot": rebuild the index from the journal during recovery.
+    let index_a = Arc::new(ClOrdIdIndex::with_default_ceiling());
+    match recover_with_index(&recording.journal, UNDERLYING, &index_a) {
+        Ok(_) => {}
+        Err(e) => panic!("recovery must not halt: {e:?}"),
+    }
+    // Every journaled placement resolves cross-session on its own account.
+    assert_eq!(
+        index_a
+            .resolve(&AccountId::new("acct-a"), &ClientOrderId::new("cl-a1"))
+            .map(|r| r.order_id),
+        Some(expected(0)),
+        "the rebuilt index resolves acct-a/cl-a1 to its journaled order id"
+    );
+    assert_eq!(
+        index_a
+            .resolve(&AccountId::new("acct-b"), &ClientOrderId::new("cl-b1"))
+            .map(|r| r.order_id),
+        Some(expected(1))
+    );
+    assert_eq!(
+        index_a
+            .resolve(&AccountId::new("acct-a"), &ClientOrderId::new("cl-a2"))
+            .map(|r| r.order_id),
+        Some(expected(2))
+    );
+    assert_eq!(index_a.len(), 3, "exactly the three placements are indexed");
+
+    // Account isolation survives the rebuild: acct-b cannot resolve acct-a's id.
+    assert!(
+        index_a
+            .resolve(&AccountId::new("acct-b"), &ClientOrderId::new("cl-a1"))
+            .is_none(),
+        "a colliding lookup on the wrong account is a miss after rebuild"
+    );
+
+    // A second, independent "boot" from the SAME journal rebuilds an identical set
+    // of resolutions — the index is a deterministic function of the journal.
+    let index_b = Arc::new(ClOrdIdIndex::with_default_ceiling());
+    recover_with_index(&recording.journal, UNDERLYING, &index_b).expect("second recovery");
+    for (account, clid, seq) in [
+        ("acct-a", "cl-a1", 0u64),
+        ("acct-b", "cl-b1", 1),
+        ("acct-a", "cl-a2", 2),
+    ] {
+        assert_eq!(
+            index_b
+                .resolve(&AccountId::new(account), &ClientOrderId::new(clid))
+                .map(|r| r.order_id),
+            Some(expected(seq)),
+            "a re-recovery resolves the same id ({account}/{clid})"
+        );
+    }
+    assert_eq!(index_a.len(), index_b.len());
+}
+
+/// #098 fix 4: a committed **replace** rekeys the journal-derived index — the new
+/// `ClOrdID` resolves to the replacement order id and the retired `OrigClOrdID` no
+/// longer resolves to a live order — and #085 boot recovery rebuilds that IDENTICAL
+/// post-replace state from the journal (the `Replace` command carries both ids), so
+/// live and recovery never diverge. Proven determinism-stable across two recoveries.
+#[test]
+fn test_recovery_rebuilds_a_replace_correlation_and_retires_the_original() {
+    let lineage = LineageId::new("run-1");
+    // seq0 rests a keyed buy; seq1 replaces it — the cancel leg removes seq0's order
+    // and the replacement buy (non-crossing) rests, so the outcome is a
+    // `Replace { cancelled: true, add: Rested }` and the derivation fires.
+    let stream = vec![
+        add_with_client_id(&lineage, 0, "acct-a", "cl-orig", 50_000),
+        replace_keyed(&lineage, 0, 1, "acct-a", "cl-orig", "cl-new", 49_000),
+    ];
+    let recording = record(&stream, &lineage, &[]);
+    match &recording.events[1].outcome {
+        VenueOutcome::Replace { cancelled, add } => {
+            assert!(*cancelled, "the cancel leg removed the original order");
+            assert!(
+                matches!(add, AddOutcome::Rested { .. }),
+                "the replacement rests, got {add:?}"
+            );
+        }
+        other => panic!("expected a Replace outcome at seq 1, got {other:?}"),
+    }
+
+    let expected = |seq: u64| lineage.venue_order_id(UNDERLYING, SequenceNumber::new(seq), 0);
+    let acct = AccountId::new("acct-a");
+
+    // Two independent "boots" rebuild the IDENTICAL post-replace index from the SAME
+    // journal — the correlation is a deterministic function of the journaled stream.
+    for boot in 0..2 {
+        let index = Arc::new(ClOrdIdIndex::with_default_ceiling());
+        recover_with_index(&recording.journal, UNDERLYING, &index)
+            .unwrap_or_else(|e| panic!("recovery on boot {boot} must not halt: {e:?}"));
+        assert_eq!(
+            index
+                .resolve(&acct, &ClientOrderId::new("cl-new"))
+                .map(|r| r.order_id),
+            Some(expected(1)),
+            "boot {boot}: the NEW ClOrdID resolves to the replacement order id"
+        );
+        assert!(
+            index
+                .resolve(&acct, &ClientOrderId::new("cl-orig"))
+                .is_none(),
+            "boot {boot}: the retired OrigClOrdID no longer resolves to a live order"
+        );
+        assert_eq!(
+            index.len(),
+            1,
+            "boot {boot}: exactly the replacement is indexed (the original was retired)"
+        );
+    }
+}
+
 #[test]
 fn test_recovery_halts_on_corrupted_stored_event_with_exact_underlying_and_sequence() {
     let lineage = LineageId::new("run-1");
@@ -1062,7 +1248,12 @@ fn test_recover_into_matches_recover_on_the_same_journal() {
         Ok(r) => r,
         Err(e) => panic!("recover must not halt on a clean journal: {e:?}"),
     };
-    let via_into = match recover_into(&recording.journal, MatchingExecutor::new(UNDERLYING), None) {
+    let via_into = match recover_into(
+        &recording.journal,
+        MatchingExecutor::new(UNDERLYING),
+        None,
+        None,
+    ) {
         Ok(r) => r,
         Err(e) => panic!("recover_into must not halt on a clean journal: {e:?}"),
     };
@@ -1086,7 +1277,7 @@ fn test_recover_into_halts_on_corruption_naming_underlying_and_sequence() {
     let target = SequenceNumber::new(6);
     let corrupted = corrupt_event_at(&recording, target);
 
-    match recover_into(&corrupted, MatchingExecutor::new(UNDERLYING), None) {
+    match recover_into(&corrupted, MatchingExecutor::new(UNDERLYING), None, None) {
         Err(JournalError::Corruption {
             underlying,
             sequence,
@@ -1109,7 +1300,7 @@ fn test_recover_into_refuses_a_newer_than_binary_schema() {
     let recording = record(&rich_stream(&lineage), &lineage, &witnesses());
     let newer = with_newer_schema(&recording);
 
-    match recover_into(&newer, MatchingExecutor::new(UNDERLYING), None) {
+    match recover_into(&newer, MatchingExecutor::new(UNDERLYING), None, None) {
         Err(JournalError::SchemaTooNew { found }) => assert_eq!(found, "venue.v2"),
         other => panic!("expected a SchemaTooNew refusal, got {other:?}"),
     }
@@ -1137,7 +1328,12 @@ fn test_recovery_then_continue_matches_a_never_restarted_run() {
     // The restarted run: record `pre`, recover its journal into a fresh executor
     // (the `recover_into` boot seam), then continue with `post`.
     let pre_rec = record(pre, &lineage, &witnesses());
-    let recovered = match recover_into(&pre_rec.journal, MatchingExecutor::new(UNDERLYING), None) {
+    let recovered = match recover_into(
+        &pre_rec.journal,
+        MatchingExecutor::new(UNDERLYING),
+        None,
+        None,
+    ) {
         Ok(r) => r,
         Err(e) => panic!("recovery of a clean pre-restart journal must not halt: {e:?}"),
     };

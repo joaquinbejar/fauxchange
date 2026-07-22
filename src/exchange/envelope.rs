@@ -775,6 +775,21 @@ pub enum VenueCommand {
         new_order_id: VenueOrderId,
         /// The requesting account.
         account: AccountId,
+        /// The **replacement's** client-order id (the new `ClOrdID`), when the
+        /// gateway supplied one — journaled so #085 boot recovery rebuilds the
+        /// cross-session `(account, ClOrdID) → new_order_id` correlation (#098) for
+        /// the replacement exactly as the live actor published it post-journal.
+        /// `#[serde(default)]` so a pre-#098 record with no field decodes to `None`
+        /// (a legacy replace simply carries no rebuildable correlation).
+        #[serde(default)]
+        client_order_id: Option<ClientOrderId>,
+        /// The **original's** client-order id (the retired `OrigClOrdID`), when the
+        /// gateway supplied one — journaled so recovery **retires** the stale
+        /// `(account, OrigClOrdID)` entry (its order was cancelled by the replace's
+        /// cancel leg) exactly as the live actor did. `#[serde(default)]` for the
+        /// same backward-compatibility reason as `client_order_id`.
+        #[serde(default)]
+        orig_client_order_id: Option<ClientOrderId>,
         /// The replacement's side.
         side: Side,
         /// The replacement's limit price in **cents**, when it is a limit.
@@ -1106,6 +1121,8 @@ mod tests {
             order_id: lineage.venue_order_id("BTC", SequenceNumber::new(7), 0),
             new_order_id: lineage.venue_order_id("BTC", SequenceNumber::new(8), 0),
             account: AccountId::new("acct-1"),
+            client_order_id: Some(ClientOrderId::new("cl-new")),
+            orig_client_order_id: Some(ClientOrderId::new("cl-orig")),
             side: Side::Sell,
             limit_price: Some(Cents::new(50_100)),
             quantity: 3,
@@ -1113,6 +1130,25 @@ mod tests {
             stp_mode: STPMode::CancelTaker,
         };
         assert_serde_identity(&command);
+    }
+
+    #[test]
+    fn test_replace_command_client_order_ids_default_when_absent() {
+        // A pre-#098 record with no ClOrdID fields must still decode (they are
+        // `#[serde(default)]`), yielding `None` for both — a legacy replace simply
+        // carries no rebuildable cross-session correlation.
+        let json = r#"{"Replace":{"symbol":"BTC-20240329-50000-C","order_id":"o","new_order_id":"n","account":"a","side":"BUY","limit_price":50100,"quantity":3,"time_in_force":"GTC","stp_mode":"None"}}"#;
+        match serde_json::from_str::<VenueCommand>(json) {
+            Ok(VenueCommand::Replace {
+                client_order_id,
+                orig_client_order_id,
+                ..
+            }) => {
+                assert_eq!(client_order_id, None);
+                assert_eq!(orig_client_order_id, None);
+            }
+            other => panic!("expected a Replace decoding both ClOrdIDs to None, got {other:?}"),
+        }
     }
 
     #[test]

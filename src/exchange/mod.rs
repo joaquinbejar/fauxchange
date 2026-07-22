@@ -52,6 +52,7 @@
 
 pub mod actor;
 pub mod boundary;
+pub mod clordid_index;
 pub mod envelope;
 pub mod event;
 pub mod executor;
@@ -70,10 +71,14 @@ pub use self::actor::{
     ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, FanOutSealed,
     FanoutSummary, FixedClock, JournalSnapshot, NoopFanOut, PlaceholderExecutor, Receipt,
     TeeFanOut, UnderlyingActor, VenueClock, spawn_underlying_actor,
+    spawn_underlying_actor_with_clordid_index,
 };
 pub use self::boundary::{
     ExpirationDate, Hash32, InstrumentStatus, OptionStyle, OrderId, ParsedSymbol, Price, Quantity,
     STPMode, Side, SymbolParser, TimeInForce, TimestampMs,
+};
+pub use self::clordid_index::{
+    ClOrdIdIndex, ClOrdIdIndexError, ClOrdIdRecord, DEFAULT_MAX_CLORDID_INDEX_ENTRIES,
 };
 pub use self::envelope::{
     AddOutcome, CancelReason, CancelledLeg, Fill, MassCancelScope, MassCancelType, RejectKind,
@@ -98,7 +103,10 @@ pub use self::mm_identity::{
 };
 pub use self::money::{Cents, MoneyError, Notional, SignedCents};
 pub(crate) use self::recovery::check_price_band;
-pub use self::recovery::{Recovered, recover, recover_into, recover_with_microstructure};
+pub use self::recovery::{
+    Recovered, recover, recover_into, recover_with_index, recover_with_microstructure,
+    recover_with_microstructure_and_index,
+};
 pub use self::snapshot::{
     ExecutionCapture, ExecutorState, IdempotencyEntry, IdempotencyFingerprint, IdempotencyKey,
     IdempotencyMap, IdempotencyRecord, PositionCapture, RestingOrderCapture, SnapshotError,

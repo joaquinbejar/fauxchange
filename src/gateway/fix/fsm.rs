@@ -1779,6 +1779,50 @@ struct PlacedOrder {
     fingerprint: OrderFingerprint,
 }
 
+impl PlacedOrder {
+    /// The cancel/replace/status correlation fields, dropping the idempotency
+    /// fingerprint (which only the new-order dedup path reads).
+    fn resolved(&self) -> ResolvedOrder {
+        ResolvedOrder {
+            order_id: self.order_id.clone(),
+            symbol: self.symbol.clone(),
+            side: self.side,
+            quantity: self.quantity,
+        }
+    }
+}
+
+/// The order a cancel / replace / status resolves an `OrigClOrdID` to — from
+/// either this session's [`PlacedOrder`] map or the venue-wide, account-scoped
+/// `(account, ClOrdID) → order_id` index (#098) that reaches **across** sessions.
+/// Carries only what the sequenced cancel command and its report render need
+/// (never the idempotency fingerprint).
+#[derive(Debug, Clone)]
+struct ResolvedOrder {
+    order_id: VenueOrderId,
+    symbol: Symbol,
+    side: OrderSide,
+    quantity: u64,
+}
+
+impl ResolvedOrder {
+    /// Builds a resolved order from a cross-session index record, mapping the
+    /// upstream matching-seam [`crate::exchange::Side`] onto the FIX wire
+    /// [`OrderSide`] (a `Buy`/`Sell` bijection).
+    fn from_index(record: crate::exchange::ClOrdIdRecord) -> Self {
+        let side = match record.side {
+            crate::exchange::Side::Buy => OrderSide::Buy,
+            crate::exchange::Side::Sell => OrderSide::Sell,
+        };
+        Self {
+            order_id: record.order_id,
+            symbol: record.symbol,
+            side,
+            quantity: record.quantity,
+        }
+    }
+}
+
 /// The economically-meaningful fields of a `NewOrderSingle (D)` (or the add leg of
 /// a `G`) — everything that determines the derived `VenueCommand`, and nothing
 /// that changes across a legitimate retry (no `MsgSeqNum`, no `SendingTime`, no
@@ -2122,31 +2166,57 @@ impl VenueFixSession {
         );
     }
 
+    /// Resolves an `OrigClOrdID` to the order it names, on the **authenticated
+    /// account** (#098). Consults this session's tracking map first (the fast local
+    /// path, which also carries replace-minted client ids), then falls back to the
+    /// venue-wide, account-scoped `(account, ClOrdID) → order_id` index — so a
+    /// cancel/replace/status referencing an order placed on a **prior** connection
+    /// resolves instead of answering `9 Unknown order`.
+    ///
+    /// Account isolation: the index key includes the account, so a colliding
+    /// `ClOrdID` under another account is a different key and resolves to [`None`]
+    /// — indistinguishable at the client boundary from a genuinely unknown id, so
+    /// one account can never resolve or cancel another's order.
+    ///
+    /// A synchronous point read — no lock is held across an `.await`.
+    fn resolve_order(
+        &self,
+        account: &AccountId,
+        cl_ord_id: &ClientOrderId,
+    ) -> Option<ResolvedOrder> {
+        if let Some(placed) = self.placed.get(cl_ord_id) {
+            return Some(placed.resolved());
+        }
+        self.state
+            .resolve_client_order_id(account, cl_ord_id)
+            .map(ResolvedOrder::from_index)
+    }
+
     /// Re-renders the true current state of a tracked order from the committed
     /// executions store (`New` when resting/unfilled, `PartiallyFilled`/`Filled`
     /// per the folded fills) — the byte-identical-retry response and the
     /// `OrderStatusRequest (H)` response, so neither fabricates state.
     fn render_tracked_status(
         &mut self,
-        placed: &PlacedOrder,
+        order: &ResolvedOrder,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
         let Some(account) = self.fsm.account.clone() else {
             return Ok(Reaction::cont());
         };
-        let legs = taker_legs_for_order(&self.state, &account, &placed.order_id);
+        let legs = taker_legs_for_order(&self.state, &account, &order.order_id);
         let cum: u64 = legs
             .iter()
             .map(|leg| leg.quantity)
             .fold(0u64, |acc, quantity| {
                 acc.checked_add(quantity).unwrap_or(acc)
             });
-        let underlying = underlying_of_symbol(&placed.symbol);
+        let underlying = underlying_of_symbol(&order.symbol);
         let spec = order_flow::render_status_report(
-            placed.symbol.clone(),
-            placed.side,
-            placed.order_id.clone(),
-            placed.quantity,
+            order.symbol.clone(),
+            order.side,
+            order.order_id.clone(),
+            order.quantity,
             cum,
             legs.last(),
             self.state.lineage_id(),
@@ -2212,7 +2282,7 @@ impl VenueFixSession {
         let fingerprint = OrderFingerprint::of_new_order(&order);
         if let Some(placed) = self.placed.get(&order.cl_ord_id).cloned() {
             if placed.fingerprint == fingerprint {
-                return self.render_tracked_status(&placed, now_ms);
+                return self.render_tracked_status(&placed.resolved(), now_ms);
             }
             return self.fsm.emit_order_rejected_code(
                 order.symbol.clone(),
@@ -2508,9 +2578,12 @@ impl VenueFixSession {
                 now_ms,
             );
         }
-        let Some(placed) = self.placed.get(&cancel.orig_cl_ord_id).cloned() else {
-            // Never placed this session — the uniform masked reject (never revealing
-            // not-found vs not-owner vs already-gone, #118).
+        // Resolve `OrigClOrdID` cross-session (#098): this session's map first, then
+        // the account-scoped venue index — so a cancel of an order placed on a prior
+        // connection succeeds instead of answering `9 Unknown order`. An unknown id
+        // (or one owned by another account) is an indistinguishable masked reject
+        // (never revealing not-found vs not-owner vs already-gone, #118).
+        let Some(resolved) = self.resolve_order(&account, &cancel.orig_cl_ord_id) else {
             return self.reject_cancel(
                 VenueOrderId::new("NONE"),
                 &cancel.orig_cl_ord_id,
@@ -2520,18 +2593,21 @@ impl VenueFixSession {
                 now_ms,
             );
         };
-        let command = order_flow::to_cancel_command(&cancel, account, placed.order_id.clone());
+        let command = order_flow::to_cancel_command(&cancel, account, resolved.order_id.clone());
         match self.state.submit(command).await {
             Ok(receipt) => {
                 // Render the OBSERVED outcome (#118), never a false `Canceled`: a cancel
-                // of an unowned / already-gone order is an `Ok(Receipt)` whose captured
-                // outcome is `Rejected` — emit a masked `OrderCancelReject (9)`, not a
-                // `Canceled`, and keep the session correlation (do not drop tracking).
+                // of an unowned / already-gone order (including a STALE cross-session
+                // index entry pointing at an order that has since filled/cancelled) is
+                // an `Ok(Receipt)` whose captured outcome is `Rejected` — emit a masked
+                // `OrderCancelReject (9)`, not a `Canceled`, and keep the session
+                // correlation (do not drop tracking). Identity is sourced from the
+                // cross-session `resolved` (#098), not a session-local `placed`.
                 let reaction =
                     if let Some(VenueOutcome::Rejected { kind, reason }) = &receipt.outcome {
-                        let masked = Self::masked_cancel_error(&placed.order_id, *kind, reason);
+                        let masked = Self::masked_cancel_error(&resolved.order_id, *kind, reason);
                         self.reject_cancel(
-                            placed.order_id.clone(),
+                            resolved.order_id.clone(),
                             &cancel.orig_cl_ord_id,
                             &cancel.cl_ord_id,
                             CxlRejResponseTo::OrderCancelRequest,
@@ -2539,15 +2615,19 @@ impl VenueFixSession {
                             now_ms,
                         )?
                     } else {
-                        let underlying = underlying_of_symbol(&placed.symbol);
+                        let underlying = underlying_of_symbol(&resolved.symbol);
                         let spec = order_flow::render_cancel_report(
-                            placed.symbol.clone(),
-                            placed.side,
-                            placed.order_id.clone(),
+                            resolved.symbol.clone(),
+                            resolved.side,
+                            resolved.order_id.clone(),
                             receipt.underlying_sequence,
                             self.state.lineage_id(),
                             &underlying,
                         );
+                        // Drop this session's local tracking of the cancelled id. The
+                        // shared index stays journal-derived; a re-cancel resolves the
+                        // same order id and the sequenced cancel then rejects it as
+                        // no-longer-resting (a masked reject via the branch above).
                         self.placed.remove(&cancel.orig_cl_ord_id);
                         self.fsm.emit_report_specs(vec![spec], now_ms)?
                     };
@@ -2558,7 +2638,7 @@ impl VenueFixSession {
                 Ok(reaction)
             }
             Err(error) => self.reject_cancel(
-                placed.order_id.clone(),
+                resolved.order_id.clone(),
                 &cancel.orig_cl_ord_id,
                 &cancel.cl_ord_id,
                 CxlRejResponseTo::OrderCancelRequest,
@@ -2593,8 +2673,11 @@ impl VenueFixSession {
                 now_ms,
             );
         }
-        let Some(placed) = self.placed.get(&replace.orig_cl_ord_id).cloned() else {
-            // Never placed this session — the uniform masked reject (#118).
+        // Resolve `OrigClOrdID` cross-session (#098): this session's map first, then
+        // the account-scoped venue index — so a replace of an order placed on a prior
+        // connection succeeds instead of `9 Unknown order`. An unknown id (or one
+        // owned by another account) is an indistinguishable masked reject (#118).
+        let Some(resolved) = self.resolve_order(&account, &replace.orig_cl_ord_id) else {
             return self.reject_cancel(
                 VenueOrderId::new("NONE"),
                 &replace.orig_cl_ord_id,
@@ -2609,7 +2692,7 @@ impl VenueFixSession {
         let command = order_flow::to_replace_command(
             &replace,
             account.clone(),
-            placed.order_id.clone(),
+            resolved.order_id.clone(),
             new_order_id.clone(),
         );
         match self.state.submit(command).await {
@@ -2624,9 +2707,9 @@ impl VenueFixSession {
                     // `OrderCancelReject (9)` — a not-owner reject is masked as not-found so
                     // the reject can never distinguish not-found vs not-owner (#118/#132).
                     Some(VenueOutcome::Rejected { kind, reason }) => {
-                        let masked = Self::masked_cancel_error(&placed.order_id, *kind, reason);
+                        let masked = Self::masked_cancel_error(&resolved.order_id, *kind, reason);
                         self.reject_cancel(
-                            placed.order_id.clone(),
+                            resolved.order_id.clone(),
                             &replace.orig_cl_ord_id,
                             &replace.cl_ord_id,
                             CxlRejResponseTo::OrderCancelReplaceRequest,
@@ -2650,7 +2733,7 @@ impl VenueFixSession {
                             self.placed.remove(&replace.orig_cl_ord_id);
                         }
                         self.reject_replace_add(
-                            placed.order_id.clone(),
+                            resolved.order_id.clone(),
                             &replace.orig_cl_ord_id,
                             &replace.cl_ord_id,
                             reason,
@@ -2692,7 +2775,7 @@ impl VenueFixSession {
                 Ok(reaction)
             }
             Err(error) => self.reject_cancel(
-                placed.order_id.clone(),
+                resolved.order_id.clone(),
                 &replace.orig_cl_ord_id,
                 &replace.cl_ord_id,
                 CxlRejResponseTo::OrderCancelReplaceRequest,
@@ -2802,17 +2885,25 @@ impl VenueFixSession {
         status: OrderStatusRequest,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
-        let placed = match (&status.order_id, &status.cl_ord_id) {
+        let Some(account) = self.fsm.account.clone() else {
+            return Ok(Reaction::cont());
+        };
+        let resolved = match (&status.order_id, &status.cl_ord_id) {
+            // Status by `OrderID (37)`: a per-session reverse lookup (there is no
+            // venue-wide `order_id → ClOrdID` index; the #098 index is keyed on
+            // `ClOrdID`, so cross-session status is by `ClOrdID` below).
             (Some(order_id), _) => self
                 .placed
                 .values()
                 .find(|placed| &placed.order_id == order_id)
-                .cloned(),
-            (None, Some(cl_ord_id)) => self.placed.get(cl_ord_id).cloned(),
+                .map(PlacedOrder::resolved),
+            // Status by `ClOrdID (11)`: resolved cross-session on the authenticated
+            // account (#098).
+            (None, Some(cl_ord_id)) => self.resolve_order(&account, cl_ord_id),
             // Decode requires one of OrderID(37)/ClOrdID(11); this is defensive.
             (None, None) => None,
         };
-        let Some(placed) = placed else {
+        let Some(resolved) = resolved else {
             let reject = VenueError::NotFound("order not found or not readable".to_string())
                 .fix_reject(FixRejectContext::NewOrder);
             return self.fsm.emit_order_rejected(
@@ -2823,7 +2914,7 @@ impl VenueFixSession {
                 now_ms,
             );
         };
-        self.render_tracked_status(&placed, now_ms)
+        self.render_tracked_status(&resolved, now_ms)
     }
 
     // ------------------------------------------------------------------------

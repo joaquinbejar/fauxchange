@@ -76,11 +76,12 @@ use tokio::task::JoinHandle;
 use crate::error::REDACTED_INTERNAL_MESSAGE;
 use crate::exchange::actor::{
     ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, VenueClock,
-    spawn_underlying_actor,
+    spawn_underlying_actor, spawn_underlying_actor_with_clordid_index,
 };
 use crate::exchange::boundary::{
     Hash32, InstrumentStatus, OptionStyle, OrderId, STPMode, Side, TimeInForce, TimestampMs,
 };
+use crate::exchange::clordid_index::ClOrdIdIndex;
 use crate::exchange::envelope::{
     AddOutcome, CancelReason, CancelledLeg, Fill, MassCancelScope, MassCancelType, RejectKind,
     VenueCommand, VenueOutcome,
@@ -2063,6 +2064,13 @@ where
 /// so a `MarketMakerControl` command takes effect on the sequenced path, and `None`
 /// where no live engine is driven.
 ///
+/// `clordid_index` is the optional shared account-scoped `(account, ClOrdID) →
+/// order_id` index (#098): `Some` on the live path (the single venue-wide index the
+/// spawned **actor** publishes into POST-journal — after each paired event durably
+/// lands — so a cancel/replace/status resolves the client id cross-session), and
+/// `None` where no cross-session correlation is needed. It is threaded to the actor,
+/// not the executor, so an event-append failure never leaves an uncommitted mapping.
+///
 /// # Errors
 ///
 /// [`MicrostructureConfigError`] if the resolved contract specs are rejected by the
@@ -2077,6 +2085,7 @@ pub fn spawn_matching_actor_with_registry_and_index<J, F, C>(
     symbol_index: Arc<SymbolIndex>,
     microstructure: &MicrostructureConfig,
     mm_control: Option<Arc<dyn MarketMakerControlSink>>,
+    clordid_index: Option<Arc<ClOrdIdIndex>>,
 ) -> Result<(ActorHandle, JoinHandle<()>), MicrostructureConfigError>
 where
     J: VenueJournal + Send + 'static,
@@ -2093,8 +2102,20 @@ where
         Some(sink) => executor.with_mm_control_sink(sink),
         None => executor,
     };
-    Ok(spawn_underlying_actor(
-        config, journal, executor, fan_out, clock,
+    // The cross-session `(account, ClOrdID) → order_id` index (#098) is held by the
+    // **actor**, NOT the executor: the actor publishes the correlation POST-journal
+    // (after the paired event durably lands), so a placement whose event append
+    // fails never leaves an uncommitted mapping. The executor stays index-agnostic;
+    // journal recovery rebuilds the index from the same committed events instead
+    // (`recover_into` → `reduce_into_executor`), so live and recovery derive the
+    // identical mapping from the identical `(command, outcome)` pairs.
+    Ok(spawn_underlying_actor_with_clordid_index(
+        config,
+        journal,
+        executor,
+        fan_out,
+        clock,
+        clordid_index,
     ))
 }
 
@@ -2779,6 +2800,8 @@ mod tests {
                 order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0),
                 new_order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0),
                 account: AccountId::new("acct"),
+                client_order_id: None,
+                orig_client_order_id: None,
                 side: Side::Sell,
                 limit_price: Some(Cents::new(50_100)),
                 quantity: 4,
@@ -2834,6 +2857,8 @@ mod tests {
                 order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0),
                 new_order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0),
                 account: AccountId::new("acct"),
+                client_order_id: None,
+                orig_client_order_id: None,
                 side: Side::Buy,
                 limit_price: Some(Cents::new(40_000)),
                 quantity: 2,
@@ -2888,6 +2913,8 @@ mod tests {
                 order_id: VenueOrderId::new("never-existed"),
                 new_order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0),
                 account: AccountId::new("acct"),
+                client_order_id: None,
+                orig_client_order_id: None,
                 side: Side::Buy,
                 limit_price: Some(Cents::new(49_000)),
                 quantity: 4,
@@ -2942,6 +2969,8 @@ mod tests {
                 order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0),
                 new_order_id: lin.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0),
                 account: AccountId::new("attacker"),
+                client_order_id: None,
+                orig_client_order_id: None,
                 side: Side::Sell,
                 limit_price: Some(Cents::new(50_100)),
                 quantity: 4,

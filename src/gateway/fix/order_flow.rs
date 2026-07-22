@@ -248,6 +248,13 @@ pub(crate) fn to_cancel_command(
 /// `G` carries no `TimeInForce`, so the replacement rests as `GTC` (the dialect
 /// default). A market replacement (`OrdType=1`, no price) yields `limit_price:
 /// None`, which the executor's add leg rejects — a market order does not rest.
+///
+/// The replacement `ClOrdID` and retired `OrigClOrdID` are carried into the command
+/// so the sequenced path journals them (#098): on a committed successful replace the
+/// actor publishes `(account, new_ClOrdID) → new_order_id` and retires the stale
+/// `(account, OrigClOrdID)` entry post-journal, and #085 boot recovery rebuilds the
+/// **identical** correlation from these journaled ids — so the replacement is
+/// cross-session cancel/replace-correlatable on a later connection, not just this one.
 #[must_use]
 pub(crate) fn to_replace_command(
     replace: &OrderCancelReplaceRequest,
@@ -264,6 +271,8 @@ pub(crate) fn to_replace_command(
         order_id: target,
         new_order_id,
         account,
+        client_order_id: Some(replace.cl_ord_id.clone()),
+        orig_client_order_id: Some(replace.orig_cl_ord_id.clone()),
         side: seam_side(replace.side),
         limit_price,
         quantity: replace.order_qty,

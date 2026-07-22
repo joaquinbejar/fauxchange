@@ -15,7 +15,7 @@ use fauxchange::exchange::{
     PositionsStore, STPMode, Side, Symbol, TimeInForce, VenueCommand, VenueOutcome,
 };
 use fauxchange::state::{AppState, AppStateConfig};
-use fauxchange::{AccountId, LiquidityFlag, OrderType, VenueError, VenueOrderId};
+use fauxchange::{AccountId, ClientOrderId, LiquidityFlag, OrderType, VenueError, VenueOrderId};
 
 fn state(underlyings: &[&str]) -> Arc<AppState> {
     // Auth defaults to the embedded dev key pair (no accounts) when the config
@@ -58,6 +58,57 @@ fn add(
         time_in_force: TimeInForce::Gtc,
         stp_mode: STPMode::None,
     }
+}
+
+/// #098 REST/FIX parity seam: a client-order-id resolves to a venue order id
+/// through the **single** [`AppState::resolve_client_order_id`] both gateways use
+/// (FIX's `resolve_order`, and any REST cancel/replace/status-by-client-order-id).
+/// A placement lands the account-scoped mapping; a lookup on another account is a
+/// masked miss — one account can never resolve another's order.
+#[tokio::test]
+async fn test_client_order_id_resolves_through_the_shared_account_scoped_seam() {
+    let state = state(&["BTC"]);
+    let symbol = "BTC-20240329-50000-C";
+    let account = AccountId::new("trader-1");
+    let clid = ClientOrderId::new("cl-parity-1");
+
+    // Empty before any placement — the ONLY way to populate the index is the
+    // sequenced submit path (the same command REST and FIX both build).
+    assert!(state.resolve_client_order_id(&account, &clid).is_none());
+
+    let order_id = VenueOrderId::new("order-parity-1");
+    state
+        .submit(VenueCommand::AddOrder {
+            symbol: sym(symbol),
+            order_id: order_id.clone(),
+            account: account.clone(),
+            owner: Hash32([0x33; 32]),
+            client_order_id: Some(clid.clone()),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(50_000)),
+            quantity: 2,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        })
+        .await
+        .expect("place");
+
+    // The shared seam maps the client id to the venue order id, on the account.
+    let resolved = state
+        .resolve_client_order_id(&account, &clid)
+        .expect("the placement is resolvable cross-session via the shared seam");
+    assert_eq!(resolved.order_id, order_id);
+    assert_eq!(resolved.side, Side::Buy);
+    assert_eq!(resolved.quantity, 2);
+
+    // Account isolation: another account with the SAME client id gets a masked miss.
+    assert!(
+        state
+            .resolve_client_order_id(&AccountId::new("intruder"), &clid)
+            .is_none(),
+        "a colliding client id on another account is indistinguishable from unknown"
+    );
 }
 
 /// A gateway stand-in submits a crossing pair through the ONLY path and reads the

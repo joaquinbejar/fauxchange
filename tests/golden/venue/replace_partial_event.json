@@ -2,9 +2,11 @@
   "command": {
     "Replace": {
       "account": "acct-1",
+      "client_order_id": "cl-new",
       "limit_price": 40000,
       "new_order_id": "run-1:BTC:13:0",
       "order_id": "run-1:BTC:5:0",
+      "orig_client_order_id": "cl-orig",
       "quantity": 2,
       "side": "BUY",
       "stp_mode": "None",

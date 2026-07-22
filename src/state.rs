@@ -77,17 +77,18 @@ use crate::auth::{
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, CancelledLeg, EventTimestamp, ExecutionsStore, ExpirationDate,
-    FanOut, FanOutSealed, FanoutSummary, InMemoryExecutionsStore, InMemoryPositionsStore,
-    InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader, JournalSnapshot,
-    LineageId, MarkPriceBook, MarketMakerControlSink, MassCancelScope, MatchingExecutor,
-    PositionsStore, Receipt, Recovered, SequenceNumber, StoreFanOut, Symbol, TeeFanOut,
-    VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_price_band, recover_into,
-    spawn_matching_actor_with_registry_and_index, spawn_underlying_actor,
+    ActorConfig, ActorHandle, CancelledLeg, ClOrdIdIndex, ClOrdIdRecord, EventTimestamp,
+    ExecutionsStore, ExpirationDate, FanOut, FanOutSealed, FanoutSummary, InMemoryExecutionsStore,
+    InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader,
+    JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink, MassCancelScope,
+    MatchingExecutor, PositionsStore, Receipt, Recovered, SequenceNumber, StoreFanOut, Symbol,
+    TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_price_band,
+    recover_into, spawn_matching_actor_with_registry_and_index,
+    spawn_underlying_actor_with_clordid_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
 use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
-use crate::models::AccountId;
+use crate::models::{AccountId, ClientOrderId};
 use crate::simulation::{
     AssetConfig, ClockMode, CorrelationId, ExpiryPhase, ExpirySchedule, JournalStream,
     PriceSimulator, RecordingController, ReplayError, ReplayReport, RunManifest, ScenarioBundle,
@@ -614,6 +615,16 @@ pub struct AppState {
     /// Read off the sequenced path only (a point-lookup `contains`, never iterated on
     /// a hot path). Empty on a fresh boot or the fully in-memory path.
     recovered: std::collections::HashSet<Arc<str>>,
+    /// The venue-wide, account-scoped `(account, ClOrdID) → order_id` correlation
+    /// index (#098) — the **cross-session** bridge every underlying's actor publishes
+    /// into POST-journal on the sequenced path, and the FIX/REST surfaces resolve
+    /// from so a client can cancel/replace/status an order it placed in a **prior**
+    /// session. It is a derived, journal-scoped artifact (never journaled itself):
+    /// #085 boot recovery rebuilds it from the same `AddOrder` / `Replace` stream, so
+    /// it survives a restart without a separate durable copy. The key is
+    /// account-scoped, so a resolution can only ever return an order the
+    /// authenticated account placed.
+    clordid_index: Arc<ClOrdIdIndex>,
 }
 
 /// The result of a venue-control clock advance fanned across the underlyings —
@@ -930,6 +941,15 @@ impl AppState {
         let positions = Arc::new(InMemoryPositionsStore::new());
         let marks = Arc::new(MarkPriceBook::new());
 
+        // The one shared cross-session `(account, ClOrdID) → order_id` index (#098):
+        // every underlying's ACTOR publishes successful placements into this SAME
+        // instance POST-journal on the sequenced path, and the FIX/REST surfaces
+        // resolve from it, so a client cancels/replaces an order it placed in a prior
+        // session. It is a derived artifact rebuilt from the journal on #085 recovery
+        // (both the boot re-execution below and the live actor use the identical
+        // deterministic derivation), never a second durable source of truth.
+        let clordid_index = Arc::new(ClOrdIdIndex::with_default_ceiling());
+
         // The WebSocket market-data service: one shared bounded broadcast + the
         // per-instrument sequence/aggregate, fed by a `WsFanOut` teed alongside
         // each actor's `StoreFanOut` (both consume the SAME post-journal event).
@@ -998,13 +1018,21 @@ impl AppState {
                         Arc::clone(&symbol_index),
                         &microstructure,
                     )?;
-                    let recovered =
-                        recover_into(&recovery_journal, executor, Some(&*microstructure)).map_err(
-                            |source| AppStateError::Recovery {
-                                underlying: ticker.to_string(),
-                                source,
-                            },
-                        )?;
+                    // Rebuild the shared cross-session `(account, ClOrdID) → order_id`
+                    // index (#098) as recovery re-executes: `recover_into` applies the
+                    // SAME deterministic `apply_committed_correlation` the live actor
+                    // publishes post-journal, so the resumed venue resolves the same
+                    // client ids it did before the restart (#085 boot recovery).
+                    let recovered = recover_into(
+                        &recovery_journal,
+                        executor,
+                        Some(&*microstructure),
+                        Some(&clordid_index),
+                    )
+                    .map_err(|source| AppStateError::Recovery {
+                        underlying: ticker.to_string(),
+                        source,
+                    })?;
                     // A header row with NO records is an earlier fresh open (or a
                     // crash before the first command) — treated as a fresh boot (seed
                     // applies, actor at `SequenceNumber::START`), preserving today's
@@ -1153,8 +1181,19 @@ impl AppState {
                             .with_start_sequence(start);
                     recovered_set.insert(Arc::clone(&ticker));
                     // Spawn with the reconstructed executor directly (its registry /
-                    // index / microstructure were wired at recovery-build time).
-                    spawn_underlying_actor(actor_config, journal, executor, fan_out, clock.clone())
+                    // index / microstructure were wired at recovery-build time), and
+                    // give the ACTOR the shared cross-session ClOrdID index (#098) so
+                    // its FUTURE live commands publish correlations post-journal — the
+                    // recovered stream's correlations were already rebuilt during
+                    // `recover_into` above (the identical deterministic derivation).
+                    spawn_underlying_actor_with_clordid_index(
+                        actor_config,
+                        journal,
+                        executor,
+                        fan_out,
+                        clock.clone(),
+                        Some(Arc::clone(&clordid_index)),
+                    )
                 }
                 None => {
                     // Fresh boot (today's path, unchanged): swap the STORE, not the
@@ -1181,6 +1220,12 @@ impl AppState {
                                 // the engine through the late-bound hub, inside the
                                 // actor turn.
                                 Some(Arc::clone(&mm_control_sink)),
+                                // The shared cross-session ClOrdID index (#098): the
+                                // SAME instance for every underlying, so a placement on
+                                // any book is cross-session correlatable from any
+                                // FIX/REST surface. Held by the actor, published
+                                // post-journal.
+                                Some(Arc::clone(&clordid_index)),
                             )?
                         }
                         None => {
@@ -1194,6 +1239,7 @@ impl AppState {
                                 Arc::clone(&symbol_index),
                                 &microstructure,
                                 Some(Arc::clone(&mm_control_sink)),
+                                Some(Arc::clone(&clordid_index)),
                             )?
                         }
                     }
@@ -1271,6 +1317,7 @@ impl AppState {
             microstructure,
             expiry_phases: std::sync::Mutex::new(std::collections::HashMap::new()),
             recovered: recovered_set,
+            clordid_index,
         }))
     }
 
@@ -2156,6 +2203,33 @@ impl AppState {
     #[inline]
     pub fn accounts(&self) -> &AccountRegistry {
         &self.accounts
+    }
+
+    /// The shared, account-scoped `(account, ClOrdID) → order_id` correlation index
+    /// (#098) — the cross-session bridge the FIX and REST surfaces resolve through.
+    #[must_use]
+    #[inline]
+    pub fn clordid_index(&self) -> &Arc<ClOrdIdIndex> {
+        &self.clordid_index
+    }
+
+    /// Resolves the order the **authenticated** `account` placed under `client_order_id`
+    /// (#098) — the **single** cross-session correlation seam **both** the FIX
+    /// (`OrigClOrdID` on `F`/`G`/status) and REST (cancel/replace/status by
+    /// client-order-id) surfaces resolve through, so the two are parity by
+    /// construction. A [`None`] means the account never placed that id **or** the
+    /// id is unknown — a cross-account id is a different key and resolves to
+    /// [`None`], so the caller cannot tell a foreign-owned id from an absent one
+    /// (the #132 masking). The lookup is a synchronous point read — no lock is held
+    /// across an `.await`.
+    #[must_use]
+    #[inline]
+    pub fn resolve_client_order_id(
+        &self,
+        account: &AccountId,
+        client_order_id: &ClientOrderId,
+    ) -> Option<ClOrdIdRecord> {
+        self.clordid_index.resolve(account, client_order_id)
     }
 
     /// The operator gate on token issuance (`AUTH_BOOTSTRAP_SECRET`).

@@ -37,9 +37,12 @@
 //! against the restored state, will not equal a re-execution from an empty book), a
 //! safe halt rather than a silent divergent resume.
 
+use std::sync::Arc;
+
 use option_chain_orderbook::SymbolParser;
 
 use crate::exchange::actor::{CommandExecutor, ExecutionContext};
+use crate::exchange::clordid_index::{ClOrdIdIndex, apply_committed_correlation};
 use crate::exchange::envelope::{AddOutcome, RejectKind, VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::event::SequenceNumber;
 use crate::exchange::executor::MatchingExecutor;
@@ -141,7 +144,32 @@ pub fn recover<J>(journal: &J, underlying: &str) -> Result<Recovered, JournalErr
 where
     J: VenueJournal + ?Sized,
 {
-    recover_inner(journal, underlying, None)
+    recover_inner(journal, underlying, None, None)
+}
+
+/// Recovers one underlying's book **and rebuilds the shared `(account, ClOrdID) →
+/// order_id` correlation index** (#098) from the same journaled `AddOrder` stream —
+/// the boot-recovery (#085) entry point that makes cross-session cancel/replace
+/// survive a restart without a separate durable copy of the correlation.
+///
+/// Every re-executed placement that carries a `client_order_id` records into
+/// `index` exactly as the live path did, so a recovered venue resolves the same
+/// client ids it resolved before the restart. Re-execution is otherwise identical
+/// to [`recover`] — the index is a pure side effect and never changes a re-derived
+/// event, so the integrity oracle is unaffected.
+///
+/// # Errors
+///
+/// The same typed failures as [`recover`].
+pub fn recover_with_index<J>(
+    journal: &J,
+    underlying: &str,
+    index: &Arc<ClOrdIdIndex>,
+) -> Result<Recovered, JournalError>
+where
+    J: VenueJournal + ?Sized,
+{
+    recover_inner(journal, underlying, None, Some(index))
 }
 
 /// Recovers one underlying's book with the venue [`MicrostructureConfig`] applied to
@@ -173,7 +201,27 @@ pub fn recover_with_microstructure<J>(
 where
     J: VenueJournal + ?Sized,
 {
-    recover_inner(journal, underlying, Some(microstructure))
+    recover_inner(journal, underlying, Some(microstructure), None)
+}
+
+/// Recovers one underlying's book with the venue [`MicrostructureConfig`] applied
+/// **and** rebuilds the shared `(account, ClOrdID) → order_id` index (#098) — the
+/// config-scoped boot-recovery entry point combining
+/// [`recover_with_microstructure`] and [`recover_with_index`].
+///
+/// # Errors
+///
+/// The same typed failures as [`recover_with_microstructure`].
+pub fn recover_with_microstructure_and_index<J>(
+    journal: &J,
+    underlying: &str,
+    microstructure: &MicrostructureConfig,
+    index: &Arc<ClOrdIdIndex>,
+) -> Result<Recovered, JournalError>
+where
+    J: VenueJournal + ?Sized,
+{
+    recover_inner(journal, underlying, Some(microstructure), Some(index))
 }
 
 /// Recovers a journal into a **caller-provided** [`MatchingExecutor`] — the
@@ -194,6 +242,14 @@ where
 /// already carries its own fee/STP/specs, so pass the venue config that built it, or
 /// `None` for a bare reconstruction with no admission check.
 ///
+/// `clordid_index` is the optional shared account-scoped `(account, ClOrdID) →
+/// order_id` correlation index (#098): `Some` on the #085 boot-recovery path so a
+/// resumed underlying **rebuilds** its cross-session correlations from the same
+/// `AddOrder` / `Replace` stream (the identical mapping the live post-journal actor
+/// published), and `None` for a bare reconstruction. It is populated as a pure
+/// side effect of the re-derived event — it never changes a re-derived event, so
+/// the integrity oracle is unaffected.
+///
 /// # Errors
 ///
 /// [`JournalError::SchemaTooNew`] / [`JournalError::Corruption`] (naming the exact
@@ -203,6 +259,7 @@ pub fn recover_into<J>(
     journal: &J,
     executor: MatchingExecutor,
     microstructure: Option<&MicrostructureConfig>,
+    clordid_index: Option<&Arc<ClOrdIdIndex>>,
 ) -> Result<Recovered, JournalError>
 where
     J: VenueJournal + ?Sized,
@@ -221,7 +278,14 @@ where
     // it for the stream being recovered.
     let underlying = executor.underlying().to_string();
     let records = journal.read_from(SequenceNumber::START)?;
-    reduce_into_executor(&records, executor, &underlying, &lineage, microstructure)
+    reduce_into_executor(
+        &records,
+        executor,
+        &underlying,
+        &lineage,
+        microstructure,
+        clordid_index,
+    )
 }
 
 /// The shared recovery core behind [`recover`] (bare) and
@@ -232,6 +296,7 @@ fn recover_inner<J>(
     journal: &J,
     underlying: &str,
     microstructure: Option<&MicrostructureConfig>,
+    clordid_index: Option<&Arc<ClOrdIdIndex>>,
 ) -> Result<Recovered, JournalError>
 where
     J: VenueJournal + ?Sized,
@@ -246,7 +311,13 @@ where
     }
     let lineage = header.lineage_id.clone();
     let records = journal.read_from(SequenceNumber::START)?;
-    recover_from_records(&records, underlying, &lineage, microstructure)
+    recover_from_records(
+        &records,
+        underlying,
+        &lineage,
+        microstructure,
+        clordid_index,
+    )
 }
 
 /// The pure reducer over an already-read record slice — re-executes the command
@@ -260,6 +331,7 @@ fn recover_from_records(
     underlying: &str,
     lineage: &LineageId,
     microstructure: Option<&MicrostructureConfig>,
+    clordid_index: Option<&Arc<ClOrdIdIndex>>,
 ) -> Result<Recovered, JournalError> {
     // The fresh reconstruction book: bare, or with the venue microstructure applied
     // BEFORE any leaf is vivified — the same apply the live book-creation path
@@ -274,7 +346,14 @@ fn recover_from_records(
             })?
         }
     };
-    reduce_into_executor(records, executor, underlying, lineage, microstructure)
+    reduce_into_executor(
+        records,
+        executor,
+        underlying,
+        lineage,
+        microstructure,
+        clordid_index,
+    )
 }
 
 /// The pure reducer over an already-read record slice **and a pre-built executor**:
@@ -285,12 +364,23 @@ fn recover_from_records(
 /// for no admission check, or `Some(config)` to re-run the live venue price-band
 /// admission on the re-execution path (a tampered record is refused before it
 /// re-executes).
+///
+/// `clordid_index` is the optional shared account-scoped `(account, ClOrdID) →
+/// order_id` correlation index (#098). When `Some`, the reducer **rebuilds** the
+/// cross-session correlations from the same journaled `AddOrder` / `Replace` stream
+/// by applying [`apply_committed_correlation`] to each re-derived, oracle-verified
+/// event — the **identical** deterministic function the live single-writer actor
+/// runs post-journal, so a recovered venue resolves the same client ids it resolved
+/// before the restart. Because it runs only **after** the stored event is confirmed
+/// (a tail command re-executes to derive its event, then publishes), the index is a
+/// pure post-journal side effect and never perturbs the integrity oracle.
 fn reduce_into_executor(
     records: &[JournalRecord],
     mut executor: MatchingExecutor,
     underlying: &str,
     lineage: &LineageId,
     microstructure: Option<&MicrostructureConfig>,
+    clordid_index: Option<&Arc<ClOrdIdIndex>>,
 ) -> Result<Recovered, JournalError> {
     let mut events = Vec::new();
 
@@ -333,6 +423,14 @@ fn reduce_into_executor(
                 underlying: underlying.to_string(),
                 sequence: command.sequence,
             });
+        }
+        // Rebuild the cross-session `(account, ClOrdID) → order_id` index (#098) from
+        // the SAME committed `(command, outcome)` the live single-writer actor
+        // publishes from post-journal — the identical deterministic function, run
+        // here only AFTER the event is oracle-verified (already journaled), so the
+        // recovered correlations are byte-for-byte the ones the live venue exposed.
+        if let Some(index) = clordid_index {
+            apply_committed_correlation(index, underlying, &derived.command, &derived.outcome);
         }
         events.push(derived);
     }
