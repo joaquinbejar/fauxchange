@@ -325,6 +325,18 @@ impl InstrumentState {
                     self.remove_order(&leg.order_id, &mut touched);
                 }
             }
+            // A kill (`MarketMakerControl { enabled: Some(false), .. }`) couples the
+            // owner-scoped market-maker sweep into the control's own turn, so its
+            // cancelled MM quotes are carried on `ControlApplied.swept` (not a
+            // separate `MassCancel` event). Remove each swept leg from the aggregate
+            // exactly as `MassCancelled` does, so a kill emits orderbook-removal
+            // deltas. Every non-kill control (and `Clock` / `SimStep`) carries an
+            // empty `swept`, so this is a no-op for them (#117).
+            VenueOutcome::ControlApplied { swept } => {
+                for leg in swept {
+                    self.remove_order(&leg.order_id, &mut touched);
+                }
+            }
             VenueOutcome::Evicted { evicted } => {
                 for id in evicted {
                     self.remove_order(id, &mut touched);
@@ -334,7 +346,6 @@ impl InstrumentState {
             // original placement's depth/prints were published at first placement, so
             // it MUST NOT re-apply any delta here (no phantom depth).
             VenueOutcome::InstrumentStatusChanged { .. }
-            | VenueOutcome::ControlApplied
             | VenueOutcome::Rejected { .. }
             | VenueOutcome::Duplicate { .. } => {}
         }
@@ -757,7 +768,9 @@ fn pair_trades(fills: &[SeamFill], symbol: &Symbol, ts: EventTimestamp) -> Vec<W
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::{Hash32, LineageId, STPMode, SequenceNumber, TimeInForce};
+    use crate::exchange::{
+        CancelReason, CancelledLeg, Hash32, LineageId, STPMode, SequenceNumber, TimeInForce,
+    };
     use crate::models::{AccountId, OrderType};
 
     const UNDERLYING: &str = "BTC";
@@ -868,7 +881,7 @@ mod tests {
                 directional_skew: None,
                 enabled: None,
             },
-            VenueOutcome::ControlApplied,
+            VenueOutcome::ControlApplied { swept: vec![] },
         )
     }
 
@@ -1024,6 +1037,84 @@ mod tests {
     }
 
     #[test]
+    fn test_kill_control_swept_removes_the_resting_level_from_the_aggregate() {
+        // A kill couples the owner-scoped MM sweep into the control's own turn:
+        // `ControlApplied.swept` carries the cancelled MM quote, which the WS
+        // per-instrument aggregate must remove exactly like a `MassCancelled` leg,
+        // emitting an orderbook-removal delta (#117). Asserted at the
+        // `InstrumentState::apply` seam the change lives on (a symbol-less control is
+        // routed to `apply` only where a swept leg names an instrument).
+        let mut state = InstrumentState::new();
+        // Rest an MM ask at 50_100 qty 8 → the aggregate reflects it.
+        let add = VenueCommand::AddOrder {
+            symbol: sym(),
+            order_id: VenueOrderId::new("mm-1"),
+            account: AccountId::new("mm"),
+            owner: Hash32([0xEE; 32]),
+            client_order_id: None,
+            side: SeamSide::Sell,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(50_100)),
+            quantity: 8,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        };
+        state.apply(
+            &add,
+            &VenueOutcome::Added {
+                fills: vec![],
+                resting_quantity: 8,
+                stp_cancelled: vec![],
+            },
+        );
+        assert_eq!(state.qty_at(BookSide::Ask, 50_100), 8, "the MM ask rests");
+
+        // A kill: the coupled owner-scoped sweep on `ControlApplied.swept` removes it.
+        let kill = VenueCommand::MarketMakerControl {
+            spread_multiplier: None,
+            size_scalar: None,
+            directional_skew: None,
+            enabled: Some(false),
+        };
+        let changes = state.apply(
+            &kill,
+            &VenueOutcome::ControlApplied {
+                swept: vec![CancelledLeg {
+                    order_id: VenueOrderId::new("mm-1"),
+                    owner: Hash32([0xEE; 32]),
+                    reason: CancelReason::MassCancel,
+                }],
+            },
+        );
+        assert_eq!(
+            state.qty_at(BookSide::Ask, 50_100),
+            0,
+            "the swept MM level is removed"
+        );
+        assert!(
+            changes.iter().any(|change| change.side == BookSide::Ask
+                && change.price == Cents::new(50_100)
+                && change.quantity == 0),
+            "a removal delta is emitted for the swept level"
+        );
+    }
+
+    #[test]
+    fn test_non_kill_control_swept_is_empty_and_emits_no_delta() {
+        // A non-kill control (a spread knob) carries an empty `swept`, so `apply`
+        // returns no change — the aggregate is untouched.
+        let mut state = InstrumentState::new();
+        let control = VenueCommand::MarketMakerControl {
+            spread_multiplier: Some(1.5),
+            size_scalar: None,
+            directional_skew: None,
+            enabled: None,
+        };
+        let changes = state.apply(&control, &VenueOutcome::ControlApplied { swept: vec![] });
+        assert!(changes.is_empty(), "an empty-swept control emits no delta");
+    }
+
+    #[test]
     fn test_cancel_removes_the_level() {
         let manager = OrderbookSubscriptionManager::new();
         // Rest, then cancel — the level returns to zero (removed).
@@ -1064,7 +1155,7 @@ mod tests {
                 bid: None,
                 ask: None,
             },
-            VenueOutcome::ControlApplied,
+            VenueOutcome::ControlApplied { swept: vec![] },
         );
         // A `SimStep` has no contract symbol → no orderbook delta, but it feeds
         // the `prices` channel with the committed override.

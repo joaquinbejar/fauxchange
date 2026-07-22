@@ -950,6 +950,17 @@ impl AppState {
     /// it rather than hiding it — the venue does not promise atomic venue-wide
     /// fan-out (#118).
     ///
+    /// A **sequenced market-maker kill** (`MarketMakerControl { enabled: Some(false),
+    /// .. }`) is just a normal venue-global control here: it needs **no** separate
+    /// follow-on command. The executor **couples** the owner-scoped market-maker
+    /// sweep into the kill control's own sequenced turn, per underlying, so each
+    /// underlying journals **one** event that both applies the control and cancels
+    /// the maker's standing quotes ([`VenueOutcome::ControlApplied`](crate::exchange::VenueOutcome::ControlApplied)
+    /// carrying the swept legs). That is crash-consistent (there is no cross-command
+    /// gap a crash could open between "control applied" and "quotes cancelled") and
+    /// reports one fan-out receipt (nothing discarded) — see the executor's
+    /// `MarketMakerControl` arm (#117).
+    ///
     /// # Errors
     ///
     /// - [`VenueError::InvalidOrder`] if the command's symbol does not parse, the
@@ -1886,7 +1897,8 @@ impl std::fmt::Debug for AppState {
 mod tests {
     use super::*;
     use crate::exchange::{
-        Cents, Hash32, MassCancelType, STPMode, Side, Symbol, TimeInForce, VenueOutcome,
+        Cents, Hash32, JournalRecord, MARKET_MAKER_ACCOUNT, MARKET_MAKER_OWNER, MassCancelType,
+        STPMode, Side, Symbol, TimeInForce, VenueOutcome,
     };
     use crate::models::{AccountId, ClientOrderId, OrderType, VenueOrderId};
 
@@ -2074,15 +2086,17 @@ mod tests {
     #[tokio::test]
     async fn test_market_maker_control_fans_out_and_is_journaled_by_every_underlying() {
         let state = new_state(config(&["BTC", "ETH"]));
-        // A venue-global MarketMakerControl fans to every actor and journals in each
-        // stream (there is no live sink wired in phase 1 — the seam is dispatched but
-        // no persona knob is applied).
+        // A venue-global **non-kill** MarketMakerControl (a spread knob, `enabled:
+        // None`) fans to every actor and journals in each stream as a SINGLE command
+        // whose `ControlApplied` sweeps nothing. A kill (`enabled: Some(false)`)
+        // couples an owner-scoped sweep INTO the same control turn (still one command
+        // per underlying) — covered by the dedicated kill tests below (#117).
         let receipt = match state
             .submit(VenueCommand::MarketMakerControl {
                 spread_multiplier: Some(1.5),
                 size_scalar: None,
                 directional_skew: None,
-                enabled: Some(false),
+                enabled: None,
             })
             .await
         {
@@ -2101,6 +2115,176 @@ mod tests {
                 "{ticker} journaled the control command"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_sequenced_kill_couples_owner_scoped_sweep_into_the_control_turn() {
+        // A **sequenced kill** (`MarketMakerControl { enabled: Some(false) }`) journals
+        // exactly ONE command per underlying — the control — whose `ControlApplied`
+        // carries the owner-scoped market-maker sweep in the SAME turn. There is no
+        // separate follow-on `MassCancel` a crash could skip: control + cancel are
+        // atomic per underlying (#117).
+        let state = new_state(config(&["BTC"]));
+        // A resting market-maker quote + a client order that must survive.
+        state
+            .submit(add(
+                "BTC-20240329-50000-C",
+                "mm-ask",
+                MARKET_MAKER_ACCOUNT,
+                0xEE,
+                Side::Sell,
+                50_000,
+                2,
+            ))
+            .await
+            .expect("mm quote rests");
+        state
+            .submit(add(
+                "BTC-20240329-50000-C",
+                "cli-bid",
+                "alice",
+                0x11,
+                Side::Buy,
+                40_000,
+                3,
+            ))
+            .await
+            .expect("client order rests");
+
+        let receipt = state
+            .submit(VenueCommand::MarketMakerControl {
+                spread_multiplier: None,
+                size_scalar: None,
+                directional_skew: None,
+                enabled: Some(false),
+            })
+            .await
+            .expect("kill fans out");
+        // The primary receipt is the CONTROL's (sequence 2, after the two adds); its
+        // outcome carries the coupled owner-scoped sweep.
+        assert_eq!(receipt.underlying_sequence.get(), 2);
+        match &receipt.outcome {
+            Some(VenueOutcome::ControlApplied { swept }) => {
+                assert_eq!(swept.len(), 1, "only the maker's own quote is swept");
+                assert!(
+                    swept.iter().all(|leg| leg.owner == MARKET_MAKER_OWNER),
+                    "the client order is untouched — only MARKET_MAKER_OWNER legs are swept"
+                );
+            }
+            other => panic!("expected a coupled ControlApplied receipt, got {other:?}"),
+        }
+
+        // The journal carries the control as the LAST command (sequence 2) — no
+        // separate follow-on `MassCancel`. The only cancellation is the coupled sweep
+        // on the control's own `ControlApplied` outcome.
+        let snap = state.journal_snapshot("BTC").await.expect("BTC snapshot");
+        assert_eq!(
+            snap.last_sequence.map(|s| s.get()),
+            Some(2),
+            "the control is the last journaled command — no follow-on MassCancel"
+        );
+        assert!(
+            !snap.records.iter().any(|record| matches!(
+                record,
+                JournalRecord::Event(event)
+                    if matches!(event.command, VenueCommand::MassCancel { .. })
+            )),
+            "a kill journals NO separate MassCancel command"
+        );
+        // The kill's own event carries the owner-scoped sweep in the same turn.
+        let swept = snap
+            .records
+            .iter()
+            .find_map(|record| match record {
+                JournalRecord::Event(event) => match (&event.command, &event.outcome) {
+                    (
+                        VenueCommand::MarketMakerControl {
+                            enabled: Some(false),
+                            ..
+                        },
+                        VenueOutcome::ControlApplied { swept },
+                    ) => Some(swept.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the kill control event carries the coupled sweep");
+        assert_eq!(swept.len(), 1, "only the maker's own quote is swept");
+        assert!(
+            swept.iter().all(|leg| leg.owner == MARKET_MAKER_OWNER),
+            "the client order is untouched — only MARKET_MAKER_OWNER legs are cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_second_sequenced_kill_on_a_disabled_engine_does_not_double_cancel() {
+        // A second kill on an already-disabled engine still journals its OWN control
+        // whose coupled sweep is a pure function of the command, but there is nothing
+        // left to sweep — it is idempotent and safe, never a double-cancel or a panic
+        // (#117).
+        let state = new_state(config(&["BTC"]));
+        state
+            .submit(add(
+                "BTC-20240329-50000-C",
+                "mm-ask",
+                MARKET_MAKER_ACCOUNT,
+                0xEE,
+                Side::Sell,
+                50_000,
+                2,
+            ))
+            .await
+            .expect("mm quote rests");
+        state
+            .submit(VenueCommand::MarketMakerControl {
+                spread_multiplier: None,
+                size_scalar: None,
+                directional_skew: None,
+                enabled: Some(false),
+            })
+            .await
+            .expect("first kill");
+        // Second kill: the control is a no-op (already disabled) and its coupled sweep
+        // finds nothing left to cancel.
+        state
+            .submit(VenueCommand::MarketMakerControl {
+                spread_multiplier: None,
+                size_scalar: None,
+                directional_skew: None,
+                enabled: Some(false),
+            })
+            .await
+            .expect("second kill is safe");
+
+        // Sequences: add(0), control(1), control(2) — no separate sweep commands.
+        let snap = state.journal_snapshot("BTC").await.expect("BTC snapshot");
+        assert_eq!(snap.last_sequence.map(|s| s.get()), Some(2));
+        assert!(
+            !snap.records.iter().any(|record| matches!(
+                record,
+                JournalRecord::Event(event)
+                    if matches!(event.command, VenueCommand::MassCancel { .. })
+            )),
+            "a kill journals NO separate MassCancel command"
+        );
+        // The two coupled ControlApplied outcomes: the first swept the one quote, the
+        // second swept nothing (already gone).
+        let swept: Vec<usize> = snap
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                JournalRecord::Event(event) => match &event.outcome {
+                    VenueOutcome::ControlApplied { swept } => Some(swept.len()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            swept,
+            vec![1, 0],
+            "the first kill sweeps the one quote; the second finds nothing to cancel"
+        );
     }
 
     #[tokio::test]

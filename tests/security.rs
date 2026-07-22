@@ -771,7 +771,7 @@ impl fauxchange::exchange::CommandExecutor for GatedExecutor {
         while !self.release.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(2));
         }
-        VenueOutcome::ControlApplied
+        VenueOutcome::ControlApplied { swept: vec![] }
     }
 }
 
