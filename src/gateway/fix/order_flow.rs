@@ -106,6 +106,18 @@ pub(crate) fn seam_side(side: OrderSide) -> SeamSide {
     }
 }
 
+/// Maps a matching-seam [`SeamSide`] back onto the FIX `Side (54)` wire enum — the
+/// inverse of [`seam_side`], for rendering a resting order's own side (carried on a
+/// [`CancelledLeg`](crate::exchange::CancelledLeg)) into an `ExecutionReport (8)`.
+#[must_use]
+#[inline]
+pub(crate) fn fix_side(side: SeamSide) -> OrderSide {
+    match side {
+        SeamSide::Buy => OrderSide::Buy,
+        SeamSide::Sell => OrderSide::Sell,
+    }
+}
+
 /// Maps the FIX `LastLiquidityInd` source (a fill leg's [`LiquidityFlag`]) onto the
 /// wire enum.
 #[must_use]

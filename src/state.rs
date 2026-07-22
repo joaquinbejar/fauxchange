@@ -80,8 +80,8 @@ use crate::exchange::{
     ActorConfig, ActorHandle, CancelledLeg, EventTimestamp, ExecutionsStore, ExpirationDate,
     FanoutSummary, InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal,
     InstrumentStatus, JournalHeader, JournalSnapshot, LineageId, MarkPriceBook,
-    MarketMakerControlSink, MassCancelScope, Receipt, SequenceNumber, StoreFanOut,
-    Symbol, TeeFanOut, VenueCommand, VenueOutcome, check_price_band,
+    MarketMakerControlSink, MassCancelScope, Receipt, SequenceNumber, StoreFanOut, Symbol,
+    TeeFanOut, VenueCommand, VenueOutcome, check_price_band,
     spawn_matching_actor_with_registry_and_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
@@ -670,6 +670,26 @@ pub struct SweptLeg {
     /// The sweeping `MassCancel` command's `underlying_sequence` on this order's
     /// underlying — distinct per underlying in a venue-global fan.
     pub sequence: SequenceNumber,
+}
+
+/// The result of a client [`VenueCommand::MassCancel`]: the **complete** set of
+/// swept legs aggregated across every underlying the sweep reached, paired with
+/// the fan-out delivery summary (#97).
+///
+/// The `fanout` is the honest delivery signal: a venue-global sweep fans to every
+/// hosted underlying's actor, and the venue makes **no** promise of atomic
+/// venue-wide fan-out (there is no venue-wide total order), so `ok_count < total`
+/// is a real, reportable state. A gateway MUST surface a non-`fully_applied`
+/// delivery rather than present a partial sweep as an unqualified success — some
+/// underlyings' live orders may remain. A `Book`-scoped sweep names one
+/// instrument → one actor, so its delivery is `{ ok_count: 1, total: 1 }`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MassCancelDelivery {
+    /// The swept legs, in the deterministic sorted-underlying then venue-id sweep
+    /// order. Its length is the caller's true cancelled count.
+    pub swept: Vec<SweptLeg>,
+    /// How the venue-global fan-out delivered across underlyings.
+    pub fanout: FanoutSummary,
 }
 
 /// The swept legs captured on a committed `MassCancel` receipt (each tagged with
@@ -1284,23 +1304,32 @@ impl AppState {
     ///   or a venue-global sweep reaches a venue hosting no underlyings;
     /// - the first actor's typed rejection if **every** targeted underlying
     ///   rejected the sweep. A **partial** fan-out (some underlyings committed,
-    ///   some rejected) is surfaced as a `WARN` and the committed legs are still
-    ///   returned — the venue does not promise atomic venue-wide fan-out.
+    ///   some rejected) is NOT collapsed into a clean success: the committed legs
+    ///   are returned TOGETHER with the [`FanoutSummary`], so a caller can tell a
+    ///   partial delivery (some underlyings still hold live orders) from a full
+    ///   one — the venue does not promise atomic venue-wide fan-out.
     pub async fn submit_mass_cancel(
         &self,
         command: VenueCommand,
-    ) -> Result<Vec<SweptLeg>, VenueError> {
+    ) -> Result<MassCancelDelivery, VenueError> {
         if !matches!(command, VenueCommand::MassCancel { .. }) {
             return Err(VenueError::InvalidOrder(
                 "submit_mass_cancel requires a MassCancel command".to_string(),
             ));
         }
         // A `Book`-scoped sweep names one instrument → one actor, one receipt that
-        // carries the full swept set for that book.
+        // carries the full swept set for that book; its fan-out is trivially full
+        // (one underlying, one delivery).
         if !is_venue_global(&command) {
             let handle = self.route(&command)?;
             let receipt = handle.submit(command).await?;
-            return Ok(swept_legs_of(&receipt));
+            return Ok(MassCancelDelivery {
+                swept: swept_legs_of(&receipt),
+                fanout: FanoutSummary {
+                    ok_count: 1,
+                    total: 1,
+                },
+            });
         }
         // Venue-global fan: aggregate every underlying's swept legs, in the
         // deterministic sorted-underlying then venue-id sweep order.
@@ -1346,7 +1375,13 @@ impl AppState {
                 "venue-global mass cancel fan-out was partial across underlyings"
             );
         }
-        Ok(aggregated)
+        // Return the swept legs TOGETHER with the fan-out summary: a partial fan-out
+        // (`ok_count < total`) is a reportable state, never hidden behind a clean
+        // aggregated success (#97 finding 2).
+        Ok(MassCancelDelivery {
+            swept: aggregated,
+            fanout: FanoutSummary { ok_count, total },
+        })
     }
 
     /// Admits a price-bearing order command against the venue-owned price band

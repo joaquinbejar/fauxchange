@@ -1345,6 +1345,8 @@ fn test_normalize_strips_stp_cancelled_order_id_but_keeps_owner_and_reason() {
             stp_cancelled: vec![CancelledLeg {
                 order_id: VenueOrderId::new("resting-self"),
                 owner: Hash32([0x22; 32]),
+                symbol: sym(),
+                side: SeamSide::Sell,
                 reason: CancelReason::SelfTradePrevention,
             }],
         },
@@ -2265,6 +2267,8 @@ fn stp_event(aggressor: &str, resting: &str) -> VenueEvent {
             stp_cancelled: vec![CancelledLeg {
                 order_id: VenueOrderId::new(resting),
                 owner: Hash32([0x22; 32]),
+                symbol: sym(),
+                side: SeamSide::Sell,
                 reason: CancelReason::SelfTradePrevention,
             }],
         },
@@ -2874,4 +2878,80 @@ async fn test_fix_mass_cancel_q_is_owner_scoped_across_accounts() {
         "trader-1's orders were never touched by trader-2's cancel-all"
     );
     assert_eq!(canceled_reports(&reply).len(), 2);
+}
+
+#[tokio::test]
+async fn test_fix_mass_cancel_q_reports_8_for_an_order_not_placed_this_session() {
+    // (#97 finding 3) A resting order the current FIX session did NOT place — here a
+    // placement submitted straight onto the sequenced path (exactly like a REST
+    // client or a prior FIX session) — is swept by a FIX `q` and MUST still receive
+    // its own `ExecutionReport(8) Canceled`. The swept leg now carries the resting
+    // order's own Symbol/Side (journaled in the outcome), so the render no longer
+    // depends on this session's placement tracking, and the `r` 533 count equals the
+    // number of `8`s.
+    let harness = cfix::FixParityHarness::start().await;
+
+    // A REST-equivalent placement for trader-1, NOT tracked by any FIX session.
+    let symbol = match Symbol::parse(CALL) {
+        Ok(s) => s,
+        Err(e) => panic!("fixture symbol parses: {e:?}"),
+    };
+    let placed_id = VenueOrderId::new("rest-side-mc-1");
+    let receipt = harness
+        .state()
+        .submit(VenueCommand::AddOrder {
+            symbol,
+            order_id: placed_id.clone(),
+            account: AccountId::new(cfix::TRADER1.account),
+            owner: Hash32([cfix::TRADER1.owner_byte; 32]),
+            client_order_id: None,
+            side: SeamSide::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(39_000)),
+            quantity: 1,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        })
+        .await;
+    assert!(
+        receipt.is_ok(),
+        "the sequenced (REST-equivalent) placement must commit: {receipt:?}"
+    );
+
+    // trader-1 logs on fresh and mass-cancels: the sweep hits the order this session
+    // never tracked in `placed`.
+    let mut client = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let reply = client.mass_cancel("mc-untracked-q").await;
+
+    let r = match cfix::find_msg(&reply, "r") {
+        Some(r) => r,
+        None => panic!("a committed q must render an r, got {reply:?}"),
+    };
+    assert_eq!(
+        cfix::field(r, "533").as_deref(),
+        Some("1"),
+        "TotalAffectedOrders counts the untracked order"
+    );
+    let canceled = canceled_reports(&reply);
+    assert_eq!(
+        canceled.len(),
+        1,
+        "the untracked order still gets its own 8 — count matches r's 533, got {reply:?}"
+    );
+    let report = canceled[0];
+    assert_eq!(
+        cfix::field(report, "55").as_deref(),
+        Some(CALL),
+        "the 8 carries the swept order's Symbol from the journaled leg, not session tracking"
+    );
+    assert_eq!(
+        cfix::field(report, "54").as_deref(),
+        Some("1"),
+        "the 8 carries the swept order's Side (Buy) from the journaled leg"
+    );
+    assert_eq!(
+        cfix::field(report, "37").as_deref(),
+        Some(placed_id.as_str()),
+        "the 8 references the REST-placed venue OrderID(37)"
+    );
 }

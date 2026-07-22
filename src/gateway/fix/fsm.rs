@@ -44,7 +44,7 @@ use ironfix_core::types::{CompId, SeqNum};
 use crate::auth::{AccountStore, RateLimitKey, RateLimitTier, RevocationOracle};
 use crate::error::{FixReject, FixRejectContext, FixRejectReason, VenueError};
 use crate::exchange::{
-    AddOutcome, Cents, MassCancelScope, MassCancelType, Symbol, SymbolParser,
+    AddOutcome, Cents, FanoutSummary, MassCancelScope, MassCancelType, Symbol, SymbolParser,
     TimeInForce as SeamTif, VenueCommand, VenueOutcome,
 };
 use crate::gateway::rest::support::{
@@ -1130,9 +1130,13 @@ impl SessionFsm {
         specs: Vec<ExecReportSpec>,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
-        // Checked (rule 10): the swept set is bounded by resting orders, so the
-        // saturating fallback is unreachable but keeps the crate `as`-cast-free.
-        let total_affected_orders = u32::try_from(affected_orders.len()).unwrap_or(u32::MAX);
+        // Checked (rule 9/13): the advertised `TotalAffectedOrders (533)` MUST agree
+        // with the encoded `affected_orders` list, so a count that will not fit the
+        // FIX `u32` field is a propagated typed error (sealing the session) — NEVER
+        // a silent `u32::MAX` clamp that would disagree with the list. Unreachable in
+        // practice (the swept set is bounded by resting orders), a fail-safe.
+        let total_affected_orders =
+            u32::try_from(affected_orders.len()).map_err(|_| SessionError::SequenceExhausted)?;
         let report = self.emit(now_ms, |header| {
             OrderMassCancelReport {
                 header,
@@ -1142,6 +1146,9 @@ impl SessionFsm {
             }
             .encode()
         })?;
+        // Capacity is a hint only (not correctness): a `checked_add` that would
+        // overflow falls back to `specs.len()`, which never implies a wrong count —
+        // the authoritative `total_affected_orders` above is separately checked.
         let mut frames = Vec::with_capacity(specs.len().checked_add(1).unwrap_or(specs.len()));
         frames.push(report);
         for spec in specs {
@@ -2306,7 +2313,9 @@ impl VenueFixSession {
             account,
         };
         match self.state.submit_mass_cancel(command).await {
-            Ok(affected) => self.render_mass_cancel(response, &affected, now_ms),
+            Ok(delivery) => {
+                self.render_mass_cancel(response, &delivery.swept, delivery.fanout, now_ms)
+            }
             Err(_) => self.fsm.emit_mass_cancel_rejected(now_ms),
         }
     }
@@ -2316,53 +2325,72 @@ impl VenueFixSession {
     ///
     /// The affected set is the deterministic, venue-id-sorted [`MassCancelled`]
     /// outcome; the `r` report carries **every** swept order id (the honest count).
-    /// Each per-order `8` recovers the order's `Symbol`/`Side` from this session's
-    /// placement tracking — the outcome carries only `(venue_order_id, owner)`
-    /// identity, and the `ExecutionReport` needs the instrument + side. A swept
-    /// order this session did not place (a prior connection, or a REST placement by
-    /// the same account) is still counted on the `r` report but has no tracked
-    /// `Symbol`/`Side` to render an `8` for — the same session-scoped correlation
-    /// limit `F`/`G` document. Every rendered order is dropped from the session's
-    /// tracking (it is gone from the book), so a later `F` on it is a masked reject.
+    /// Each per-order `8` renders the order's `Symbol`/`Side` **directly from the
+    /// swept leg** — the [`CancelledLeg`](crate::exchange::CancelledLeg) now carries
+    /// the resting order's own `symbol`/`side`, journaled in the outcome — so EVERY
+    /// swept order gets its `8`, including one this session did not place (a REST
+    /// placement by the same account, or a prior FIX session). Any matching
+    /// session-tracked entry is still dropped from `self.placed` (the order is gone
+    /// from the book), so a later `F` on it is a masked reject.
+    ///
+    /// `fanout` is the venue-global delivery summary. On a NON-full fan-out the
+    /// per-order `8`s for what WAS swept are still emitted (those cancellations are
+    /// real) and the `r` carries the honest affected count, but the partial delivery
+    /// is `WARN`-logged — FIX has no structured partial-delivery field, so it is not
+    /// presented as a clean full success; the structured signal lives on REST.
     fn render_mass_cancel(
         &mut self,
         response: MassCancelResponse,
         affected: &[SweptLeg],
+        fanout: FanoutSummary,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
+        // A partial venue-wide fan-out is a reportable state (#97 finding 2): warn
+        // rather than present the sweep as a clean full success. FIX has no
+        // structured partial-delivery field; the per-order `8`s below are still the
+        // real cancellations, and the structured `fully_applied` signal is on REST.
+        if !fanout.fully_applied() {
+            tracing::warn!(
+                ok_underlyings = fanout.ok_count,
+                total_underlyings = fanout.total,
+                swept = affected.len(),
+                "FIX mass-cancel fan-out was partial across underlyings; live orders \
+                 may remain on the rejected underlyings"
+            );
+        }
         let lineage = self.state.lineage_id().clone();
         let affected_ids: Vec<VenueOrderId> = affected
             .iter()
             .map(|swept| swept.leg.order_id.clone())
             .collect();
-        // Reverse-resolve each swept leg to its session-tracked `Symbol`/`Side` and
-        // synthesize a collision-free composite `ExecID` (per-leg underlying + the
-        // swept command's `underlying_sequence` join key + the leg index).
+        // Render each swept leg's `8` directly from the journaled `symbol`/`side` on
+        // the outcome — no session-tracked reverse resolution, so no swept order is
+        // ever silently skipped. The composite `ExecID` is collision-free (per-leg
+        // underlying + the swept command's `underlying_sequence` join key + index).
         let mut specs: Vec<ExecReportSpec> = Vec::with_capacity(affected.len());
         let mut index: u32 = 0;
         for swept in affected {
+            // Drop any session-tracked correlation for this order: it is gone from
+            // the book, so a later `F`/`G` on it must masked-reject.
             let tracked = self
                 .placed
                 .iter()
                 .find(|(_, placed)| placed.order_id == swept.leg.order_id)
                 .map(|(cl_ord_id, _)| cl_ord_id.clone());
-            let Some(cl_ord_id) = tracked else {
-                continue;
-            };
-            let Some(placed) = self.placed.remove(&cl_ord_id) else {
-                continue;
-            };
-            let underlying = underlying_of_symbol(&placed.symbol);
+            if let Some(cl_ord_id) = tracked {
+                self.placed.remove(&cl_ord_id);
+            }
+            let underlying = underlying_of_symbol(&swept.leg.symbol);
             specs.push(order_flow::render_mass_cancel_leg_report(
-                placed.symbol,
-                placed.side,
+                swept.leg.symbol.clone(),
+                order_flow::fix_side(swept.leg.side),
                 swept.leg.order_id.clone(),
                 swept.sequence,
                 &lineage,
                 &underlying,
                 index,
             ));
-            // Checked (rule 10); the affected set is bounded by resting orders.
+            // Checked (rule 9); the affected set is bounded by resting orders.
             index = index
                 .checked_add(1)
                 .ok_or(SessionError::SequenceExhausted)?;

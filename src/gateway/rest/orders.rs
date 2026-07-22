@@ -711,13 +711,20 @@ pub async fn bulk_cancel_orders(
 /// owner-scoped venue-wide [`VenueCommand::MassCancel`] (#97).
 ///
 /// The sweep is scoped to the caller via [`MassCancelType::ByUser`] keyed on the
-/// account's STP owner [`Hash32`](crate::exchange::Hash32), so an account can only
-/// ever cancel its OWN orders — never another account's (the executor's owner
-/// filter enforces the isolation). It fans across every hosted underlying and
-/// returns the **complete** cancelled set aggregated across them
-/// ([`AppState::submit_mass_cancel`]), so `canceled_count` is the account's true
-/// total (never one representative underlying's). A second cancel-all with nothing
-/// left to sweep reports `canceled_count: 0`.
+/// account's STP owner [`Hash32`](crate::exchange::Hash32) AND gated on the
+/// requesting account inside the sequenced executor, so an account can only ever
+/// cancel its OWN orders — never another account's, even one sharing the same STP
+/// owner (the executor's account gate enforces the isolation). It fans across
+/// every hosted underlying and returns the **complete** cancelled set aggregated
+/// across them ([`AppState::submit_mass_cancel`]), so `canceled_count` is the
+/// account's true total (never one representative underlying's). A second
+/// cancel-all with nothing left to sweep reports `canceled_count: 0`.
+///
+/// **Partial fan-out is reported, never hidden.** The venue makes no promise of
+/// atomic venue-wide fan-out; when some underlyings reject the sweep the response
+/// carries `fully_applied: false` with `ok_underlyings` / `total_underlyings`, so
+/// a client sees that live orders may remain on the failed underlyings rather than
+/// a false clean success.
 ///
 /// **Fine-grained filters are refused, not silently ignored.** The `MassCancelType`
 /// is single-axis (`ByUser` XOR `BySide`), so an `underlying` / `expiration` /
@@ -735,7 +742,7 @@ pub async fn bulk_cancel_orders(
         ("style" = Option<crate::models::OptionStyle>, Query, description = "Filter by style (not yet supported — a filtered request is a 400)"),
     ),
     responses(
-        (status = 200, description = "Owner-scoped cancel-all outcome (count of the account's swept orders)", body = CancelAllResponse),
+        (status = 200, description = "Owner-scoped cancel-all outcome: canceled_count of the account's swept orders plus the fan-out delivery (fully_applied / ok_underlyings / total_underlyings)", body = CancelAllResponse),
         (status = 400, description = "A filtered cancel-all is not supported; omit filters for an owner-scoped cancel-all"),
         (status = 401, description = "Missing or invalid token"),
         (status = 403, description = "Missing Trade permission"),
@@ -763,15 +770,24 @@ pub async fn cancel_all_orders(
     }
     let account = auth.claims.account().clone();
     let owner = owner_for(&state, &account)?;
-    let affected = state
+    let delivery = state
         .submit_mass_cancel(VenueCommand::MassCancel {
             scope: MassCancelScope::Underlying,
             cancel_type: MassCancelType::ByUser(owner),
             account,
         })
         .await?;
+    // Render the fan-out delivery explicitly (#97 finding 2): a partial venue-wide
+    // fan-out (some underlyings rejected) is reported through `fully_applied` /
+    // `ok_underlyings` / `total_underlyings`, never collapsed into a clean success
+    // — a client can tell live orders may remain on the failed underlyings.
+    // `failed_count` stays 0 at the ORDER granularity: a failed underlying's orders
+    // were never enumerated, so an order-level failed count is not knowable.
     Ok(Json(CancelAllResponse {
-        canceled_count: affected.len(),
+        canceled_count: delivery.swept.len(),
         failed_count: 0,
+        fully_applied: delivery.fanout.fully_applied(),
+        ok_underlyings: delivery.fanout.ok_count,
+        total_underlyings: delivery.fanout.total,
     }))
 }

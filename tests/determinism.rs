@@ -1727,12 +1727,14 @@ fn test_instrument_status_lifecycle_replays_identically() {
 fn test_mass_cancel_replays_identically() {
     let lineage = LineageId::new("run-mass-cancel");
     let commands = vec![
-        // Two resting sells + one resting buy on the call, and one on the put.
+        // The `admin` account rests two sells; other accounts rest the buys. A
+        // client `BySide` sweep is account-scoped (#97 finding 1: the side filter is
+        // never a cross-account authority), so both swept sells belong to `admin`.
         add(
             &lineage,
             0,
             CALL,
-            "a",
+            "admin",
             0x11,
             Side::Sell,
             50_000,
@@ -1743,7 +1745,7 @@ fn test_mass_cancel_replays_identically() {
             &lineage,
             1,
             CALL,
-            "b",
+            "admin",
             0x12,
             Side::Sell,
             50_100,
@@ -1772,7 +1774,8 @@ fn test_mass_cancel_replays_identically() {
             5,
             TimeInForce::Gtc,
         ),
-        // Cancel every SELL across the whole underlying (both call sells, not the buys).
+        // `admin` cancels every one of ITS OWN sells across the whole underlying
+        // (both call sells, not the buys) — an account-scoped `BySide` sweep.
         VenueCommand::MassCancel {
             scope: MassCancelScope::Underlying,
             cancel_type: MassCancelType::BySide(Side::Sell),

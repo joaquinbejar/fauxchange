@@ -91,7 +91,7 @@ fn stp_event(symbol: Symbol, aggressor: &str, resting: &str) -> VenueEvent {
         SequenceNumber::new(9),
         EventTimestamp::new(1_700_000_000_000),
         VenueCommand::AddOrder {
-            symbol,
+            symbol: symbol.clone(),
             order_id: VenueOrderId::new(aggressor),
             account: AccountId::new("trader-1"),
             owner: Hash32([0x22; 32]),
@@ -109,6 +109,8 @@ fn stp_event(symbol: Symbol, aggressor: &str, resting: &str) -> VenueEvent {
             stp_cancelled: vec![CancelledLeg {
                 order_id: VenueOrderId::new(resting),
                 owner: Hash32([0x22; 32]),
+                symbol,
+                side: Side::Sell,
                 reason: CancelReason::SelfTradePrevention,
             }],
         },

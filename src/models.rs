@@ -923,12 +923,30 @@ pub struct CancelAllQuery {
 }
 
 /// Response for the cancel-all endpoint.
+///
+/// The `fully_applied` / `ok_underlyings` / `total_underlyings` fields carry the
+/// honest venue-global fan-out delivery signal: a cancel-all fans to every hosted
+/// underlying's actor and the venue makes NO promise of atomic venue-wide fan-out,
+/// so a client MUST check `fully_applied` — when it is `false`, some underlyings
+/// rejected the sweep and may still hold live orders. `canceled_count` is the
+/// actual number of orders swept (the length of the aggregated swept set).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CancelAllResponse {
-    /// Number of orders canceled.
+    /// Number of orders actually canceled (the aggregated swept-leg count).
     pub canceled_count: usize,
-    /// Number of orders that failed to cancel.
+    /// Number of orders that failed to cancel. Always `0` at the ORDER
+    /// granularity: a failed underlying's orders were never enumerated, so an
+    /// order-level failed count is not knowable — the fan-out fields
+    /// (`fully_applied` / `ok_underlyings` / `total_underlyings`) carry the honest
+    /// partial-delivery signal instead.
     pub failed_count: usize,
+    /// Whether the sweep committed on EVERY underlying it was fanned to. When
+    /// `false`, some underlyings rejected the sweep and may still hold live orders.
+    pub fully_applied: bool,
+    /// How many underlyings the sweep committed on.
+    pub ok_underlyings: usize,
+    /// How many underlyings the sweep was fanned to.
+    pub total_underlyings: usize,
 }
 
 // ============================================================================
