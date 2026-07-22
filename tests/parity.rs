@@ -1931,6 +1931,62 @@ async fn test_order_entry_parity_place_into_halted_rejects_on_rest_and_fix() {
 }
 
 #[tokio::test]
+async fn test_fix_partial_replace_failure_is_a_cancel_reject_never_a_false_replaced() {
+    // #118: a non-atomic replace whose cancel leg commits but whose replacement add is
+    // rejected (`Replace { cancelled: true, add: Rejected }`) MUST NOT render a false
+    // `8 Replaced`, and MUST NOT track the never-resting replacement (a phantom F/G
+    // correlation). It renders an `OrderCancelReject (9)` naming the add-leg reason.
+    let harness = cfix::FixParityHarness::start().await;
+    let mut trader = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+
+    // Rest a buy on the empty book (no cross), so the original is genuinely resting.
+    let placed = trader.place_limit("pr-orig", "1", 50_000, 5, "1").await;
+    let new = match cfix::find_msg(&placed, "8") {
+        Some(new) => new,
+        None => panic!("the initial D must yield an ExecutionReport(8), got {placed:?}"),
+    };
+    assert_eq!(
+        cfix::field(new, "39").as_deref(),
+        Some("0"),
+        "OrdStatus New"
+    );
+
+    // A MARKET replace (OrdType=1, no price): the cancel leg removes the resting order,
+    // then the add leg is rejected — a market order does not rest.
+    let reply = trader.market_replace("pr-orig", "pr-new", "1", 5).await;
+    assert!(
+        cfix::find_msg(&reply, "8")
+            .filter(|f| cfix::field(f, "150").as_deref() == Some("5"))
+            .is_none(),
+        "a partial-replace failure must NEVER emit a false ExecutionReport(8) Replaced, got {reply:?}"
+    );
+    let reject = match cfix::find_msg(&reply, "9") {
+        Some(reject) => reject,
+        None => panic!("a partial-replace failure must be an OrderCancelReject(9), got {reply:?}"),
+    };
+    assert_eq!(
+        cfix::field(reject, "102").as_deref(),
+        Some("2"),
+        "CxlRejReason Broker/Exchange Option — the named add-leg reason, not the unknown-order mask (1)"
+    );
+
+    // The rejected replacement was never tracked: a cancel of its ClOrdID is the uniform
+    // masked reject (unknown order), proving no phantom correlation was created.
+    let phantom_cancel = trader.cancel("pr-new", "pr-cxl", "1").await;
+    let masked = match cfix::find_msg(&phantom_cancel, "9") {
+        Some(masked) => masked,
+        None => {
+            panic!("cancelling the never-tracked replacement must be a 9, got {phantom_cancel:?}")
+        }
+    };
+    assert_eq!(
+        cfix::field(masked, "102").as_deref(),
+        Some("1"),
+        "the never-tracked replacement is an unknown order (masked reject), not a live order"
+    );
+}
+
+#[tokio::test]
 async fn test_order_entry_parity_uncancellable_cancel_masks_reason_on_rest_and_fix() {
     // #118: a cancel the order path refuses is the OBSERVED reject on BOTH surfaces —
     // REST `success:false` (never a false success), FIX `OrderCancelReject(9)` (never a

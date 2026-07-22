@@ -43,7 +43,9 @@ use ironfix_core::types::{CompId, SeqNum};
 
 use crate::auth::{AccountStore, RateLimitKey, RateLimitTier, RevocationOracle};
 use crate::error::{FixReject, FixRejectContext, FixRejectReason, VenueError};
-use crate::exchange::{Cents, Symbol, SymbolParser, TimeInForce as SeamTif, VenueOutcome};
+use crate::exchange::{
+    AddOutcome, Cents, Symbol, SymbolParser, TimeInForce as SeamTif, VenueOutcome,
+};
 use crate::gateway::rest::support::{
     immediate_execution_records, mint_order_id, owner_for, taker_legs_for_order,
 };
@@ -2284,8 +2286,12 @@ impl VenueFixSession {
     }
 
     /// `OrderCancelReplaceRequest (G)` → the non-atomic [`VenueCommand::Replace`].
-    /// A committed replace renders `ExecutionReport (8) Replaced` + the add leg's
-    /// fills; an unknown order or a runtime failure renders `OrderCancelReject (9)`.
+    /// A committed replace (add leg `Filled`/`Rested`) renders `ExecutionReport (8)
+    /// Replaced` + the add leg's fills. A **whole-replace refusal** (cancel leg never
+    /// removed the original) and a **partial-replace failure** (cancel succeeded, add
+    /// rejected — the original is gone, no new order rests) both render
+    /// `OrderCancelReject (9)`; only the whole refusal keeps the original tracked, and
+    /// neither tracks the rejected replacement (no phantom `F`/`G` correlation, #118).
     async fn route_replace(
         &mut self,
         replace: OrderCancelReplaceRequest,
@@ -2325,21 +2331,48 @@ impl VenueFixSession {
         );
         match self.state.submit(command).await {
             Ok(receipt) => {
-                // Render the OBSERVED outcome (#118), never a false `Replaced`: a replace
-                // the order path refused (unknown / unowned / already-gone original) is an
-                // `Ok(Receipt)` whose captured outcome is `Rejected` — emit a masked
-                // `OrderCancelReject (9)`. The replace did NOT take effect, so keep the
-                // ORIGINAL tracking (do not re-key to the new ClOrdID) and do not track the
-                // rejected new order as placed.
-                if let Some(VenueOutcome::Rejected { reason }) = &receipt.outcome {
-                    return self.reject_cancel_masked(
-                        placed.order_id.clone(),
-                        &replace.orig_cl_ord_id,
-                        &replace.cl_ord_id,
-                        CxlRejResponseTo::OrderCancelReplaceRequest,
-                        reason,
-                        now_ms,
-                    );
+                // Render the OBSERVED outcome (#118), never a false `Replaced`. A replace has
+                // TWO distinct failure shapes the order path captures losslessly, and each
+                // renders differently because the ORIGINAL order ends in a different state:
+                match &receipt.outcome {
+                    // Whole-replace refusal (the cancel leg never removed the target: unknown
+                    // / unowned / already-gone original). The ORIGINAL still rests untouched,
+                    // so keep its tracking (do not re-key) and emit the uniform masked
+                    // `OrderCancelReject (9)` (#118/#132).
+                    Some(VenueOutcome::Rejected { reason }) => {
+                        return self.reject_cancel_masked(
+                            placed.order_id.clone(),
+                            &replace.orig_cl_ord_id,
+                            &replace.cl_ord_id,
+                            CxlRejResponseTo::OrderCancelReplaceRequest,
+                            reason,
+                            now_ms,
+                        );
+                    }
+                    // Partial-replace failure (cancel succeeded, replacement add rejected —
+                    // the defined non-atomic `Replace { cancelled: true, add: Rejected }`
+                    // state, ADR-0009). The ORIGINAL is gone and NO new order rests, so drop
+                    // the now-stale original tracking and do NOT track the rejected new order
+                    // (that phantom entry was the bug: it fabricated an `F`/`G` correlation to
+                    // an order that never entered the book, and a false `Replaced`). The add
+                    // leg's reason is order-/instrument-level — the cancel leg already proved
+                    // ownership, so this is NOT the cross-account mask (#132) and it is named.
+                    Some(VenueOutcome::Replace {
+                        cancelled,
+                        add: AddOutcome::Rejected { reason },
+                    }) => {
+                        if *cancelled {
+                            self.placed.remove(&replace.orig_cl_ord_id);
+                        }
+                        return self.reject_replace_add(
+                            placed.order_id.clone(),
+                            &replace.orig_cl_ord_id,
+                            &replace.cl_ord_id,
+                            reason,
+                            now_ms,
+                        );
+                    }
+                    _ => {}
                 }
                 // The old order is replaced; re-key tracking under the new ClOrdID.
                 self.placed.remove(&replace.orig_cl_ord_id);
@@ -2426,6 +2459,39 @@ impl VenueFixSession {
             cl_ord_id,
             response_to,
             &VenueError::NotFound(order_flow::CANCEL_REJECT_MASKED_REASON.to_string()),
+            now_ms,
+        )
+    }
+
+    /// The `OrderCancelReject (9)` for a **partial-replace failure** — the cancel leg
+    /// removed the original but the replacement add was rejected
+    /// ([`VenueOutcome::Replace { add: AddOutcome::Rejected, .. }`](crate::exchange::VenueOutcome::Replace),
+    /// ADR-0009). Unlike [`reject_cancel_masked`](Self::reject_cancel_masked) this NAMES
+    /// the reason in `Text (58)`: the cancel leg already proved ownership, so the add-leg
+    /// rejection is order-/instrument-level (bad replacement price, halted/settling
+    /// instrument) and carries no cross-account signal to mask (#132). It is reported as
+    /// a rejected `G` (`OrderCancelReject (9)`, [03 §5](../../../docs/03-protocol-surfaces.md));
+    /// the caller has already dropped the original tracking because the order is gone.
+    fn reject_replace_add(
+        &mut self,
+        order_id: VenueOrderId,
+        orig_cl_ord_id: &ClientOrderId,
+        cl_ord_id: &ClientOrderId,
+        reason: &str,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        tracing::info!(
+            order_id = %order_id.as_str(),
+            reason = %reason,
+            "partial replace: cancel leg committed but the replacement add was rejected; \
+             original is gone, no new order rests"
+        );
+        self.reject_cancel(
+            order_id,
+            orig_cl_ord_id,
+            cl_ord_id,
+            CxlRejResponseTo::OrderCancelReplaceRequest,
+            &VenueError::InvalidOrder(reason.to_string()),
             now_ms,
         )
     }
