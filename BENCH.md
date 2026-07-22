@@ -627,7 +627,7 @@ third).
 |---|---|---|
 | `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **77.374** | 10 881.6 |
 | `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **82.657** | 11 102.3 |
-| `MarketMakerEngine::update_price` steady-state requote (HP-4, `#050`, no `tokio` — a 10-contract chain, `CountingSink`) | **343.000** | 6 663.3 |
+| `MarketMakerEngine::update_price` steady-state requote (HP-4, `#050`/`#122`, no `tokio` — a 10-contract chain, `CountingSink`) | **232.000** (was 343.000 pre-`#122`) | 3 513.3 (was 6 663.3) |
 
 **Target status: NOT MET — disclosed gap, not partial credit.** docs/07 §4's
 criterion is *zero* steady-state allocation on the common path; the measured
@@ -658,15 +658,90 @@ journal specifically; not investigated further here.
 above, three consecutive runs of the `MarketMakerEngine::update_price` section
 (`ALLOC_MM_WARMUP_OPS=1000 ALLOC_MM_MEASURED_OPS=5000`) produced the
 **IDENTICAL** `343.000` allocs/op and `6 663.3` bytes/op every time — no
-variance at all. This is expected, not suspicious: this section runs entirely
+variance at all (the `#050` baseline; `#122` below has since reduced this
+section to an equally-reproducible `232.000` allocs/op / `3 513.3` bytes/op).
+This is expected, not suspicious: this section runs entirely
 synchronously with no `tokio` runtime at all (`CountingSink::enqueue` is a
 bare atomic increment), driven by a fixed, seeded price stream against a
 `MarketMakerEngine` built fresh each run in the same sequence — there is no
 async task scheduling, no `DashMap`/hasher randomization in this path, and no
 other source of run-to-run nondeterminism the two `tokio`-driven sections
 above are subject to. See §12 for the full interpretation (a 10-contract
-requote at ~34 allocations per instrument, non-zero and honestly reported as
-the DESIGN TARGET's regression-signal baseline, matching the framing below).
+requote, non-zero and honestly reported as the DESIGN TARGET's
+regression-signal baseline, matching the framing below).
+
+**The `#122` reduction (measured 2026-07-22), disclosed before/after.** `#122`
+drove the `MarketMakerEngine::update_price` section down from **343.000
+allocs/op / 6 663.3 bytes/op** to **232.000 allocs/op / 3 513.3 bytes/op** — a
+measured **−111 allocs/op (−32.4%)** and **−3 150 bytes/op (−47.3%)**, on the
+same host/toolchain/`Cargo.lock`, and equally reproducible (`232.000` exactly
+on every re-run, same zero-variance property as the `#050` baseline). The
+reduction is three purely-internal, **wire-form-preserving** representation
+changes on the venue's own requote plumbing (the produced `VenueCommand`
+stream is byte-identical — asserted by
+`market_maker::engine::tests::test_requote_output_is_byte_identical_across_identical_runs`):
+
+- `Symbol` now stores its canonical string as `Arc<str>` instead of `String`
+  (`src/exchange/symbol.rs`), so the ~7 `Symbol` clones a single-instrument
+  requote fans across two tracking maps and up to four `VenueCommand`s become
+  reference-count bumps, not heap allocations. Wire form is unchanged: `Symbol`
+  serialises through `#[serde(try_from = "String", into = "String")]`, not a
+  transparent `Arc<str>` forward, so the JSON/FIX/journal bytes are identical
+  and no serde `rc` feature is pulled — the one owned `String` is still
+  materialised only at the serialize seam.
+- The underlying ticker is interned once at registration as an `Arc<str>` on
+  each `QuotableInstrument` and cloned (a refcount bump) into each per-leg
+  `RestingQuote`, replacing the per-leg `String` allocations the old
+  `underlying.to_string()` calls made in the quote loop every tick. (The
+  `update_price` ENTRY path's own two `underlying.to_string()` calls — the
+  prices-map key and the `PriceUpdated` event — are NOT removed by this pass;
+  see "What remains" below.)
+- `requote_symbol` gathers an underlying's contracts into a **reused
+  per-engine scratch buffer** of `Arc<QuotableInstrument>` clones instead of
+  deep-cloning the whole `Vec<QuotableInstrument>` (with its owned `Symbol` /
+  underlying / persona-name) each tick — eliminating that per-tick `Vec` +
+  per-contract deep copy while still releasing the `instruments` read lock
+  before the quote loop (no lock across a sink enqueue / broadcast, rule 8).
+
+**What remains — HYPOTHESISED contributors, not a measured attribution.** The
+`alloc_profile` counter is **process-wide** and no call-stack profiler was run,
+so the breakdown below is a **source-reading hypothesis** about where the
+residual 232 allocs/op most likely come from — NOT a per-call-site measurement.
+It is not evidence that these are the dominant costs or that venue plumbing has
+reached any "floor"; attributing the 232 to concrete call sites needs the
+call-stack-profiler follow-up (#138). Read the list as candidates to
+investigate, not as measured shares. In particular, `update_price` itself
+(`src/market_maker/engine.rs`) **still visibly allocates two owned underlying
+`String`s per tick** — one for the prices-map `insert` key and one for the
+`MarketMakerEvent::PriceUpdated { symbol }` broadcast — so the entry path is
+demonstrably NOT at a wire-safe allocation floor; those two are a known,
+removable venue-plumbing residual (a follow-up, not claimed already-minimal).
+The likely larger contributors, by source inspection:
+
+- the **`optionstratlib` Black-Scholes evaluation** — 10 real
+  `Quoter::generate_quote` calls per tick, each building an
+  `optionstratlib::Options` (which owns a `String` underlying its API forces
+  us to allocate, rebuilt per valuation because spot/strike/style differ) and
+  running the Decimal-heavy `black_scholes` kernel. Pricing/Greeks are
+  mandated to go through `optionstratlib` (CLAUDE.md), so this is a **named
+  upstream-bound cost**, not venue plumbing to optimise here; and
+- the `AccountId` / `VenueOrderId` owned-`String` clones on the emitted
+  commands (the reserved market-maker account tag on 4 commands/instrument,
+  plus the minted leg-id clones the two tracking maps hold). These id
+  newtypes are `#[serde(transparent)]` `String`-backed DTOs in `src/models.rs`;
+  interning them to `Arc<str>` the way `Symbol` was done would require either
+  the serde `rc` feature or a hand-rolled `Serialize`/`Deserialize` +
+  `ToSchema` on that DTO surface — a wire/schema change out of scope for this
+  in-plumbing pass and gated by `#122`'s own "if the wire form would change,
+  don't do it." Named as a follow-up, not silently absorbed.
+
+The zero-steady-state-allocation DESIGN TARGET therefore remains **open** for
+this path, now at a smaller, MEASURED gap (232 allocs/op, down from 343 — the
+number is measured; the per-call-site breakdown above is not). The remainder is
+NOT claimed to be at any "wire-safe floor": `update_price` still allocates two
+owned underlying strings per tick (above), and the split between the pricing
+kernel, the DTO id representation, and that entry-path residual is a hypothesis
+pending the #138 call-stack-attribution follow-up, not a measured attribution.
 
 **Method and what this does / does not prove.** This is a **process-wide**
 allocation-pressure profile of the measured loop (every allocation on any
@@ -1210,10 +1285,12 @@ genuinely sensitive to load rather than trivially always green.
   data, §12.1); isolation under an arbitrarily aggressive requote cadence
   (§12.3's 1 ms diagnostic shows the effect is real and grows with load, just
   not yet at the 20 ms cadence this assertion commits to); or a
-  call-stack-attributed allocation breakdown for the 343 allocs/op the
-  allocation profile's third section reports (§6 — the same process-wide,
-  not call-stack-scoped, limitation §6 already discloses for its other two
-  sections).
+  call-stack-attributed allocation breakdown for the 232 allocs/op the
+  allocation profile's third section reports (§6 — reduced from 343 by `#122`;
+  the same process-wide, not call-stack-scoped, limitation §6 already discloses
+  for its other two sections. The `#122` reduction is attributed to concrete
+  code changes and verified byte-identical, but the residual 232 is still a
+  process-wide count, not a per-call-site attribution).
 - **CI regression gate**: not armed by this change — `#050` is scope-limited
   to landing the measured baseline and the isolation assertion (a `cargo
   test`, so it runs as a normal, always-on correctness check, not a
@@ -1380,6 +1457,17 @@ unusually favourable conditions, or that today's session has an identifiable
 cause; neither is known yet). The `MarketMakerEngine::update_price` ceiling
 (350) stays tight, matching that section's genuine, ten-run,
 zero-variance reproducibility.
+
+> **`#122` update (2026-07-22).** The seven-run table above records the
+> pre-`#122` state (MM section `343.000`, correct for 2026-07-19). `#122` has
+> since reduced the `MarketMakerEngine::update_price` section to an equally
+> reproducible **`232.000` allocs/op / `3 513.3` bytes/op** (see §6's `#122`
+> note for the mechanism and the honest re-scope of the remainder). This stays
+> comfortably under the existing `350` allocs/op gate ceiling, so
+> `scripts/bench_regression_gate.py` remains green with more margin and this
+> change does not require re-arming it. Tightening that ceiling toward the new
+> `232` baseline is a `devops`/`architect` follow-up (a ceiling that already
+> passes is not a regression), not part of `#122`.
 
 ### 13.4 The synthetic-regression dry-run
 

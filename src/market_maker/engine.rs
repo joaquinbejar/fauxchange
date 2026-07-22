@@ -34,7 +34,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use tokio::sync::broadcast;
 
@@ -69,10 +69,19 @@ const MILLIS_PER_DAY: f64 = 86_400_000.0;
 
 /// A contract the market maker quotes, pre-parsed from its canonical [`Symbol`]
 /// so the requote loop borrows rather than re-parses (rule 8).
+///
+/// Registered instruments are held behind an [`Arc`] in the instrument map so
+/// that gathering an underlying's contracts for a requote is a slice of cheap
+/// `Arc` clones into a reused scratch buffer, never a deep clone of the owned
+/// `Symbol` / `underlying` / persona per tick (#122).
 #[derive(Debug, Clone)]
 struct QuotableInstrument {
     /// The canonical contract symbol (the book key and command target).
     symbol: Symbol,
+    /// The underlying ticker, interned once at registration so the per-leg
+    /// [`RestingQuote`] records it with a reference-count bump rather than a
+    /// fresh `String` allocation on every requote (#122).
+    underlying: Arc<str>,
     /// The absolute contract expiry (a canonical `DateTime`), used with the
     /// venue clock to derive a deterministic relative time-to-expiry.
     expiration: ExpirationDate,
@@ -98,8 +107,9 @@ struct QuotableInstrument {
 /// edge calc when it fills.
 #[derive(Debug, Clone)]
 struct RestingQuote {
-    /// The underlying ticker (for `cancel_symbol_orders`).
-    underlying: String,
+    /// The underlying ticker (for `cancel_symbol_orders`), interned as an
+    /// `Arc<str>` cloned from the instrument (#122).
+    underlying: Arc<str>,
     /// The canonical contract symbol (the cancel target).
     symbol: Symbol,
     /// True for the bid (buy) leg, false for the ask (sell) leg.
@@ -151,8 +161,20 @@ pub struct MarketMakerEngine {
     config: RwLock<MarketMakerConfig>,
     /// Latest underlying prices (underlying ticker → **cents**).
     prices: RwLock<HashMap<String, u64>>,
-    /// Registered quotable instruments (underlying ticker → contracts).
-    instruments: RwLock<HashMap<String, Vec<QuotableInstrument>>>,
+    /// Registered quotable instruments (underlying ticker → contracts). Each
+    /// contract is `Arc`-shared so a requote gathers an underlying's chain with
+    /// cheap reference-count clones, not a deep per-contract copy (#122).
+    instruments: RwLock<HashMap<String, Vec<Arc<QuotableInstrument>>>>,
+    /// A per-engine scratch buffer the requote loop drains the registered
+    /// contracts into (a snapshot of cheap `Arc` clones taken under the
+    /// `instruments` read lock, then iterated with **no** lock held across the
+    /// sink enqueue / broadcast, rule 8). Reusing one buffer avoids allocating
+    /// a fresh `Vec` on every requote tick (#122); it is taken out under this
+    /// mutex and returned after the loop, so the mutex is never held across an
+    /// enqueue. Reuse is best-effort — a concurrent requote on another
+    /// underlying transparently falls back to a fresh `Vec` — and never changes
+    /// the produced quotes or their order (rule 5).
+    requote_scratch: Mutex<Vec<Arc<QuotableInstrument>>>,
     /// Resting leg ids per instrument, for replace-not-accumulate on requote.
     /// Mutated together with `resting` under both guards in `cancel_symbol_orders`.
     legs: RwLock<HashMap<Symbol, LegSlots>>,
@@ -186,6 +208,7 @@ impl MarketMakerEngine {
             config: RwLock::new(MarketMakerConfig::default()),
             prices: RwLock::new(HashMap::new()),
             instruments: RwLock::new(HashMap::new()),
+            requote_scratch: Mutex::new(Vec::new()),
             legs: RwLock::new(HashMap::new()),
             resting: RwLock::new(HashMap::new()),
             next_order_seq: AtomicU64::new(0),
@@ -292,10 +315,13 @@ impl MarketMakerEngine {
         // Guard the analytic boundary: a non-finite / non-positive override is
         // dropped to the pricer default rather than carried onto the quote path.
         let iv = iv.filter(|value| value.is_finite() && *value > 0.0);
-        let underlying = parsed.underlying().to_string();
+        // Intern the underlying once here (registration is off the hot path) so
+        // every requote clones the `Arc<str>` rather than re-allocating it (#122).
+        let underlying: Arc<str> = Arc::from(parsed.underlying());
         let strike_cents = parsed.strike().saturating_mul(100);
         let instrument = QuotableInstrument {
             symbol: symbol.clone(),
+            underlying: Arc::clone(&underlying),
             expiration: *parsed.expiration(),
             strike_cents,
             style: parsed.option_style(),
@@ -307,11 +333,11 @@ impl MarketMakerEngine {
             .instruments
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        let list = instruments.entry(underlying).or_default();
+        let list = instruments.entry(underlying.to_string()).or_default();
         if list.iter().any(|i| i.symbol == instrument.symbol) {
             return;
         }
-        list.push(instrument);
+        list.push(Arc::new(instrument));
     }
 
     /// The number of registered quotable contracts for `underlying`.
@@ -361,21 +387,68 @@ impl MarketMakerEngine {
     }
 
     /// Requotes every registered instrument of `underlying` at its latest price.
+    ///
+    /// The registered contracts are snapshotted into a **reused** scratch buffer
+    /// as cheap `Arc` clones under the `instruments` read lock, which is then
+    /// released before the quote loop, so no lock is held across a sink enqueue
+    /// or a broadcast (rule 8) and no fresh `Vec`/`Symbol`/`underlying` is
+    /// allocated per requote tick (#122). Snapshotting also keeps the requote
+    /// stable against a concurrent `register_*`.
     fn requote_symbol(&self, underlying: &str) {
         let Some(price_cents) = self.get_price(underlying) else {
             tracing::warn!(underlying, "no price available; skipping requote");
             return;
         };
         let config = self.get_config();
-        let instruments = self
-            .instruments
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(underlying)
-            .cloned()
-            .unwrap_or_default();
+
+        // Take the scratch buffer out (or a fresh empty one if a concurrent
+        // requote holds it) and fill it with reference-count clones of the
+        // registered contracts, releasing the read lock before quoting.
+        let mut instruments = self.take_requote_scratch();
+        instruments.clear();
+        {
+            let registered = self
+                .instruments
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(list) = registered.get(underlying) {
+                instruments.extend(list.iter().map(Arc::clone));
+            }
+        }
+
         for instrument in &instruments {
-            self.update_quote(underlying, instrument, price_cents, &config);
+            self.update_quote(instrument, price_cents, &config);
+        }
+
+        // Drop the Arc clones and return the (now larger-capacity) buffer for
+        // the next tick to reuse.
+        instruments.clear();
+        self.return_requote_scratch(instruments);
+    }
+
+    /// Takes the requote scratch buffer out of its mutex, leaving an empty
+    /// buffer behind. The mutex is held only for the swap — never across a sink
+    /// enqueue or a broadcast (rule 8).
+    #[must_use]
+    fn take_requote_scratch(&self) -> Vec<Arc<QuotableInstrument>> {
+        std::mem::take(
+            &mut *self
+                .requote_scratch
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Returns the scratch buffer for reuse, keeping whichever buffer has the
+    /// larger capacity (a concurrent requote may have installed its own). The
+    /// mutex is held only for the swap.
+    fn return_requote_scratch(&self, buffer: Vec<Arc<QuotableInstrument>>) {
+        let mut slot = self
+            .requote_scratch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if buffer.capacity() >= slot.capacity() {
+            *slot = buffer;
         }
     }
 
@@ -400,10 +473,10 @@ impl MarketMakerEngine {
 
     /// Generates and routes a fresh two-sided quote for one instrument, cancelling
     /// the prior legs (replace-not-accumulate). No lock is held across a sink
-    /// enqueue or a broadcast send.
+    /// enqueue or a broadcast send. The instrument carries its own interned
+    /// `underlying` (#122), so no separate underlying argument is threaded here.
     fn update_quote(
         &self,
-        underlying: &str,
         instrument: &QuotableInstrument,
         spot_cents: u64,
         config: &MarketMakerConfig,
@@ -494,7 +567,7 @@ impl MarketMakerEngine {
             resting.insert(
                 bid_id.clone(),
                 RestingQuote {
-                    underlying: underlying.to_string(),
+                    underlying: Arc::clone(&instrument.underlying),
                     symbol: instrument.symbol.clone(),
                     is_buy: true,
                     theo_cents: params.theo_price.get(),
@@ -504,7 +577,7 @@ impl MarketMakerEngine {
             resting.insert(
                 ask_id.clone(),
                 RestingQuote {
-                    underlying: underlying.to_string(),
+                    underlying: Arc::clone(&instrument.underlying),
                     symbol: instrument.symbol.clone(),
                     is_buy: false,
                     theo_cents: params.theo_price.get(),
@@ -781,7 +854,7 @@ impl MarketMakerEngine {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
-            .filter(|(_, quote)| quote.underlying == underlying)
+            .filter(|(_, quote)| quote.underlying.as_ref() == underlying)
             .map(|(id, quote)| (quote.symbol.clone(), id.clone()))
             .collect();
         orders.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()));
@@ -1063,6 +1136,50 @@ mod tests {
             }
         }
         assert!(sides.contains(&Side::Buy) && sides.contains(&Side::Sell));
+    }
+
+    #[test]
+    fn test_requote_output_is_byte_identical_across_identical_runs() {
+        // The #122 interning (Arc<str> Symbol / interned underlying / reused
+        // scratch buffer) is a pure representation change: it must NOT alter the
+        // produced commands, their field values, or their order. Two engines
+        // built identically and driven by the same price sequence must emit a
+        // byte-identical `VenueCommand` stream (prices, sizes, ids, symbols,
+        // accounts, sides — everything serde renders), across a first tick (adds
+        // only) and steady-state ticks (cancel-then-add), for two underlyings.
+        fn run() -> String {
+            let sink = Arc::new(CollectingSink::default());
+            let engine =
+                MarketMakerEngine::new(sink.clone(), LineageId::new("run-1"), Quoter::default())
+                    .with_run_seed(0xA5A5_A5A5_A5A5_A5A5);
+            engine.set_venue_now_ms(1_735_689_600_000);
+            for raw in [BTC_CALL, "BTC-20351231-60000-P", "ETH-20351231-3000-C"] {
+                engine.register_instrument(&sym(raw));
+            }
+            let mut all = Vec::new();
+            for (underlying, price) in [
+                ("BTC", 5_000_000),
+                ("ETH", 300_000),
+                ("BTC", 5_050_000),
+                ("ETH", 305_000),
+                ("BTC", 4_950_000),
+            ] {
+                engine.update_price(underlying, price);
+                all.extend(sink.drain());
+            }
+            serde_json::to_string(&all).expect("VenueCommand stream serializes")
+        }
+        let first = run();
+        assert!(
+            !first.is_empty(),
+            "the requote must actually emit commands — guards against a vacuous \
+             empty-vs-empty pass if the sink wiring ever regresses"
+        );
+        assert_eq!(
+            first,
+            run(),
+            "the interned requote path must produce a byte-identical command stream"
+        );
     }
 
     #[test]
