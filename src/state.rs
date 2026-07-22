@@ -2381,14 +2381,28 @@ mod tests {
             Err(e) => panic!("resend submit failed: {e}"),
         };
 
-        // (a) The resend's receipt carries the STORED terminal outcome, byte-
-        // identical to the original's — the canonical order/exec ids and the
-        // ORIGINAL fills — not a recomputed fresh outcome.
-        assert_eq!(
-            resend.outcome.as_ref(),
-            Some(&original_outcome),
-            "the resend receipt replays the stored terminal outcome (#099)"
-        );
+        // (a) The resend's receipt carries an idempotent `Duplicate` echoing the
+        // ORIGINAL identity + terminal sequence and boxing the STORED terminal
+        // outcome — the canonical order/exec ids and the ORIGINAL fills — not a
+        // recomputed fresh outcome or a phantom retry id (#099).
+        match resend.outcome.as_ref() {
+            Some(VenueOutcome::Duplicate {
+                original_sequence,
+                terminal,
+                ..
+            }) => {
+                assert_eq!(
+                    *original_sequence, original.underlying_sequence,
+                    "the resend echoes the ORIGINAL terminal sequence, not the resend turn's"
+                );
+                assert_eq!(
+                    terminal.as_ref(),
+                    &original_outcome,
+                    "the Duplicate boxes the stored terminal outcome"
+                );
+            }
+            other => panic!("the resend receipt must be an idempotent Duplicate, got {other:?}"),
+        }
 
         // (b) The dedup opened NO second order: the store still holds exactly the
         // two original legs — no phantom fill.

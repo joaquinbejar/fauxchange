@@ -20,7 +20,7 @@ use fauxchange::exchange::{
     FixedClock, Hash32, InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal,
     JournalHeader, JournalRecord, LineageId, MarkPriceBook, MatchingExecutor, PositionsStore,
     RecordKind, RestingOrderCapture, STPMode, SequenceNumber, Side, SnapshotError, StoreFanOut,
-    Symbol, TimeInForce, UnderlyingActor, VenueCommand, VenueJournal, VenueSnapshot,
+    Symbol, TimeInForce, UnderlyingActor, VenueCommand, VenueJournal, VenueOutcome, VenueSnapshot,
 };
 use fauxchange::{AccountId, ClientOrderId, OrderType};
 
@@ -283,7 +283,18 @@ fn test_clordid_retried_after_restore_returns_stored_result_not_a_second_order()
             _ => None,
         })
         .expect("a paired event at the retry sequence");
-    assert_eq!(event.outcome, stored, "retry replays the stored terminal");
+    // The retry after restore is journaled as an idempotent `Duplicate` (#099)
+    // boxing the STORED terminal result and echoing the original identity.
+    match &event.outcome {
+        VenueOutcome::Duplicate { terminal, .. } => {
+            assert_eq!(
+                terminal.as_ref(),
+                &stored,
+                "the retry Duplicate boxes the stored terminal result"
+            );
+        }
+        other => panic!("the retry after restore must be an idempotent Duplicate, got {other:?}"),
+    }
 
     // ...and the book gained NO second order (still the restored cut).
     assert_eq!(

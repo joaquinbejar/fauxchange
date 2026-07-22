@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::exchange::boundary::{Hash32, InstrumentStatus, Side, TimeInForce};
 use crate::exchange::envelope::VenueOutcome;
-use crate::exchange::event::EventTimestamp;
+use crate::exchange::event::{EventTimestamp, SequenceNumber};
 use crate::exchange::identity::{LineageId, VENUE_ENVELOPE_SCHEMA};
 use crate::exchange::money::Cents;
 use crate::exchange::symbol::Symbol;
@@ -234,6 +234,11 @@ pub struct IdempotencyEntry {
     pub fingerprint: IdempotencyFingerprint,
     /// The venue order id assigned to the original placement.
     pub order_id: VenueOrderId,
+    /// The `underlying_sequence` of the original placement's committed turn — the
+    /// terminal sequence a matching retry renders instead of the retry turn's, so
+    /// the idempotent [`VenueOutcome::Duplicate`](crate::exchange::VenueOutcome::Duplicate)
+    /// echoes the canonical identity (#099).
+    pub sequence: SequenceNumber,
     /// The captured terminal outcome to replay to a matching retry.
     pub terminal: VenueOutcome,
 }
@@ -529,6 +534,7 @@ mod tests {
         IdempotencyEntry {
             fingerprint: fingerprint(),
             order_id: lineage.venue_order_id("BTC", SequenceNumber::new(order_seq), 0),
+            sequence: SequenceNumber::new(order_seq),
             terminal: VenueOutcome::Added {
                 fills: vec![],
                 resting_quantity: 2,

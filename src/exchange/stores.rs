@@ -1447,6 +1447,54 @@ mod tests {
     }
 
     #[test]
+    fn test_store_fanout_skips_an_idempotent_duplicate() {
+        // A #099 idempotent retry surfaces `VenueOutcome::Duplicate`; the store
+        // fan-out MUST fold nothing — the original placement's legs were already
+        // folded at first placement, so re-folding would double-count both the
+        // executions and the positions.
+        let executions = Arc::new(InMemoryExecutionsStore::new());
+        let positions = Arc::new(InMemoryPositionsStore::new());
+        let mut fan = StoreFanOut::new(
+            Arc::clone(&executions),
+            Arc::clone(&positions),
+            Arc::new(MarkPriceBook::new()),
+        );
+
+        // First placement folds both legs once.
+        fan.emit(&added_event(1, 50_000, 2));
+        assert_eq!(executions.len(), 2, "the fresh placement records two legs");
+
+        // The retry event carries the SAME command with a `Duplicate` outcome.
+        let first = added_event(1, 50_000, 2);
+        let duplicate = VenueEvent::new(
+            SequenceNumber::new(2),
+            EventTimestamp::new(1_700_000_000_000),
+            first.command.clone(),
+            VenueOutcome::Duplicate {
+                original_order_id: lineage().venue_order_id(UNDERLYING, SequenceNumber::new(1), 0),
+                original_sequence: SequenceNumber::new(1),
+                terminal: Box::new(first.outcome.clone()),
+            },
+        );
+        fan.emit(&duplicate);
+
+        assert_eq!(
+            executions.len(),
+            2,
+            "a Duplicate records no additional execution leg"
+        );
+        let symbol = sym();
+        let taker = match positions.get(&AccountId::new("taker"), &symbol, None) {
+            Ok(Some(p)) => p,
+            other => panic!("expected the taker position, got {other:?}"),
+        };
+        assert_eq!(
+            taker.net_quantity, 2,
+            "the taker position stayed folded exactly once (no double-count)"
+        );
+    }
+
+    #[test]
     fn test_positions_list_is_symbol_ordered() {
         let store = InMemoryPositionsStore::new();
         let account = AccountId::new("acct-1");

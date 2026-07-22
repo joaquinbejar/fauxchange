@@ -166,10 +166,24 @@ pub async fn place_limit_order(
         ))
         .await?;
 
-    // Render the OBSERVED outcome, not the requested state (#118): an order into a
-    // halted / `Settling` / `Expired` instrument is a journaled `Rejected` — surface
-    // that reject rather than deriving a false `Accepted` for a resting TIF.
-    let (status, filled, message) = match &receipt.outcome {
+    // On an idempotent resend the canonical identity is the ORIGINAL placement's
+    // order id + terminal sequence, never this retry turn's freshly-minted id (which
+    // never entered the book) (#099); `rendered_identity` picks the original on a
+    // `Duplicate` and the fresh ids otherwise.
+    let (rendered_order_id, rendered_sequence) = match &receipt.outcome {
+        Some(outcome) => {
+            let (id, seq) = outcome.rendered_identity(&order_id, receipt.underlying_sequence);
+            (id.clone(), seq)
+        }
+        None => (order_id.clone(), receipt.underlying_sequence),
+    };
+
+    // Render the OBSERVED, effective-terminal outcome, not the requested state
+    // (#118): an order into a halted / `Settling` / `Expired` instrument is a
+    // journaled `Rejected`; an idempotent retry unwraps to the ORIGINAL placement's
+    // terminal (`VenueOutcome::terminal`), so a stored reject reads as a reject and a
+    // stored fill as its fills — never a fresh empty accept.
+    let (status, filled, message) = match receipt.outcome.as_ref().map(VenueOutcome::terminal) {
         Some(VenueOutcome::Rejected { reason }) => {
             (LimitOrderStatus::Rejected, 0u64, reason.clone())
         }
@@ -182,7 +196,6 @@ pub async fn place_limit_order(
             // fresh read-back; on a fresh add it is the identical taker-leg set the
             // store fan-out folded from this same event.
             let fills = outcome
-                .as_ref()
                 .map(VenueOutcome::taker_fill_legs)
                 .unwrap_or_default();
             let filled: u64 = fills
@@ -199,11 +212,11 @@ pub async fn place_limit_order(
     };
 
     Ok(Json(PlaceLimitOrderResponse {
-        order_id,
+        order_id: rendered_order_id,
         status,
         filled_quantity: filled,
         remaining_quantity: remaining(request.quantity, filled),
-        sequence: receipt.underlying_sequence,
+        sequence: rendered_sequence,
         message,
     }))
 }
@@ -260,12 +273,23 @@ pub async fn place_market_order(
         ))
         .await?;
 
+    // On an idempotent resend echo the ORIGINAL placement's order id + terminal
+    // sequence, never this retry turn's freshly-minted id (#099).
+    let (rendered_order_id, rendered_sequence) = match &receipt.outcome {
+        Some(outcome) => {
+            let (id, seq) = outcome.rendered_identity(&order_id, receipt.underlying_sequence);
+            (id.clone(), seq)
+        }
+        None => (order_id.clone(), receipt.underlying_sequence),
+    };
+
     // Project the immediate fills straight from the captured terminal outcome, not
     // a store read-back keyed on the freshly-minted order id and this turn's
     // sequence (#099): an idempotent market resend renders the STORED terminal
     // outcome (the original fills), never an empty fresh read-back. On a market
     // (`IOC`) add the observed outcome is `Market`/`Rejected`; the taker legs it
     // carries are the identical set the store fan-out folded from this same event.
+    // `taker_fill_legs` unwraps a `Duplicate` to its stored terminal.
     let fills = match &receipt.outcome {
         Some(outcome) => outcome.taker_fill_legs(),
         None => Vec::new(),
@@ -291,12 +315,12 @@ pub async fn place_market_order(
         .collect();
 
     Ok(Json(PlaceMarketOrderResponse {
-        order_id,
+        order_id: rendered_order_id,
         status,
         filled_quantity: filled,
         remaining_quantity: remaining(request.quantity, filled),
         average_price,
-        sequence: receipt.underlying_sequence,
+        sequence: rendered_sequence,
         fills: fill_prints,
     }))
 }

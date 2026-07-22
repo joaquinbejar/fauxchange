@@ -524,9 +524,18 @@ impl MatchingExecutor {
         };
         if let Some(entry) = self.idempotency.lookup(&key) {
             if entry.fingerprint == fingerprint {
-                // A matching retry: replay the stored terminal result, untouched
-                // book — no second order.
-                return entry.terminal.clone();
+                // A matching retry: no second order enters the book and NO economic
+                // effect re-executes. Surface a distinct `Duplicate` carrying the
+                // ORIGINAL identity + terminal sequence + stored terminal outcome, so
+                // the gateway renders the true original terminal report while every
+                // fan-out projection treats it as a no-op — replaying the stored fills
+                // through a fresh event would double-fold positions and re-print
+                // phantom fills/depth (#099).
+                return VenueOutcome::Duplicate {
+                    original_order_id: entry.order_id.clone(),
+                    original_sequence: entry.sequence,
+                    terminal: Box::new(entry.terminal.clone()),
+                };
             }
             // Conflicting reuse of the same key: refuse rather than rebind it.
             return VenueOutcome::Rejected {
@@ -546,11 +555,15 @@ impl MatchingExecutor {
             quantity,
             time_in_force,
         );
+        // Record ONLY a fresh placement's genuine terminal outcome (never a
+        // `Duplicate`) under the key, tagged with this committed turn's sequence so a
+        // later retry can echo the canonical identity.
         self.idempotency.record(
             key,
             IdempotencyEntry {
                 fingerprint,
                 order_id: order_id.clone(),
+                sequence: ctx.sequence,
                 terminal: outcome.clone(),
             },
         );
@@ -3180,15 +3193,39 @@ mod tests {
         assert_eq!(top_after_first.ask_depth, 2);
 
         // Retry the SAME (account, client_order_id) with a matching payload at a
-        // later sequence: the stored terminal result is replayed, and the book is
-        // untouched (no second order).
+        // later sequence: a distinct `Duplicate` surfaces the ORIGINAL identity +
+        // terminal sequence + stored terminal outcome, and the book is untouched (no
+        // second order) (#099).
         let retry = run(
             &mut ex,
             &lin,
             1,
             &add_with_cloid(&lin, 1, "acct", 0x11, Side::Sell, 50_000, 2, "dup-1"),
         );
-        assert_eq!(retry, first, "the retry replays the stored terminal result");
+        match &retry {
+            VenueOutcome::Duplicate {
+                original_order_id,
+                original_sequence,
+                terminal,
+            } => {
+                assert_eq!(
+                    original_order_id,
+                    &lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0),
+                    "the retry echoes the ORIGINAL order id, not the retry turn's fresh id"
+                );
+                assert_eq!(
+                    *original_sequence,
+                    SequenceNumber::new(0),
+                    "the retry echoes the ORIGINAL terminal sequence, not this turn's"
+                );
+                assert_eq!(
+                    terminal.as_ref(),
+                    &first,
+                    "the Duplicate carries the stored terminal result for rendering"
+                );
+            }
+            other => panic!("expected an idempotent Duplicate, got {other:?}"),
+        }
         assert_eq!(
             ex.top_of_book(&sym()),
             top_after_first,
@@ -3250,8 +3287,24 @@ mod tests {
             1,
             &add_with_cloid(&lin, 1, "acct", 0x11, Side::Sell, 50_000, 2, "dup-1"),
         );
-        // The rehydrated map serves the stored result; no second order rests.
-        assert!(matches!(retry, VenueOutcome::Added { .. }));
+        // The rehydrated map serves the stored result as an idempotent `Duplicate`
+        // carrying the original identity + the stored `Added` terminal; no second
+        // order rests.
+        match &retry {
+            VenueOutcome::Duplicate {
+                original_order_id,
+                original_sequence,
+                terminal,
+            } => {
+                assert_eq!(
+                    original_order_id,
+                    &lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0)
+                );
+                assert_eq!(*original_sequence, SequenceNumber::new(0));
+                assert!(matches!(terminal.as_ref(), VenueOutcome::Added { .. }));
+            }
+            other => panic!("expected an idempotent Duplicate after restore, got {other:?}"),
+        }
         assert_eq!(restored.top_of_book(&sym()), top_after_restore);
     }
 }

@@ -330,9 +330,13 @@ impl InstrumentState {
                     self.remove_order(id, &mut touched);
                 }
             }
+            // A `Duplicate` (#099 idempotent retry) executed no book effect — the
+            // original placement's depth/prints were published at first placement, so
+            // it MUST NOT re-apply any delta here (no phantom depth).
             VenueOutcome::InstrumentStatusChanged { .. }
             | VenueOutcome::ControlApplied
-            | VenueOutcome::Rejected { .. } => {}
+            | VenueOutcome::Rejected { .. }
+            | VenueOutcome::Duplicate { .. } => {}
         }
         touched
             .into_iter()
@@ -955,6 +959,53 @@ mod tests {
             .filter(|m| matches!(m, WsMessage::Trade { .. }))
             .count();
         assert_eq!(trades, 1, "one public trade print per match");
+    }
+
+    #[test]
+    fn test_idempotent_duplicate_republishes_nothing() {
+        // A #099 idempotent retry surfaces `VenueOutcome::Duplicate`; the WS fan-out
+        // MUST republish NOTHING — no orderbook delta (no phantom depth), no fill
+        // print, no trade print. The original placement's prints fired at first
+        // placement; replaying them here would double-print.
+        let manager = OrderbookSubscriptionManager::new();
+        let mut rx = manager.subscribe();
+
+        // A first crossing add prints a fill + trade and moves the book.
+        manager.on_committed_event(&resting_add(0, "maker-1", SeamSide::Sell, 50_000, 2));
+        let _ = drain(&mut rx);
+
+        // The retry event carries the same AddOrder command with a `Duplicate` outcome.
+        let original = crossing_buy(1, 50_000, 2);
+        let duplicate = VenueEvent::new(
+            SequenceNumber::new(2),
+            EventTimestamp::new(1_700_000_000_000),
+            original.command.clone(),
+            VenueOutcome::Duplicate {
+                original_order_id: VenueOrderId::new("taker-1"),
+                original_sequence: SequenceNumber::new(1),
+                terminal: Box::new(original.outcome.clone()),
+            },
+        );
+        assert_eq!(
+            manager.on_committed_event(&duplicate),
+            None,
+            "a Duplicate emits no orderbook delta sequence"
+        );
+        let republished = drain(&mut rx)
+            .into_iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    WsMessage::OrderbookDelta { .. }
+                        | WsMessage::Fill { .. }
+                        | WsMessage::Trade { .. }
+                )
+            })
+            .count();
+        assert_eq!(
+            republished, 0,
+            "a Duplicate republishes no delta, fill, or trade"
+        );
     }
 
     #[test]

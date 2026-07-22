@@ -1845,10 +1845,28 @@ async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
         2,
         "REST journals original + deduped-replay retry"
     );
-    assert_eq!(
-        rest_events[1].outcome, rest_events[0].outcome,
-        "the REST retry replays the stored terminal result (no second order)"
-    );
+    // The REST retry is journaled as an idempotent `Duplicate` (#099): it echoes the
+    // ORIGINAL placement's terminal sequence and boxes the stored terminal, so every
+    // fan-out projection treats it as a no-op (no double-fold, no phantom id) while
+    // the book stays untouched.
+    match &rest_events[1].outcome {
+        VenueOutcome::Duplicate {
+            original_sequence,
+            terminal,
+            ..
+        } => {
+            assert_eq!(
+                *original_sequence, rest_events[0].underlying_sequence,
+                "the retry echoes the ORIGINAL terminal sequence, not the retry turn's"
+            );
+            assert_eq!(
+                terminal.as_ref(),
+                &rest_events[0].outcome,
+                "the Duplicate boxes the first placement's stored terminal (no second order)"
+            );
+        }
+        other => panic!("the REST retry must be an idempotent Duplicate, got {other:?}"),
+    }
     // FIX dedups before the sequencer (gateway ClOrdID correlation): one journaled
     // event, the resend never reaching the actor.
     assert_eq!(
@@ -1934,6 +1952,17 @@ async fn test_idempotent_resend_after_fill_renders_stored_terminal_report_on_res
     assert_eq!(
         resend["filled_quantity"], 2,
         "REST resend shows the ORIGINAL filled 2, not a read-back 0 (#099)"
+    );
+    // The phantom-identity fix (#099): the resend echoes the ORIGINAL placement's
+    // order id + terminal sequence — the id that actually entered the book — never
+    // the freshly-minted retry id (which never rested) or this turn's sequence.
+    assert_eq!(
+        resend["order_id"], first["order_id"],
+        "REST resend echoes the ORIGINAL order id, not a freshly-minted retry id (#099)"
+    );
+    assert_eq!(
+        resend["sequence"], first["sequence"],
+        "REST resend echoes the ORIGINAL terminal sequence, not the retry turn's (#099)"
     );
     assert_eq!(
         rest.executions()

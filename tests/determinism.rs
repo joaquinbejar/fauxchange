@@ -675,12 +675,35 @@ fn test_idempotent_resend_replays_the_stored_terminal_outcome() {
         "the original keyed add fills 2 and rests 1, got {:?}",
         recording.events[1].outcome
     );
-    // The resend event carries the STORED terminal — byte-identical to the original
-    // add's captured outcome, NOT a recomputed second fill.
-    assert_eq!(
-        recording.events[2].outcome, recording.events[1].outcome,
-        "the resend event replays the stored terminal outcome (no second fill)"
-    );
+    // The resend event carries an idempotent `Duplicate` (#099): it echoes the
+    // ORIGINAL placement's identity + terminal sequence and boxes the STORED terminal
+    // outcome — byte-identical to the original add's captured outcome, NOT a
+    // recomputed second fill. The distinct variant is what makes every fan-out
+    // projection treat the resend as a no-op (no double-fold, no phantom id).
+    match &recording.events[2].outcome {
+        VenueOutcome::Duplicate {
+            original_order_id,
+            original_sequence,
+            terminal,
+        } => {
+            assert_eq!(
+                original_sequence,
+                &SequenceNumber::new(1),
+                "the resend echoes the ORIGINAL terminal sequence, not the resend turn's"
+            );
+            assert_eq!(
+                original_order_id.as_str(),
+                "resend-run:BTC:1:0",
+                "the resend echoes the ORIGINAL order id, not the resend turn's fresh id"
+            );
+            assert_eq!(
+                terminal.as_ref(),
+                &recording.events[1].outcome,
+                "the Duplicate boxes the stored terminal outcome (no second fill)"
+            );
+        }
+        other => panic!("the resend event must be an idempotent Duplicate, got {other:?}"),
+    }
 
     // The oracle: a fresh-registry replay reconstructs the identical event stream —
     // including the resend's stored outcome and its untouched top-of-book witness.

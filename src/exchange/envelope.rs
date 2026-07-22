@@ -370,6 +370,29 @@ pub enum VenueOutcome {
         /// The client-safe reason.
         reason: String,
     },
+    /// A **client-order-id idempotent retry** (#099): the account + `ClOrdID` key
+    /// already resolved to a committed placement, so this turn created **no** new
+    /// order, executed **no** new fill, and touched the book not at all. It carries
+    /// the **original** placement's identity and captured terminal outcome so a
+    /// gateway renders the true original terminal report (its order id, sequence,
+    /// and fills), while every fan-out projection treats it as a no-op — the
+    /// economic effects were already folded into the stores and published on the
+    /// WS at first placement, and replaying them here would double-count positions
+    /// and re-print phantom fills/depth. The boxed [`terminal`](Self::Duplicate::terminal)
+    /// is always a genuine terminal outcome (never itself a `Duplicate`), because
+    /// only a **fresh** placement is ever recorded under the key.
+    Duplicate {
+        /// The venue order id the **original** placement was assigned — the id
+        /// that actually entered the book, echoed on the retry so a client never
+        /// receives a freshly-minted id that never rested.
+        original_order_id: VenueOrderId,
+        /// The `underlying_sequence` of the **original** placement's committed
+        /// turn — the terminal sequence a gateway renders, not this retry turn's.
+        original_sequence: SequenceNumber,
+        /// The original placement's captured terminal outcome, replayed for
+        /// rendering only.
+        terminal: Box<VenueOutcome>,
+    },
 }
 
 impl VenueOutcome {
@@ -393,6 +416,11 @@ impl VenueOutcome {
     /// non-filling outcome (a pure rest, a reject, a cancel, or a control).
     #[must_use]
     pub fn taker_fill_legs(&self) -> Vec<(Cents, u64)> {
+        // An idempotent Duplicate carries the ORIGINAL terminal outcome; render its
+        // fills, never an empty read-back keyed on the retry's fresh id (#099).
+        if let Self::Duplicate { terminal, .. } = self {
+            return terminal.taker_fill_legs();
+        }
         let fills: &[Fill] = match self {
             Self::Added { fills, .. } | Self::Market { fills, .. } => fills,
             _ => &[],
@@ -402,6 +430,42 @@ impl VenueOutcome {
             .filter(|fill| fill.liquidity == LiquidityFlag::Taker)
             .map(|fill| (fill.price, fill.quantity))
             .collect()
+    }
+
+    /// The **effective terminal outcome** a gateway renders — the stored terminal
+    /// of an idempotent [`Duplicate`](Self::Duplicate), else `self`. Unwrapping the
+    /// Duplicate lets a handler match the ORIGINAL placement's reject/fill state
+    /// (e.g. a stored `Rejected`) instead of misreading a retry as a fresh accept
+    /// (#099). A Duplicate's terminal is never itself a Duplicate, so this unwraps
+    /// at most once.
+    #[must_use]
+    #[inline]
+    pub fn terminal(&self) -> &VenueOutcome {
+        match self {
+            Self::Duplicate { terminal, .. } => terminal,
+            other => other,
+        }
+    }
+
+    /// The order identity a gateway renders on the placement response: on an
+    /// idempotent [`Duplicate`](Self::Duplicate) the **original** placement's id +
+    /// terminal sequence (the id that actually entered the book), else the
+    /// freshly-minted `fresh_order_id` + `fresh_sequence` of this turn (#099). This
+    /// closes the phantom-identity gap where a retry echoed an id that never rested.
+    #[must_use]
+    pub fn rendered_identity<'a>(
+        &'a self,
+        fresh_order_id: &'a VenueOrderId,
+        fresh_sequence: SequenceNumber,
+    ) -> (&'a VenueOrderId, SequenceNumber) {
+        match self {
+            Self::Duplicate {
+                original_order_id,
+                original_sequence,
+                ..
+            } => (original_order_id, *original_sequence),
+            _ => (fresh_order_id, fresh_sequence),
+        }
     }
 }
 

@@ -429,10 +429,30 @@ async fn case_same_payload_retry() -> CaseOutcome {
         rest_events.len() == 2,
         "REST journals original + deduped-replay retry",
     )?;
-    require(
-        rest_events[1].outcome == rest_events[0].outcome,
-        "the REST retry must replay the stored terminal result",
-    )?;
+    // The REST retry is journaled as an idempotent `Duplicate` (#099): it echoes the
+    // ORIGINAL terminal sequence and boxes the stored terminal, so every fan-out
+    // projection treats it as a no-op (no double-fold, no phantom id).
+    match &rest_events[1].outcome {
+        VenueOutcome::Duplicate {
+            original_sequence,
+            terminal,
+            ..
+        } => {
+            require(
+                *original_sequence == rest_events[0].underlying_sequence,
+                "the REST retry must echo the ORIGINAL terminal sequence, not the retry turn's",
+            )?;
+            require(
+                terminal.as_ref() == &rest_events[0].outcome,
+                "the REST retry Duplicate must box the stored terminal result",
+            )?;
+        }
+        other => {
+            return Err(format!(
+                "the REST retry must be an idempotent Duplicate, got {other:?}"
+            ));
+        }
+    }
     require(
         fix_events.len() == 1,
         "FIX dedups the retry before the sequencer",
