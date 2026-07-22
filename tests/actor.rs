@@ -17,10 +17,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use fauxchange::exchange::{
-    ActorConfig, CommandExecutor, EventTimestamp, ExecutionContext, FanOut, FixedClock,
-    InMemoryVenueJournal, JournalError, JournalHeader, JournalRecord, LineageId, NoopFanOut,
-    PlaceholderExecutor, RecordKind, SequenceNumber, Symbol, VenueClock, VenueCommand, VenueEvent,
-    VenueJournal, VenueOutcome, spawn_underlying_actor,
+    ActorConfig, CommandExecutor, EventTimestamp, ExecutionContext, FanOut, FanOutSealed,
+    FixedClock, InMemoryVenueJournal, JournalError, JournalHeader, JournalRecord, LineageId,
+    NoopFanOut, PlaceholderExecutor, RecordKind, SequenceNumber, Symbol, VenueClock, VenueCommand,
+    VenueEvent, VenueJournal, VenueOutcome, spawn_underlying_actor,
 };
 use fauxchange::{AccountId, VenueError, VenueOrderId};
 
@@ -75,8 +75,9 @@ struct CountingFanOut {
 }
 
 impl FanOut for CountingFanOut {
-    fn emit(&mut self, _event: &VenueEvent) {
+    fn emit(&mut self, _event: &VenueEvent) -> Result<(), FanOutSealed> {
         self.emits.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 

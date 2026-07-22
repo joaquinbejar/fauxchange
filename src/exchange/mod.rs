@@ -67,9 +67,9 @@ pub mod stores;
 pub mod symbol;
 
 pub use self::actor::{
-    ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, FanoutSummary, FixedClock,
-    JournalSnapshot, NoopFanOut, PlaceholderExecutor, Receipt, TeeFanOut, UnderlyingActor,
-    VenueClock, spawn_underlying_actor,
+    ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, FanOutSealed,
+    FanoutSummary, FixedClock, JournalSnapshot, NoopFanOut, PlaceholderExecutor, Receipt,
+    TeeFanOut, UnderlyingActor, VenueClock, spawn_underlying_actor,
 };
 pub use self::boundary::{
     ExpirationDate, Hash32, InstrumentStatus, OptionStyle, OrderId, ParsedSymbol, Price, Quantity,

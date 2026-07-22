@@ -16,6 +16,7 @@
 pub mod account;
 pub mod admin;
 pub mod controls;
+pub mod extract;
 pub mod market;
 pub mod meta;
 pub mod middleware;
@@ -120,6 +121,8 @@ fn protected_routes() -> Router<Arc<AppState>> {
     Router::new()
         // ---- meta ----------------------------------------------------------
         .route("/api/v1/stats", get(meta::stats))
+        // ---- auth (authenticated: WS handshake ticket) ---------------------
+        .route("/api/v1/auth/ws-ticket", post(meta::issue_ws_ticket))
         // ---- controls ------------------------------------------------------
         .route("/api/v1/controls", get(controls::get_controls))
         .route("/api/v1/controls/kill-switch", post(controls::kill_switch))

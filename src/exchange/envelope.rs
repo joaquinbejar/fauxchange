@@ -596,6 +596,111 @@ impl VenueOutcome {
 }
 
 // ============================================================================
+// Journaled market-maker control knobs — finite, range-validated on decode
+// ============================================================================
+//
+// The three [`VenueCommand::MarketMakerControl`] knobs are **dimensionless
+// `f64` multipliers** (the documented float exception — not money,
+// [01 §3](../../../docs/01-domain-model.md)). A journaled `f64` is carried
+// verbatim and read back byte-identical, so a `NaN` / `±Inf` / out-of-range
+// value in a hostile or corrupt journal record would poison replay and JSON
+// persistence (`serde_json` renders a non-finite `f64` as `null`). Decode is
+// therefore the venue's re-validation boundary: each present knob is checked
+// finite and in its documented range, so a bad record is a **typed decode
+// error**, never a silent poison. Valid values decode unchanged, so the wire
+// form is stable.
+//
+// The ranges mirror the market-maker substrate's documented clamps
+// (`market_maker::config`); they are owned here independently because the
+// `exchange` layer is below `market_maker` (which depends on it) and cannot
+// import back without a cycle. The gateway validates the same ranges on the
+// write side before a control is journaled ([05 §8](../../../docs/05-microstructure-config.md)).
+
+/// Minimum accepted spread multiplier.
+const SPREAD_MULTIPLIER_MIN: f64 = 0.1;
+/// Maximum accepted spread multiplier.
+const SPREAD_MULTIPLIER_MAX: f64 = 10.0;
+/// Minimum accepted size scalar.
+const SIZE_SCALAR_MIN: f64 = 0.0;
+/// Maximum accepted size scalar.
+const SIZE_SCALAR_MAX: f64 = 1.0;
+/// Minimum accepted directional skew.
+const DIRECTIONAL_SKEW_MIN: f64 = -1.0;
+/// Maximum accepted directional skew.
+const DIRECTIONAL_SKEW_MAX: f64 = 1.0;
+
+/// Decodes an optional control knob and rejects a non-finite / out-of-range
+/// value.
+///
+/// `RangeInclusive::contains` rejects `NaN` (every comparison with `NaN` is
+/// false) and both infinities (outside any finite range), so one containment
+/// check covers finiteness and range together. A `None` (unchanged) knob is
+/// admitted unchecked. The error is a typed serde decode error — the journal
+/// read fails loudly rather than admitting a poison value.
+#[inline]
+fn deserialize_ranged_knob<'de, D>(
+    deserializer: D,
+    field: &'static str,
+    min: f64,
+    max: f64,
+) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<f64>::deserialize(deserializer)?;
+    if let Some(v) = value
+        && !(min..=max).contains(&v)
+    {
+        return Err(serde::de::Error::custom(format!(
+            "{field} must be finite and within [{min}, {max}], got {v}"
+        )));
+    }
+    Ok(value)
+}
+
+/// Field validator for `spread_multiplier` — see [`deserialize_ranged_knob`].
+#[inline]
+fn deserialize_spread_multiplier<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_ranged_knob(
+        deserializer,
+        "spread_multiplier",
+        SPREAD_MULTIPLIER_MIN,
+        SPREAD_MULTIPLIER_MAX,
+    )
+}
+
+/// Field validator for `size_scalar` — see [`deserialize_ranged_knob`].
+#[inline]
+fn deserialize_size_scalar<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_ranged_knob(
+        deserializer,
+        "size_scalar",
+        SIZE_SCALAR_MIN,
+        SIZE_SCALAR_MAX,
+    )
+}
+
+/// Field validator for `directional_skew` — see [`deserialize_ranged_knob`].
+#[inline]
+fn deserialize_directional_skew<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_ranged_knob(
+        deserializer,
+        "directional_skew",
+        DIRECTIONAL_SKEW_MIN,
+        DIRECTIONAL_SKEW_MAX,
+    )
+}
+
+// ============================================================================
 // VenueCommand — the venue's own instruction set
 // ============================================================================
 
@@ -718,11 +823,17 @@ pub enum VenueCommand {
     /// `f64` is carried verbatim and read back byte-identical on replay, so it is
     /// replay-stable (it is never recomputed).
     MarketMakerControl {
-        /// New global spread multiplier, when changing it.
+        /// New global spread multiplier (`0.1`–`10.0`), when changing it.
+        /// Re-validated finite and in range on decode.
+        #[serde(deserialize_with = "deserialize_spread_multiplier")]
         spread_multiplier: Option<f64>,
         /// New global size scalar (`0.0`–`1.0`), when changing it.
+        /// Re-validated finite and in range on decode.
+        #[serde(deserialize_with = "deserialize_size_scalar")]
         size_scalar: Option<f64>,
         /// New global directional skew (`-1.0`–`1.0`), when changing it.
+        /// Re-validated finite and in range on decode.
+        #[serde(deserialize_with = "deserialize_directional_skew")]
         directional_skew: Option<f64>,
         /// New master-enabled (kill / enable) state, when changing it.
         enabled: Option<bool>,
@@ -1048,6 +1159,56 @@ mod tests {
             enabled: Some(false),
         };
         assert_serde_identity(&command);
+    }
+
+    #[test]
+    fn test_market_maker_control_rejects_out_of_range_and_non_finite() {
+        // A hostile / corrupt journal record with an out-of-range or non-finite
+        // persona knob must be a typed decode error, not a silent poison — a
+        // non-finite `f64` would break replay-equality and JSON persistence.
+        // Documented ranges: spread [0.1, 10.0], size [0.0, 1.0], skew [-1.0, 1.0].
+        let out_of_range = [
+            r#"{"MarketMakerControl":{"spread_multiplier":999.0,"size_scalar":null,"directional_skew":null,"enabled":null}}"#,
+            r#"{"MarketMakerControl":{"spread_multiplier":0.0,"size_scalar":null,"directional_skew":null,"enabled":null}}"#,
+            r#"{"MarketMakerControl":{"spread_multiplier":null,"size_scalar":2.0,"directional_skew":null,"enabled":null}}"#,
+            r#"{"MarketMakerControl":{"spread_multiplier":null,"size_scalar":-0.5,"directional_skew":null,"enabled":null}}"#,
+            r#"{"MarketMakerControl":{"spread_multiplier":null,"size_scalar":null,"directional_skew":1.5,"enabled":null}}"#,
+            r#"{"MarketMakerControl":{"spread_multiplier":null,"size_scalar":null,"directional_skew":-5.0,"enabled":null}}"#,
+        ];
+        for json in out_of_range {
+            match serde_json::from_str::<VenueCommand>(json) {
+                Err(_) => {}
+                Ok(parsed) => panic!("expected an out-of-range knob rejection, parsed {parsed:?}"),
+            }
+        }
+        // A non-finite literal (`NaN` / `Infinity`) is not valid JSON and is
+        // refused at the tokenizer, so no non-finite value can survive decode.
+        for json in [
+            r#"{"MarketMakerControl":{"spread_multiplier":NaN,"size_scalar":null,"directional_skew":null,"enabled":null}}"#,
+            r#"{"MarketMakerControl":{"spread_multiplier":null,"size_scalar":null,"directional_skew":Infinity,"enabled":null}}"#,
+        ] {
+            match serde_json::from_str::<VenueCommand>(json) {
+                Err(_) => {}
+                Ok(parsed) => panic!("expected a non-finite knob rejection, parsed {parsed:?}"),
+            }
+        }
+        // A valid, in-range control still decodes — the wire form is stable for
+        // valid data (no golden churn).
+        let ok = r#"{"MarketMakerControl":{"spread_multiplier":1.5,"size_scalar":0.5,"directional_skew":-0.25,"enabled":false}}"#;
+        match serde_json::from_str::<VenueCommand>(ok) {
+            Ok(VenueCommand::MarketMakerControl {
+                spread_multiplier,
+                size_scalar,
+                directional_skew,
+                enabled,
+            }) => {
+                assert_eq!(spread_multiplier, Some(1.5));
+                assert_eq!(size_scalar, Some(0.5));
+                assert_eq!(directional_skew, Some(-0.25));
+                assert_eq!(enabled, Some(false));
+            }
+            other => panic!("expected a valid MarketMakerControl to decode, got {other:?}"),
+        }
     }
 
     #[test]

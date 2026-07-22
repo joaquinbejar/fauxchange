@@ -517,6 +517,74 @@ pub fn validate_order_shape(
     }
 }
 
+/// Validates the **GTD ⟺ `gtd_expires_at` pairing** at the DTO boundary
+/// ([01 §6](../docs/01-domain-model.md)), returning a typed [`VenueError`] the
+/// gateway maps to a `400` / FIX reject:
+///
+/// - a [`TimeInForce::Gtd`] order REQUIRES a `gtd_expires_at` strictly in the
+///   **future** (`> now`), so a rest-until-expiry order always has a valid resting
+///   window;
+/// - any non-`GTD` time-in-force MUST NOT carry a `gtd_expires_at` — a stray expiry
+///   on a `GTC`/`IOC`/`FOK` order is a client mistake, rejected rather than silently
+///   ignored.
+///
+/// `now` is the **venue-clock** instant (never `SystemTime` on the sequenced path);
+/// the caller reads it from the venue clock. The expiry itself is an absolute
+/// [`EventTimestamp`] (venue-clock ms), so an accepted `GTD` order journals an
+/// absolute `ExpirationDate::DateTime` and replays deterministically — a relative
+/// `ExpirationDate::Days` offset is unrepresentable through this field and can never
+/// reach the sequenced path.
+///
+/// # Errors
+///
+/// Returns [`VenueError::InvalidOrder`] describing the first violated pairing rule.
+///
+/// # Examples
+///
+/// ```
+/// use fauxchange::{TimeInForce, validate_gtd_expiry};
+/// use fauxchange::exchange::EventTimestamp;
+/// let now = EventTimestamp::new(1_000);
+/// // A GTD order needs a future expiry.
+/// assert!(validate_gtd_expiry(TimeInForce::Gtd, Some(EventTimestamp::new(2_000)), now).is_ok());
+/// // A GTD order with a past / present expiry is rejected.
+/// assert!(validate_gtd_expiry(TimeInForce::Gtd, Some(EventTimestamp::new(1_000)), now).is_err());
+/// // A GTD order with no expiry is rejected.
+/// assert!(validate_gtd_expiry(TimeInForce::Gtd, None, now).is_err());
+/// // A stray expiry on a non-GTD order is rejected.
+/// assert!(validate_gtd_expiry(TimeInForce::Gtc, Some(EventTimestamp::new(2_000)), now).is_err());
+/// // A non-GTD order with no expiry is fine.
+/// assert!(validate_gtd_expiry(TimeInForce::Gtc, None, now).is_ok());
+/// ```
+pub fn validate_gtd_expiry(
+    time_in_force: TimeInForce,
+    gtd_expires_at: Option<EventTimestamp>,
+    now: EventTimestamp,
+) -> Result<(), VenueError> {
+    match (time_in_force, gtd_expires_at) {
+        (TimeInForce::Gtd, Some(expiry)) => {
+            if expiry.get() > now.get() {
+                Ok(())
+            } else {
+                Err(VenueError::InvalidOrder(format!(
+                    "GTD expiry {} ms must be strictly in the future (venue-clock now {} ms)",
+                    expiry.get(),
+                    now.get()
+                )))
+            }
+        }
+        (TimeInForce::Gtd, None) => Err(VenueError::InvalidOrder(
+            "GTD order requires a gtd_expires_at instant".to_string(),
+        )),
+        (TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok, Some(_)) => {
+            Err(VenueError::InvalidOrder(
+                "gtd_expires_at is only valid with a GTD time-in-force".to_string(),
+            ))
+        }
+        (TimeInForce::Gtc | TimeInForce::Ioc | TimeInForce::Fok, None) => Ok(()),
+    }
+}
+
 // ============================================================================
 // Order value objects and projections
 // ============================================================================
@@ -589,14 +657,22 @@ pub struct PlaceLimitOrderRequest {
 }
 
 impl PlaceLimitOrderRequest {
-    /// Validates this request's order shape ([`validate_order_shape`]).
+    /// Validates this request's order shape ([`validate_order_shape`]) **and** its
+    /// GTD ⟺ `gtd_expires_at` pairing ([`validate_gtd_expiry`]) against the
+    /// venue-clock `now`.
     ///
     /// # Errors
     ///
     /// Returns [`VenueError::InvalidOrder`] if the quantity or price is
-    /// non-positive.
-    pub fn validate(&self) -> Result<(), VenueError> {
-        validate_order_shape(OrderType::Limit, Some(self.price), self.quantity)
+    /// non-positive, or if the GTD ⟺ expiry pairing is violated (a GTD order with
+    /// no / non-future expiry, or a non-GTD order carrying a stray expiry).
+    pub fn validate(&self, now: EventTimestamp) -> Result<(), VenueError> {
+        validate_order_shape(OrderType::Limit, Some(self.price), self.quantity)?;
+        validate_gtd_expiry(
+            self.time_in_force.unwrap_or_default(),
+            self.gtd_expires_at,
+            now,
+        )
     }
 }
 
@@ -807,20 +883,34 @@ pub struct BulkOrderItem {
     /// Time in force (defaults to `GTC` when omitted).
     #[serde(default)]
     pub time_in_force: Option<TimeInForce>,
+    /// For a `GTD` order, the expiry instant on the venue clock, in
+    /// **milliseconds**. Required for `GTD` (and must be in the future), rejected
+    /// for any other time-in-force — the same pairing rule the single-order place
+    /// shape enforces ([`validate_gtd_expiry`]).
+    #[serde(default)]
+    #[schema(value_type = Option<u64>)]
+    pub gtd_expires_at: Option<EventTimestamp>,
     /// Optional account-scoped idempotency key.
     #[serde(default)]
     pub client_order_id: Option<ClientOrderId>,
 }
 
 impl BulkOrderItem {
-    /// Validates this item's order shape ([`validate_order_shape`]).
+    /// Validates this item's order shape ([`validate_order_shape`]) **and** its
+    /// GTD ⟺ `gtd_expires_at` pairing ([`validate_gtd_expiry`]) against the
+    /// venue-clock `now`.
     ///
     /// # Errors
     ///
     /// Returns [`VenueError::InvalidOrder`] if the quantity or price is
-    /// non-positive.
-    pub fn validate(&self) -> Result<(), VenueError> {
-        validate_order_shape(OrderType::Limit, Some(self.price), self.quantity)
+    /// non-positive, or if the GTD ⟺ expiry pairing is violated.
+    pub fn validate(&self, now: EventTimestamp) -> Result<(), VenueError> {
+        validate_order_shape(OrderType::Limit, Some(self.price), self.quantity)?;
+        validate_gtd_expiry(
+            self.time_in_force.unwrap_or_default(),
+            self.gtd_expires_at,
+            now,
+        )
     }
 }
 
@@ -1910,6 +2000,24 @@ pub struct TokenResponse {
     pub expires_at: String,
 }
 
+/// Response for `POST /api/v1/auth/ws-ticket` — a short-lived, single-use,
+/// opaque WebSocket handshake **ticket** ([03 §6](../docs/03-protocol-surfaces.md)).
+///
+/// The client presents this ticket to `GET /ws` (as a `?ticket=` query parameter
+/// or the `X-WS-Ticket` header) instead of putting a long-lived bearer JWT in the
+/// query string, which would leak into access logs, proxies, and browser history.
+/// The ticket is unguessable (CSPRNG), expires within seconds, is valid for exactly
+/// one upgrade, and grants the SAME [`Permission`] set the caller's bearer holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WsTicketResponse {
+    /// The opaque single-use ticket — present it once to `GET /ws` within its TTL.
+    pub ticket: String,
+    /// Ticket expiry as an ISO-8601 / RFC3339 UTC timestamp.
+    pub expires_at: String,
+    /// Ticket lifetime from issuance, in **seconds**.
+    pub expires_in_secs: u64,
+}
+
 /// Health-check response (the auth-exempt `GET /health`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct HealthResponse {
@@ -2275,6 +2383,30 @@ pub enum WsMessage {
         /// The per-underlying replay summary + reconstructed executions count.
         report: ReplayReportResponse,
     },
+    /// A **resync marker** emitted after a broadcast lag on a subscribed channel
+    /// that has no snapshot to replay (`trades` / `quotes` / `prices` / `fills`,
+    /// [03 §4.1](../docs/03-protocol-surfaces.md)).
+    ///
+    /// On a `tokio::broadcast` lag the connection dropped an unknown span of
+    /// messages; the `orderbook` channel repairs the gap with a fresh
+    /// [`OrderbookSnapshot`](WsMessage::OrderbookSnapshot), but the event-stream
+    /// channels have no snapshot, so this marker signals the gap explicitly rather
+    /// than leaving a silent hole — the client should treat the stream as having a
+    /// discontinuity and re-fetch current state via REST. `sequence` carries the
+    /// current market-data `instrument_sequence` checkpoint for an instrument-scoped
+    /// channel, and is omitted for the underlying `prices` channel (which has no
+    /// per-instrument sequence).
+    #[serde(rename = "resync")]
+    Resync {
+        /// The channel that lagged.
+        channel: SubscriptionChannel,
+        /// The symbol (canonical contract, or underlying ticker for `prices`).
+        symbol: String,
+        /// The current market-data `instrument_sequence` checkpoint, when the
+        /// channel is instrument-scoped; omitted for `prices`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sequence: Option<u64>,
+    },
     /// A typed error envelope ([03 §4.2](../docs/03-protocol-surfaces.md)) — the
     /// versioned [`WsError`] from the shared error boundary (#003), reused
     /// verbatim as the payload.
@@ -2511,11 +2643,12 @@ mod tests {
             gtd_expires_at: None,
             client_order_id: None,
         };
-        assert!(req.validate().is_err());
+        assert!(req.validate(EventTimestamp::new(0)).is_err());
     }
 
     #[test]
     fn test_place_limit_order_request_validate_delegates() {
+        let now = EventTimestamp::new(0);
         let ok = PlaceLimitOrderRequest {
             side: Side::Buy,
             price: Cents::new(500),
@@ -2524,12 +2657,12 @@ mod tests {
             gtd_expires_at: None,
             client_order_id: None,
         };
-        assert!(ok.validate().is_ok());
+        assert!(ok.validate(now).is_ok());
         let bad = PlaceLimitOrderRequest {
             price: Cents::new(0),
             ..ok
         };
-        assert!(bad.validate().is_err());
+        assert!(bad.validate(now).is_err());
     }
 
     #[test]
@@ -2653,6 +2786,106 @@ mod tests {
         );
         assert_eq!(value["data"]["underlying_sequence"], serde_json::json!(7));
         assert_eq!(value["data"]["liquidity"], serde_json::json!("taker"));
+    }
+
+    // ---- GTD ⟺ gtd_expires_at pairing (#59) -------------------------------
+
+    #[test]
+    fn test_validate_gtd_expiry_requires_future_expiry() {
+        let now = EventTimestamp::new(1_000);
+        // Happy path: a future expiry is accepted.
+        assert!(
+            validate_gtd_expiry(TimeInForce::Gtd, Some(EventTimestamp::new(2_000)), now).is_ok()
+        );
+        // A present-instant expiry is not "in the future" and is rejected.
+        match validate_gtd_expiry(TimeInForce::Gtd, Some(EventTimestamp::new(1_000)), now) {
+            Err(VenueError::InvalidOrder(m)) => assert!(m.contains("future")),
+            other => panic!("expected InvalidOrder for a non-future GTD expiry, got {other:?}"),
+        }
+        // A past expiry is rejected.
+        assert!(
+            validate_gtd_expiry(TimeInForce::Gtd, Some(EventTimestamp::new(500)), now).is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_gtd_expiry_rejects_gtd_without_expiry() {
+        let now = EventTimestamp::new(1_000);
+        match validate_gtd_expiry(TimeInForce::Gtd, None, now) {
+            Err(VenueError::InvalidOrder(m)) => assert!(m.contains("requires a gtd_expires_at")),
+            other => panic!("expected InvalidOrder for a GTD order with no expiry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_gtd_expiry_rejects_stray_expiry_on_non_gtd() {
+        let now = EventTimestamp::new(1_000);
+        for tif in [TimeInForce::Gtc, TimeInForce::Ioc, TimeInForce::Fok] {
+            match validate_gtd_expiry(tif, Some(EventTimestamp::new(2_000)), now) {
+                Err(VenueError::InvalidOrder(m)) => {
+                    assert!(m.contains("only valid with a GTD"), "tif {tif:?}: {m}");
+                }
+                other => {
+                    panic!("expected InvalidOrder for a stray expiry on {tif:?}, got {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_gtd_expiry_accepts_non_gtd_without_expiry() {
+        let now = EventTimestamp::new(1_000);
+        for tif in [TimeInForce::Gtc, TimeInForce::Ioc, TimeInForce::Fok] {
+            assert!(validate_gtd_expiry(tif, None, now).is_ok(), "tif {tif:?}");
+        }
+    }
+
+    #[test]
+    fn test_place_limit_order_request_validate_enforces_gtd_pairing() {
+        let now = EventTimestamp::new(1_000);
+        let base = PlaceLimitOrderRequest {
+            side: Side::Buy,
+            price: Cents::new(50_000),
+            quantity: 3,
+            time_in_force: Some(TimeInForce::Gtd),
+            gtd_expires_at: Some(EventTimestamp::new(2_000)),
+            client_order_id: None,
+        };
+        // Happy path: GTD with a future expiry.
+        assert!(base.validate(now).is_ok());
+        // GTD with no expiry is rejected.
+        let mut no_expiry = base.clone();
+        no_expiry.gtd_expires_at = None;
+        assert!(no_expiry.validate(now).is_err());
+        // Non-GTD with a stray expiry is rejected.
+        let mut stray = base.clone();
+        stray.time_in_force = Some(TimeInForce::Gtc);
+        assert!(stray.validate(now).is_err());
+    }
+
+    #[test]
+    fn test_bulk_order_item_validate_enforces_gtd_pairing() {
+        let now = EventTimestamp::new(1_000);
+        let symbol = match Symbol::parse("BTC-20240329-50000-C") {
+            Ok(s) => s,
+            Err(e) => panic!("symbol parse failed: {e:?}"),
+        };
+        let base = BulkOrderItem {
+            symbol,
+            side: Side::Buy,
+            price: Cents::new(50_000),
+            quantity: 3,
+            time_in_force: Some(TimeInForce::Gtd),
+            gtd_expires_at: Some(EventTimestamp::new(2_000)),
+            client_order_id: None,
+        };
+        assert!(base.validate(now).is_ok());
+        let mut no_expiry = base.clone();
+        no_expiry.gtd_expires_at = None;
+        assert!(no_expiry.validate(now).is_err());
+        let mut stray = base.clone();
+        stray.time_in_force = Some(TimeInForce::Ioc);
+        assert!(stray.validate(now).is_err());
     }
 
     #[test]

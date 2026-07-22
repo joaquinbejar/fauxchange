@@ -639,7 +639,15 @@ fn replay_streams_inner(
             Arc::clone(&marks),
         );
         for event in &events {
-            fan_out.emit(event);
+            // A store projection failure during reconstruction means the journal
+            // cannot be faithfully re-projected — halt at the exact sequence rather
+            // than return a partially-rebuilt (divergent) store (#131).
+            fan_out
+                .emit(event)
+                .map_err(|_sealed| ReplayError::JournalCorruption {
+                    underlying: stream.underlying.clone(),
+                    sequence: event.underlying_sequence,
+                })?;
         }
 
         per_underlying.push(UnderlyingReplay {

@@ -331,7 +331,7 @@ fn test_golden_rest_execution_report() {
         Arc::new(InMemoryPositionsStore::new()),
         Arc::new(MarkPriceBook::new()),
     );
-    fan.emit(&store_match_event());
+    let _ = fan.emit(&store_match_event());
 
     let execution_id = ExecutionId::new("run-1:BTC:7:0");
     let maker = executions
@@ -372,7 +372,7 @@ fn test_golden_rest_positions() {
         Arc::clone(&positions),
         Arc::new(MarkPriceBook::new()),
     );
-    fan.emit(&store_match_event());
+    let _ = fan.emit(&store_match_event());
 
     let symbol = sym("BTC-20240329-50000-C");
     let mark = Some(Cents::new(50_500));

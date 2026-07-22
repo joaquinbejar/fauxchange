@@ -2229,7 +2229,7 @@ fn fold_positions(events: &[VenueEvent]) -> Arc<InMemoryPositionsStore> {
         Arc::new(MarkPriceBook::new()),
     );
     for event in events {
-        fan.emit(event);
+        let _ = fan.emit(event);
     }
     positions
 }

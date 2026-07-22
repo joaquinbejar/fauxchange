@@ -167,7 +167,26 @@ impl CommandExecutor for PlaceholderExecutor {
 /// failure. #006 ships the [`NoopFanOut`]; #008 wires the real consumers.
 pub trait FanOut: Send {
     /// Emits one committed event to the fan-out consumers.
-    fn emit(&mut self, event: &VenueEvent);
+    ///
+    /// Returns `Err(`[`FanOutSealed`]`)` when an **authoritative** projection (the
+    /// executions/positions stores) failed and the fan-out fail-stopped: the served
+    /// stores would otherwise diverge from the committed journal. The actor
+    /// **seals** the underlying on that error so no further command is
+    /// matched/journaled/served on a divergent store; recovery rebuilds the stores
+    /// from the journal (#131). A **best-effort** consumer (the WS broadcast) never
+    /// seals — a lagging subscriber re-snapshots — so it returns `Ok`.
+    fn emit(&mut self, event: &VenueEvent) -> Result<(), FanOutSealed>;
+}
+
+/// The signal an **authoritative** [`FanOut`] projection raises when it fail-stops
+/// on a store write failure — the actor seals the underlying on it so the served
+/// executions/positions stores can never diverge from the journal (#131).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanOutSealed {
+    /// Which authoritative projection failed (`"executions"` / `"positions"`).
+    pub projection: &'static str,
+    /// The store error detail (already logged at `ERROR` by the projection).
+    pub detail: String,
 }
 
 /// The #006 no-op fan-out — the consumers land in #008.
@@ -176,7 +195,9 @@ pub struct NoopFanOut;
 
 impl FanOut for NoopFanOut {
     #[inline]
-    fn emit(&mut self, _event: &VenueEvent) {}
+    fn emit(&mut self, _event: &VenueEvent) -> Result<(), FanOutSealed> {
+        Ok(())
+    }
 }
 
 /// A **tee** [`FanOut`]: emits one committed event to two consumers in order.
@@ -210,9 +231,13 @@ where
     B: FanOut,
 {
     #[inline]
-    fn emit(&mut self, event: &VenueEvent) {
-        self.first.emit(event);
-        self.second.emit(event);
+    fn emit(&mut self, event: &VenueEvent) -> Result<(), FanOutSealed> {
+        // `first` is the AUTHORITATIVE #008 StoreFanOut: if it seals, propagate so
+        // the actor fail-stops and never feeds the best-effort `second` (WS) an
+        // event whose authoritative projection failed (#131). `second` (WS) is
+        // best-effort and never seals.
+        self.first.emit(event)?;
+        self.second.emit(event)
     }
 }
 
@@ -333,6 +358,10 @@ enum SealReason {
     /// A post-mutation event append failed; the actor must not build the next
     /// command on unjournaled state.
     JournalUnavailable,
+    /// An authoritative store projection (executions/positions) failed during
+    /// fan-out; the served stores diverged from the committed journal, so the
+    /// underlying fail-stops until the stores are rebuilt from the journal (#131).
+    ProjectionFailed,
 }
 
 impl SealReason {
@@ -342,7 +371,7 @@ impl SealReason {
     fn as_error(self) -> VenueError {
         match self {
             Self::SequenceExhausted => VenueError::SequenceExhausted,
-            Self::JournalUnavailable => VenueError::JournalUnavailable,
+            Self::JournalUnavailable | Self::ProjectionFailed => VenueError::JournalUnavailable,
         }
     }
 }
@@ -527,8 +556,23 @@ where
             return Err(VenueError::JournalUnavailable);
         }
 
-        // Step 5: fan-out ONLY after the paired event is journaled.
-        self.fan_out.emit(&event);
+        // Step 5: fan-out ONLY after the paired event is journaled. An authoritative
+        // projection failure (executions/positions) fail-stops the whole underlying:
+        // the event is committed to the journal, but a served store now diverges from
+        // it, so seal and refuse further commands rather than keep matching/serving on
+        // a divergent store — recovery rebuilds the stores from the journal (#131).
+        if let Err(sealed) = self.fan_out.emit(&event) {
+            self.sealed = Some(SealReason::ProjectionFailed);
+            tracing::error!(
+                underlying = %self.underlying,
+                sequence = sequence.get(),
+                projection = sealed.projection,
+                detail = %sealed.detail,
+                "authoritative store projection failed on fan-out; sealing underlying — \
+                 the served stores diverged from the journal and must be rebuilt from it"
+            );
+            return Err(VenueError::JournalUnavailable);
+        }
 
         // Advance the venue-owned counter per COMMITTED command — checked, never
         // wrapping. Exhaustion at u64::MAX seals the underlying.
@@ -701,7 +745,9 @@ where
         if let Some(reason) = self.sealed {
             return Err(match reason {
                 SealReason::SequenceExhausted => SnapshotError::SequenceExhausted,
-                SealReason::JournalUnavailable => SnapshotError::JournalUnavailable,
+                SealReason::JournalUnavailable | SealReason::ProjectionFailed => {
+                    SnapshotError::JournalUnavailable
+                }
             });
         }
 
@@ -816,9 +862,11 @@ enum ActorMessage {
         command: VenueCommand,
         reply: oneshot::Sender<Result<Receipt, VenueError>>,
     },
-    /// Reply with a read-only snapshot of the journal.
+    /// Reply with a read-only snapshot of the journal, or the read error (a
+    /// journal read failure must propagate, never collapse to a false-empty
+    /// snapshot while `last_sequence` still reports records present).
     Snapshot {
-        reply: oneshot::Sender<JournalSnapshot>,
+        reply: oneshot::Sender<Result<JournalSnapshot, VenueError>>,
     },
 }
 
@@ -890,7 +938,12 @@ impl ActorHandle {
                 return Err(VenueError::JournalUnavailable);
             }
         }
-        reply_rx.await.map_err(|_| VenueError::JournalUnavailable)
+        // Flatten: the outer `Err` is a dropped reply (actor gone); the inner
+        // `Err` is a propagated journal read failure.
+        match reply_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(VenueError::JournalUnavailable),
+        }
     }
 }
 
@@ -912,14 +965,28 @@ where
                     let _ = reply.send(result);
                 }
                 ActorMessage::Snapshot { reply } => {
-                    let snapshot = JournalSnapshot {
-                        last_sequence: self.journal.last_sequence(),
-                        records: self
-                            .journal
-                            .read_from(SequenceNumber::START)
-                            .unwrap_or_else(|_| Vec::new()),
+                    // Read the records FIRST: a journal read failure must propagate
+                    // as an error, never be swallowed into an empty `records` vec
+                    // while `last_sequence` still reports the journal non-empty
+                    // (that internally-inconsistent snapshot would silently corrupt
+                    // recovery/replay). Only on a successful read is the consistent
+                    // `last_sequence` paired with it.
+                    let result = match self.journal.read_from(SequenceNumber::START) {
+                        Ok(records) => Ok(JournalSnapshot {
+                            last_sequence: self.journal.last_sequence(),
+                            records,
+                        }),
+                        Err(error) => {
+                            tracing::error!(
+                                underlying = %self.underlying,
+                                %error,
+                                "journal read failed while building snapshot; \
+                                 propagating error instead of a false-empty snapshot"
+                            );
+                            Err(VenueError::JournalUnavailable)
+                        }
                     };
-                    let _ = reply.send(snapshot);
+                    let _ = reply.send(result);
                 }
             }
         }
@@ -1049,8 +1116,22 @@ mod tests {
     }
 
     impl FanOut for CountingFanOut {
-        fn emit(&mut self, _event: &VenueEvent) {
+        fn emit(&mut self, _event: &VenueEvent) -> Result<(), FanOutSealed> {
             self.emits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// A [`FanOut`] whose authoritative projection FAILS on the first emit — the
+    /// #131 fault the actor must fail-stop on.
+    struct SealingFanOut;
+
+    impl FanOut for SealingFanOut {
+        fn emit(&mut self, _event: &VenueEvent) -> Result<(), FanOutSealed> {
+            Err(FanOutSealed {
+                projection: "executions",
+                detail: "store write failed".to_string(),
+            })
         }
     }
 
@@ -1115,6 +1196,40 @@ mod tests {
         }
     }
 
+    /// A [`VenueJournal`] whose `read_from` always fails while `last_sequence`
+    /// still reports records present — the exact #61 inconsistency the snapshot
+    /// path must propagate as an error rather than swallow into a false-empty
+    /// snapshot. Appends land normally (so `last_sequence` becomes non-empty).
+    struct ReadFailJournal {
+        inner: InMemoryVenueJournal,
+    }
+
+    impl ReadFailJournal {
+        fn new() -> Self {
+            Self { inner: journal() }
+        }
+    }
+
+    impl VenueJournal for ReadFailJournal {
+        fn header(&self) -> &JournalHeader {
+            self.inner.header()
+        }
+
+        fn append(&mut self, record: JournalRecord) -> Result<(), JournalError> {
+            self.inner.append(record)
+        }
+
+        fn read_from(&self, _from: SequenceNumber) -> Result<Vec<JournalRecord>, JournalError> {
+            Err(JournalError::Backend {
+                operation: "snapshot_read",
+            })
+        }
+
+        fn last_sequence(&self) -> Option<SequenceNumber> {
+            self.inner.last_sequence()
+        }
+    }
+
     // ---- happy path: pairing + fan-out ordering --------------------------
 
     #[test]
@@ -1141,6 +1256,45 @@ mod tests {
                 .journal()
                 .contains(SequenceNumber::new(0), RecordKind::Event)
         );
+    }
+
+    // ---- projection-failure fail-stop (#131) -----------------------------
+
+    #[test]
+    fn test_handle_seals_the_actor_when_an_authoritative_projection_fails() {
+        // The review 🔴: a StoreFanOut seal must reach the OWNING ACTOR, not stay
+        // local — else the actor keeps journaling/matching and returning successful
+        // receipts while the served stores diverge from the journal. Now an
+        // authoritative projection failure fail-stops the whole underlying (#131).
+        let mut actor = UnderlyingActor::new(
+            config(16),
+            journal(),
+            PlaceholderExecutor,
+            SealingFanOut,
+            CLOCK,
+        );
+
+        // The command IS committed to the journal (fan-out is post-journal), but the
+        // projection failed — the actor seals and returns an error, never a
+        // success receipt on a divergent store.
+        match actor.handle(cancel("a")) {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("a projection failure must fail-stop the command, got {other:?}"),
+        }
+        // The command + its paired event ARE journaled (the journal is the source of
+        // truth a rebuild replays).
+        assert!(
+            actor
+                .journal()
+                .contains(SequenceNumber::new(0), RecordKind::Event)
+        );
+
+        // The actor is now SEALED: every subsequent command is refused, so no further
+        // matching/journaling/serving happens on the divergent store.
+        match actor.handle(cancel("b")) {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("a sealed actor must refuse further commands, got {other:?}"),
+        }
     }
 
     // ---- checked-add monotonicity ----------------------------------------
@@ -1644,5 +1798,63 @@ mod tests {
         };
         assert_eq!(receipt.underlying_sequence, SequenceNumber::new(0));
         assert_eq!(exec_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ---- snapshot: journal read failure propagates (#61) -----------------
+
+    #[tokio::test]
+    async fn test_snapshot_propagates_journal_read_failure_not_false_empty() {
+        // A journal whose `read_from` fails while `last_sequence` reports records
+        // present. Before #61 the actor swallowed the read error into an empty
+        // `records` vec (an internally-inconsistent snapshot that silently
+        // corrupts recovery); it must now propagate the error instead.
+        let (handle, join) = spawn_underlying_actor(
+            config(16),
+            ReadFailJournal::new(),
+            PlaceholderExecutor,
+            NoopFanOut,
+            CLOCK,
+        );
+        // Land one record so `last_sequence` is non-empty — the exact mismatch.
+        match handle.submit(cancel("seed")).await {
+            Ok(_) => {}
+            Err(e) => panic!("seed submit should commit: {e}"),
+        }
+        match handle.snapshot().await {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("read failure must propagate, got {other:?}"),
+        }
+        drop(handle);
+        let _ = join.await;
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_returns_consistent_records_on_healthy_journal() {
+        let (handle, join) = spawn_underlying_actor(
+            config(16),
+            journal(),
+            PlaceholderExecutor,
+            NoopFanOut,
+            CLOCK,
+        );
+        match handle.submit(cancel("one")).await {
+            Ok(_) => {}
+            Err(e) => panic!("submit should commit: {e}"),
+        }
+        match handle.snapshot().await {
+            Ok(snapshot) => {
+                assert!(
+                    snapshot.last_sequence.is_some(),
+                    "last_sequence must report the record present"
+                );
+                assert!(
+                    !snapshot.records.is_empty(),
+                    "records must be consistent with a non-empty last_sequence"
+                );
+            }
+            Err(e) => panic!("a healthy journal must snapshot: {e}"),
+        }
+        drop(handle);
+        let _ = join.await;
     }
 }

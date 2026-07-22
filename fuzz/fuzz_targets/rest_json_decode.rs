@@ -57,13 +57,19 @@
 #![no_main]
 
 use axum::Json;
-use fauxchange::exchange::Symbol;
+use fauxchange::exchange::{EventTimestamp, Symbol};
 use fauxchange::gateway::rest::MAX_REQUEST_BODY_BYTES;
 use fauxchange::{
     BulkOrderRequest, InsertPriceRequest, MAX_ORDER_QUANTITY, MAX_PRICE_CENTS,
     PlaceLimitOrderRequest, PlaceMarketOrderRequest,
 };
 use libfuzzer_sys::fuzz_target;
+
+/// A fixed venue-clock instant for the `now`-dependent `.validate()` calls (the
+/// GTD ↔ `gtd_expires_at` pairing, #131). A constant keeps the fuzz run
+/// deterministic; the economic-ceiling assertions below are independent of the
+/// TIF/expiry path.
+const FUZZ_NOW: EventTimestamp = EventTimestamp::new(1_700_000_000_000);
 
 fuzz_target!(|data: &[u8]| {
     // The real router rejects an over-ceiling body with a `413` BEFORE any
@@ -78,7 +84,7 @@ fuzz_target!(|data: &[u8]| {
     // validates Ok must genuinely sit inside both ceilings — that is the
     // typed-rejection contract this target exists to prove.
     if let Ok(Json(request)) = Json::<PlaceLimitOrderRequest>::from_bytes(data)
-        && request.validate().is_ok()
+        && request.validate(FUZZ_NOW).is_ok()
     {
         let price = request.price.get();
         assert!(
@@ -110,7 +116,7 @@ fuzz_target!(|data: &[u8]| {
     // item (the "malformed symbols" class, at array scale).
     if let Ok(Json(request)) = Json::<BulkOrderRequest>::from_bytes(data) {
         for item in &request.orders {
-            if item.validate().is_ok() {
+            if item.validate(FUZZ_NOW).is_ok() {
                 let price = item.price.get();
                 assert!(
                     (1..=MAX_PRICE_CENTS).contains(&price),
