@@ -24,7 +24,9 @@ mod stp;
 
 pub use apply::apply_to_underlying;
 pub use config::{FileMicrostructure, MicrostructureConfig, MicrostructureProfile};
-pub use error::{LatencyConfigError, MicrostructureConfigError, PriceBoundError};
+pub use error::{
+    LatencyConfigError, MicrostructureConfigError, OrderAdmissionError, PriceBoundError,
+};
 pub use fees::FeeConfig;
 pub use ingress::{
     DEFAULT_INGRESS_BUFFER_CAPACITY, IngressBufferFull, IngressReorderBuffer, IngressStamp,

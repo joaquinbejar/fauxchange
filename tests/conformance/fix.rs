@@ -47,6 +47,7 @@ use fauxchange::gateway::fix::{
     FixAcceptor, FixAcceptorConfig, FixSessionStore, InMemoryFixSessionStore, SessionConfig,
     VenueFixSessionFactory,
 };
+use fauxchange::microstructure::{FeeConfig, FileMicrostructure, MicrostructureConfig};
 use fauxchange::models::{AccountId, Permission};
 use fauxchange::state::{AppState, AppStateConfig, AuthConfig};
 
@@ -191,10 +192,35 @@ pub struct FixParityHarness {
     shutdown: watch::Sender<bool>,
 }
 
+/// The venue fee schedule the fee-observation parity harness applies (#114 item 4):
+/// a maker rebate + a taker fee, so a crossing produces a non-zero, signed
+/// per-leg fee on every surface.
+#[must_use]
+pub fn fee_microstructure() -> MicrostructureConfig {
+    let file = FileMicrostructure {
+        fees: Some(FeeConfig {
+            maker_bps: -10,
+            taker_bps: 25,
+        }),
+        ..FileMicrostructure::default()
+    };
+    match MicrostructureConfig::resolve(&file, &std::collections::BTreeMap::new()) {
+        Ok(config) => config,
+        Err(error) => panic!("fee microstructure must resolve: {error:?}"),
+    }
+}
+
 impl FixParityHarness {
     /// Binds an ephemeral acceptor over a fresh `parity_accounts`-seeded serving
-    /// venue and spawns its serve loop.
+    /// venue (zero-fee) and spawns its serve loop.
     pub async fn start() -> Self {
+        Self::start_with_microstructure(MicrostructureConfig::default()).await
+    }
+
+    /// Like [`start`](Self::start), but applies `microstructure` to the venue — the
+    /// fee-configured arm the cross-protocol fee-observation parity test drives
+    /// (#114 item 4).
+    pub async fn start_with_microstructure(microstructure: MicrostructureConfig) -> Self {
         let auth = match AuthConfig::dev() {
             Ok(auth) => auth
                 .with_bootstrap_secret(SECRET)
@@ -205,7 +231,8 @@ impl FixParityHarness {
         let state = match AppState::new(
             AppStateConfig::new(["BTC"])
                 .with_serving(true)
-                .with_auth(auth),
+                .with_auth(auth)
+                .with_microstructure(microstructure),
         ) {
             Ok(state) => state,
             Err(error) => panic!("FIX parity venue must build: {error}"),

@@ -206,14 +206,15 @@ pub enum ReplayError {
         /// The non-secret config-rejection detail.
         detail: String,
     },
-    /// A journaled `AddOrder` / `Replace` in the bundle carried a limit price outside
-    /// the venue-owned `[min_price_cents, max_price_cents]` band — the replay
-    /// re-execution seam re-runs the live admission-band check, so a hostile bundle
-    /// cannot smuggle an out-of-band price past the gateway. Refused **before** the
-    /// offending command re-executes.
-    #[error("scenario bundle order price out of band: {detail}")]
+    /// A journaled `AddOrder` / `Replace` in the bundle failed the venue-owned
+    /// **order-admission** gate — the per-symbol price band **or** the per-symbol
+    /// tick / lot / max-quantity contract-spec check (#114 item 5). The replay
+    /// re-execution seam re-runs the live admission gate, so a hostile bundle cannot
+    /// smuggle an order the live gateway would reject. Refused **before** the offending
+    /// command re-executes.
+    #[error("scenario bundle order rejected at venue admission: {detail}")]
     PriceOutOfBand {
-        /// The non-secret price-band violation detail.
+        /// The non-secret admission-violation detail (band / tick / lot / max qty).
         detail: String,
     },
 }
@@ -632,7 +633,10 @@ fn replay_streams_inner(
         } = recovered.map_err(|error| ReplayError::from_journal(&stream.underlying, error))?;
 
         // Reconstruct the executions store + positions fold from the SAME events,
-        // through the same post-journal fan-out the live actor drives.
+        // through the same post-journal fan-out the live actor drives. When a config
+        // is applied, feed the venue fee schedule so the reconstructed executions
+        // store's net-of-fee `edge_cents` matches the live venue's (#114 item 3) — a
+        // live-only analytic, excluded from the replay oracle either way.
         let mut fan_out = StoreFanOut::new(
             Arc::clone(&executions),
             Arc::clone(&positions),

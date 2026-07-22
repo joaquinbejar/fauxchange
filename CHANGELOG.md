@@ -11,6 +11,38 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Microstructure completion — the remaining #44 follow-ups** (#114):
+  - **Live-path config validation.** `AppState::new` now calls
+    `MicrostructureConfig::validate()` **before spawning any actor** and returns
+    a typed `AppStateError::Microstructure` on failure — so the startup fee/spec
+    proof is enforced on the live path, not only on the replay/bundle path.
+  - **BIGINT domain bound.** `ResolvedContractSpecs::validate` now bounds both
+    `max_price_cents` and `max_order_qty` to the durable-store `i64::MAX` domain
+    (`DB_DOMAIN_CEILING`), a typed `SpecKnobAboveDbDomain` rejection at boot — so
+    an over-domain config fails fast instead of a fill being rejected by the
+    `BIGINT` store with `ValueRange`.
+  - **Net-of-fee edge on `ExecutionRecord`.** `project_execution` no longer
+    hardcodes `edge_cents = 0`: with `theo_value_cents` kept at the fill price,
+    the net edge is exactly the **negation of the leg's already-journaled
+    authoritative signed fee** (`edge = -fill.fee`, a **checked** `i64`
+    negation — no `f64`, no recompute). A maker **rebate** ⇒ a **positive** edge,
+    a taker **fee** ⇒ a **negative** edge. Using the journaled fee directly keeps
+    it exact by construction (no fan-out fee-schedule to diverge from the leg).
+    It remains a **live-only analytic** — not journaled, excluded from the
+    replay oracle.
+  - **Cross-protocol fee-observation parity.** A test proves one committed
+    fill's fee renders consistently as REST `fee_cents` and FIX `Commission(12)`
+    (`CommType(13)=3`, equal, non-zero) while the WS `fill` **omits** the
+    account-private fee and keeps its public `edge` at `0` — the net-of-fee edge
+    never leaks onto the anonymised surface.
+  - **Per-symbol specs resolution.** `MicrostructureConfig` gains a `per_symbol`
+    override map; `specs_for_symbol` resolves **symbol-specific → underlying →
+    venue-default** (a `[microstructure.instrument_specs]` config section keys
+    full option symbols or underlyings). `specs_for(underlying)` is unchanged;
+    resolution is deterministic (pure function of config, sorted maps), and the
+    resolved per-symbol tick/lot/max-quantity/price-band is enforced on the
+    live and replay order-admission seams (a venue-owned per-symbol admission
+    check ahead of the per-underlying upstream leaf specs).
 - **REST pre-submit idempotency dedup — aligns the `underlying_sequence`
   progression with FIX on retries** (#103). The #41 parity suite surfaced a
   cross-surface asymmetry: a REST idempotent retry **consumed** an

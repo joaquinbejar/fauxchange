@@ -329,18 +329,19 @@ pub enum JournalError {
         /// The non-secret rejection detail from the microstructure apply.
         detail: String,
     },
-    /// A journaled `AddOrder` / `Replace` carried a limit price outside the
-    /// venue-owned `[min_price_cents, max_price_cents]` band during a config-aware
-    /// recovery. Raised only by
+    /// A journaled `AddOrder` / `Replace` failed the venue-owned **order-admission**
+    /// gate during a config-aware recovery — the per-symbol price band **or** the
+    /// per-symbol tick / lot / max-quantity contract-spec check (#114 item 5), the
+    /// same gate the live submit seam runs. Raised only by
     /// [`recover_with_microstructure`](crate::exchange::recover_with_microstructure)
-    /// (the replay re-execution path re-runs the live admission-band check): a
-    /// legitimate journal never trips it because the live venue admitted every
-    /// command before journaling it, so this fires only on a **tampered** bundle /
-    /// durable journal, refusing the command before it re-executes. Carries the
-    /// non-secret band-violation detail.
-    #[error("recovery order price out of band: {detail}")]
+    /// (the replay re-execution path re-runs the live admission check): a legitimate
+    /// journal never trips it because the live venue admitted every command before
+    /// journaling it, so this fires only on a **tampered** bundle / durable journal,
+    /// refusing the command before it re-executes. Carries the non-secret
+    /// admission-violation detail (band, tick, lot, or max quantity).
+    #[error("recovery order rejected at venue admission: {detail}")]
     PriceOutOfBand {
-        /// The non-secret price-band violation detail.
+        /// The non-secret admission-violation detail (band / tick / lot / max qty).
         detail: String,
     },
 }

@@ -14,7 +14,8 @@ use fauxchange::exchange::{
     Cents, ExecutionFilter, ExecutionsStore, FanoutSummary, Hash32, InstrumentStatus, LineageId,
     PositionsStore, STPMode, Side, Symbol, TimeInForce, VenueCommand, VenueOutcome,
 };
-use fauxchange::state::{AppState, AppStateConfig};
+use fauxchange::microstructure::{ContractSpecsConfig, FileMicrostructure, MicrostructureConfig};
+use fauxchange::state::{AppState, AppStateConfig, AppStateError};
 use fauxchange::{AccountId, ClientOrderId, LiquidityFlag, OrderType, VenueError, VenueOrderId};
 
 fn state(underlyings: &[&str]) -> Arc<AppState> {
@@ -109,6 +110,31 @@ async fn test_client_order_id_resolves_through_the_shared_account_scoped_seam() 
             .is_none(),
         "a colliding client id on another account is indistinguishable from unknown"
     );
+}
+
+/// #114 item 1: `AppState::new` re-runs `MicrostructureConfig::validate()` on the
+/// live path (before spawning any actor), so a config that arrived deserialized
+/// (bypassing the `resolve` proof) with an out-of-domain spec knob fails fast with a
+/// typed `AppStateError::Microstructure`, never serving a request.
+#[tokio::test]
+async fn test_appstate_new_rejects_invalid_microstructure_before_spawning_actors() {
+    // Start from the neutral default, then poison one persisted spec knob past the
+    // durable BIGINT (i64) domain via a serde round-trip — the same path a hostile /
+    // legacy bundle takes to reach `AppState` without going through `resolve`.
+    let mut json = serde_json::to_value(MicrostructureConfig::default())
+        .expect("the default microstructure serializes");
+    json["default_specs"]["max_price_cents"] = serde_json::json!(u64::MAX);
+    let hostile: MicrostructureConfig =
+        serde_json::from_value(json).expect("the poisoned microstructure deserializes");
+
+    let config = AppStateConfig::new(["BTC"])
+        .with_lineage(LineageId::new("run-ms-invalid"))
+        .with_microstructure(hostile);
+    match AppState::new(config) {
+        Err(AppStateError::Microstructure(_)) => {}
+        Err(other) => panic!("expected AppStateError::Microstructure, got {other:?}"),
+        Ok(_) => panic!("an invalid microstructure config must not build an AppState"),
+    }
 }
 
 /// A gateway stand-in submits a crossing pair through the ONLY path and reads the
@@ -454,4 +480,149 @@ async fn test_venue_global_fanout_reports_full_delivery_on_the_receipt() {
         }
         other => panic!("the representative outcome is ControlApplied, got {other:?}"),
     }
+}
+
+/// #114 item 5: the per-symbol contract-spec override — configured TIGHTER than its
+/// underlying — genuinely gates ORDER acceptance on the live `AppState::submit` seam.
+/// The overridden contract carries a 5-cent tick, 2-lot, 10-contract cap, and a
+/// `[100, 200_000]` band; its BTC underlying keeps the wide venue default. An order
+/// that satisfies the underlying but violates the per-symbol tick / lot / max-qty /
+/// band is rejected with a typed `VenueError::InvalidOrder`; one satisfying the
+/// per-symbol profile is accepted; and a sibling contract falls back to the
+/// (looser) underlying default.
+#[tokio::test]
+async fn test_per_symbol_override_gates_order_acceptance_live() {
+    let overridden = "BTC-20240329-50000-C";
+    let mut instrument_specs = std::collections::BTreeMap::new();
+    instrument_specs.insert(
+        overridden.to_string(),
+        ContractSpecsConfig {
+            tick_size_cents: Some(5),
+            lot_size: Some(2),
+            min_price_cents: Some(100),
+            max_price_cents: Some(200_000),
+            max_order_qty: Some(10),
+        },
+    );
+    let microstructure =
+        MicrostructureConfig::resolve(&FileMicrostructure::default(), &instrument_specs)
+            .expect("per-symbol config resolves");
+    let state = match AppState::new(
+        AppStateConfig::new(["BTC"])
+            .with_lineage(LineageId::new("run-per-symbol"))
+            .with_microstructure(microstructure),
+    ) {
+        Ok(state) => state,
+        Err(error) => panic!("AppState::new must succeed: {error}"),
+    };
+
+    // ACCEPT: price 500 (on the per-symbol 5-tick, in-band), qty 4 (a 2-lot multiple,
+    // ≤ the 10 cap) satisfies the per-symbol profile.
+    state
+        .submit(add(overridden, "ok-1", "trader", 0x11, Side::Buy, 500, 4))
+        .await
+        .expect("an order satisfying the per-symbol profile is accepted");
+
+    // REJECT off-tick: 503 is on the underlying's 1-cent tick but off the per-symbol
+    // 5-cent tick → typed InvalidOrder naming the tick.
+    match state
+        .submit(add(
+            overridden,
+            "bad-tick",
+            "trader",
+            0x11,
+            Side::Buy,
+            503,
+            4,
+        ))
+        .await
+    {
+        Err(VenueError::InvalidOrder(detail)) => {
+            assert!(
+                detail.contains("tick"),
+                "the reject names the tick: {detail}"
+            );
+        }
+        other => panic!("an off-per-symbol-tick order must be rejected, got {other:?}"),
+    }
+
+    // REJECT off-lot: qty 3 is a valid underlying quantity but off the per-symbol 2-lot.
+    match state
+        .submit(add(
+            overridden,
+            "bad-lot",
+            "trader",
+            0x11,
+            Side::Buy,
+            500,
+            3,
+        ))
+        .await
+    {
+        Err(VenueError::InvalidOrder(detail)) => {
+            assert!(detail.contains("lot"), "the reject names the lot: {detail}");
+        }
+        other => panic!("an off-per-symbol-lot order must be rejected, got {other:?}"),
+    }
+
+    // REJECT above the per-symbol max quantity: 12 clears the underlying's 1_000_000
+    // cap but violates the per-symbol 10 cap.
+    match state
+        .submit(add(
+            overridden,
+            "bad-qty",
+            "trader",
+            0x11,
+            Side::Buy,
+            500,
+            12,
+        ))
+        .await
+    {
+        Err(VenueError::InvalidOrder(detail)) => {
+            assert!(
+                detail.contains("max order quantity"),
+                "the reject names the max quantity: {detail}"
+            );
+        }
+        other => panic!("an over-per-symbol-cap order must be rejected, got {other:?}"),
+    }
+
+    // REJECT below the per-symbol band: 50 is on the 5-tick and above the underlying's
+    // 1-cent floor, but below the per-symbol 100-cent floor.
+    match state
+        .submit(add(
+            overridden,
+            "bad-band",
+            "trader",
+            0x11,
+            Side::Buy,
+            50,
+            4,
+        ))
+        .await
+    {
+        Err(VenueError::InvalidOrder(detail)) => {
+            assert!(
+                detail.contains("min_price_cents"),
+                "the reject names the per-symbol band floor: {detail}"
+            );
+        }
+        other => panic!("a below-per-symbol-band order must be rejected, got {other:?}"),
+    }
+
+    // FALLBACK: a sibling BTC contract with no per-symbol override falls back to the
+    // (looser) BTC underlying default — 503 / qty 3 are admitted there.
+    state
+        .submit(add(
+            "BTC-20240329-60000-C",
+            "sibling-ok",
+            "trader",
+            0x11,
+            Side::Buy,
+            503,
+            3,
+        ))
+        .await
+        .expect("a sibling contract falls back to the looser underlying default");
 }

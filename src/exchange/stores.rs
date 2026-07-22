@@ -987,6 +987,9 @@ where
     P: PositionsStore,
 {
     /// Wires a fan-out over shared executions / positions stores and a mark book.
+    /// The net-of-fee `edge_cents` analytic (#114 item 3) is the negation of each
+    /// fill's already-journaled authoritative `fee`, so the fan-out needs no fee
+    /// schedule of its own.
     #[must_use]
     #[inline]
     pub fn new(executions: Arc<E>, positions: Arc<P>, marks: Arc<MarkPriceBook>) -> Self {
@@ -1169,11 +1172,19 @@ fn underlying_of(symbol: &Symbol) -> Option<String> {
 /// authoritative account-scoped [`ExecutionRecord`].
 ///
 /// The journal-derived fields (ids, account, side, liquidity, quantity, price,
-/// fee, sequence, timestamp) are deterministic. `theo_value_cents`,
-/// `edge_cents`, and `latency_us` are live-only analytics that need a pricer /
-/// latency injector not wired in #008: `theo_value_cents` defaults to the fill
-/// price so `edge_cents` is `0`, and `latency_us` is `0`. Later issues supply
-/// real values without changing the wire shape ([01 §7](../../../docs/01-domain-model.md)).
+/// fee, sequence, timestamp) are deterministic. `theo_value_cents` and
+/// `edge_cents` are **live-only** analytics excluded from the replay oracle
+/// ([02 §5.5](../../../docs/02-matching-architecture.md)); `latency_us` needs a
+/// latency injector not wired in #008 and is `0`.
+///
+/// `theo_value_cents` is kept at the **fill price** — a real quote-time
+/// theoretical value needs a pricer (`optionstratlib`) not wired at this seam. With
+/// theo equal to the fill price the *gross* theo-edge is zero, so `edge_cents` is
+/// the **net-of-fee edge** ([`net_of_fee_edge`]): the negation of this leg's signed
+/// fee, derived from the venue [`FeeSchedule`] + the leg's maker/taker liquidity +
+/// its notional via the same checked `try_calculate_fee` the matching seam used.
+/// A maker rebate (negative fee) is a **positive** edge, a taker fee (positive fee)
+/// a **negative** edge (#114 item 3, [01 §7](../../../docs/01-domain-model.md)).
 #[must_use]
 fn project_execution(
     event: &VenueEvent,
@@ -1193,10 +1204,38 @@ fn project_execution(
         price_cents: fill.price,
         fee_cents: fill.fee,
         theo_value_cents: fill.price,
-        edge_cents: SignedCents::new(0),
+        edge_cents: net_of_fee_edge(fill),
         underlying_sequence: event.underlying_sequence,
         latency_us: 0,
         executed_at: event.venue_ts,
+    }
+}
+
+/// The signed **net-of-fee edge** in cents for one fill leg — a live-only analytic
+/// ([01 §7](../../../docs/01-domain-model.md), #114 item 3).
+///
+/// With `theo_value_cents` kept at the fill price the gross theo-edge is zero, so the
+/// net edge is exactly the **negation of the leg's already-authoritative signed fee**
+/// (`fill.fee` — the value the matching seam computed and journaled): a maker rebate
+/// (negative fee) yields a **positive** edge, a taker fee (positive fee) a
+/// **negative** edge. Using the journaled fee directly (rather than recomputing it
+/// from a fan-out [`FeeSchedule`]) keeps this exact by construction and removes any
+/// surface where a fan-out schedule could diverge from the leg that produced the fee.
+///
+/// The one arithmetic step is a **checked** negation of the persisted `i64` cents (no
+/// `f64`); the only unreachable edge is negating `i64::MIN`, a seal-class fail-safe
+/// that logs and records a zero edge rather than panic.
+#[must_use]
+fn net_of_fee_edge(fill: &Fill) -> SignedCents {
+    match fill.fee.get().checked_neg() {
+        Some(edge) => SignedCents::new(edge),
+        None => {
+            tracing::error!(
+                fee = fill.fee.get(),
+                "fill fee negation overflowed i64 computing net-of-fee edge; recording 0"
+            );
+            SignedCents::new(0)
+        }
     }
 }
 
@@ -1319,10 +1358,78 @@ mod tests {
         assert_eq!(taker.instrument, sym());
         assert_eq!(maker.side, Side::Sell);
         assert_eq!(taker.side, Side::Buy);
-        // No pricer / latency wired: theo defaults to the fill price (edge 0).
+        // No pricer / latency wired: theo defaults to the fill price. The net-of-fee
+        // edge is the negation of the leg's journaled fee (#114 item 3), so the
+        // taker's +15 fee is a -15 edge.
         assert_eq!(taker.theo_value_cents, Cents::new(50_000));
-        assert_eq!(taker.edge_cents, SignedCents::new(0));
+        assert_eq!(taker.edge_cents, SignedCents::new(-15));
         assert_eq!(taker.latency_us, 0);
+    }
+
+    #[test]
+    fn test_net_of_fee_edge_signs_maker_rebate_positive_taker_fee_negative() {
+        // #114 item 3: with a concrete fee schedule the net-of-fee `edge_cents` is
+        // the negation of each leg's signed fee — a maker rebate is a POSITIVE edge,
+        // a taker fee a NEGATIVE edge — computed checked from the FeeSchedule +
+        // liquidity + notional (never `f64`).
+        //
+        // Schedule: maker rebate -10 bps, taker fee +15 bps. Fill: price 50_000c,
+        // qty 2 → notional 100_000. maker fee = -(100_000×10/10_000) = -100 →
+        // edge +100. taker fee = +(100_000×15/10_000) = +150 → edge -150.
+        let store = InMemoryExecutionsStore::new();
+        let mut fan = StoreFanOut::new(
+            Arc::new(store),
+            Arc::new(InMemoryPositionsStore::new()),
+            Arc::new(MarkPriceBook::new()),
+        );
+        // Set the per-leg fees the matching seam would have journaled, so the
+        // `edge_cents = -fill.fee` analytic derives directly from them.
+        let (mut maker, mut taker) = match_legs(1, 50_000, 2);
+        maker.fee = SignedCents::new(-100);
+        taker.fee = SignedCents::new(150);
+        let command = VenueCommand::AddOrder {
+            symbol: sym(),
+            order_id: taker.order_id.clone(),
+            account: taker.account.clone(),
+            owner: taker.owner,
+            client_order_id: None,
+            side: SeamSide::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(50_000)),
+            quantity: 2,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        };
+        let event = VenueEvent::new(
+            SequenceNumber::new(1),
+            EventTimestamp::new(1_700_000_000_000),
+            command,
+            VenueOutcome::Added {
+                fills: vec![maker, taker],
+                resting_quantity: 0,
+                stp_cancelled: vec![],
+            },
+        );
+        let _ = fan.emit(&event);
+
+        let execution_id = lineage().execution_id(UNDERLYING, SequenceNumber::new(1), 0);
+        let maker_rec = match fan.executions.get(&execution_id, &AccountId::new("maker")) {
+            Ok(Some(record)) => record,
+            other => panic!("expected the maker leg, got {other:?}"),
+        };
+        let taker_rec = match fan.executions.get(&execution_id, &AccountId::new("taker")) {
+            Ok(Some(record)) => record,
+            other => panic!("expected the taker leg, got {other:?}"),
+        };
+        // Maker rebate (fee -100) → positive edge +100.
+        assert_eq!(maker_rec.fee_cents, SignedCents::new(-100));
+        assert_eq!(maker_rec.edge_cents, SignedCents::new(100));
+        // Taker fee (+150) → negative edge -150.
+        assert_eq!(taker_rec.fee_cents, SignedCents::new(150));
+        assert_eq!(taker_rec.edge_cents, SignedCents::new(-150));
+        // The net-of-fee edge is exactly the negation of the signed fee.
+        assert_eq!(maker_rec.edge_cents.get(), -maker_rec.fee_cents.get());
+        assert_eq!(taker_rec.edge_cents.get(), -taker_rec.fee_cents.get());
     }
 
     #[test]

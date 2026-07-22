@@ -3488,6 +3488,190 @@ async fn test_per_instrument_profile_replays_exactly_from_bundle() {
     assert_eq!(top_a.ask_depth, 1);
 }
 
+/// A resolved venue microstructure with a per-**symbol** override on `MS_CALL_A`
+/// TIGHTER than its BTC underlying (a 5-cent tick, 2-lot, 10-contract cap) — the
+/// #114 item 5 config the venue admits orders against before the leaf.
+fn ms_config_with_per_symbol() -> MicrostructureConfig {
+    let mut instrument_specs = BTreeMap::new();
+    instrument_specs.insert(
+        MS_CALL_A.to_string(),
+        ContractSpecsConfig {
+            tick_size_cents: Some(5),
+            lot_size: Some(2),
+            max_order_qty: Some(10),
+            ..ContractSpecsConfig::default()
+        },
+    );
+    MicrostructureConfig::resolve(&FileMicrostructure::default(), &instrument_specs)
+        .expect("per-symbol microstructure resolves")
+}
+
+/// #114 item 5 determinism: a per-**symbol** tick / lot / max-quantity override
+/// genuinely gates order acceptance on the LIVE sequenced path, and the same order
+/// stream re-executed from the journal + bundled config rebuilds the IDENTICAL
+/// accept/reject decisions — a per-symbol-rejected order was never journaled (so
+/// replay never sees it), and the accepted crossing fill reconstructs byte-for-byte.
+#[tokio::test]
+async fn test_per_symbol_override_gates_acceptance_and_replays_exactly() {
+    let micro = ms_config_with_per_symbol();
+    // The per-symbol profile resolves symbol → underlying → default: MS_CALL_A carries
+    // the tighter tick; its BTC underlying (and a sibling contract) keep the default.
+    assert_eq!(micro.specs_for_symbol(MS_CALL_A).tick_size_cents(), 5);
+    assert_eq!(micro.specs_for_symbol(MS_CALL_A).max_order_qty(), 10);
+    assert_eq!(micro.specs_for("BTC"), micro.default_specs());
+    assert_eq!(micro.specs_for_symbol(MS_CALL_B), micro.default_specs());
+
+    let state = ms_state(micro.clone());
+
+    // A per-symbol-VIOLATING order (off the 5-cent tick) is rejected at submit BEFORE
+    // the sequencer — even though 50_003 is a valid price on the underlying's 1-cent
+    // tick — so it is never journaled.
+    match state
+        .submit(ms_add(
+            MS_CALL_A,
+            "off-tick",
+            "acct",
+            0x11,
+            Side::Buy,
+            50_003,
+            2,
+        ))
+        .await
+    {
+        Err(VenueError::InvalidOrder(detail)) => {
+            assert!(
+                detail.contains("tick"),
+                "the reject names the tick: {detail}"
+            );
+        }
+        other => panic!("an off-per-symbol-tick order must be rejected, got {other:?}"),
+    }
+    // A per-symbol max-quantity violation (12 > the per-symbol 10 cap) is likewise
+    // rejected before the sequencer.
+    match state
+        .submit(ms_add(
+            MS_CALL_A,
+            "over-qty",
+            "acct",
+            0x11,
+            Side::Buy,
+            50_000,
+            12,
+        ))
+        .await
+    {
+        Err(VenueError::InvalidOrder(detail)) => assert!(
+            detail.contains("max order quantity"),
+            "the reject names the max quantity: {detail}"
+        ),
+        other => panic!("an over-per-symbol-cap order must be rejected, got {other:?}"),
+    }
+    // Neither rejected order reached the journal.
+    let snapshot = state
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("snapshot BTC");
+    assert!(
+        snapshot.records.is_empty(),
+        "a per-symbol-rejected order is never journaled"
+    );
+
+    // ACCEPTED crossing orders on the overridden symbol (50_000 is on the 5-tick, qty 2
+    // is a 2-lot multiple within the 10 cap) produce a fill.
+    for command in [
+        ms_add(MS_CALL_A, "mk-0", "mkr", 0x11, Side::Sell, 50_000, 2),
+        ms_add(MS_CALL_A, "tk-1", "tkr", 0x22, Side::Buy, 50_000, 2),
+    ] {
+        state
+            .submit(command)
+            .await
+            .expect("a per-symbol-satisfying order sequences");
+    }
+
+    let filter = ExecutionFilter::default();
+    let live_maker = state
+        .executions()
+        .list(&AccountId::new("mkr"), &filter)
+        .expect("list mkr");
+    let live_taker = state
+        .executions()
+        .list(&AccountId::new("tkr"), &filter)
+        .expect("list tkr");
+    assert_eq!(
+        live_maker.len(),
+        1,
+        "the per-symbol-admitted crossing filled"
+    );
+    assert_eq!(live_taker.len(), 1);
+
+    // The exported bundle carries the per-symbol profile; replay re-runs the identical
+    // per-symbol admission (the journal holds only the accepted orders), so `Ok` is
+    // the identical-events proof and the reconstructed fills reproduce byte-for-byte.
+    let bundle = state.export_bundle().await.expect("export bundle");
+    assert_eq!(bundle.microstructure, micro);
+    assert_eq!(
+        bundle
+            .microstructure
+            .specs_for_symbol(MS_CALL_A)
+            .tick_size_cents(),
+        5
+    );
+    assert_eq!(
+        bundle.microstructure.fingerprint(),
+        bundle.manifest.microstructure_fingerprint,
+    );
+    let report = replay_bundle(&bundle).expect("per-symbol scenario replays exactly");
+    let replay_maker = report
+        .executions
+        .list(&AccountId::new("mkr"), &filter)
+        .expect("replay mkr");
+    let replay_taker = report
+        .executions
+        .list(&AccountId::new("tkr"), &filter)
+        .expect("replay tkr");
+    assert_eq!(
+        replay_maker, live_maker,
+        "the per-symbol-admitted maker leg reconstructs identically"
+    );
+    assert_eq!(replay_taker, live_taker);
+    let replay = report.underlying(UNDERLYING).expect("BTC replay");
+    let top_a = replay.top_of_book(&Symbol::parse(MS_CALL_A).expect("A parses"));
+    assert_eq!(top_a.best_bid, None, "the crossing consumed both legs");
+    assert_eq!(top_a.best_ask, None);
+}
+
+/// #114 item 5 (security): the per-symbol contract-spec gate is enforced on the
+/// **replay re-execution** path, not only at live `AppState::submit`. A hostile
+/// `ScenarioBundle` carrying an `AddOrder` whose price is off the per-symbol tick
+/// (valid on the underlying's tick) is refused before the command re-executes.
+#[test]
+fn test_replay_refuses_an_off_per_symbol_tick_order_in_a_bundle() {
+    const TS: EventTimestamp = EventTimestamp::new(1_700_000_000_000);
+    let micro = ms_config_with_per_symbol();
+
+    // 50_003 is off the per-symbol 5-cent tick but on the underlying's 1-cent tick —
+    // the live venue would reject it at submit before journaling; here it is smuggled
+    // straight into the bundle's journal stream.
+    let off_tick = ms_add(MS_CALL_A, "hostile", "acct", 0x11, Side::Buy, 50_003, 2);
+    let records = vec![JournalRecord::command(SequenceNumber::new(0), TS, off_tick)];
+    let stream = JournalStream::new(
+        UNDERLYING,
+        JournalHeader::new(LineageId::new("run-per-symbol-tamper")),
+        records,
+    );
+    let manifest = RunManifest::new(0, ClockMode::Realtime)
+        .with_microstructure_fingerprint(micro.fingerprint());
+    let bundle = ScenarioBundle::new(manifest, vec![stream]).with_microstructure(micro);
+
+    match replay_bundle(&bundle) {
+        Err(ReplayError::PriceOutOfBand { detail }) => assert!(
+            detail.contains("50003") && detail.contains("tick"),
+            "the reject names the per-symbol tick violation, got: {detail}"
+        ),
+        other => panic!("an off-per-symbol-tick bundle order must be refused, got {other:?}"),
+    }
+}
+
 // ============================================================================
 // Latency injection (#045): a seeded, venue-owned, virtual-clock sub-stream
 // ============================================================================
@@ -3882,13 +4066,15 @@ fn test_replay_refuses_an_out_of_band_price_in_a_bundle() {
 /// rejection, not a downstream generic `MoneyError::Overflow` at the fill seam.
 #[test]
 fn test_replay_refuses_an_unprovable_fee_config_in_a_bundle() {
-    // A config that would saturate `FeeSchedule::calculate_fee` (taker 100% bps on a
-    // u64::MAX × u64::MAX notional) — one `resolve` would REJECT, deserialized here to
-    // model the bypass.
+    // A config that would saturate `FeeSchedule::calculate_fee` (taker 100% bps on an
+    // i64::MAX × i64::MAX notional) — one `resolve` would REJECT, deserialized here to
+    // model the bypass. Both persisted knobs sit exactly at the durable BIGINT (i64)
+    // domain ceiling, so the domain bound (#114 item 2) passes and the checked-fee
+    // proof — not the domain check — is the rejecting gate this test targets.
     let json = r#"{
         "fees": {"maker_bps": 0, "taker_bps": 10000},
         "stp": {"mode": "off"},
-        "default_specs": {"tick_size_cents":1,"lot_size":1,"min_price_cents":1,"max_price_cents":18446744073709551615,"max_order_qty":18446744073709551615},
+        "default_specs": {"tick_size_cents":1,"lot_size":1,"min_price_cents":1,"max_price_cents":9223372036854775807,"max_order_qty":9223372036854775807},
         "per_underlying": {}
     }"#;
     let bad: MicrostructureConfig =

@@ -48,24 +48,30 @@ use crate::exchange::event::SequenceNumber;
 use crate::exchange::executor::MatchingExecutor;
 use crate::exchange::identity::LineageId;
 use crate::exchange::journal::{JournalCommand, JournalRecord, VenueJournal};
-use crate::microstructure::{MicrostructureConfig, PriceBoundError};
+use crate::microstructure::{MicrostructureConfig, OrderAdmissionError, PriceBoundError};
 
 pub use crate::exchange::journal::JournalError;
 
-/// Checks a command's limit price against the venue-owned price band, resolving the
-/// underlying from the command's symbol **exactly** as the live [`AppState::submit`]
-/// admission seam does — the single admission-band check shared by the gateway submit
-/// path ([`crate::state::AppState`]) and the replay/recovery re-execution path, so an
-/// over-band price is refused identically on both.
+/// Checks a command's limit price against the venue-owned price band, resolving it by
+/// the order's full **symbol** (#114 item 5) — the band-only admission the venue's
+/// internal producers share (the market-maker requote sink and the price-simulator
+/// step sink, #109), so a band-violating quote or price step is dropped before it is
+/// sequenced.
 ///
 /// Only `AddOrder` / `Replace` carrying a `limit_price` are checked; a market order
 /// (no limit price) and every non-order command carry no price to admit. A symbol
 /// that does not parse is skipped here (the executor rejects it and the integrity
 /// oracle catches it), mirroring the submit seam where the router rejects it.
 ///
+/// The band is resolved through
+/// [`admit_price_for_symbol`](MicrostructureConfig::admit_price_for_symbol) in the
+/// **symbol-specific → underlying → venue-default** fallback order, so a per-symbol
+/// price band gates the producers too. A `SimStep` reference price has no full symbol,
+/// so it is band-checked directly on its underlying ticker.
+///
 /// # Errors
 ///
-/// A [`PriceBoundError`] if the order price falls outside the underlying's
+/// A [`PriceBoundError`] if the order price falls outside the resolved per-symbol
 /// `[min_price_cents, max_price_cents]` band.
 pub(crate) fn check_price_band(
     config: &MicrostructureConfig,
@@ -93,10 +99,71 @@ pub(crate) fn check_price_band(
         } => return config.admit_price(underlying, *price),
         _ => return Ok(()),
     };
-    let Ok(parsed) = SymbolParser::parse(symbol.as_str()) else {
+    let Ok(_) = SymbolParser::parse(symbol.as_str()) else {
         return Ok(());
     };
-    config.admit_price(parsed.underlying(), price)
+    config.admit_price_for_symbol(symbol.as_str(), price)
+}
+
+/// The full venue-owned **order admission** — the per-**symbol** price band, tick,
+/// lot, and max-quantity gate (#114 item 5) — resolved by the order's full symbol via
+/// [`admit_order_for_symbol`](MicrostructureConfig::admit_order_for_symbol) in the
+/// **symbol-specific → underlying → venue-default** fallback order.
+///
+/// This is the single admission the **live gateway submit** seam
+/// ([`crate::state::AppState::submit`]) and the **replay/recovery re-execution** seam
+/// both run **before matching**, so a per-symbol tick / lot / max-quantity /
+/// price-band override genuinely accepts/rejects an order **identically live and on
+/// replay**. It is a pure function of the shared config (no wall-clock / RNG), so a
+/// hostile bundle carrying an order the live venue would have refused is refused
+/// identically on re-execution, and a legitimate journal (whose orders the live venue
+/// already admitted) re-executes unchanged.
+///
+/// The upstream `orderbook-rs` `ContractSpecs` is applied at the leaf **per
+/// underlying** only (verified against the pinned upstream — a leaf's validation is
+/// fixed at vivification from its underlying's specs, with no per-symbol / per-style
+/// setter), so this venue-owned check closes the per-symbol gap ahead of the leaf; the
+/// leaf keeps enforcing the per-underlying tick / lot / max-quantity, so net
+/// acceptance is the intersection (a per-symbol override tighter than its underlying is
+/// the enforceable direction).
+///
+/// Only `AddOrder` / `Replace` carry an order to admit (their `limit_price` +
+/// `quantity`); a `SimStep` reference price is band-checked on its underlying (no lot /
+/// tick / quantity semantics); every other command carries nothing to admit. A symbol
+/// that does not parse is skipped (the router / executor rejects it).
+///
+/// # Errors
+///
+/// An [`OrderAdmissionError`] naming the specific per-symbol violation (band, tick,
+/// lot, or max quantity).
+pub(crate) fn check_order_admission(
+    config: &MicrostructureConfig,
+    command: &VenueCommand,
+) -> Result<(), OrderAdmissionError> {
+    let (symbol, limit_price, quantity) = match command {
+        VenueCommand::AddOrder {
+            symbol,
+            limit_price,
+            quantity,
+            ..
+        }
+        | VenueCommand::Replace {
+            symbol,
+            limit_price,
+            quantity,
+            ..
+        } => (symbol, *limit_price, *quantity),
+        // A `SimStep` reference price carries no order quantity/tick — band only, on
+        // the underlying (mirrors `check_price_band`'s `SimStep` arm).
+        VenueCommand::SimStep {
+            underlying, price, ..
+        } => return config.admit_price(underlying, *price).map_err(Into::into),
+        _ => return Ok(()),
+    };
+    let Ok(_) = SymbolParser::parse(symbol.as_str()) else {
+        return Ok(());
+    };
+    config.admit_order_for_symbol(symbol.as_str(), limit_price, quantity)
 }
 
 /// The reconstructed artifacts a successful [`recover`] produces.
@@ -394,15 +461,17 @@ fn reduce_into_executor(
     let mut events = Vec::new();
 
     for command in command_records_in_order(records) {
-        // Venue-owned price-band admission on the replay re-execution path (the same
-        // check `AppState::submit` runs live): a hostile bundle can carry an order
-        // whose price bypasses the live admission seam, so refuse it BEFORE it
-        // re-executes rather than reconstruct an out-of-band book. A legitimate
-        // journal never trips this — the live venue admitted every command before
-        // journaling it, and the fingerprint gate pins the replay band to the
-        // recorded one.
+        // Venue-owned order admission on the replay re-execution path (the SAME
+        // per-symbol band + tick + lot + max-quantity gate `AppState::submit` runs
+        // live, #114 item 5): a hostile bundle can carry an order whose price /
+        // tick / lot / quantity bypasses the live admission seam, so refuse it BEFORE
+        // it re-executes rather than reconstruct a book the live venue would never
+        // have. A legitimate journal never trips this — the live venue admitted every
+        // command before journaling it, and the fingerprint gate pins the replay
+        // config (hence the per-symbol specs) to the recorded one, so admission is
+        // identical live and on replay.
         if let Some(config) = microstructure {
-            check_price_band(config, &command.command).map_err(|error| {
+            check_order_admission(config, &command.command).map_err(|error| {
                 JournalError::PriceOutOfBand {
                     detail: error.to_string(),
                 }
@@ -816,6 +885,65 @@ mod tests {
         assert!(
             check_price_band(&config, &sim_step(1_000_000)).is_ok(),
             "an at-cap SimStep is admitted (the band is inclusive)"
+        );
+    }
+
+    #[test]
+    fn test_check_order_admission_enforces_per_symbol_tick_lot_and_max_qty() {
+        use std::collections::BTreeMap;
+
+        use crate::exchange::Cents;
+        use crate::exchange::boundary::{Hash32, STPMode, Side, TimeInForce};
+        use crate::microstructure::{
+            ContractSpecsConfig, FileMicrostructure, MicrostructureConfig,
+        };
+        use crate::models::OrderType;
+
+        // A per-symbol override TIGHTER than its underlying: a 5-cent tick, 2-lot,
+        // 10-contract cap on one BTC contract, over a wide underlying default.
+        let file = FileMicrostructure::default();
+        let mut specs = BTreeMap::new();
+        specs.insert(
+            "BTC-20240329-50000-C".to_string(),
+            ContractSpecsConfig {
+                tick_size_cents: Some(5),
+                lot_size: Some(2),
+                max_order_qty: Some(10),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let config = MicrostructureConfig::resolve(&file, &specs).expect("resolves");
+
+        let add = |contract: &str, seq: u64, price: u64, quantity: u64| VenueCommand::AddOrder {
+            symbol: sym(contract),
+            order_id: lineage().venue_order_id(UNDERLYING, SequenceNumber::new(seq), 0),
+            account: AccountId::new("acct-1"),
+            owner: Hash32([0x11; 32]),
+            client_order_id: None,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(price)),
+            quantity,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        };
+        let overridden = "BTC-20240329-50000-C";
+
+        // Satisfies the per-symbol gate → admitted.
+        assert!(check_order_admission(&config, &add(overridden, 0, 500, 4)).is_ok());
+        // Off the per-symbol 5-cent tick → rejected (the underlying's 1-cent tick would
+        // have admitted 503; the per-symbol gate closes it before the leaf).
+        assert!(check_order_admission(&config, &add(overridden, 0, 503, 4)).is_err());
+        // Off the per-symbol 2-lot → rejected.
+        assert!(check_order_admission(&config, &add(overridden, 0, 500, 3)).is_err());
+        // Above the per-symbol 10-contract cap → rejected.
+        assert!(check_order_admission(&config, &add(overridden, 0, 500, 12)).is_err());
+
+        // A sibling contract with no per-symbol override falls back to the venue
+        // default (1-cent tick, 1-lot, 1_000_000 cap): 503 / 3 all admitted.
+        assert!(
+            check_order_admission(&config, &add("BTC-20240329-60000-C", 1, 503, 3)).is_ok(),
+            "a sibling contract falls back to the (looser) venue default"
         );
     }
 }

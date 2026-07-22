@@ -53,6 +53,28 @@ pub enum MicrostructureConfigError {
         /// The configured maximum price (cents).
         max: u64,
     },
+    /// A persisted contract-spec knob (`max_price_cents` / `max_order_qty`)
+    /// exceeded the durable `BIGINT` (`i64`) domain of the store it is recorded in.
+    ///
+    /// Both knobs bound values that flow into the persisted-cents columns — a
+    /// fill's price/quantity and (through the widest notional) its fee — so a knob
+    /// above `i64::MAX` would let a fill be **admitted** yet **rejected** by the
+    /// durable store's `ValueRange` at commit. Bounding both to the DB domain at
+    /// startup makes an over-domain config a **fail-fast boot rejection** instead
+    /// of a first-durable-fill surprise
+    /// ([governance-precedence §2.1](../../../docs/governance-precedence.md#21-cents-at-the-database-boundary-lossless-encoding)).
+    #[error(
+        "{field} ({value}) exceeds the durable BIGINT (i64) domain ceiling of {ceiling}; \
+         lower {field} so a fill records losslessly in the persisted store"
+    )]
+    SpecKnobAboveDbDomain {
+        /// The offending field name (`max_price_cents` or `max_order_qty`).
+        field: &'static str,
+        /// The offending value.
+        value: u64,
+        /// The durable `i64::MAX` domain ceiling.
+        ceiling: u64,
+    },
     /// **Checked-fee proof, part A.** The widest admissible notional
     /// (`max_price_cents × max_order_qty`) exceeds the upstream
     /// multiplication-safety bound `FeeSchedule::max_guaranteed_exact_notional()`
@@ -195,5 +217,55 @@ pub enum PriceBoundError {
         price: u64,
         /// The configured minimum price (cents).
         min: u64,
+    },
+}
+
+/// A venue-owned **order-admission** failure raised per order at the order-admission
+/// and replay seams — the full per-**symbol** contract-spec gate resolved via
+/// [`MicrostructureConfig::specs_for_symbol`](crate::microstructure::MicrostructureConfig::specs_for_symbol)
+/// (#114 item 5).
+///
+/// The upstream `orderbook-rs` `ContractSpecs` is applied at the leaf **per
+/// underlying** (verified against the pinned `option-chain-orderbook` 0.7.0 /
+/// `orderbook-rs` 0.10.5 — a leaf's `ValidationConfig` is fixed at vivification from
+/// its underlying's specs, with no per-symbol / per-style setter and no post-vivify
+/// mutator). A per-**symbol** tick / lot / max-quantity override therefore cannot be
+/// installed at the leaf, so the venue enforces it as a check on the sequenced
+/// admission path **before** the leaf — the same one shared by live submit and the
+/// replay/recovery re-execution seam, so acceptance is identical live and on replay
+/// ([05 §7](../../../docs/05-microstructure-config.md#7-contract-specs-tick-and-lot)).
+/// The venue-owned price band ([`PriceBoundError`]) is folded in as one variant so a
+/// single admission call covers band + tick + lot + max-quantity.
+///
+/// Mapped onto `VenueError::InvalidOrder` (→ REST 400 / FIX reject) at the live seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum OrderAdmissionError {
+    /// The order price fell outside the venue-owned `[min_price_cents,
+    /// max_price_cents]` band for the resolved per-symbol profile.
+    #[error(transparent)]
+    PriceBand(#[from] PriceBoundError),
+    /// The order price was not a whole multiple of the resolved per-symbol tick.
+    #[error("price {price} cents is off the {tick}-cent tick for this instrument")]
+    OffTick {
+        /// The offending order price (cents).
+        price: u64,
+        /// The resolved per-symbol tick size (cents).
+        tick: u64,
+    },
+    /// The order quantity was not a whole multiple of the resolved per-symbol lot.
+    #[error("quantity {quantity} is not a multiple of the {lot}-contract lot for this instrument")]
+    OffLot {
+        /// The offending order quantity (contracts).
+        quantity: u64,
+        /// The resolved per-symbol lot size (contracts).
+        lot: u64,
+    },
+    /// The order quantity exceeded the resolved per-symbol maximum order quantity.
+    #[error("quantity {quantity} exceeds the max order quantity {max} for this instrument")]
+    AboveMaxQty {
+        /// The offending order quantity (contracts).
+        quantity: u64,
+        /// The resolved per-symbol maximum order quantity (contracts).
+        max: u64,
     },
 }

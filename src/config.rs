@@ -2165,14 +2165,19 @@ impl FileConfig {
         )
     }
 
-    /// Resolves the `[microstructure.*]` section and every per-underlying
-    /// `[instruments."<SYM>".specs]` into a validated [`MicrostructureConfig`],
+    /// Resolves the `[microstructure.*]` section, every per-underlying
+    /// `[instruments."<SYM>".specs]`, and every `[microstructure.instrument_specs]`
+    /// per-symbol / per-underlying override into a validated [`MicrostructureConfig`],
     /// running the **checked-fee startup proof** for the venue default and each
-    /// per-underlying override.
+    /// override.
     ///
-    /// Per-underlying specs are collected in **sorted underlying order**
-    /// ([`BTreeMap`]) so resolution is a fixed function of the file. The upstream
-    /// fee/STP/contract-spec types are surfaced, never forked
+    /// Overrides are collected in **sorted key order** ([`BTreeMap`]) so resolution
+    /// is a fixed function of the file. `[instruments."X".specs]` keys are always
+    /// underlyings (coupled to a seed instrument); `[microstructure.instrument_specs]`
+    /// keys may be a full option symbol (`UNDERLYING-YYYYMMDD-STRIKE-STYLE`) or an
+    /// underlying, with the resolver classifying them (#114 item 5). On a key
+    /// collision, the dedicated `[microstructure.instrument_specs]` section **wins**.
+    /// The upstream fee/STP/contract-spec types are surfaced, never forked
     /// ([05 §1](../docs/05-microstructure-config.md#1-scope)).
     ///
     /// # Errors
@@ -2184,11 +2189,20 @@ impl FileConfig {
         let default_file = FileMicrostructure::default();
         let file = self.microstructure.as_ref().unwrap_or(&default_file);
         let mut instrument_specs: BTreeMap<String, ContractSpecsConfig> = BTreeMap::new();
+        // The per-underlying overrides coupled to each seed instrument.
         if let Some(instruments) = &self.instruments {
             for (underlying, instrument) in instruments {
                 if let Some(specs) = instrument.specs {
                     instrument_specs.insert(underlying.clone(), specs);
                 }
+            }
+        }
+        // The dedicated `[microstructure.instrument_specs]` per-symbol / per-underlying
+        // overrides (#114 item 5). Inserted AFTER the seed-coupled specs so a
+        // collision on the same key resolves to the dedicated section.
+        if let Some(overrides) = &file.instrument_specs {
+            for (key, specs) in overrides {
+                instrument_specs.insert(key.clone(), *specs);
             }
         }
         Ok(MicrostructureConfig::resolve(file, &instrument_specs)?)
@@ -3315,6 +3329,50 @@ max_order_qty = 10000
         assert_eq!(btc.max_order_qty(), 10_000);
         // An unconfigured underlying inherits the venue-default specs.
         assert_eq!(micro.specs_for("ETH"), micro.default_specs());
+        Ok(())
+    }
+
+    /// `[microstructure.instrument_specs]` per-symbol overrides resolve
+    /// symbol-specific → underlying → venue-default (#114 item 5).
+    #[test]
+    fn test_microstructure_resolves_per_symbol_specs_override() -> Result<(), ConfigError> {
+        let document = "\
+[microstructure.fees]
+maker_bps = -10
+taker_bps = 35
+
+[instruments.BTC]
+opening_price_cents = 5000000
+expirations = [\"20260327\"]
+strikes = [50000]
+
+[instruments.BTC.specs]
+max_order_qty = 10000
+
+[microstructure.instrument_specs.\"BTC-20260327-50000-C\"]
+tick_size_cents = 5
+";
+        let micro = parse_file_config(document)?.microstructure_config()?;
+        // The per-symbol override wins on tick and inherits the BTC underlying's qty.
+        let sym = micro.specs_for_symbol("BTC-20260327-50000-C");
+        assert_eq!(sym.tick_size_cents(), 5, "per-symbol tick override wins");
+        assert_eq!(
+            sym.max_order_qty(),
+            10_000,
+            "inherits the BTC underlying qty"
+        );
+        // A different BTC contract falls back to the BTC underlying (baseline tick).
+        let other = micro.specs_for_symbol("BTC-20260327-60000-C");
+        assert_eq!(other, micro.specs_for("BTC"));
+        assert_eq!(other.tick_size_cents(), 1);
+        assert_eq!(other.max_order_qty(), 10_000);
+        // `specs_for(underlying)` never sees the per-symbol override.
+        assert_eq!(micro.specs_for("BTC").tick_size_cents(), 1);
+        // An unrelated underlying falls back to the venue default.
+        assert_eq!(
+            micro.specs_for_symbol("ETH-20260327-50000-C"),
+            micro.default_specs()
+        );
         Ok(())
     }
 

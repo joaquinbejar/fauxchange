@@ -16,11 +16,13 @@
 
 use std::collections::BTreeMap;
 
-use option_chain_orderbook::{FeeSchedule, STPMode};
+use option_chain_orderbook::{FeeSchedule, STPMode, SymbolParser};
 use serde::{Deserialize, Serialize};
 
 use crate::exchange::Cents;
-use crate::microstructure::error::{MicrostructureConfigError, PriceBoundError};
+use crate::microstructure::error::{
+    MicrostructureConfigError, OrderAdmissionError, PriceBoundError,
+};
 use crate::microstructure::fees::FeeConfig;
 use crate::microstructure::latency::{FileLatency, LatencyConfig};
 use crate::microstructure::specs::{ContractSpecsConfig, PriceBounds, ResolvedContractSpecs};
@@ -45,6 +47,15 @@ pub struct FileMicrostructure {
     /// per-underlying `[instruments."X".specs]` inherits unset knobs from.
     #[serde(default)]
     pub specs: Option<ContractSpecsConfig>,
+    /// `[microstructure.instrument_specs."<KEY>"]` — per-instrument contract-spec
+    /// overrides keyed by a **full option symbol** (`UNDERLYING-YYYYMMDD-STRIKE-STYLE`)
+    /// OR a bare **underlying** (#114 item 5). A full-symbol key resolves **before**
+    /// its underlying's override; an underlying key resolves before the venue
+    /// default. Standalone from the `[instruments.*]` seed table, so a per-symbol
+    /// override needs no seed instrument. On a key collision with an
+    /// `[instruments."X".specs]` entry, this dedicated section wins.
+    #[serde(default)]
+    pub instrument_specs: Option<BTreeMap<String, ContractSpecsConfig>>,
     /// `[microstructure.latency]` — the seeded latency-injection distribution
     /// (#045). Absent ⇒ no latency injection.
     #[serde(default)]
@@ -73,6 +84,13 @@ pub struct MicrostructureConfig {
     stp: StpConfig,
     default_specs: ResolvedContractSpecs,
     per_underlying: BTreeMap<String, ResolvedContractSpecs>,
+    /// Per-**symbol** contract-spec overrides keyed by the full option symbol
+    /// (#114 item 5), resolved over the underlying's specs (or the venue default).
+    /// `#[serde(default)]` so a legacy bundle without it decodes as empty, preserving
+    /// the reserved default fingerprint and the recorded manifest fingerprint of a
+    /// venue that predates per-symbol specs.
+    #[serde(default)]
+    per_symbol: BTreeMap<String, ResolvedContractSpecs>,
     /// The seeded latency-injection distribution (#045). `#[serde(default)]` so a
     /// legacy bundle without it decodes as [`LatencyConfig::Disabled`], preserving
     /// the reserved default fingerprint.
@@ -87,6 +105,7 @@ impl Default for MicrostructureConfig {
             stp: StpConfig::default(),
             default_specs: ResolvedContractSpecs::baseline(),
             per_underlying: BTreeMap::new(),
+            per_symbol: BTreeMap::new(),
             latency: LatencyConfig::default(),
         }
     }
@@ -98,16 +117,20 @@ impl MicrostructureConfig {
     /// the venue default and every per-underlying override.
     ///
     /// The venue default is `[microstructure.specs]` resolved over the hard-coded
-    /// [`ResolvedContractSpecs::baseline`]; each per-underlying override is
-    /// `[instruments."X".specs]` resolved over that venue default. Iterated in
-    /// sorted underlying order ([`BTreeMap`]) so resolution is a fixed function of
-    /// the file.
+    /// [`ResolvedContractSpecs::baseline`]; each **per-underlying** override resolves
+    /// over that venue default, and each **per-symbol** override resolves over its
+    /// underlying's specs (its per-underlying override if present, else the venue
+    /// default). A key in `instrument_specs` that parses as a full option symbol
+    /// (`UNDERLYING-YYYYMMDD-STRIKE-STYLE`, via the upstream [`SymbolParser`]) is a
+    /// per-symbol override; any other key is an underlying (#114 item 5). Both maps
+    /// iterate in sorted key order ([`BTreeMap`]) so resolution is a fixed function
+    /// of the file.
     ///
     /// # Errors
     ///
     /// A [`MicrostructureConfigError`] on a negative taker fee, an out-of-range
     /// spec knob, or a fee/spec combination that fails the checked-fee proof for
-    /// the venue default or any underlying.
+    /// the venue default, any underlying, or any symbol.
     pub fn resolve(
         file: &FileMicrostructure,
         instrument_specs: &BTreeMap<String, ContractSpecsConfig>,
@@ -131,12 +154,38 @@ impl MicrostructureConfig {
             .resolve_over(ResolvedContractSpecs::baseline())?;
         fees.validate_notional_bound(default_specs.max_notional()?)?;
 
-        // Per-underlying overrides: each over the venue default, each proved.
+        // Pass 1 — per-**underlying** overrides (a key that is NOT a full option
+        // symbol): each over the venue default, each proved. A full-symbol key is
+        // deferred to pass 2 so a per-symbol override can inherit its underlying's
+        // resolved specs.
         let mut per_underlying = BTreeMap::new();
-        for (underlying, specs_config) in instrument_specs {
+        for (key, specs_config) in instrument_specs {
+            if SymbolParser::parse(key).is_ok() {
+                continue;
+            }
             let resolved = specs_config.resolve_over(default_specs)?;
             fees.validate_notional_bound(resolved.max_notional()?)?;
-            per_underlying.insert(underlying.clone(), resolved);
+            per_underlying.insert(key.clone(), resolved);
+        }
+
+        // Pass 2 — per-**symbol** overrides (a full option-symbol key): each over its
+        // underlying's specs (the per-underlying override if present, else the venue
+        // default), each proved. Deterministic: the underlying's specs are resolved
+        // in pass 1, the key set is a sorted `BTreeMap`, and the underlying is the
+        // upstream parser's canonical mapping — no wall-clock / RNG / iteration-order
+        // input.
+        let mut per_symbol = BTreeMap::new();
+        for (key, specs_config) in instrument_specs {
+            let Ok(parsed) = SymbolParser::parse(key) else {
+                continue;
+            };
+            let base = per_underlying
+                .get(parsed.underlying())
+                .copied()
+                .unwrap_or(default_specs);
+            let resolved = specs_config.resolve_over(base)?;
+            fees.validate_notional_bound(resolved.max_notional()?)?;
+            per_symbol.insert(key.clone(), resolved);
         }
 
         Ok(Self {
@@ -144,6 +193,7 @@ impl MicrostructureConfig {
             stp,
             default_specs,
             per_underlying,
+            per_symbol,
             latency,
         })
     }
@@ -180,9 +230,10 @@ impl MicrostructureConfig {
     /// # Errors
     ///
     /// A [`MicrostructureConfigError`] if a spec knob is out of range (a zero
-    /// tick / lot / min-price / max-qty, or `max_price_cents` below `min_price_cents`)
-    /// or the fee schedule fails the checked-fee proof against the venue-default or
-    /// any per-underlying widest notional.
+    /// tick / lot / min-price / max-qty, a persisted knob above the durable `BIGINT`
+    /// domain, or `max_price_cents` below `min_price_cents`) or the fee schedule
+    /// fails the checked-fee proof against the venue-default or any per-underlying /
+    /// per-symbol widest notional.
     pub fn validate(&self) -> Result<(), MicrostructureConfigError> {
         self.fees.validate()?;
         // The latency distribution (deserialize bypassed `FileLatency::resolve`).
@@ -194,6 +245,11 @@ impl MicrostructureConfig {
             .validate_notional_bound(self.default_specs.max_notional()?)?;
         // Every per-underlying override, in sorted order (a `BTreeMap`).
         for specs in self.per_underlying.values() {
+            specs.validate()?;
+            self.fees.validate_notional_bound(specs.max_notional()?)?;
+        }
+        // Every per-symbol override (#114 item 5), in sorted order.
+        for specs in self.per_symbol.values() {
             specs.validate()?;
             self.fees.validate_notional_bound(specs.max_notional()?)?;
         }
@@ -224,6 +280,27 @@ impl MicrostructureConfig {
             .get(underlying)
             .copied()
             .unwrap_or(self.default_specs)
+    }
+
+    /// The resolved contract specs for a full option `symbol`, resolving in the
+    /// **symbol-specific → underlying → venue-default** fallback order (#114 item 5):
+    /// its per-symbol override if one is configured, else its underlying's
+    /// per-underlying override (via [`specs_for`](Self::specs_for)), else the venue
+    /// default.
+    ///
+    /// A **pure function** of the shared config — the symbol → underlying mapping is
+    /// the upstream [`SymbolParser`] (never hand-parsed), and both override maps are
+    /// point lookups — so a book vivified during replay resolves identical specs. A
+    /// `symbol` that does not parse falls back to the venue default.
+    #[must_use]
+    pub fn specs_for_symbol(&self, symbol: &str) -> ResolvedContractSpecs {
+        if let Some(specs) = self.per_symbol.get(symbol) {
+            return *specs;
+        }
+        match SymbolParser::parse(symbol) {
+            Ok(parsed) => self.specs_for(parsed.underlying()),
+            Err(_) => self.default_specs,
+        }
     }
 
     /// The venue-default contract specs (the fallback for an unconfigured
@@ -266,6 +343,23 @@ impl MicrostructureConfig {
         }
     }
 
+    /// Resolves the active [`MicrostructureProfile`] for a full option `symbol`,
+    /// resolving its contract specs in the **symbol-specific → underlying →
+    /// venue-default** fallback order (#114 item 5) via
+    /// [`specs_for_symbol`](Self::specs_for_symbol). The fee schedule, STP mode, and
+    /// latency distribution are venue-wide, so they are the same as
+    /// [`profile_for`](Self::profile_for). A pure function of the shared config, so a
+    /// profiled symbol resolves identically during replay.
+    #[must_use]
+    pub fn profile_for_symbol(&self, symbol: &str) -> MicrostructureProfile {
+        MicrostructureProfile {
+            fees: self.fees,
+            stp: self.stp,
+            specs: self.specs_for_symbol(symbol),
+            latency: self.latency,
+        }
+    }
+
     /// Admits `price` for `underlying` against the venue-owned price band — the
     /// check the order-admission and replay seams run **before matching**, resolved
     /// through the per-instrument [`profile_for`](Self::profile_for).
@@ -277,6 +371,60 @@ impl MicrostructureConfig {
     #[inline]
     pub fn admit_price(&self, underlying: &str, price: Cents) -> Result<(), PriceBoundError> {
         self.profile_for(underlying).admit_price(price)
+    }
+
+    /// Admits `price` for a full option `symbol` against the venue-owned price band,
+    /// resolving the band in the **symbol-specific → underlying → venue-default**
+    /// fallback order (#114 item 5) via [`specs_for_symbol`](Self::specs_for_symbol)
+    /// — so a per-symbol price band genuinely gates order acceptance, not only the
+    /// per-underlying one.
+    ///
+    /// A **pure function** of the shared config (the symbol → underlying mapping is
+    /// the upstream [`SymbolParser`], both override maps are point lookups), so the
+    /// same order resolves the same band decision live and on replay.
+    ///
+    /// # Errors
+    ///
+    /// A [`PriceBoundError`] if `price` falls outside the resolved per-symbol
+    /// `[min_price_cents, max_price_cents]` band.
+    #[inline]
+    pub fn admit_price_for_symbol(
+        &self,
+        symbol: &str,
+        price: Cents,
+    ) -> Result<(), PriceBoundError> {
+        self.specs_for_symbol(symbol).price_bounds().admit(price)
+    }
+
+    /// Admits a full order (`limit_price` + `quantity`) for a full option `symbol`
+    /// against the resolved **per-symbol** contract-spec gate — the venue-owned price
+    /// band, tick, lot, and max order quantity — resolving in the **symbol-specific →
+    /// underlying → venue-default** fallback order (#114 item 5) via
+    /// [`specs_for_symbol`](Self::specs_for_symbol).
+    ///
+    /// This is the admission the sequenced order path runs **before** the leaf so a
+    /// per-symbol tick / lot / max-quantity / price-band override genuinely
+    /// accepts/rejects an order. The upstream `orderbook-rs` `ContractSpecs` applies
+    /// only **per underlying** at the leaf (verified against the pinned upstream), so
+    /// this venue-owned check closes the per-symbol gap; the leaf continues to enforce
+    /// the per-underlying tick / lot / max-quantity, so net acceptance is the
+    /// intersection (a per-symbol override **tighter** than its underlying is the
+    /// enforceable direction). A **pure function** of the shared config, identical live
+    /// and on replay.
+    ///
+    /// # Errors
+    ///
+    /// An [`OrderAdmissionError`] naming the specific violation (band, tick, lot, or
+    /// max quantity) for the resolved per-symbol specs.
+    #[inline]
+    pub fn admit_order_for_symbol(
+        &self,
+        symbol: &str,
+        limit_price: Option<Cents>,
+        quantity: u64,
+    ) -> Result<(), OrderAdmissionError> {
+        self.specs_for_symbol(symbol)
+            .admit_order(limit_price, quantity)
     }
 
     /// A stable, deterministic fingerprint of the resolved config content — the
@@ -309,6 +457,14 @@ impl MicrostructureConfig {
         // order — a fixed, reproducible sequence independent of insertion order.
         for (underlying, specs) in &self.per_underlying {
             out.push_str(&format!(";specs.{underlying}={}", specs_fragment(specs)));
+        }
+        // Per-symbol overrides (#114 item 5), also in sorted order under a distinct
+        // `specs.sym.` prefix so they never collide with an underlying fragment and a
+        // per-symbol change yields a distinct fingerprint. Appended AFTER the
+        // per-underlying fragments, so a config with no per-symbol override records
+        // the identical fingerprint it did before per-symbol specs existed.
+        for (symbol, specs) in &self.per_symbol {
+            out.push_str(&format!(";specs.sym.{symbol}={}", specs_fragment(specs)));
         }
         // The latency distribution (empty fragment when disabled), so a latency-only
         // config change still yields a distinct fingerprint.
@@ -575,6 +731,259 @@ mod tests {
         // The fee schedule surfaces the configured bps.
         assert_eq!(config.fee_schedule().maker_fee_bps, -10);
         assert_eq!(config.fee_schedule().taker_fee_bps, 35);
+    }
+
+    #[test]
+    fn test_specs_for_symbol_resolves_symbol_then_underlying_then_default() {
+        // #114 item 5: a full-symbol override resolves BEFORE the underlying default,
+        // and an unlisted symbol falls back (symbol → underlying → venue-default).
+        let file = FileMicrostructure {
+            fees: Some(FeeConfig {
+                maker_bps: -10,
+                taker_bps: 35,
+            }),
+            ..FileMicrostructure::default()
+        };
+        let mut specs = BTreeMap::new();
+        // A per-underlying override for BTC (max_order_qty).
+        specs.insert(
+            "BTC".to_string(),
+            ContractSpecsConfig {
+                max_order_qty: Some(10_000),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        // A per-symbol override for one BTC contract (tick), inheriting BTC's qty.
+        specs.insert(
+            "BTC-20240329-50000-C".to_string(),
+            ContractSpecsConfig {
+                tick_size_cents: Some(5),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let config = MicrostructureConfig::resolve(&file, &specs).expect("resolves");
+
+        // The symbol-specific override wins, and inherits its underlying's qty.
+        let sym = config.specs_for_symbol("BTC-20240329-50000-C");
+        assert_eq!(
+            sym.tick_size_cents(),
+            5,
+            "the per-symbol tick override wins"
+        );
+        assert_eq!(
+            sym.max_order_qty(),
+            10_000,
+            "the per-symbol override inherits the underlying's qty"
+        );
+
+        // A different BTC contract (no per-symbol override) falls back to the BTC
+        // underlying: baseline tick, the underlying's qty.
+        let other = config.specs_for_symbol("BTC-20240329-60000-C");
+        assert_eq!(
+            other.tick_size_cents(),
+            1,
+            "falls back to the baseline tick"
+        );
+        assert_eq!(other.max_order_qty(), 10_000, "falls back to the BTC qty");
+        assert_eq!(other, config.specs_for("BTC"));
+
+        // An ETH contract (no per-symbol, no per-underlying) falls back to the venue
+        // default across every knob.
+        let eth = config.specs_for_symbol("ETH-20240329-50000-C");
+        assert_eq!(eth, config.default_specs());
+
+        // `specs_for(underlying)` is unchanged and never sees per-symbol overrides.
+        assert_eq!(config.specs_for("BTC").tick_size_cents(), 1);
+        assert_eq!(config.specs_for("BTC").max_order_qty(), 10_000);
+
+        // A malformed symbol falls back to the venue default (never a panic).
+        assert_eq!(
+            config.specs_for_symbol("not-a-symbol"),
+            config.default_specs()
+        );
+        // The per-symbol profile resolves the same specs the direct lookup does.
+        assert_eq!(
+            config.profile_for_symbol("BTC-20240329-50000-C").specs(),
+            sym
+        );
+    }
+
+    #[test]
+    fn test_admit_order_for_symbol_resolves_per_symbol_then_underlying_then_default() {
+        // #114 item 5 at the ORDER level: a per-symbol override tighter than its
+        // underlying genuinely gates order acceptance, and an unlisted symbol falls
+        // back symbol → underlying → venue-default.
+        let file = FileMicrostructure {
+            specs: Some(ContractSpecsConfig {
+                // Venue default: a wide 1-cent tick, 1-lot, up to 1_000 contracts.
+                max_order_qty: Some(1_000),
+                ..ContractSpecsConfig::default()
+            }),
+            ..FileMicrostructure::default()
+        };
+        let mut specs = BTreeMap::new();
+        // BTC underlying: a looser-than-default 2_000-contract cap.
+        specs.insert(
+            "BTC".to_string(),
+            ContractSpecsConfig {
+                max_order_qty: Some(2_000),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        // One BTC contract: a TIGHTER per-symbol override — 5-cent tick, 2-lot, 10 max.
+        specs.insert(
+            "BTC-20240329-50000-C".to_string(),
+            ContractSpecsConfig {
+                tick_size_cents: Some(5),
+                lot_size: Some(2),
+                max_order_qty: Some(10),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let config = MicrostructureConfig::resolve(&file, &specs).expect("resolves");
+
+        // The overridden symbol: an order satisfying the tighter per-symbol profile is
+        // admitted; one that satisfies the (looser) underlying but violates the
+        // per-symbol tick / lot / max is rejected with the SPECIFIC per-symbol error.
+        let sym = "BTC-20240329-50000-C";
+        assert_eq!(
+            config.admit_order_for_symbol(sym, Some(Cents::new(500)), 4),
+            Ok(())
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(sym, Some(Cents::new(503)), 4),
+            Err(OrderAdmissionError::OffTick {
+                price: 503,
+                tick: 5
+            }),
+            "off the per-symbol 5-cent tick (on the underlying 1-cent tick) is rejected"
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(sym, Some(Cents::new(500)), 3),
+            Err(OrderAdmissionError::OffLot {
+                quantity: 3,
+                lot: 2
+            }),
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(sym, Some(Cents::new(500)), 50),
+            Err(OrderAdmissionError::AboveMaxQty {
+                quantity: 50,
+                max: 10
+            }),
+            "50 contracts clears the underlying 2_000 cap but violates the per-symbol 10 cap"
+        );
+
+        // A different BTC contract (no per-symbol override) falls back to the BTC
+        // underlying: 1-cent tick, 1-lot, 2_000 cap — 50 contracts is admitted here.
+        let other = "BTC-20240329-60000-C";
+        assert_eq!(
+            config.admit_order_for_symbol(other, Some(Cents::new(503)), 3),
+            Ok(())
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(other, Some(Cents::new(500)), 50),
+            Ok(())
+        );
+
+        // An ETH contract (no per-symbol, no per-underlying) falls back to the venue
+        // default: 1_000 cap — 50 admitted, 1_500 rejected.
+        let eth = "ETH-20240329-3000-C";
+        assert_eq!(
+            config.admit_order_for_symbol(eth, Some(Cents::new(500)), 50),
+            Ok(())
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(eth, Some(Cents::new(500)), 1_500),
+            Err(OrderAdmissionError::AboveMaxQty {
+                quantity: 1_500,
+                max: 1_000
+            }),
+        );
+    }
+
+    #[test]
+    fn test_admit_price_for_symbol_resolves_per_symbol_band() {
+        // A per-symbol price band narrower than its underlying genuinely gates the
+        // symbol, while a sibling contract keeps the underlying's band.
+        let file = FileMicrostructure::default();
+        let mut specs = BTreeMap::new();
+        specs.insert(
+            "BTC".to_string(),
+            ContractSpecsConfig {
+                min_price_cents: Some(100),
+                max_price_cents: Some(100_000),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        specs.insert(
+            "BTC-20240329-50000-C".to_string(),
+            ContractSpecsConfig {
+                min_price_cents: Some(1_000),
+                max_price_cents: Some(2_000),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let config = MicrostructureConfig::resolve(&file, &specs).expect("resolves");
+
+        // The overridden symbol: inside [1_000, 2_000] admitted, outside rejected.
+        assert_eq!(
+            config.admit_price_for_symbol("BTC-20240329-50000-C", Cents::new(1_500)),
+            Ok(())
+        );
+        assert_eq!(
+            config.admit_price_for_symbol("BTC-20240329-50000-C", Cents::new(3_000)),
+            Err(PriceBoundError::AboveMax {
+                price: 3_000,
+                max: 2_000
+            })
+        );
+        // A sibling contract keeps the BTC underlying band [100, 100_000] — 3_000 is in.
+        assert_eq!(
+            config.admit_price_for_symbol("BTC-20240329-60000-C", Cents::new(3_000)),
+            Ok(())
+        );
+        // Determinism: the resolution is a pure function of config.
+        assert_eq!(
+            config.admit_order_for_symbol("BTC-20240329-50000-C", Some(Cents::new(1_500)), 1),
+            config.admit_order_for_symbol("BTC-20240329-50000-C", Some(Cents::new(1_500)), 1),
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_is_sensitive_to_per_symbol_override() {
+        // A per-symbol override changes the fingerprint (a distinct `specs.sym.`
+        // fragment), and is stable/deterministic across insertion order.
+        let file = FileMicrostructure {
+            fees: Some(FeeConfig {
+                maker_bps: -10,
+                taker_bps: 35,
+            }),
+            ..FileMicrostructure::default()
+        };
+        let base = MicrostructureConfig::resolve(&file, &BTreeMap::new()).expect("resolves");
+        let mut specs = BTreeMap::new();
+        specs.insert(
+            "BTC-20240329-50000-C".to_string(),
+            ContractSpecsConfig {
+                tick_size_cents: Some(5),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let with_symbol = MicrostructureConfig::resolve(&file, &specs).expect("resolves");
+        assert_ne!(base.fingerprint(), with_symbol.fingerprint());
+        assert!(
+            with_symbol
+                .fingerprint()
+                .contains("specs.sym.BTC-20240329-50000-C=")
+        );
+        // Deterministic across repeated resolution.
+        assert_eq!(
+            with_symbol.fingerprint(),
+            MicrostructureConfig::resolve(&file, &specs)
+                .expect("resolves")
+                .fingerprint()
+        );
     }
 
     #[test]

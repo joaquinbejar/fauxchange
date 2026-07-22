@@ -83,7 +83,7 @@ use crate::exchange::{
     InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader,
     JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink, MassCancelScope,
     MatchingExecutor, PositionsStore, Receipt, Recovered, SequenceNumber, StoreFanOut, Symbol,
-    TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_price_band,
+    TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_order_admission,
     recover_into, spawn_matching_actor_with_registry_and_index,
     spawn_underlying_actor_with_clordid_index,
 };
@@ -152,10 +152,15 @@ pub enum AppStateError {
     /// runtime). Only reachable when `DATABASE_URL` is set.
     #[error(transparent)]
     Db(#[from] DbError),
-    /// The venue microstructure (#044) could not be applied to a book at creation —
-    /// the resolved contract specs were rejected by the upstream builder. Unreachable
-    /// for a resolver-validated config (the config seam proves it at load); surfaced
-    /// rather than unwrapped.
+    /// The venue microstructure (#044) failed validation on the live path (#114
+    /// item 1): a spec knob is out of range (a zero tick / lot / min-price / max-qty,
+    /// a `max_price_cents` below `min_price_cents`, or a persisted knob above the
+    /// durable `BIGINT` domain), or the fee schedule fails the checked-fee proof
+    /// against the venue-default or a per-underlying/per-symbol widest notional.
+    /// [`AppState::new`] re-runs [`MicrostructureConfig::validate`](crate::microstructure::MicrostructureConfig::validate)
+    /// **before spawning any actor**, so a config that arrived resolved OR
+    /// deserialized directly (bypassing `resolve`) fails fast at boot rather than at
+    /// the first fill.
     #[error(transparent)]
     Microstructure(#[from] MicrostructureConfigError),
     /// Boot-time journal recovery (#85) failed for an underlying whose durable
@@ -1002,6 +1007,16 @@ impl AppState {
         // reproduction. Held behind an `Arc` shared into the actors' book-creation
         // and the admission seam.
         let microstructure = Arc::new(microstructure);
+
+        // Re-run the resolver's validation on the LIVE path (#114 item 1) BEFORE any
+        // actor is spawned. `AppStateConfig::microstructure` may arrive already
+        // resolved OR deserialized directly (bypassing `resolve` and therefore the
+        // spec-range + checked-fee proof), so the live venue must prove it the same
+        // way the replay/bundle path does — a degenerate fee/spec config fails fast
+        // at boot with a typed `AppStateError::Microstructure`, never serving a
+        // request or reaching a leaf
+        // ([05 §4.1](../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
+        microstructure.validate()?;
 
         // The one shared venue clock (#028): the rate limiter, every actor's
         // `venue_ts`, and the simulator's `SimStep.now_ms` all read this SAME
@@ -2136,19 +2151,24 @@ impl AppState {
         })
     }
 
-    /// Admits a price-bearing order command against the venue-owned price band
-    /// (`[min_price_cents, max_price_cents]`, #044) resolved for the command's
-    /// underlying — the admission seam that runs **before matching** so an over-band
-    /// price never reaches a leaf and is never journaled
-    /// ([05 §4.1](../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
+    /// Admits an order command against the venue-owned **per-symbol** contract-spec
+    /// gate — the price band (`[min_price_cents, max_price_cents]`, #044) **and** the
+    /// tick / lot / max-quantity (#114 item 5), resolved for the command's full
+    /// **symbol** (symbol-specific → underlying → venue-default) — the admission seam
+    /// that runs **before matching** so a per-symbol-violating order never reaches a
+    /// leaf and is never journaled
+    /// ([05 §4.1](../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable),
+    /// [05 §7](../docs/05-microstructure-config.md#7-contract-specs-tick-and-lot)).
     ///
-    /// Only `AddOrder` / `Replace` carrying a `limit_price` are checked; a market
-    /// order (no limit price) and every non-order command carry no price to admit.
-    /// Delegates to the **shared** [`check_price_band`] so the live submit seam and
-    /// the replay/recovery re-execution seam enforce the venue-owned band identically
-    /// (a non-parsing symbol is skipped here and rejected by [`route`](Self::route)).
+    /// Only `AddOrder` / `Replace` (and a `SimStep` reference price, band-only) carry
+    /// anything to admit; every other command is a no-op. Delegates to the **shared**
+    /// [`check_order_admission`] so the live submit seam and the replay/recovery
+    /// re-execution seam enforce the identical per-symbol gate (a non-parsing symbol
+    /// is skipped here and rejected by [`route`](Self::route)). The typed
+    /// [`OrderAdmissionError`](crate::microstructure::OrderAdmissionError) maps onto
+    /// [`VenueError::InvalidOrder`] (→ REST 400 / FIX reject).
     fn admit_command_price(&self, command: &VenueCommand) -> Result<(), VenueError> {
-        check_price_band(&self.microstructure, command)
+        check_order_admission(&self.microstructure, command)
             .map_err(|error| VenueError::InvalidOrder(error.to_string()))
     }
 
