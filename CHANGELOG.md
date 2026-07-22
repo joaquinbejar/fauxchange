@@ -219,9 +219,13 @@ The full versioning and release-process policy lives in the design docs
   - Both drops happen **before** the write-ahead journal append, so an
     out-of-band item is simply never in the journal — replay reproduces the
     identical admitted stream (proved by `test_band_drop_is_identical_across_two_runs`).
-    The band is now an unconditional venue-wide admission invariant (gateway +
-    replay + both internal producers), which makes the checked-fee proof
-    unconditional.
+  - `check_price_band` now also admits a `SimStep` **reference** price against
+    the band, so a price entered via REST `insert_price` (submitted as a
+    `SimStep` through `AppState::submit`) is band-checked identically to the
+    simulation producer — no producer can inject an out-of-band price. The band
+    is now an unconditional venue-wide admission invariant (gateway
+    order-admission + REST `insert_price` + replay + both internal producers),
+    which makes the checked-fee proof unconditional.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;

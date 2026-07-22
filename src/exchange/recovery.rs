@@ -82,6 +82,15 @@ pub(crate) fn check_price_band(
             limit_price: Some(price),
             ..
         } => (symbol, *price),
+        // A `SimStep` reference price is band-checked directly on its underlying
+        // ticker (no symbol to parse) — so a `SimStep` entered via REST
+        // `insert_price` (submitted through this same seam) is admitted against the
+        // venue band identically to the simulation producer's own price step
+        // (#109): the band is one venue-wide admission invariant, not a
+        // per-producer policy.
+        VenueCommand::SimStep {
+            underlying, price, ..
+        } => return config.admit_price(underlying, *price),
         _ => return Ok(()),
     };
     let Ok(parsed) = SymbolParser::parse(symbol.as_str()) else {
@@ -767,5 +776,46 @@ mod tests {
         }
         // Sanity: the current schema is what the reducer accepts.
         assert_eq!(VENUE_ENVELOPE_SCHEMA, "venue.v1");
+    }
+
+    #[test]
+    fn test_check_price_band_admits_sim_step_reference_price_like_the_producer() {
+        use std::collections::BTreeMap;
+
+        use crate::exchange::Cents;
+        use crate::microstructure::{
+            ContractSpecsConfig, FileMicrostructure, MicrostructureConfig,
+        };
+
+        // A band capped at 1_000_000 cents — the same shape the sim producer's own
+        // test uses. A `SimStep` reference price is now band-checked at this seam,
+        // so a REST `insert_price` (submitted as a `SimStep`) is admitted against
+        // the band identically to the simulation producer (#109).
+        let file = FileMicrostructure {
+            specs: Some(ContractSpecsConfig {
+                max_price_cents: Some(1_000_000),
+                ..ContractSpecsConfig::default()
+            }),
+            ..FileMicrostructure::default()
+        };
+        let config = MicrostructureConfig::resolve(&file, &BTreeMap::new())
+            .expect("narrow-band config resolves");
+
+        let sim_step = |cents: u64| VenueCommand::SimStep {
+            now_ms: EventTimestamp::new(0),
+            underlying: UNDERLYING.to_string(),
+            price: Cents::new(cents),
+            bid: None,
+            ask: None,
+        };
+
+        assert!(
+            check_price_band(&config, &sim_step(1_000_001)).is_err(),
+            "a SimStep reference price above the band is rejected (REST ≡ sim producer)"
+        );
+        assert!(
+            check_price_band(&config, &sim_step(1_000_000)).is_ok(),
+            "an at-cap SimStep is admitted (the band is inclusive)"
+        );
     }
 }

@@ -31,7 +31,12 @@
 //! (never sequenced, drives no requote) — each consistent with `admit_price`'s reject
 //! semantics and each a pure function of config + price, so the decision is identical
 //! on a live run and on replay (the journal simply never contains the dropped item).
-//! The band is therefore a true venue-wide admission invariant, which makes the
+//! The band spans **both** what a resting order carries (`AddOrder`/`Replace` limit
+//! prices) **and** a `SimStep` reference price: `check_price_band` admits a `SimStep`
+//! against the band too, so a reference price entered via REST `insert_price`
+//! (submitted as a `SimStep` through `AppState::submit`) is band-checked identically
+//! to the simulation producer — there is no producer that can inject an out-of-band
+//! price. The band is therefore a true venue-wide admission invariant, which makes the
 //! checked-fee proof (`FeeSchedule::try_calculate_fee`) unconditional rather than
 //! conditional on the gateway/replay seams alone.
 //! ([05 §4.1](../../../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
