@@ -194,12 +194,13 @@ The full versioning and release-process policy lives in the design docs
     "quotes" are already served as the depth-bounded (`MarketDepth=1`) orderbook
     projection (`269=0/1` `W`/`X`) — no separate channel is needed or minted. A
     **trade tape** (`269=2`) is **permanently out** of FIX MD: a trade print has
-    no book snapshot and no per-instrument `instrument_sequence`, so it cannot
-    ride the `W`/`X` `RptSeq(83)` model without a second sequence namespace that
-    breaks the "orderbook is the only on-the-wire `instrument_sequence`"
-    invariant; per-fill detail already reaches a FIX client via
-    `ExecutionReport(8)`. Documented in `docs/specs/fix-dialect.md` §2.3 +
-    `docs/03` §5.4.
+    no book snapshot and rides its **own** separate `instrument_sequence`
+    namespace, distinct from the orderbook's. FIX `W`/`X` carries exactly one
+    `RptSeq(83)` (the orderbook's), so serving the tape would multiplex a second
+    on-the-wire sequence namespace under one `MDReqID`, breaking the "orderbook
+    is the only on-the-wire `RptSeq` on a FIX MD subscription" invariant;
+    per-fill detail already reaches a FIX client via `ExecutionReport(8)`.
+    Documented in `docs/specs/fix-dialect.md` §2.3 + `docs/03` §5.4.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;

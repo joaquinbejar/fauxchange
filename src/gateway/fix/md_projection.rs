@@ -27,7 +27,8 @@ use crate::models::{BookSide, PriceLevelChange, PriceLevelData, WsMessage};
 /// Which book sides a FIX market-data subscription asked for, derived from the
 /// `MDEntryType (269)` group (`0` = Bid, `1` = Offer). A `2` = Trade entry type
 /// selects neither book side: the trade tape is **permanently out** of FIX MD (a
-/// trade print carries no book snapshot or `instrument_sequence` for `RptSeq`, so
+/// trade print carries no book snapshot and rides its own separate
+/// `instrument_sequence` namespace, distinct from the orderbook's `RptSeq`, so
 /// it cannot ride the `W`/`X` model — [`requests_trade_tape`] gates it and the
 /// subscribe path rejects any `V` carrying a Trade entry type with `Y`
 /// (`MDReqRejReason = 8`) **before** this projection is built). In the serve path,
@@ -44,10 +45,11 @@ pub struct RequestedSides {
 /// Whether a decoded `MDEntryType (269)` group requests the Trade tape (`269 = 2`)
 /// — the FIX MD orderbook surface does **not** serve it. A trade print (the WS
 /// `trades` / `fills` channel) is an append-only event stream with no book snapshot
-/// and no per-instrument `instrument_sequence`, so it cannot be carried coherently
-/// under the `W`/`X` `RptSeq (83)` model (that would require a second, parallel
-/// sequence namespace, breaking the invariant that the orderbook is the only
-/// on-the-wire `instrument_sequence`). The trade tape over FIX MD is therefore
+/// and its **own** per-instrument `instrument_sequence` namespace, distinct from the
+/// orderbook's. FIX `W`/`X` carries exactly one `RptSeq (83)` — the orderbook's — so
+/// serving the tape would multiplex a **second** on-the-wire sequence namespace under
+/// one `MDReqID`, breaking the invariant that the orderbook is the only on-the-wire
+/// `RptSeq` on a FIX MD subscription. The trade tape over FIX MD is therefore
 /// **permanently out**; per-fill detail reaches a FIX client via
 /// `ExecutionReport (8)` on its own session. A `V` requesting a Trade entry type —
 /// alone **or** mixed with a book side — is rejected whole with `Y`

@@ -128,8 +128,9 @@ const MD_REJ_REASON_INSUFFICIENT_PERMISSIONS: u16 = 3;
 /// carried a Trade entry type (`269 = 2`) — alone (a trade-tape-only `V`) **or**
 /// mixed with a book side — which the FIX MD orderbook surface does not serve. The
 /// trade tape is **permanently out** of FIX MD (a trade print has no book snapshot
-/// or `instrument_sequence` for `RptSeq (83)`); the whole `V` is rejected, never a
-/// silent serve of the book side with the Trade entry type dropped
+/// and rides its own separate `instrument_sequence`, distinct from the orderbook's
+/// `RptSeq (83)`, so `W`/`X` cannot carry it under one `MDReqID`); the whole `V` is
+/// rejected, never a silent serve of the book side with the Trade entry type dropped
 /// ([fix-dialect §2.3](../../../docs/specs/fix-dialect.md#23-market-data-subscription-surfaces-03-54)).
 /// Best-bid/offer "quotes" are the depth-bounded (`MarketDepth (264) = 1`) book
 /// projection — the same `269 = 0/1` `W`/`X`, not a separate channel.
@@ -2988,7 +2989,8 @@ impl VenueFixSession {
         // A `V` carrying a Trade entry type (`269 = 2`) — a trade-tape-only request
         // OR a mixed request pairing Trade with a book side — is not served by the
         // FIX MD orderbook surface: the trade tape is permanently out (no book
-        // snapshot / `instrument_sequence` for `RptSeq`, #101). Reject the whole
+        // snapshot, and its own separate `instrument_sequence` namespace that
+        // `W`/`X`'s single `RptSeq` cannot carry under one `MDReqID`, #101). Reject the whole
         // request with `Y`, never silently serving the book side while dropping the
         // Trade entry type; per-fill detail reaches a FIX client via
         // `ExecutionReport (8)`.
