@@ -2520,6 +2520,28 @@ The full versioning and release-process policy lives in the design docs
     every subscribed channel** (`trades` / `quotes` / `prices` / `fills`, not
     just `orderbook`), so no channel silently drops messages after an overflow.
 
+- **Bumped IronFix to 0.3.1 and retired the now-redundant FIX pre-decode
+  guards** (#140). `ironfix-core` / `ironfix-tagvalue` / `ironfix-dictionary` /
+  `ironfix-transport` → `0.3.1` (all four; `Cargo.toml` pins + `Cargo.lock`,
+  audit note added). The 0.3.1 decoder now rejects a malformed `BodyLength(9)`
+  and a bad/absent `CheckSum(10=)` **internally** with checked arithmetic, so
+  the venue's own pre-decode guards for those two cases became redundant:
+  - Removed the `BoundedFrameDecoder` **framing precheck** (`FrameTooLarge` /
+    `MalformedChecksum`) and the tag-value **`validate_body_length` +
+    `10=`/CheckSum scan** — after empirically confirming, against the published
+    0.3.1 source, that the decoder produces an **equivalent typed reject** (same
+    reject class → `IncorrectDataFormat` / `SessionReject`, no panic) for each
+    case. Removed the now-unconstructible `InvalidBodyLength` / `MalformedChecksum`
+    error variants.
+  - **`BoundedFrameDecoder` is kept as a by-policy byte cap** (a DoS/resource
+    ceiling via `FixCodec::with_max_message_size`), explicitly re-documented as
+    **policy, not a security-correctness check** (the hostile-arithmetic
+    correctness now lives upstream) — an over-cap frame is still rejected
+    (`MessageTooLarge`) **before** the full body is buffered.
+  - Re-verified after the bump: `cargo audit` (0 vulns) + `cargo deny` clean;
+    the `fix_decode` fuzz target rebuilt + ran 918,950 iterations with **no new
+    crash**; FIX conformance/adversarial/golden suites green (the decoder's
+    built-in rejections match the removed guards' behavior).
 - **REST/WS JSON decoder fuzz targets, the journal/bundle deserialiser fuzz
   target, and the final `SECURITY.md` — the v1.0 security gate** (#52). Three
   `cargo fuzz` targets extend the FIX-primary fuzz set (#42) with the

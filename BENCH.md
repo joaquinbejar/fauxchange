@@ -789,8 +789,17 @@ themselves (never a reject-path measurement).
 Run conditions are identical to §1 (same host, same toolchain, no Postgres/
 Docker needed — this bench is pure in-process CPU work) plus the FIX-specific
 pinned crate versions (from `Cargo.lock` on this branch): `ironfix-core`
-`0.3.0`, `ironfix-tagvalue` `0.3.0`, `ironfix-dictionary` `0.3.0`,
-`ironfix-transport` `0.3.0`, `tokio-util` `0.7.18`, `bytes` `1.12.1`.
+`0.3.1`, `ironfix-tagvalue` `0.3.1`, `ironfix-dictionary` `0.3.1`,
+`ironfix-transport` `0.3.1`, `tokio-util` `0.7.18`, `bytes` `1.12.1`.
+
+> **Re-measured on `ironfix` 0.3.1 (#140).** The numbers below were re-run after
+> the 0.3.1 bump that retired the venue's redundant `BodyLength`/`CheckSum`
+> pre-decode guards (the checks now live in the checked upstream decoder, which
+> already ran them). Removing venue-side prechecks only *reduces* work on this
+> path, so the decode `p99`/`p99.9` tail is if anything **tighter** than the
+> 0.3.0 grounding (decode `p99` 875–916 ns vs the prior 1 084–2 251 ns); no
+> regression. Setting the actual numeric HP-3 budget from this data remains
+> #107's scope.
 
 ### 11.1 Closed-loop, 5 000 warmup + 100 000 measured ops (discarded warmup)
 
@@ -801,31 +810,31 @@ collapsed into one (the same "show the variance, don't hide it" convention
 
 | | Run 1 | Run 2 | Run 3 |
 |---|---|---|---|
-| `hp3_decode_d_closed_loop` p50 | 875 ns | 875 ns | 750 ns |
-| `hp3_decode_d_closed_loop` p99 | 2 251 ns | 1 125 ns | 1 084 ns |
-| `hp3_decode_d_closed_loop` p99.9 | 2 543 ns | 1 250 ns | 1 167 ns |
-| `hp3_decode_d_closed_loop` p99.99 | 20 047 ns | 7 375 ns | 2 793 ns |
-| `hp3_decode_d_closed_loop` min / max | 750 / 99 839 ns | 708 / 41 567 ns | 666 / 23 423 ns |
-| `hp3_encode_8_closed_loop` p50 | 417 ns | 458 ns | 458 ns |
-| `hp3_encode_8_closed_loop` p99 | 583 ns | 625 ns | 625 ns |
-| `hp3_encode_8_closed_loop` p99.9 | 667 ns | 750 ns | 667 ns |
-| `hp3_encode_8_closed_loop` p99.99 | 792 ns | 6 419 ns | 875 ns |
-| `hp3_encode_8_closed_loop` min / max | 333 / 10 127 ns | 375 / 17 055 ns | 333 / 5 335 ns |
+| `hp3_decode_d_closed_loop` p50 | 750 ns | 750 ns | 750 ns |
+| `hp3_decode_d_closed_loop` p99 | 875 ns | 916 ns | 875 ns |
+| `hp3_decode_d_closed_loop` p99.9 | 1 000 ns | 1 000 ns | 1 000 ns |
+| `hp3_decode_d_closed_loop` p99.99 | 8 879 ns | 4 711 ns | 4 251 ns |
+| `hp3_decode_d_closed_loop` min / max | 666 / 42 047 ns | 666 / 17 423 ns | 666 / 20 543 ns |
+| `hp3_encode_8_closed_loop` p50 | 458 ns | 458 ns | 458 ns |
+| `hp3_encode_8_closed_loop` p99 | 542 ns | 542 ns | 542 ns |
+| `hp3_encode_8_closed_loop` p99.9 | 625 ns | 625 ns | 625 ns |
+| `hp3_encode_8_closed_loop` p99.99 | 2 543 ns | 2 833 ns | 2 791 ns |
+| `hp3_encode_8_closed_loop` min / max | 375 / 14 167 ns | 375 / 14 375 ns | 375 / 14 751 ns |
 
 **Interpretation — DESIGN TARGET grounding, not yet a stated number.**
 docs/07 §3-HP3 has, until now, deliberately carried NO numeric budget for
 HP-3 ("Budget stated once the FIX wire dialect is pinned … the bench lands
 with v0.4, not before, so the number is grounded in the real message
 schema"). This is that grounding measurement: across three independent runs,
-decode `p50` is **sub-microsecond** (750–875 ns) with a low-single-digit-µs
-`p99`/`p99.9` tail (1.08–2.54 µs), while encode is **sub-microsecond through
-`p99.9`** (417–750 ns) — both one to two orders of magnitude inside even a
+decode `p50` is **sub-microsecond** (750 ns) with a sub-microsecond
+`p99`/`p99.9` tail (875–1 000 ns), while encode is **sub-microsecond through
+`p99.9`** (458–625 ns) — both one to two orders of magnitude inside even a
 generous "sub-millisecond" reading, and
-decode is consistently ~1.6–2× the cost of encode (a `FieldBag::collect` +
+decode is consistently ~1.6× the cost of encode (a `FieldBag::collect` +
 per-tag UTF-8/parse pass on untrusted bytes is real work the encoder's
 straight-line field-write does not do). `p99.99` is the one quantile that
-moves meaningfully run to run (decode: 2 793 ns – 20 047 ns; encode:
-792 ns – 6 419 ns) — at 100 000 samples this quantile is resolved by roughly
+moves meaningfully run to run (decode: 4 251 ns – 8 879 ns; encode:
+2 543 ns – 2 833 ns) — at 100 000 samples this quantile is resolved by roughly
 the 10 slowest samples, so a single OS-scheduler preemption on this shared,
 un-pinned developer laptop (background process, GC-style pause, whatever) can
 move it by an order of magnitude without the underlying decode/encode code
@@ -850,19 +859,19 @@ time), never `completion − actual_send` — the identical CO-correction
 
 | | Run 1 | Run 2 | Run 3 |
 |---|---|---|---|
-| `hp3_decode_d_open_loop_sojourn` p50 | 11 543 ns | 11 007 ns | 11 295 ns |
-| `hp3_decode_d_open_loop_sojourn` p99 | 32 863 ns | 23 919 ns | 22 463 ns |
-| `hp3_decode_d_open_loop_sojourn` p99.9 | 87 999 ns | 61 023 ns | 62 975 ns |
-| `hp3_decode_d_open_loop_sojourn` p99.99 | 339 967 ns | 87 231 ns | 226 303 ns |
-| `hp3_encode_8_open_loop_sojourn` p50 | 9 503 ns | 10 375 ns | 10 591 ns |
-| `hp3_encode_8_open_loop_sojourn` p99 | 28 639 ns | 21 759 ns | 21 375 ns |
-| `hp3_encode_8_open_loop_sojourn` p99.9 | 117 183 ns | 52 031 ns | 47 135 ns |
-| `hp3_encode_8_open_loop_sojourn` p99.99 | 1 510 399 ns | 741 375 ns | 65 599 ns |
+| `hp3_decode_d_open_loop_sojourn` p50 | 12 711 ns | 14 007 ns | 14 215 ns |
+| `hp3_decode_d_open_loop_sojourn` p99 | 52 095 ns | 35 103 ns | 42 879 ns |
+| `hp3_decode_d_open_loop_sojourn` p99.9 | 111 359 ns | 71 423 ns | 108 543 ns |
+| `hp3_decode_d_open_loop_sojourn` p99.99 | 153 471 ns | 484 863 ns | 1 407 999 ns |
+| `hp3_encode_8_open_loop_sojourn` p50 | 12 423 ns | 13 007 ns | 13 463 ns |
+| `hp3_encode_8_open_loop_sojourn` p99 | 43 903 ns | 43 839 ns | 32 175 ns |
+| `hp3_encode_8_open_loop_sojourn` p99.9 | 530 431 ns | 85 055 ns | 77 759 ns |
+| `hp3_encode_8_open_loop_sojourn` p99.99 | 2 605 055 ns | 591 871 ns | 97 215 ns |
 
 **Interpretation — an honest, disclosed harness-overhead effect, not a
-decode/encode regression.** The open-loop sojourn p50 (~9.5–11.5 µs across
-both spans) is **~13–25× the closed-loop p50** (§11.1: 750–875 ns decode,
-417–458 ns encode) — a MUCH larger gap than HP-1's own open-loop section saw
+decode/encode regression.** The open-loop sojourn p50 (~12.4–14.2 µs across
+both spans) is **~17–30× the closed-loop p50** (§11.1: 750 ns decode,
+458 ns encode) — a MUCH larger gap than HP-1's own open-loop section saw
 relative to its closed-loop number (§3.5: 26 µs vs 15 µs, under 2×). The
 reason is scale, not queueing: HP-1's actor turn costs hundreds of
 microseconds, so `run_open_loop`'s own per-call dispatch overhead (Tokio task
@@ -878,7 +887,7 @@ cost itself; §11.2 remains genuinely useful as the honest answer to "what
 does a FIX frame's dispatch-to-completion sojourn look like under an
 independent-arrival-schedule load," which is a real and different question
 from "how expensive is one decode call." The `p99.99` column is, again, a
-single-sample artifact at 3 000 samples (encode run 1: 1.51 ms driven by one
+single-sample artifact at 3 000 samples (encode run 1: 2.61 ms driven by one
 outlier — a plausible one-off scheduling stall on this shared, un-pinned
 host, not a repeatable finding, mirroring §3.5's identical disclosure at
 comparable sample counts) and should not be read as a stable figure.

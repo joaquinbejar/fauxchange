@@ -221,34 +221,14 @@ pub enum FixDecodeError {
         /// The unsupported `MsgType (35)` value.
         msg_type: String,
     },
-    /// The declared `BodyLength (9)` did not match the actual frame body length —
-    /// a malformed or hostile frame. **Validated in `fauxchange`'s own `decode`
-    /// before the `ironfix-tagvalue` codec**, whose unchecked `BodyLength` add
-    /// would otherwise panic on an oversized declared value (upstream gap tracked
-    /// in the report); an exact-match check is also correct FIX.
-    #[error("declared body length {declared} does not match the actual body length {actual}")]
-    InvalidBodyLength {
-        /// The declared `BodyLength (9)` value (a bounded snippet).
-        declared: String,
-        /// The actual body length implied by the frame.
-        actual: usize,
-    },
-    /// A `CheckSum (10)` field carried a value that would overflow
-    /// `ironfix-tagvalue`'s `parse_checksum`, which folds the three checksum
-    /// digits as `d0*100 + d1*10 + d2` into a `u8` — ANY value `> 255` overflows
-    /// it (panicking in a debug build, wrapping in release). Because
-    /// [`ironfix_tagvalue::Decoder::decode`] folds the **first** `CheckSum (10)`
-    /// field it reaches — wherever tag 10 occurs, not only the trailing field — a
-    /// duplicate or mid-body `10=` reaches the fold and crashes, bypassing the
-    /// trailing-only framing precheck. **Validated in `fauxchange`'s own `decode`
-    /// before the codec**, scanning every `CheckSum (10)` occurrence; a
-    /// conformant checksum is `sum % 256` and always `000..=255`, so a value
-    /// `> 255` can never be real.
-    #[error("malformed checksum (tag 10): {reason}")]
-    MalformedChecksum {
-        /// A payload-free category describing why the checksum field was rejected.
-        reason: &'static str,
-    },
+    // NOTE (#140): the `InvalidBodyLength` and `MalformedChecksum` variants were
+    // removed here — they were only ever produced by the venue's own pre-decode
+    // guards (`validate_body_length` / `reject_malformed_checksum`), retired in
+    // #140. As of `ironfix-tagvalue` 0.3.1 the decoder folds `BodyLength (9)` and
+    // `CheckSum (10)` with checked, non-wrapping arithmetic itself, so a malformed
+    // body length or out-of-range checksum now surfaces as a `DecodeError`
+    // (`InvalidBodyLength` / `InvalidFieldValue`) through [`Self::Framing`], which
+    // routes to the SAME session `Reject (3)` / `IncorrectDataFormat` class.
     /// A tag appeared more than once outside a repeating group — a session
     /// violation (`SessionRejectReason=13`), rejected rather than silently
     /// first-wins.
@@ -331,8 +311,6 @@ impl FixDecodeError {
             }
             Self::UnsupportedMsgType { .. } => session(R::InvalidMsgType, Some(35)),
             Self::UnsupportedApplicationMsgType { .. } => FixRejectRoute::BusinessMessageReject,
-            Self::InvalidBodyLength { .. } => session(R::IncorrectDataFormat, Some(9)),
-            Self::MalformedChecksum { .. } => session(R::IncorrectDataFormat, Some(10)),
             Self::DuplicateTag { tag } => session(R::TagAppearsMoreThanOnce, Some(*tag)),
             Self::TooManyFields { .. } => session(R::Other(99), None),
             Self::TooManyGroupEntries { count_tag, .. } => {
@@ -406,14 +384,16 @@ mod tests {
     }
 
     #[test]
-    fn test_malformed_checksum_routes_to_session_reject_on_tag_10() {
-        let err = FixDecodeError::MalformedChecksum {
-            reason: "checksum value exceeds 255",
-        };
+    fn test_framing_error_routes_to_session_reject_incorrect_data_format() {
+        // #140: a malformed BodyLength / out-of-range CheckSum now surfaces from the
+        // checked `ironfix-tagvalue` decoder as a `DecodeError` wrapped in
+        // `Framing`, and MUST route to the same session `Reject (3)` class the
+        // retired `InvalidBodyLength` / `MalformedChecksum` guards produced —
+        // `IncorrectDataFormat` (without the optional `RefTagID`).
+        let err = FixDecodeError::Framing(DecodeError::InvalidBodyLength);
         match err.reject_route() {
-            FixRejectRoute::SessionReject { reason, ref_tag } => {
+            FixRejectRoute::SessionReject { reason, .. } => {
                 assert_eq!(reason, SessionRejectReason::IncorrectDataFormat);
-                assert_eq!(ref_tag, Some(10));
             }
             other => panic!("expected SessionReject, got {other:?}"),
         }

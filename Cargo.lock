@@ -1037,7 +1037,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1812,9 +1812,9 @@ dependencies = [
 
 [[package]]
 name = "ironfix-core"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6c2fefddcb2239fdc8b1424bb0d739deb628f42b6151540b9986b3adf6734ee"
+checksum = "44aa0f17c56416044a60a955c5cce4893f128e64155f0d3f9e35ae0fa678a726"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -1829,9 +1829,9 @@ dependencies = [
 
 [[package]]
 name = "ironfix-dictionary"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d09ff909033a3eaf0174377320f7fa89d9d566902155addb427503d38a2a6ad"
+checksum = "17c4b3073a1132853374e57a949cee32e59ab9aa66823d1bd2ba1d5a36a7ea24"
 dependencies = [
  "ironfix-core",
  "quick-xml",
@@ -1841,9 +1841,9 @@ dependencies = [
 
 [[package]]
 name = "ironfix-tagvalue"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d17f3f57da805de04b89050af08e96d947af87bc88f5b6a7049a6451326a15ea"
+checksum = "a1ec4521c548231a8c88ff59bade526f69b41111a2cdeeb808311df18f552cc5"
 dependencies = [
  "bytes",
  "ironfix-core",
@@ -1855,9 +1855,9 @@ dependencies = [
 
 [[package]]
 name = "ironfix-transport"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d25b19a8f3d413e2c57c47204e2be558f4c4b8555508ced2490b21a6fb1e00e1"
+checksum = "749694a36b0f5f9ff7d97ec5faf6d98ef7db9d90554f0ddac9139f94decf520f"
 dependencies = [
  "bytes",
  "ironfix-core",
@@ -1877,7 +1877,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2136,7 +2136,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3045,7 +3045,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3762,10 +3762,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4562,7 +4562,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

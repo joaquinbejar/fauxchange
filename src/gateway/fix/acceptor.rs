@@ -14,8 +14,8 @@
 //! ## The pipe
 //!
 //! `TcpListener::accept` → one tokio task per connection → the connection's read
-//! half is framed by a [`BoundedFrameDecoder`] (a venue guard around `FixCodec`,
-//! see below) and each complete frame is decoded into a typed
+//! half is framed by a [`BoundedFrameDecoder`] (a by-policy byte cap around
+//! `FixCodec`, see below) and each complete frame is decoded into a typed
 //! [`DecodedMessage`](super::DecodedMessage) via the #036
 //! [`decode`](super::decode) path → handed to the connection's [`FixSession`] →
 //! any reply frames are enqueued on a **bounded** outbound `mpsc` a dedicated
@@ -34,15 +34,19 @@
 //! - **Bounded outbound mailbox** — the per-session `mpsc` is bounded at
 //!   `mailbox_depth`; a full mailbox marks the session overflowed and closes it
 //!   (a typed busy), never an unbounded queue.
-//! - **Max frame length** — [`BoundedFrameDecoder`] pre-checks the declared
-//!   `BodyLength (9)` against `max_frame_bytes` **before** delegating to
-//!   `FixCodec`, so an oversize frame is rejected at the framing boundary with no
-//!   unbounded allocation **and no panic** (`FixCodec` 0.3.0 computes
-//!   `... + body_length + 7` unchecked, which would overflow — and panic in a
-//!   debug build — on a hostile declared length; this guard is the framing-layer
-//!   analogue of #036's `validate_body_length`). The accumulated read buffer is
-//!   independently capped at `max_frame_bytes`, so a peer dribbling an unframed
-//!   blob cannot grow it unbounded either.
+//! - **Max frame length** — [`BoundedFrameDecoder`] caps a frame at
+//!   `max_frame_bytes` by **policy** (a DoS/resource ceiling), handing `FixCodec`
+//!   that cap as its `max_message_size`, so a frame whose declared total length
+//!   exceeds it is rejected at the framing boundary with
+//!   `CodecError::MessageTooLarge` and no unbounded allocation. The
+//!   hostile-arithmetic *correctness* — an overflowing `BodyLength (9)` add, an
+//!   out-of-range `CheckSum (10)` — is owned by `FixCodec` itself as of
+//!   `ironfix-transport` 0.3.1, which folds both fields with checked,
+//!   non-wrapping arithmetic and returns a typed `CodecError` (never a panic), so
+//!   the venue no longer pre-checks them (the framing-layer precheck was retired
+//!   in #140). The accumulated read buffer is independently capped at
+//!   `max_frame_bytes`, so a peer dribbling an unframed blob cannot grow it
+//!   unbounded either.
 //! - **Graceful shutdown** — every task observes a shared [`watch`] signal;
 //!   on shutdown the accept loop stops and the in-flight sessions drain and close,
 //!   so connect/disconnect churn and process shutdown both leave **no task leak**
@@ -263,104 +267,64 @@ impl SessionOutbound {
 }
 
 // ============================================================================
-// The bounded framing decoder — the max-frame-length guard around FixCodec
+// The bounded framing decoder — the by-policy byte-cap ceiling around FixCodec
 // ============================================================================
 
-/// A typed framing failure from [`BoundedFrameDecoder`] — the venue's own guard
-/// rejections plus the wrapped inner [`FixCodec`] error.
+/// A **by-policy byte cap** around [`FixCodec`] — a DoS / resource ceiling, **not**
+/// a security correctness check.
 ///
-/// The two venue variants ([`Self::FrameTooLarge`], [`Self::MalformedChecksum`])
-/// are rejected **before** the corresponding unchecked `ironfix` arithmetic runs,
-/// so a hostile frame never reaches an overflowing add — no panic, in a debug
-/// **or** a release build.
-#[derive(Debug)]
-pub enum FrameError {
-    /// The declared `BodyLength (9)` exceeds `max_frame_bytes` — rejected before
-    /// `FixCodec`'s unchecked `... + body_length + 7` add, which would overflow
-    /// `usize` on a hostile value.
-    FrameTooLarge {
-        /// The declared `BodyLength (9)` value.
-        declared: usize,
-        /// The configured max frame size.
-        max: usize,
-    },
-    /// A complete frame's `CheckSum (10)` field does not parse to a value in
-    /// `0..=255` — rejected before `ironfix-tagvalue`'s `parse_checksum` folds
-    /// `d0*100 + d1*10 + d2` into a `u8`, which overflows (and panics in a debug
-    /// build) for ANY value `> 255` — a hundreds digit `>= 3`, but also `256..=299`.
-    /// A conformant FIX checksum is `sum % 256` (always `000..=255`), so a value
-    /// `> 255` (or a non-digit) can never be a real checksum; a value `<= 255` still
-    /// flows to `FixCodec`, which validates the actual sum.
-    MalformedChecksum,
-    /// A framing error from the inner [`FixCodec`] (incomplete, begin-string,
-    /// missing/invalid body length, checksum mismatch, oversize, or I/O).
-    Codec(CodecError),
-}
-
-/// A venue guard around [`FixCodec`] that rejects the two hostile-arithmetic frames
-/// at the framing boundary before they reach `ironfix`'s unchecked folds
-/// ([08 §4](../../../docs/08-threat-model.md#4-untrusted-input-hardening)).
+/// It caps a frame at `max_frame_bytes` by handing that value to `FixCodec` as its
+/// `max_message_size`, so a frame whose declared total length exceeds the cap is
+/// rejected at the framing boundary ([`CodecError::MessageTooLarge`]) with no
+/// unbounded allocation. That is the *only* thing this wrapper adds; the cap is a
+/// resource policy the operator tunes (`[fix] max_frame_bytes`), not a
+/// correctness guard.
 ///
-/// `FixCodec` 0.3.0 and its `ironfix-tagvalue` checksum helper both fold
-/// attacker-controlled digits with **unchecked** arithmetic that overflows (and
-/// panics in a debug build) on a hostile value:
-///
-/// 1. **`BodyLength (9)`** — `FixCodec` computes the total frame length as
-///    `body_len_end + body_length + 7`; a declared value near `usize::MAX`
-///    overflows the add. This guard pre-checks the declared length against
-///    `max_frame_bytes` first.
-/// 2. **`CheckSum (10)`** — for a *complete* frame, `parse_checksum` folds
-///    `d0*100 + d1*10 + d2` into a `u8`; ANY value `> 255` overflows it (a hundreds
-///    digit `>= 3`, but also `256..=299`). This guard parses the three checksum
-///    digits into a `u16` and pre-rejects a value `> 255` first.
-///
-/// Both checks match exactly what `FixCodec` reads (`BodyLength` only in its
-/// literal `9=` form; the checksum as the three bytes at `total_length - 4`), so a
-/// value within range still flows to `FixCodec`, which validates it for real. This
-/// is the framing-layer analogue of #036's `validate_body_length` guard at the
-/// tag-value layer.
+/// The **hostile-arithmetic correctness** — an overflowing `BodyLength (9)` add
+/// (`... + body_length + 7`) and an out-of-range `CheckSum (10)` triple — is owned
+/// by `FixCodec` itself as of `ironfix-transport` 0.3.1: the frame-length add is a
+/// `checked_add` chain returning [`CodecError::InvalidBodyLength`] on overflow, and
+/// the checksum is folded in `u16` and range-checked to `0..=255`
+/// (`parse_checksum` returns `None` → `InvalidBodyLength`), so a hostile value is a
+/// typed [`CodecError`] and **never a panic**, in a debug or a release build. The
+/// venue therefore does **not** pre-check either field — the framing-layer precheck
+/// was retired in #140. Do **not** re-add a security rationale here: that
+/// correctness now lives upstream in the checked decoder.
 #[derive(Debug)]
 pub struct BoundedFrameDecoder {
     inner: FixCodec,
-    max_frame_bytes: usize,
 }
 
 impl BoundedFrameDecoder {
-    /// Builds a decoder capping frames at `max_frame_bytes` bytes.
+    /// Builds a decoder capping frames at `max_frame_bytes` bytes (the by-policy
+    /// resource ceiling), clamped up to [`MIN_FRAME_BYTES`] so `FixCodec` is never
+    /// handed a nonsensically tiny cap.
     #[must_use]
     pub fn new(max_frame_bytes: usize) -> Self {
         let max = max_frame_bytes.max(MIN_FRAME_BYTES);
         Self {
-            // `FixCodec`'s own `max_message_size` is the coarser total-length cap;
-            // the declared-length pre-check below is what closes the unchecked-add
-            // overflow the total-length cap alone cannot (the add happens first).
+            // The byte cap is enforced by `FixCodec`'s own `max_message_size`
+            // total-length check (`total_length > max_message_size` →
+            // `MessageTooLarge`), which — as of 0.3.1 — runs after a *checked*
+            // frame-length add, so no hostile declared length can overflow it.
             inner: FixCodec::new().with_max_message_size(max),
-            max_frame_bytes: max,
         }
     }
 
-    /// Decodes one complete frame, applying the venue pre-checks before delegating
-    /// to `FixCodec`.
+    /// Decodes one complete frame by delegating to `FixCodec`.
     ///
     /// This is an inherent method, **not** the `tokio_util::codec::Decoder` trait:
     /// the acceptor drives the socket read loop manually (split halves + a bounded
-    /// writer task), so the codec is used as a plain frame extractor and can return
-    /// the richer [`FrameError`] rather than the trait's `From<io::Error>`-bound
-    /// error.
+    /// writer task), so the codec is used as a plain frame extractor. All framing
+    /// rejection (oversize, begin-string, body-length, checksum) is owned by
+    /// `FixCodec` and surfaces as a typed [`CodecError`] — no venue pre-check runs.
     ///
     /// # Errors
     ///
-    /// [`FrameError::FrameTooLarge`] / [`FrameError::MalformedChecksum`] for the two
-    /// venue guards, or [`FrameError::Codec`] for an inner `FixCodec` framing error.
-    pub fn decode(&mut self, src: &mut BytesMut) -> Result<Option<BytesMut>, FrameError> {
-        match precheck(src, self.max_frame_bytes) {
-            Precheck::FrameTooLarge(declared) => Err(FrameError::FrameTooLarge {
-                declared,
-                max: self.max_frame_bytes,
-            }),
-            Precheck::MalformedChecksum => Err(FrameError::MalformedChecksum),
-            Precheck::Proceed => self.inner.decode(src).map_err(FrameError::Codec),
-        }
+    /// A [`CodecError`] for any inner `FixCodec` framing error (incomplete is
+    /// `Ok(None)`, not an error).
+    pub fn decode(&mut self, src: &mut BytesMut) -> Result<Option<BytesMut>, CodecError> {
+        self.inner.decode(src)
     }
 }
 
@@ -370,98 +334,6 @@ impl BoundedFrameDecoder {
 /// smaller than — the config-layer minimum [`crate::config::FIX_MIN_MAX_FRAME_BYTES`]
 /// (the config never passes a value this low; this only defends a direct caller).
 const MIN_FRAME_BYTES: usize = 32;
-
-/// SOH field delimiter.
-const SOH: u8 = 0x01;
-
-/// The trailing `CheckSum` field length `FixCodec` assumes: `10=XXX<SOH>` = 7 bytes.
-const CHECKSUM_TRAILER_LEN: usize = 7;
-
-/// The outcome of pre-checking a frame's hostile-arithmetic fields.
-#[derive(Debug, PartialEq, Eq)]
-enum Precheck {
-    /// Defer to `FixCodec` (the frame is incomplete, the fields are not in the
-    /// literal form `FixCodec` reads, or the values are within range).
-    Proceed,
-    /// The declared `BodyLength (9)` exceeds the cap.
-    FrameTooLarge(usize),
-    /// The complete frame's `CheckSum (10)` digits are not `[0-2][0-9][0-9]`.
-    MalformedChecksum,
-}
-
-/// Pre-validates the two attacker-controlled numeric fields `FixCodec` folds with
-/// unchecked arithmetic — the declared `BodyLength (9)`, and (for a complete frame)
-/// the `CheckSum (10)` triple — so a hostile value is rejected here before it can
-/// overflow (and panic in a debug build) inside `ironfix`.
-///
-/// It matches exactly what `FixCodec` reads: `BodyLength` only in its literal `9=`
-/// form, and the checksum as the three bytes at `total_length - 4`. Anything it
-/// cannot positively classify is deferred to `FixCodec`'s own framing errors
-/// ([`Precheck::Proceed`]).
-fn precheck(src: &[u8], max: usize) -> Precheck {
-    // Field 1 ends at the first SOH (BeginString); BodyLength follows it.
-    let Some(soh1) = src.iter().position(|&b| b == SOH) else {
-        return Precheck::Proceed; // incomplete → FixCodec Ok(None)
-    };
-    let bl_start = soh1 + 1;
-    let Some(rel) = src
-        .get(bl_start..)
-        .and_then(|s| s.iter().position(|&b| b == SOH))
-    else {
-        return Precheck::Proceed;
-    };
-    let soh2 = bl_start + rel;
-    let field = &src[bl_start..soh2];
-    // `FixCodec` accepts BodyLength only as a literal `9=` prefix — match exactly.
-    let Some(digits) = field.strip_prefix(b"9=") else {
-        return Precheck::Proceed; // FixCodec → MissingBodyLength
-    };
-    let declared = match std::str::from_utf8(digits)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        Some(declared) if declared > max => return Precheck::FrameTooLarge(declared),
-        Some(declared) => declared,
-        // Non-numeric or `> usize::MAX`: `FixCodec` fails the parse before the add.
-        None => return Precheck::Proceed,
-    };
-    // The frame's total length, computed the way `FixCodec` does. `declared <= max`
-    // keeps this add well inside `usize`; `checked_add` defends the (unreachable)
-    // overflow rather than ever panicking.
-    let Some(total_length) = soh2
-        .checked_add(1)
-        .and_then(|value| value.checked_add(declared))
-        .and_then(|value| value.checked_add(CHECKSUM_TRAILER_LEN))
-    else {
-        return Precheck::Proceed;
-    };
-    if src.len() < total_length {
-        return Precheck::Proceed; // incomplete → FixCodec Ok(None)
-    }
-    // The frame is complete: `FixCodec` reads the three checksum digits at
-    // `total_length - 4`. A conformant FIX checksum is `sum % 256`, i.e. the VALUE
-    // `0..=255` (rendered `000..=255`). `parse_checksum` folds `d0*100 + d1*10 + d2`
-    // into a `u8`, so ANY value `> 255` overflows — not just a hundreds digit `>= 3`
-    // but also `256..=299` (`d0=2`, `d1>=5`). Parse the three ASCII digits into a
-    // `u16` (max `999`, no overflow) and reject a value `> 255` here, before the u8
-    // fold runs. A non-digit is rejected too (`FixCodec` would `InvalidBodyLength`
-    // it anyway). A value `<= 255` still flows to `FixCodec`'s real sum check.
-    let checksum_start = total_length - 4;
-    match src.get(checksum_start..checksum_start + 3) {
-        Some(&[d0, d1, d2])
-            if d0.is_ascii_digit() && d1.is_ascii_digit() && d2.is_ascii_digit() =>
-        {
-            let value =
-                u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0');
-            if value <= 255 {
-                Precheck::Proceed
-            } else {
-                Precheck::MalformedChecksum
-            }
-        }
-        _ => Precheck::MalformedChecksum,
-    }
-}
 
 // ============================================================================
 // The acceptor
@@ -774,7 +646,7 @@ async fn run_session<S: FixSession>(
                     // logged (never the bytes).
                     tracing::debug!(
                         %peer,
-                        kind = frame_error_kind(&error),
+                        kind = codec_error_kind(&error),
                         "fix frame rejected at the framing boundary; closing"
                     );
                     break 'serve;
@@ -900,16 +772,6 @@ async fn writer_loop(mut write_half: OwnedWriteHalf, mut out_rx: mpsc::Receiver<
         }
     }
     let _ = write_half.shutdown().await;
-}
-
-/// A stable, payload-free label for a [`FrameError`] — the venue guard kind or the
-/// inner framing kind, never the offending bytes (safe to log).
-fn frame_error_kind(error: &FrameError) -> &'static str {
-    match error {
-        FrameError::FrameTooLarge { .. } => "frame_too_large",
-        FrameError::MalformedChecksum => "malformed_checksum",
-        FrameError::Codec(inner) => codec_error_kind(inner),
-    }
 }
 
 /// A stable, payload-free label for a [`CodecError`] — the framing error **kind**
@@ -1085,40 +947,56 @@ mod tests {
 
     #[test]
     fn test_bounded_decoder_rejects_oversize_declared_length_without_panic() {
-        // A declared BodyLength of u64::MAX would overflow FixCodec's unchecked
-        // `+ body_length` add (panicking in a debug build); the guard rejects it
-        // first with FrameTooLarge, no panic and no allocation of the payload.
+        // #140: a declared BodyLength of u64::MAX would overflow FixCodec's
+        // `body_len_soh + 1 + body_length + 7` add. As of ironfix-transport 0.3.1
+        // that add is a `checked_add` chain returning `InvalidBodyLength` on
+        // overflow — so the frame is rejected at the framing boundary with a typed
+        // CodecError, no panic and no allocation of the payload (the decoder owns
+        // this; the retired venue precheck did the same job).
         let mut decoder = BoundedFrameDecoder::new(64 * 1024);
         let hostile = frame_with_declared_body_length("18446744073709551615", HEARTBEAT_BODY);
         let mut buf = BytesMut::from(&hostile[..]);
         match decoder.decode(&mut buf) {
-            Err(FrameError::FrameTooLarge { max, .. }) => {
-                assert_eq!(max, 64 * 1024);
-            }
-            other => panic!("expected FrameTooLarge, got {other:?}"),
+            Err(CodecError::InvalidBodyLength) => {}
+            other => panic!("expected InvalidBodyLength, got {other:?}"),
         }
     }
 
     #[test]
     fn test_bounded_decoder_rejects_over_cap_but_in_range_declared_length() {
-        // A declared length above the (small) cap but well within usize is rejected
-        // at the boundary too.
+        // A declared length above the (small) by-policy cap but well within usize is
+        // rejected at the boundary too — FixCodec's `total_length > max_message_size`
+        // check (the byte cap `BoundedFrameDecoder` sets) fires MessageTooLarge.
         let mut decoder = BoundedFrameDecoder::new(128);
         let hostile = frame_with_declared_body_length("100000", HEARTBEAT_BODY);
         let mut buf = BytesMut::from(&hostile[..]);
         match decoder.decode(&mut buf) {
-            Err(FrameError::FrameTooLarge { declared, max }) => {
-                assert_eq!(declared, 100_000);
-                assert_eq!(max, 128);
+            Err(CodecError::MessageTooLarge { max_size, .. }) => {
+                assert_eq!(max_size, 128);
             }
-            other => panic!("expected FrameTooLarge, got {other:?}"),
+            other => panic!("expected MessageTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_over_cap_frame_is_rejected_before_the_full_body_is_buffered() {
+        // The by-policy byte cap rejects an over-cap declared length WITHOUT waiting
+        // for (or allocating) the full hostile body: FixCodec 0.3.1 checks
+        // `total_length > max_message_size` before the completeness check, so a small
+        // buffer carrying only the header + a complete over-cap `BodyLength (9)` is
+        // rejected as MessageTooLarge at the framing boundary — no unbounded growth.
+        let mut decoder = BoundedFrameDecoder::new(1024);
+        let mut buf = BytesMut::from(&b"8=FIX.4.4\x019=5000\x0135=0\x01"[..]);
+        match decoder.decode(&mut buf) {
+            Err(CodecError::MessageTooLarge { max_size, .. }) => assert_eq!(max_size, 1024),
+            other => panic!("expected MessageTooLarge before completeness, got {other:?}"),
         }
     }
 
     /// Builds a COMPLETE, BodyLength-correct frame with `body` and an ARBITRARY
     /// 3-char literal `CheckSum (10)` string — the shape a checksum-overflow attack
-    /// takes (the BodyLength guard passes; only the checksum guard can fire). The
-    /// checksum must be exactly 3 chars for `FixCodec`'s `10=XXX<SOH>` framing math.
+    /// takes. The checksum must be exactly 3 chars for `FixCodec`'s `10=XXX<SOH>`
+    /// framing math.
     fn frame_with_raw_checksum(body: &[u8], checksum: &str) -> Vec<u8> {
         let mut msg = Vec::new();
         msg.extend_from_slice(b"8=FIX.4.4\x01");
@@ -1130,79 +1008,77 @@ mod tests {
 
     #[test]
     fn test_bounded_decoder_rejects_malformed_checksum_without_panic() {
-        // PoC (P1): a COMPLETE, BodyLength-correct frame whose CheckSum(10) parses to
-        // a value > 255. `ironfix-tagvalue`'s parse_checksum folds `d0*100 + d1*10 +
-        // d2` into a u8, which overflows (and panics in a debug build) for ANY value
-        // > 255 — a hundreds digit >= 3 (`999`), AND `256`/`260`/`299` (d0=2, d1>=5).
-        // The guard rejects all of them as MalformedChecksum before the u8 fold, so
-        // the overflow bytes never reach parse_checksum. `35=0<SOH>` is a 5-byte
-        // body, so BodyLength(9)=5 is correct — only the checksum guard fires.
+        // #140 regression (was P1): a COMPLETE, BodyLength-correct frame whose
+        // CheckSum(10) parses to a value > 255 — a hundreds digit >= 3 (`999`), AND
+        // `256`/`260`/`299` (d0=2, d1>=5). ironfix-tagvalue 0.3.1's parse_checksum
+        // folds the three digits in u16 and range-checks to 0..=255, returning None
+        // for every one of these; FixCodec maps that to InvalidBodyLength — a typed
+        // reject at the framing boundary, no u8-fold overflow and no panic. `35=0<SOH>`
+        // is a 5-byte body, so BodyLength(9)=5 is correct — only the checksum fails.
         for hostile_checksum in ["999", "256", "260", "299"] {
             let frame = frame_with_raw_checksum(b"35=0\x01", hostile_checksum);
             let mut decoder = BoundedFrameDecoder::new(64 * 1024);
             let mut buf = BytesMut::from(&frame[..]);
             match decoder.decode(&mut buf) {
-                Err(FrameError::MalformedChecksum) => {}
+                Err(CodecError::InvalidBodyLength) => {}
                 other => {
-                    panic!("expected MalformedChecksum for `10={hostile_checksum}`, got {other:?}")
+                    panic!("expected InvalidBodyLength for `10={hostile_checksum}`, got {other:?}")
                 }
             }
         }
     }
 
     #[test]
-    fn test_bounded_decoder_checksum_guard_is_boundary_exact_at_255() {
-        // Boundary-exact: `255` (the max valid checksum value) is NOT rejected by the
-        // format guard — it flows to FixCodec's real sum check (which then reports a
-        // ChecksumMismatch, since 255 is unlikely to be the true sum). `256` IS
-        // rejected by the guard.
-        let at_max = frame_with_raw_checksum(b"35=0\x01", "255");
-        assert_eq!(
-            precheck(&at_max, 64 * 1024),
-            Precheck::Proceed,
-            "the max valid checksum value (255) must not be rejected by the format guard"
-        );
-        let over_max = frame_with_raw_checksum(b"35=0\x01", "256");
-        assert_eq!(
-            precheck(&over_max, 64 * 1024),
-            Precheck::MalformedChecksum,
-            "256 overflows the u8 fold and must be rejected by the guard"
-        );
-        // And through the decoder, `255` is not a MalformedChecksum (it is either a
-        // real match or a ChecksumMismatch from FixCodec — never the guard).
+    fn test_bounded_decoder_checksum_boundary_is_exact_at_255() {
+        // Boundary-exact through the real decoder: `256` (the first value that
+        // overflows a u8) is rejected as InvalidBodyLength (parse_checksum → None),
+        // while `255` (the max valid checksum) is NOT — it parses and flows to
+        // FixCodec's real sum check (a ChecksumMismatch here, since 255 is unlikely
+        // to be the true sum), never an InvalidBodyLength from a fold failure.
         let mut decoder = BoundedFrameDecoder::new(64 * 1024);
-        let mut buf = BytesMut::from(&at_max[..]);
+        let mut over = BytesMut::from(&frame_with_raw_checksum(b"35=0\x01", "256")[..]);
         assert!(
-            !matches!(decoder.decode(&mut buf), Err(FrameError::MalformedChecksum)),
-            "255 must not be caught by the checksum-format guard"
+            matches!(
+                decoder.decode(&mut over),
+                Err(CodecError::InvalidBodyLength)
+            ),
+            "256 overflows the u8 domain and must be rejected by the checked fold"
+        );
+        let mut at_max = BytesMut::from(&frame_with_raw_checksum(b"35=0\x01", "255")[..]);
+        assert!(
+            !matches!(
+                decoder.decode(&mut at_max),
+                Err(CodecError::InvalidBodyLength)
+            ),
+            "255 is in-domain and must reach FixCodec's real sum check, not the fold reject"
         );
     }
 
     #[test]
-    fn test_checksum_guard_is_exhaustively_magnitude_bounded() {
-        // Exhaustive over the FULL 3-digit checksum input space `000..=999`: the guard
-        // validates the checksum MAGNITUDE (`<= 255`, the u8 domain of a real
-        // `sum % 256`), not a per-digit range. Every value `> 255` (the whole
-        // `256..=999` band — a hundreds digit `>= 3`, AND `256..=299`) overflows
-        // parse_checksum's u8 fold and MUST be rejected by the guard; every value
-        // `<= 255` must NOT be rejected by the guard (it flows to FixCodec's real sum
-        // check). No panic anywhere across the input space — the guard parses the
-        // digits with widening `u16` arithmetic, so it cannot itself overflow.
+    fn test_decoder_checksum_fold_never_panics_across_the_input_space() {
+        // Exhaustive over the FULL 3-digit checksum input space `000..=999`, driven
+        // through the REAL decoder (the retired precheck's magnitude sweep, moved to
+        // prove the upstream checked fold): every value `> 255` (the whole `256..=999`
+        // band) must be rejected as InvalidBodyLength (parse_checksum's u16 fold
+        // range-checks to 0..=255 → None); every value `<= 255` must NOT be an
+        // InvalidBodyLength (it reaches FixCodec's real sum check — a ChecksumMismatch,
+        // or a match for the one true value). The loop completing IS the no-panic
+        // assertion, in a debug OR a release build.
         for value in 0u16..=999 {
             let checksum = format!("{value:03}");
             let frame = frame_with_raw_checksum(b"35=0\x01", &checksum);
-            let outcome = precheck(&frame, 64 * 1024);
+            let mut decoder = BoundedFrameDecoder::new(64 * 1024);
+            let mut buf = BytesMut::from(&frame[..]);
+            let outcome = decoder.decode(&mut buf);
             if value > 255 {
-                assert_eq!(
-                    outcome,
-                    Precheck::MalformedChecksum,
-                    "`10={checksum}` (> 255) overflows the u8 fold and must be rejected"
+                assert!(
+                    matches!(outcome, Err(CodecError::InvalidBodyLength)),
+                    "`10={checksum}` (> 255) must be rejected by the checked fold, got {outcome:?}"
                 );
             } else {
-                assert_eq!(
-                    outcome,
-                    Precheck::Proceed,
-                    "`10={checksum}` (<= 255) must not be rejected by the format guard"
+                assert!(
+                    !matches!(outcome, Err(CodecError::InvalidBodyLength)),
+                    "`10={checksum}` (<= 255) must reach the real sum check, got {outcome:?}"
                 );
             }
         }
@@ -1215,30 +1091,6 @@ mod tests {
         let mut decoder = BoundedFrameDecoder::new(64 * 1024);
         let mut buf = BytesMut::from(&b"8=FIX.4.4\x019=999"[..]);
         assert!(matches!(decoder.decode(&mut buf), Ok(None)));
-    }
-
-    #[test]
-    fn test_precheck_classifies_body_length_and_checksum() {
-        // A complete, well-formed frame → Proceed.
-        let ok = frame_with_body(HEARTBEAT_BODY);
-        assert_eq!(precheck(&ok, 64 * 1024), Precheck::Proceed);
-        // An over-cap declared BodyLength → FrameTooLarge (before completeness).
-        assert_eq!(
-            precheck(b"8=FIX.4.4\x019=5000\x0135=0\x01", 1024),
-            Precheck::FrameTooLarge(5000)
-        );
-        // An incomplete frame (no BodyLength SOH yet) → Proceed (defer to FixCodec).
-        assert_eq!(precheck(b"8=FIX.4.4\x01", 1024), Precheck::Proceed);
-        // A complete frame with a checksum value > 255 → MalformedChecksum, for both
-        // a hundreds digit >= 3 (`999`) and the 256..=299 band (`260`).
-        for hostile in ["999", "260"] {
-            let frame = frame_with_raw_checksum(b"35=0\x01", hostile);
-            assert_eq!(
-                precheck(&frame, 64 * 1024),
-                Precheck::MalformedChecksum,
-                "`10={hostile}` overflows the u8 fold"
-            );
-        }
     }
 
     #[test]

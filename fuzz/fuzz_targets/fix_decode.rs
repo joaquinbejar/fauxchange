@@ -5,17 +5,19 @@
 //! the live acceptor drives on every inbound TCP read
 //! (`src/gateway/fix/acceptor.rs::run_session`), not a reimplementation:
 //!
-//! 1. [`BoundedFrameDecoder::decode`] — the framing layer, which pre-checks the
-//!    two hostile-arithmetic fields (`BodyLength (9)`, `CheckSum (10)`) before
-//!    delegating to `ironfix_transport::FixCodec`, splitting the byte stream
-//!    into complete frames.
+//! 1. [`BoundedFrameDecoder::decode`] — the framing layer, a by-policy byte cap
+//!    (`max_frame_bytes`) around `ironfix_transport::FixCodec`, splitting the byte
+//!    stream into complete frames. As of `ironfix-transport` 0.3.1 (#140) the
+//!    codec itself folds the two hostile-arithmetic fields (`BodyLength (9)`,
+//!    `CheckSum (10)`) with checked, non-wrapping arithmetic, so the venue's own
+//!    framing-layer precheck was retired — a hostile value is a typed `CodecError`.
 //! 2. [`fauxchange::gateway::fix::decode`] — the tag-value decoder, turning one
 //!    complete frame into a typed [`DecodedMessage`] or a typed
 //!    [`FixDecodeError`].
 //!
 //! Neither stage may ever panic, allocate unboundedly, or silently accept a
 //! malformed frame as valid — every failure must surface as a typed error
-//! (`FrameError` / `FixDecodeError`). This target does not assert *which*
+//! (`CodecError` / `FixDecodeError`). This target does not assert *which*
 //! typed error a given input produces (that is the adversarial-fixture matrix
 //! in `tests/fix_adversarial.rs`, which shares this exact corpus); it only
 //! proves the decode path itself never crashes or hangs on adversarial input.
