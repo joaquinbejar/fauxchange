@@ -42,7 +42,9 @@ use std::time::{Duration, Instant};
 
 use fauxchange::gateway::fix::{DecodedMessage, FixBody, decode};
 
-use support::fix_fixtures::{execution_report_fixture, new_order_single_frame};
+use support::fix_fixtures::{
+    execution_report_fixture, execution_report_golden_frame, new_order_single_frame,
+};
 use support::hdr::{new_histogram, record_duration, report};
 use support::openloop::run_open_loop_pure;
 
@@ -100,11 +102,26 @@ async fn run(
     open_loop_interval_us: u64,
 ) {
     // Built ONCE, outside every measured loop — the fixed decode input and the
-    // fixed encode input. `new_order_single_frame()` panics if the fixture
-    // does not decode to `NewOrderSingle`, so a broken fixture cannot silently
-    // turn this bench into a reject-path measurement.
+    // fixed encode input. `new_order_single_frame()` returns the committed #036
+    // golden bytes directly (asserting the reconstructed fixture still encodes
+    // to them, and that they decode to `NewOrderSingle`), so a broken or drifted
+    // fixture cannot silently turn this bench into a reject-path or stale-shape
+    // measurement.
     let decode_frame = new_order_single_frame();
     let encode_report = execution_report_fixture();
+
+    // Off the timed path: pin the encode span to the committed #036 golden
+    // (tests/golden/fix/execution_report_8.txt). `cargo bench` builds --release,
+    // so this is a plain `assert_eq!` — a `debug_assert!` would be compiled out
+    // and never fire on a real bench run. A dialect change the fixture missed
+    // fails loudly here instead of measuring a stale shape.
+    assert_eq!(
+        FixBody::encode(&encode_report),
+        execution_report_golden_frame(),
+        "HP-3 encode fixture drifted from tests/golden/fix/execution_report_8.txt; \
+         regenerate the golden (UPDATE_GOLDEN=1 cargo test --test golden_fix) and \
+         re-check execution_report_fixture"
+    );
 
     // ---- closed-loop decode ---------------------------------------------------
     for _ in 0..warmup_ops {

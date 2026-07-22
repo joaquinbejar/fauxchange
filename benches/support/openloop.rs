@@ -53,6 +53,61 @@ async fn wait_until(intended: Instant) {
     }
 }
 
+/// Validates, up front, that the entire fixed open-loop schedule for `ops`
+/// operations at `interval` spacing is representable **without loss**: the
+/// maximum offset `ops - 1` fits a `u32` (`Duration::checked_mul`'s multiplier),
+/// the span `interval × (ops - 1)` is a representable `Duration`, and the last
+/// intended-send `start + span` does not overflow `Instant`. Panics with a
+/// descriptive message otherwise — a bench harness must fail loudly rather than
+/// silently saturate to a wrong schedule (the repo checked-arithmetic rule; a
+/// panic here is off every measured path and never fabricates a send time).
+fn validate_schedule(start: Instant, ops: usize, interval: Duration) {
+    let Some(max_offset) = ops.checked_sub(1) else {
+        return; // ops == 0: no operations, nothing to schedule.
+    };
+    let max_offset = match u32::try_from(max_offset) {
+        Ok(offset) => offset,
+        Err(_) => panic!(
+            "open-loop schedule needs {ops} ops, but the maximum offset {max_offset} exceeds \
+             u32::MAX (Duration multiplication takes a u32 multiplier); reduce ops"
+        ),
+    };
+    let span = match interval.checked_mul(max_offset) {
+        Some(span) => span,
+        None => panic!(
+            "open-loop schedule span {interval:?} × {max_offset} overflows Duration; \
+             reduce ops or interval"
+        ),
+    };
+    if start.checked_add(span).is_none() {
+        panic!(
+            "open-loop schedule end (start + {span:?}) overflows Instant; reduce ops or interval"
+        );
+    }
+}
+
+/// The intended-send `Instant` for operation `i` on the fixed schedule
+/// (`start + interval × i`), computed with **checked** conversion and checked
+/// `Duration`/`Instant` arithmetic — never a lossy `u32::MAX` clamp or a
+/// `saturating_mul` that would fabricate a wrong send time. Pre-validated by
+/// [`validate_schedule`], so the panics below are unreachable in practice, yet
+/// the path stays checked rather than silently saturating if that invariant is
+/// ever broken.
+fn intended_send(start: Instant, interval: Duration, i: usize) -> Instant {
+    let offset = match u32::try_from(i) {
+        Ok(offset) => offset,
+        Err(_) => panic!("open-loop offset {i} exceeds u32::MAX"),
+    };
+    let span = match interval.checked_mul(offset) {
+        Some(span) => span,
+        None => panic!("open-loop schedule span {interval:?} × {offset} overflows Duration"),
+    };
+    match start.checked_add(span) {
+        Some(instant) => instant,
+        None => panic!("open-loop intended-send instant overflows Instant at offset {offset}"),
+    }
+}
+
 /// Runs `workload` against `handle` on a fixed-interval open-loop schedule,
 /// recording the **sojourn time** of every successful submission into the
 /// returned histogram.
@@ -76,11 +131,11 @@ pub async fn run_open_loop(
     let sojourn = Arc::new(Mutex::new(new_histogram()));
     let rejected = Arc::new(AtomicUsize::new(0));
     let start = Instant::now();
+    validate_schedule(start, workload.len(), interval);
     let mut join_set = tokio::task::JoinSet::new();
 
     for (i, command) in workload.into_iter().enumerate() {
-        let offset = u32::try_from(i).unwrap_or(u32::MAX);
-        let intended = start + interval.saturating_mul(offset);
+        let intended = intended_send(start, interval, i);
         wait_until(intended).await;
 
         let handle = handle.clone();
@@ -148,11 +203,11 @@ where
 {
     let sojourn = Arc::new(Mutex::new(new_histogram()));
     let start = Instant::now();
+    validate_schedule(start, ops, interval);
     let mut join_set = tokio::task::JoinSet::new();
 
     for i in 0..ops {
-        let offset = u32::try_from(i).unwrap_or(u32::MAX);
-        let intended = start + interval.saturating_mul(offset);
+        let intended = intended_send(start, interval, i);
         wait_until(intended).await;
 
         let op = op.clone();
