@@ -17,34 +17,46 @@
 //! and the journal records **that** order. On replay the journal is replayed in
 //! `underlying_sequence` order — the reorder is **not** re-run — so replay
 //! determinism is automatic (replay uses the journaled post-reorder order). The
-//! obligation this module carries is narrower: the **live** reorder must be a pure,
-//! reproducible function of its seeded inputs, so that the *same run seed, config,
-//! and input command stream* yield the *same reorder* and thus the *same journal*.
-//! Concretely the ordering decision reads **no wall clock and no unseeded state**:
+//! obligation this module carries is narrower: the **live** reorder is a pure
+//! function of its seeded inputs **under a controlled clock and a serialized
+//! admission order**, so that the *same run seed, config, and input command stream*
+//! yield the *same reorder* and thus the *same journal*. The ordering **rule** never
+//! calls `SystemTime` directly:
 //!
 //! - a command's release **deadline** is `venue_now_at_arrival + LatencyOffset` —
-//!   the venue clock read at admission plus the #45 seeded draw (never a fresh RNG
-//!   here), in microseconds ([`release_deadline_us`]);
-//! - commands release in **deadline order**, and an equal-deadline tie breaks
-//!   deterministically on `(session_id, arrival_sequence)` — a monotonic per-arrival
-//!   counter, never a wall clock, hash-map order, or task-scheduling order
-//!   ([`ReleaseKey`]).
+//!   the **venue clock** read at admission plus the #45 seeded draw (never a fresh
+//!   RNG here), in microseconds ([`release_deadline_us`]). Under a stepped/seeded
+//!   clock that `venue_now` is itself deterministic; under a **realtime** clock it
+//!   is wall-fed, so the deadline *value* is wall-influenced and live run-to-run
+//!   reproducibility is **not** claimed there (replay stays deterministic
+//!   regardless — see below);
+//! - commands release in **deadline order**, and an equal-deadline tie breaks on
+//!   `(session_id, arrival_sequence)` — a monotonic per-arrival counter, never a
+//!   hash-map order or task-scheduling order in the **key** ([`ReleaseKey`]). The
+//!   `arrival_sequence` *value* is assigned by the admission-race counter, so under
+//!   genuinely concurrent admission two equal-`(deadline, session)` commands take
+//!   their relative order from that race — the same off-oracle class as a plain-FIFO
+//!   mailbox arrival race, and equally baked into the journal once assigned.
 //!
 //! ## The release horizon (why we never release too early)
 //!
 //! An entry is releasable once the venue clock has **strictly passed** its deadline
 //! (`now_us > deadline_us`, [`IngressReorderBuffer::drain_below`]). This strict
-//! comparison **is** the release horizon, and it is airtight because latency offsets
-//! are non-negative and the venue clock is monotonic: any command that has **not yet
-//! arrived** will arrive at a venue instant `≥ now`, so its deadline is
-//! `≥ now > deadline_us` of anything we release. Therefore, at the moment we release
-//! an entry with deadline `D`, **every** command whose key is `≤ (D, session, seq)`
-//! has already arrived and is already in the buffer — draining `deadline < now_us`
-//! in `(deadline_us, session_id, arrival_sequence)` order reproduces the exact global
-//! total order, batch after batch. No separate horizon parameter is needed; it falls
-//! out of the invariant. This holds identically under all three clock modes — the
-//! order is by the **virtual** deadline; only *when* the clock passes it differs
-//! (realtime/accelerated: the off-path cadence driver; stepped: an explicit step).
+//! comparison **is** the release horizon: latency offsets are non-negative and the
+//! venue clock is monotonic, so any command that has **not yet been admitted** will
+//! be admitted at a venue instant `≥ now` and thus carry a deadline `≥ now >
+//! deadline_us` of anything we release. So — modulo the small admission window
+//! between reading the clock (fixing the deadline) and inserting into the buffer,
+//! which only matters under genuinely concurrent admission — every command whose key
+//! is `≤ (D, session, seq)` has already been admitted when we release deadline `D`,
+//! and draining `deadline < now_us` in key order reproduces the global total order.
+//! No separate horizon parameter is needed; it falls out of the invariant. The
+//! ordering **rule** is identical under all three clock modes (order by the virtual
+//! deadline; only *when* the clock passes it differs). The resulting live global
+//! order is run-to-run reproducible under a **controlled clock with serialized
+//! admission**; under a realtime clock or concurrent admission it is best-effort and
+//! only **replay** is guaranteed — which is the load-bearing property, since the
+//! journal records whatever order the live run produced.
 //!
 //! ## Bounded (a DoS control)
 //!
@@ -116,7 +128,11 @@ impl IngressStamp {
 /// ([03 §6.1](../../../docs/03-protocol-surfaces.md#61-deterministic-ingress-ordering)).
 /// Because `arrival_sequence` is a venue-wide monotonic counter it is globally
 /// unique, so the key is a strict total order — two commands can never collide, and
-/// the ordering never depends on wall clock, hash-map order, or task scheduling.
+/// the key comparison never depends on hash-map order or task scheduling. (The
+/// `arrival_sequence` *value* is drawn from the admission-race counter, so under
+/// concurrent admission two equal-`(deadline, session)` commands take their relative
+/// order from that race — deterministic once assigned and journaled, off the replay
+/// oracle exactly like a plain-FIFO mailbox race.)
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReleaseKey {
     /// The release deadline, in **microseconds on the virtual clock**

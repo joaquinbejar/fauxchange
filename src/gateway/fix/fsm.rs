@@ -2280,6 +2280,14 @@ impl VenueFixSession {
     /// the seeded latency draw and the deadline tie-break consume when the venue has
     /// latency injection configured. The `MsgSeqNum` is read from the frame header
     /// (its stable per-message id); the `SenderCompID` is the resolved client comp.
+    ///
+    /// A FIX client paces its own `MsgSeqNum`, so a session could in principle grind
+    /// cheap admin messages (`Heartbeat`/`TestRequest`) to land its real order on a
+    /// favorable seeded draw **if the run seed were known**. This is an accepted
+    /// limitation of #45's per-message latency keying — the offset **models**
+    /// realistic latency, it is not an adversarial-market fairness control — and it
+    /// is FIX-only: REST's `msg_seq` is a venue-minted atomic counter the client
+    /// cannot pace ([05 §3](../../../docs/05-microstructure-config.md#3-latency-injection)).
     fn ingress_stamp(&self, message: &DecodedMessage) -> IngressStamp {
         let session_id = self.fsm.client_comp.as_ref().map_or("fix", CompId::as_str);
         let msg_seq = header_of(message).msg_seq_num.value();

@@ -1571,9 +1571,15 @@ impl AppState {
     /// deadline-ordered buffer, and await the actor's [`Receipt`] once the venue
     /// clock strictly passes that deadline and the command is released in order.
     ///
-    /// The **ordering decision reads no wall clock and no unseeded state**: the
-    /// deadline is `venue_now_at_arrival + clamped LatencyOffset`, and the tie-break
-    /// is `(session_id, arrival_sequence)` on a checked monotonic counter.
+    /// The ordering **rule** never calls `SystemTime`: the deadline is
+    /// `venue_now_at_arrival + clamped LatencyOffset` (the venue clock, which is
+    /// wall-fed under a realtime clock) and the tie-break is
+    /// `(session_id, arrival_sequence)` on a checked monotonic counter. Live
+    /// run-to-run reproducibility of the reorder holds under a controlled clock;
+    /// **replay is deterministic regardless** (see [`crate::microstructure::ingress`]).
+    /// A buffered order's completion is gated on the venue clock **advancing past its
+    /// deadline**, not just on admission — under a stepped clock that never advances,
+    /// a buffered caller awaits until the clock steps.
     async fn submit_reordered(
         &self,
         command: VenueCommand,

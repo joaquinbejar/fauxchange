@@ -236,7 +236,9 @@ The full versioning and release-process policy lives in the design docs
     `BTreeMap` keyed on `ReleaseKey { deadline_us, session_id, arrival_sequence }`
     — exactly the doc's `(deadline, session_id, arrival_sequence)` total order).
     The FIX/REST edges stamp each admitted `AddOrder`/`Cancel`/`Replace` with its
-    `(session_id, msg_seq)`; `AppState::submit_with_ingress` computes the release
+    `(session_id, msg_seq)` — single **and bulk** REST order entry both route
+    through the ingress seam, so bulk is not a silent bypass;
+    `AppState::submit_with_ingress` computes the release
     deadline `venue_now + clamp(LatencyOffset)` (the #45 seeded draw, no fresh
     RNG) and releases commands into the actor in **deadline order**, equal-deadline
     ties broken deterministically on `(session_id, arrival_sequence)` — never on

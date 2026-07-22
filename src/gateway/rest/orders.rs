@@ -727,7 +727,13 @@ pub async fn bulk_place_orders(
             time_in_force: tif,
             stp_mode: STPMode::None,
         };
-        match state.submit(command).await {
+        // #111: stamp each bulk item's ingress identity and route it through the
+        // same `submit_with_ingress` seam single order entry uses — so a
+        // latency-injected venue reshapes bulk arrival order too, never a silent
+        // bulk bypass of the reorder (with no latency configured this is plain
+        // FIFO, identical to a bare submit).
+        let stamp = state.next_rest_ingress_stamp(&account)?;
+        match state.submit_with_ingress(command, stamp).await {
             Ok(receipt) => {
                 success_count += 1;
                 placed.push((item.symbol.clone(), order_id.clone()));
@@ -764,7 +770,20 @@ pub async fn bulk_place_orders(
                 order_id: order_id.clone(),
                 account: account.clone(),
             };
-            if let Err(error) = state.submit(cancel).await {
+            // Best-effort rollback: a stamp-mint failure (counter exhaustion) is a
+            // rollback warning, not a hard abort — the same latency seam as above.
+            let stamp = match state.next_rest_ingress_stamp(&account) {
+                Ok(stamp) => stamp,
+                Err(error) => {
+                    rollback_warnings.push(format!(
+                        "rollback cancel of {} could not be stamped: {}",
+                        order_id.as_str(),
+                        error.redacted_message()
+                    ));
+                    continue;
+                }
+            };
+            if let Err(error) = state.submit_with_ingress(cancel, stamp).await {
                 rollback_warnings.push(format!(
                     "rollback cancel of {} failed: {}",
                     order_id.as_str(),
