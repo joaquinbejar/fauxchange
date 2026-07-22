@@ -1151,10 +1151,12 @@ comparable sample counts) and should not be read as a stable figure.
   acceptor code path (not a reimplementation), reusing the pinned #036 golden
   fixtures.
 - **Does not prove**: a production SLA (this is one un-pinned developer
-  laptop, §1's own disclosed limitation, not a dedicated bench rig); a stated
-  HP-3 numeric budget in `docs/07-performance-budgets.md` (an `architect`
-  follow-up against this data, §11.1); or a clean isolation of decode/encode
-  cost under open-loop dispatch (§11.2's harness-overhead disclosure).
+  laptop, §1's own disclosed limitation, not a dedicated bench rig); or a clean
+  isolation of decode/encode cost under open-loop dispatch (§11.2's
+  harness-overhead disclosure). (The HP-3 numeric budget it *grounds* — decode
+  p99 ≤ 5 µs / encode p99 ≤ 2 µs — was set from this data by `#107`, stated in
+  §11.1 above and `docs/07-performance-budgets.md` §3-HP3; this bench measures
+  and grounds it, it did not itself establish the target.)
 - **CI regression gate**: not armed by this change — `#043` is scope-limited
   to landing the measured baseline; the CI `bench-regression` gate arms
   before v1.0 (#053, [07 §6](docs/07-performance-budgets.md#6-ci-regression-gate)),
