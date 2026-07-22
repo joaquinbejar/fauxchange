@@ -43,9 +43,9 @@ use conformance::{
 };
 
 use fauxchange::exchange::{
-    CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as SeamFill, Hash32, LineageId,
-    STPMode, SequenceNumber, Side as SeamSide, SignedCents, Symbol, TimeInForce, VenueCommand,
-    VenueEvent, VenueOutcome,
+    CancelReason, CancelledLeg, Cents, EventTimestamp, Fill as SeamFill, Hash32, InstrumentStatus,
+    LineageId, STPMode, SequenceNumber, Side as SeamSide, SignedCents, Symbol, TimeInForce,
+    VenueCommand, VenueEvent, VenueOutcome,
 };
 use fauxchange::exchange::{ExecutionFilter, ExecutionsStore};
 use fauxchange::gateway::fix::md_projection::{self, RequestedSides};
@@ -1863,6 +1863,205 @@ async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
         rest_events[0].outcome, fix_events[0].outcome,
         "the one opened order is identical across REST and FIX (idempotency parity)"
     );
+}
+
+#[tokio::test]
+async fn test_order_entry_parity_place_into_halted_rejects_on_rest_and_fix() {
+    // #118: a place into a HALTED instrument is a journaled `VenueOutcome::Rejected`,
+    // surfaced as the OBSERVED reject on BOTH surfaces — REST `status: rejected` (a 200
+    // body, never a false `accepted`) ≡ FIX `ExecutionReport(8)` `ExecType=Rejected`
+    // (`150=8` / `39=8`), never a false `New`. REST ≡ FIX order entry.
+    let contract = sym(); // BTC-20240329-50000-C
+
+    // REST arm: halt the instrument on the domain, then POST a resting limit order.
+    let rest = cfix::rest_parity_venue();
+    rest.submit_set_instrument_status(contract.clone(), InstrumentStatus::Halted)
+        .await
+        .expect("halting the instrument must be sequenced");
+    let trader = token(&rest, "trader-1");
+    let (rest_status, rest_body) = send(
+        &rest,
+        build_request(
+            "POST",
+            &format!("{CONTRACT}/orders"),
+            Some(&trader),
+            Some(serde_json::json!({ "side": "buy", "price": 50_000, "quantity": 1 })),
+        ),
+    )
+    .await;
+    assert_eq!(
+        rest_status,
+        StatusCode::OK,
+        "an observed reject is an Ok(Receipt) rendered 200 with status=rejected, not an HTTP error"
+    );
+    assert_eq!(
+        rest_body["status"], "rejected",
+        "REST renders the OBSERVED reject, never a false accepted"
+    );
+
+    // FIX arm: an identically-seeded venue, the same instrument halted, then a `D`.
+    let harness = cfix::FixParityHarness::start().await;
+    harness
+        .state()
+        .submit_set_instrument_status(contract, InstrumentStatus::Halted)
+        .await
+        .expect("halting the instrument must be sequenced");
+    let mut trader_fix = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let reply = trader_fix.place_limit("halt-1", "1", 50_000, 1, "1").await;
+    assert!(
+        !cfix::any_msg_type(&reply, "3"),
+        "an observed place reject is never a session Reject(3)"
+    );
+    let rejected = match cfix::find_msg(&reply, "8") {
+        Some(frame) => frame,
+        None => panic!(
+            "a place into a halted instrument must be an ExecutionReport(8) Rejected, got {reply:?}"
+        ),
+    };
+    assert_eq!(
+        cfix::field(rejected, "150").as_deref(),
+        Some("8"),
+        "ExecType Rejected (never a false New)"
+    );
+    assert_eq!(
+        cfix::field(rejected, "39").as_deref(),
+        Some("8"),
+        "OrdStatus Rejected"
+    );
+}
+
+#[tokio::test]
+async fn test_fix_partial_replace_failure_is_a_cancel_reject_never_a_false_replaced() {
+    // #118: a non-atomic replace whose cancel leg commits but whose replacement add is
+    // rejected (`Replace { cancelled: true, add: Rejected }`) MUST NOT render a false
+    // `8 Replaced`, and MUST NOT track the never-resting replacement (a phantom F/G
+    // correlation). It renders an `OrderCancelReject (9)` naming the add-leg reason.
+    let harness = cfix::FixParityHarness::start().await;
+    let mut trader = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+
+    // Rest a buy on the empty book (no cross), so the original is genuinely resting.
+    let placed = trader.place_limit("pr-orig", "1", 50_000, 5, "1").await;
+    let new = match cfix::find_msg(&placed, "8") {
+        Some(new) => new,
+        None => panic!("the initial D must yield an ExecutionReport(8), got {placed:?}"),
+    };
+    assert_eq!(
+        cfix::field(new, "39").as_deref(),
+        Some("0"),
+        "OrdStatus New"
+    );
+
+    // A MARKET replace (OrdType=1, no price): the cancel leg removes the resting order,
+    // then the add leg is rejected — a market order does not rest.
+    let reply = trader.market_replace("pr-orig", "pr-new", "1", 5).await;
+    assert!(
+        cfix::find_msg(&reply, "8")
+            .filter(|f| cfix::field(f, "150").as_deref() == Some("5"))
+            .is_none(),
+        "a partial-replace failure must NEVER emit a false ExecutionReport(8) Replaced, got {reply:?}"
+    );
+    let reject = match cfix::find_msg(&reply, "9") {
+        Some(reject) => reject,
+        None => panic!("a partial-replace failure must be an OrderCancelReject(9), got {reply:?}"),
+    };
+    assert_eq!(
+        cfix::field(reject, "102").as_deref(),
+        Some("2"),
+        "CxlRejReason Broker/Exchange Option — the named add-leg reason, not the unknown-order mask (1)"
+    );
+    assert_eq!(
+        cfix::field(reject, "39").as_deref(),
+        Some("4"),
+        "OrdStatus Canceled — the cancel leg committed, so the original is gone, not Rejected (8)"
+    );
+
+    // The rejected replacement was never tracked: a cancel of its ClOrdID is the uniform
+    // masked reject (unknown order), proving no phantom correlation was created.
+    let phantom_cancel = trader.cancel("pr-new", "pr-cxl", "1").await;
+    let masked = match cfix::find_msg(&phantom_cancel, "9") {
+        Some(masked) => masked,
+        None => {
+            panic!("cancelling the never-tracked replacement must be a 9, got {phantom_cancel:?}")
+        }
+    };
+    assert_eq!(
+        cfix::field(masked, "102").as_deref(),
+        Some("1"),
+        "the never-tracked replacement is an unknown order (masked reject), not a live order"
+    );
+}
+
+#[tokio::test]
+async fn test_order_entry_parity_uncancellable_cancel_masks_reason_on_rest_and_fix() {
+    // #118: a cancel the order path refuses is the OBSERVED reject on BOTH surfaces —
+    // REST `success:false` (never a false success), FIX `OrderCancelReject(9)` (never a
+    // false `Canceled`) — and the FIX reject `Text(58)` is UNIFORM: it never reveals
+    // not-found vs not-owner vs already-gone (a cross-account enumeration oracle).
+
+    // REST arm: a cancel of an order id the venue never issued → observed Rejected,
+    // reported `success:false` (a 200 body, never a false success).
+    let rest = cfix::rest_parity_venue();
+    let trader = token(&rest, "trader-1");
+    let (rest_status, rest_body) = send(
+        &rest,
+        build_request(
+            "DELETE",
+            &format!("{CONTRACT}/orders/never-issued-id"),
+            Some(&trader),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        rest_status,
+        StatusCode::OK,
+        "an observed cancel reject is a 200 body, not an HTTP error"
+    );
+    assert_eq!(
+        rest_body["success"], false,
+        "REST reports the observed reject as success:false, never a false success"
+    );
+
+    // FIX arm: a session cancels its OWN order that has already fully filled (gone from
+    // the book) — the order path rejects it, so the masked-reject branch emits a `9`.
+    let harness = cfix::FixParityHarness::start().await;
+    let mut maker = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let mut taker = cfix::FixClient::logon(harness.addr(), cfix::TRADER2).await;
+    // trader-1 rests a sell; trader-2 fully crosses it, so trader-1's order is gone.
+    let _ = maker.place_limit("mask-maker", "2", 50_000, 2, "1").await;
+    let _ = taker.place_limit("mask-taker", "1", 50_000, 2, "1").await;
+    // trader-1 cancels its now-filled order → observed Rejected → masked OrderCancelReject(9).
+    let reply = maker.cancel("mask-maker", "mask-cxl", "2").await;
+    assert!(
+        !cfix::any_msg_type(&reply, "3"),
+        "a cancel reject is never a session Reject(3)"
+    );
+    let r9 = match cfix::find_msg(&reply, "9") {
+        Some(r9) => r9,
+        None => panic!(
+            "a cancel of an uncancellable order must be an OrderCancelReject(9), got {reply:?}"
+        ),
+    };
+    assert_eq!(
+        cfix::field(r9, "102").as_deref(),
+        Some("1"),
+        "CxlRejReason is the uniform Unknown order (not a per-reason code)"
+    );
+    // The masking contract: the Text(58) is the uniform masked reason (identical to a
+    // never-placed reject), and NEVER leaks the specific journaled cause — the not-owner
+    // reason ("requesting account does not own the order") or the already-gone reason
+    // ("order is not resting").
+    if let Some(text) = cfix::field(r9, "58") {
+        let lowered = text.to_lowercase();
+        assert!(
+            lowered.contains("unknown order"),
+            "the reject carries the uniform masked reason, got {text:?}"
+        );
+        assert!(
+            !lowered.contains("does not own") && !lowered.contains("not resting"),
+            "the reject must not reveal not-owner / already-gone, got {text:?}"
+        );
+    }
 }
 
 /// An `AddOrder` whose STP-configured book cancels one resting leg — the STP-outcome

@@ -15,13 +15,22 @@
 //! The gateway **translates**; the exchange **decides** — nothing here matches,
 //! prices, or sequences.
 //!
-//! ## Reports render committed fills, never invented state
+//! ## Reports render the observed outcome, never invented state
 //!
-//! The [`ExecReportSpec`] stream is derived from the **committed** taker fill legs
-//! read back from the shared executions store (the same read REST renders from),
-//! plus the resolved time-in-force: `New` on accept, a `Trade` per fill leg with
-//! the running `CumQty`/`LeavesQty` and the per-leg `Commission`, and a terminal
-//! `Canceled` for a killed `IOC`/`FOK`/market remainder ([03 §5.3](../../../docs/03-protocol-surfaces.md#53-order-entry-and-execution-reports),
+//! The accept/fill [`ExecReportSpec`] stream is emitted **only** for a committed,
+//! *accepted* placement: the session first inspects the sequenced
+//! [`Receipt`](crate::exchange::Receipt)'s observed
+//! [`VenueOutcome`](crate::exchange::VenueOutcome), and a journaled
+//! [`VenueOutcome::Rejected`](crate::exchange::VenueOutcome::Rejected) — a place into
+//! a halted / `Settling` / `Expired` instrument, or a cancel/replace the order path
+//! refused — renders `ExecutionReport (8) Rejected` (`D`) or `OrderCancelReject (9)`
+//! (`F`/`G`) instead of a false accept, exactly as the REST handler renders the same
+//! command's observed reject (REST ≡ FIX order entry, #118). When the outcome *is* an
+//! accept, the stream is derived from the **committed** taker fill legs read back from
+//! the shared executions store (the same read REST renders from), plus the resolved
+//! time-in-force: `New` on accept, a `Trade` per fill leg with the running
+//! `CumQty`/`LeavesQty` and the per-leg `Commission`, and a terminal `Canceled` for a
+//! killed `IOC`/`FOK`/market remainder ([03 §5.3](../../../docs/03-protocol-surfaces.md#53-order-entry-and-execution-reports),
 //! [fix-dialect §2.2](../../../docs/specs/fix-dialect.md#22-order-entry-and-execution)).
 //! Money is integer [`Cents`] internally; the decimal `Price` seam lives only at
 //! the wire edge (#036).
@@ -62,6 +71,18 @@ pub const ORD_REJ_REASON_DUPLICATE: u16 = 6;
 /// A short, non-secret `Text (58)` for a conflicting-`ClOrdID` reject — names the
 /// policy (a reused key), never a credential or internal state.
 pub const DUPLICATE_CLORDID_TEXT: &str = "client_order_id reused with a different order";
+
+/// The **uniform**, client-safe `Text (58)` an `OrderCancelReject (9)` carries when the
+/// referenced order cannot be cancelled/replaced — whether it was never placed this
+/// session, is owned by another account, or is already gone. It deliberately collapses
+/// all three so the reject is never a cross-account existence/ownership enumeration
+/// oracle (BOLA/IDOR); the specific journaled reason (`order not found`, the
+/// not-owner reason, or `order is not resting`) stays **internal** (journal + tracing),
+/// never on the wire (#118). Both the never-placed reject and the observed
+/// [`VenueOutcome::Rejected`](crate::exchange::VenueOutcome::Rejected) reject render
+/// with this one text + `CxlRejReason (102) = 1` (Unknown order), so they are
+/// indistinguishable to a client.
+pub const CANCEL_REJECT_MASKED_REASON: &str = "unknown order";
 
 /// The `BusinessRejectReason (380)` the venue emits for an unsupported application
 /// `MsgType` — `3` (Unsupported Message Type), the only `BusinessMessageReject (j)`
@@ -535,10 +556,13 @@ pub(crate) fn render_replace_reports(
 
 /// The `ExecutionReport (8)` `Canceled` for an accepted `OrderCancelRequest (F)`.
 ///
-/// The gateway confirms the cancel was accepted and sequenced; the pre-cancel fill
-/// count is not surfaced by the [`Receipt`](crate::exchange::Receipt), so `CumQty`
-/// is `0` and `LeavesQty` is `0` (the order is gone) — the same honest limitation
-/// the REST cancel handler documents.
+/// Rendered **only** when the sequenced [`Receipt`](crate::exchange::Receipt)'s observed
+/// outcome is [`VenueOutcome::Cancelled`](crate::exchange::VenueOutcome::Cancelled); a
+/// cancel the order path refused (unknown / unowned / already-gone) is a journaled
+/// [`VenueOutcome::Rejected`](crate::exchange::VenueOutcome::Rejected) rendered as a
+/// masked `OrderCancelReject (9)` instead (#118), never this `Canceled`. The pre-cancel
+/// fill count is not surfaced by the receipt, so `CumQty` is `0` and `LeavesQty` is `0`
+/// (the order is gone) — the same honest limitation the REST cancel handler documents.
 #[must_use]
 pub(crate) fn render_cancel_report(
     symbol: Symbol,

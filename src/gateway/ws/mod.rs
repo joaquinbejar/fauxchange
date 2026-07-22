@@ -53,7 +53,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::auth::{Admission, Claims, PeerAddr, RateLimitKey, RateLimitTier};
 use crate::error::{VenueError, WsError};
-use crate::exchange::{EventTimestamp, Symbol, VenueCommand};
+use crate::exchange::{EventTimestamp, FanoutSummary, Symbol, VenueCommand, VenueOutcome};
 use crate::models::{
     ActiveSubscription, Permission, SubscriptionChannel, SubscriptionResult, WsMessage,
 };
@@ -773,13 +773,36 @@ impl Connection {
         };
         match state.submit(command).await {
             // `MarketMakerControl` is venue-global: [`AppState::submit`] fans it out
-            // to every underlying's actor, each journaling it (#47). The live persona
-            // apply seam is wired by phase 2; the control is sequenced today.
-            Ok(_receipt) => WsMessage::Config {
-                enabled: knobs.enabled.unwrap_or(true),
-                spread_multiplier: knobs.spread_multiplier.unwrap_or(1.0),
-                size_scalar: knobs.size_scalar.unwrap_or(1.0),
-                directional_skew: knobs.directional_skew.unwrap_or(0.0),
+            // to every underlying's actor, each journaling it (#47). Render the OBSERVED
+            // outcome + fan-out delivery (#118), never an unconditional success:
+            //   - a journaled control `Rejected` is reflected as a WS error, not a false
+            //     `config` success;
+            //   - the receipt's `FanoutSummary` (`ok_count` / `total` / `fully_applied`)
+            //     is surfaced on the ack, so a PARTIAL fan-out (committed on some
+            //     underlyings, not others) is reported rather than hidden — mirroring the
+            //     REST control response.
+            Ok(receipt) => match &receipt.outcome {
+                Some(VenueOutcome::Rejected { reason }) => {
+                    WsMessage::Error(VenueError::InvalidOrder(reason.clone()).ws_error(request_id))
+                }
+                _ => {
+                    // A `MarketMakerControl` is always fanned to every underlying, so the
+                    // receipt carries a `FanoutSummary`; the `None` arm is defensive (a
+                    // single delivery, fully applied) and not taken on this control path.
+                    let fanout = receipt.fanout.unwrap_or(FanoutSummary {
+                        ok_count: 1,
+                        total: 1,
+                    });
+                    WsMessage::Config {
+                        enabled: knobs.enabled.unwrap_or(true),
+                        spread_multiplier: knobs.spread_multiplier.unwrap_or(1.0),
+                        size_scalar: knobs.size_scalar.unwrap_or(1.0),
+                        directional_skew: knobs.directional_skew.unwrap_or(0.0),
+                        ok_count: Some(fanout.ok_count),
+                        total: Some(fanout.total),
+                        fully_applied: Some(fanout.fully_applied()),
+                    }
+                }
             },
             Err(error) => WsMessage::Error(error.ws_error(request_id)),
         }
@@ -1106,6 +1129,49 @@ mod tests {
                 assert!(!enabled, "the kill control is sequenced and echoed back");
             }
             other => panic!("expected a sequenced Config response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_control_ack_surfaces_fanout_counts() {
+        // #118: a `MarketMakerControl` is venue-global (fans out to every underlying's
+        // actor), so the WS control ack surfaces the OBSERVED fan-out delivery
+        // (`ok_count` / `total` / `fully_applied`) rather than an unconditional success —
+        // a partial fan-out would show `ok_count < total` / `fully_applied: false` on the
+        // same fields, mirroring the REST control response.
+        let state = crate::state::AppState::new(crate::state::AppStateConfig::new(["BTC", "ETH"]))
+            .expect("state builds");
+        let connection = Connection::new(claims("admin", vec![Permission::Admin]));
+        let message = connection
+            .control(
+                &state,
+                ControlKnobs {
+                    spread_multiplier: Some(1.5),
+                    ..ControlKnobs::default()
+                },
+                None,
+            )
+            .await;
+        match message {
+            WsMessage::Config {
+                ok_count,
+                total,
+                fully_applied,
+                ..
+            } => {
+                assert_eq!(
+                    total,
+                    Some(2),
+                    "the venue-global control fanned out to both hosted underlyings"
+                );
+                assert_eq!(ok_count, Some(2), "both underlyings committed the control");
+                assert_eq!(
+                    fully_applied,
+                    Some(true),
+                    "a full fan-out reports fully_applied on the ack"
+                );
+            }
+            other => panic!("expected a Config ack carrying the fan-out counts, got {other:?}"),
         }
     }
 

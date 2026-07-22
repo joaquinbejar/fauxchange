@@ -67,7 +67,7 @@ pub mod stores;
 pub mod symbol;
 
 pub use self::actor::{
-    ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, FixedClock,
+    ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, FanoutSummary, FixedClock,
     JournalSnapshot, NoopFanOut, PlaceholderExecutor, Receipt, TeeFanOut, UnderlyingActor,
     VenueClock, spawn_underlying_actor,
 };

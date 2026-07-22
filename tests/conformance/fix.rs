@@ -348,6 +348,24 @@ pub fn replace_frame(
     frame_with_body(body.as_bytes())
 }
 
+/// A **market** `OrderCancelReplaceRequest (G)` (`OrdType=1`, no `Price (44)`).
+/// The executor's add leg rejects it — a market order does not rest — so the
+/// captured outcome is the partial-replace `Replace { cancelled: true, add: Rejected }`.
+#[must_use]
+pub fn market_replace_frame(
+    sender: &str,
+    seq: u64,
+    orig_cl_ord_id: &str,
+    cl_ord_id: &str,
+    side: &str,
+    qty: u64,
+) -> Vec<u8> {
+    let body = format!(
+        "35=G\x0149={sender}\x0156={VENUE}\x0134={seq}\x0152=20240329-12:00:00.000\x0141={orig_cl_ord_id}\x0111={cl_ord_id}\x0155=BTC-20240329-50000-C\x0154={side}\x0140=1\x0138={qty}\x01"
+    );
+    frame_with_body(body.as_bytes())
+}
+
 /// A `TestRequest (1)`.
 #[must_use]
 pub fn test_request_frame(sender: &str, seq: u64, test_req_id: &str) -> Vec<u8> {
@@ -604,6 +622,21 @@ impl FixClient {
             &price,
             qty,
         );
+        self.seq += 1;
+        self.round_trip(frame).await
+    }
+
+    /// Sends a **market** replace (`G`, `OrdType=1`, no price) — the cancel leg
+    /// commits but the replacement add is rejected (a market order does not rest).
+    pub async fn market_replace(
+        &mut self,
+        orig_cl_ord_id: &str,
+        cl_ord_id: &str,
+        side: &str,
+        qty: u64,
+    ) -> Vec<Vec<u8>> {
+        let frame =
+            market_replace_frame(&self.sender, self.seq, orig_cl_ord_id, cl_ord_id, side, qty);
         self.seq += 1;
         self.round_trip(frame).await
     }
