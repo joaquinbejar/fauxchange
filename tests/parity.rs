@@ -2792,6 +2792,108 @@ async fn test_one_committed_fill_renders_identically_on_rest_ws_and_fix() {
     assert_eq!(rest_keys.liquidity, "taker");
 }
 
+#[tokio::test]
+async fn test_one_committed_fill_renders_fee_consistently_on_rest_fix_and_omits_it_on_ws() {
+    // #114 item 4: the SAME committed fill's fee/commission renders with consistent
+    // SEMANTICS and UNITS (integer cents) on every present surface — the REST
+    // `ExecutionRecord.fee_cents` and the FIX `ExecutionReport(8)` `Commission(12)` +
+    // `CommType(13)=3` (absolute) carry the SAME value; the anonymised WS `fill`
+    // INTENTIONALLY omits the account-private fee. Driven over the live FIX order
+    // path into a fee-configured venue and observed on all three surfaces.
+    let harness =
+        cfix::FixParityHarness::start_with_microstructure(cfix::fee_microstructure()).await;
+    let state = harness.state();
+    let mut rx = state.subscriptions().subscribe();
+
+    // Maker trader-1 rests a sell; taker trader-2 fully crosses it. taker_bps = 25 on
+    // a 50_000c × 5 notional (250_000) → a 625c (= $6.25) taker fee.
+    let mut maker = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let _ = maker.place_limit("fee-maker", "2", 50_000, 5, "1").await;
+    let mut taker = cfix::FixClient::logon(harness.addr(), cfix::TRADER2).await;
+    let taker_reports = taker.place_limit("fee-taker", "1", 50_000, 5, "1").await;
+    let taker_reports = collect_until_trade(&mut taker, taker_reports).await;
+
+    // FIX: the taker's Trade ExecutionReport(8) carries Commission(12) + CommType(13).
+    let trade = match taker_reports
+        .iter()
+        .find(|f| cfix::fix_report_projection(f).is_some())
+    {
+        Some(frame) => frame,
+        None => panic!("the crossing must emit a taker FIX Trade report: {taker_reports:?}"),
+    };
+    let fix_commission = match cfix::field(trade, "12") {
+        Some(value) => value,
+        None => panic!("the Trade report must carry Commission(12)"),
+    };
+    let fix_commission_cents =
+        match fauxchange::gateway::fix::price::parse_signed_decimal_to_cents(&fix_commission) {
+            Ok(cents) => cents.get(),
+            Err(error) => panic!("Commission(12) must parse to signed cents: {error}"),
+        };
+    assert_eq!(
+        cfix::field(trade, "13").as_deref(),
+        Some("3"),
+        "CommType(13) is Absolute (a value in cents, not bps/percent)"
+    );
+    let execution_id = match cfix::field(trade, "17") {
+        Some(id) => id,
+        None => panic!("the Trade report must carry ExecID(17)"),
+    };
+
+    // WS: the anonymised taker fill OMITS the account-private fee/commission.
+    let messages = drain(&mut rx);
+    let taker_fill = match find_taker_fill(&messages) {
+        Some(fill) => fill,
+        None => panic!("the crossing must emit a taker WS fill"),
+    };
+    let ws_data = match ws_fill_data(&taker_fill) {
+        Some(data) => data,
+        None => panic!("the taker fill must yield a data object"),
+    };
+    assert!(ws_data.get("fee").is_none(), "WS fill must omit fee");
+    assert!(
+        ws_data.get("fee_cents").is_none(),
+        "WS fill must omit fee_cents"
+    );
+    assert!(
+        ws_data.get("commission").is_none(),
+        "WS fill must omit commission"
+    );
+    // The public `edge` must NOT leak the account-private fee: the net-of-fee edge is
+    // a REST/FIX ExecutionRecord-only analytic, so the anonymised WS fill's edge is 0
+    // (the public gross projection), never `-fee`.
+    assert_eq!(
+        ws_data.get("edge").and_then(Value::as_i64),
+        Some(0),
+        "WS fill edge must not leak the account-private net-of-fee edge"
+    );
+
+    // REST: the account-scoped ExecutionRecord for the taker leg carries fee_cents.
+    let taker_token = token(state, "trader-2");
+    let uri = format!("/api/v1/executions/{execution_id}");
+    let (status, record) = send(state, build_request("GET", &uri, Some(&taker_token), None)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the taker ExecutionRecord must be readable: {record}"
+    );
+    let rest_fee_cents = match record["fee_cents"].as_i64() {
+        Some(fee) => fee,
+        None => panic!("the REST ExecutionRecord must carry an integer fee_cents: {record}"),
+    };
+
+    // The parity contract: the fee is a non-zero integer number of cents, IDENTICAL
+    // on REST and FIX, and absent on WS.
+    assert_eq!(
+        rest_fee_cents, 625,
+        "the taker fee is 25 bps of the 250_000c notional"
+    );
+    assert_eq!(
+        fix_commission_cents, rest_fee_cents,
+        "FIX Commission(12) and REST fee_cents are the same value in the same unit (cents)"
+    );
+}
+
 // ============================================================================
 // 10. FIX conformance script (#041) — session admin + order + MD happy path
 //     AND every context-sensitive reject row of 03 §8, with reason tags +

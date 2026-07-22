@@ -53,6 +53,28 @@ pub enum MicrostructureConfigError {
         /// The configured maximum price (cents).
         max: u64,
     },
+    /// A persisted contract-spec knob (`max_price_cents` / `max_order_qty`)
+    /// exceeded the durable `BIGINT` (`i64`) domain of the store it is recorded in.
+    ///
+    /// Both knobs bound values that flow into the persisted-cents columns — a
+    /// fill's price/quantity and (through the widest notional) its fee — so a knob
+    /// above `i64::MAX` would let a fill be **admitted** yet **rejected** by the
+    /// durable store's `ValueRange` at commit. Bounding both to the DB domain at
+    /// startup makes an over-domain config a **fail-fast boot rejection** instead
+    /// of a first-durable-fill surprise
+    /// ([governance-precedence §2.1](../../../docs/governance-precedence.md#21-cents-at-the-database-boundary-lossless-encoding)).
+    #[error(
+        "{field} ({value}) exceeds the durable BIGINT (i64) domain ceiling of {ceiling}; \
+         lower {field} so a fill records losslessly in the persisted store"
+    )]
+    SpecKnobAboveDbDomain {
+        /// The offending field name (`max_price_cents` or `max_order_qty`).
+        field: &'static str,
+        /// The offending value.
+        value: u64,
+        /// The durable `i64::MAX` domain ceiling.
+        ceiling: u64,
+    },
     /// **Checked-fee proof, part A.** The widest admissible notional
     /// (`max_price_cents × max_order_qty`) exceeds the upstream
     /// multiplication-safety bound `FeeSchedule::max_guaranteed_exact_notional()`

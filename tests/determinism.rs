@@ -3882,13 +3882,15 @@ fn test_replay_refuses_an_out_of_band_price_in_a_bundle() {
 /// rejection, not a downstream generic `MoneyError::Overflow` at the fill seam.
 #[test]
 fn test_replay_refuses_an_unprovable_fee_config_in_a_bundle() {
-    // A config that would saturate `FeeSchedule::calculate_fee` (taker 100% bps on a
-    // u64::MAX × u64::MAX notional) — one `resolve` would REJECT, deserialized here to
-    // model the bypass.
+    // A config that would saturate `FeeSchedule::calculate_fee` (taker 100% bps on an
+    // i64::MAX × i64::MAX notional) — one `resolve` would REJECT, deserialized here to
+    // model the bypass. Both persisted knobs sit exactly at the durable BIGINT (i64)
+    // domain ceiling, so the domain bound (#114 item 2) passes and the checked-fee
+    // proof — not the domain check — is the rejecting gate this test targets.
     let json = r#"{
         "fees": {"maker_bps": 0, "taker_bps": 10000},
         "stp": {"mode": "off"},
-        "default_specs": {"tick_size_cents":1,"lot_size":1,"min_price_cents":1,"max_price_cents":18446744073709551615,"max_order_qty":18446744073709551615},
+        "default_specs": {"tick_size_cents":1,"lot_size":1,"min_price_cents":1,"max_price_cents":9223372036854775807,"max_order_qty":9223372036854775807},
         "per_underlying": {}
     }"#;
     let bad: MicrostructureConfig =

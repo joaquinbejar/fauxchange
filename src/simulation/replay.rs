@@ -632,12 +632,18 @@ fn replay_streams_inner(
         } = recovered.map_err(|error| ReplayError::from_journal(&stream.underlying, error))?;
 
         // Reconstruct the executions store + positions fold from the SAME events,
-        // through the same post-journal fan-out the live actor drives.
+        // through the same post-journal fan-out the live actor drives. When a config
+        // is applied, feed the venue fee schedule so the reconstructed executions
+        // store's net-of-fee `edge_cents` matches the live venue's (#114 item 3) — a
+        // live-only analytic, excluded from the replay oracle either way.
         let mut fan_out = StoreFanOut::new(
             Arc::clone(&executions),
             Arc::clone(&positions),
             Arc::clone(&marks),
         );
+        if let Some(config) = microstructure {
+            fan_out = fan_out.with_fee_schedule(config.fee_schedule());
+        }
         for event in &events {
             // A store projection failure during reconstruction means the journal
             // cannot be faithfully re-projected — halt at the exact sequence rather

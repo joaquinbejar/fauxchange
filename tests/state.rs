@@ -14,7 +14,8 @@ use fauxchange::exchange::{
     Cents, ExecutionFilter, ExecutionsStore, FanoutSummary, Hash32, InstrumentStatus, LineageId,
     PositionsStore, STPMode, Side, Symbol, TimeInForce, VenueCommand, VenueOutcome,
 };
-use fauxchange::state::{AppState, AppStateConfig};
+use fauxchange::microstructure::MicrostructureConfig;
+use fauxchange::state::{AppState, AppStateConfig, AppStateError};
 use fauxchange::{AccountId, ClientOrderId, LiquidityFlag, OrderType, VenueError, VenueOrderId};
 
 fn state(underlyings: &[&str]) -> Arc<AppState> {
@@ -109,6 +110,31 @@ async fn test_client_order_id_resolves_through_the_shared_account_scoped_seam() 
             .is_none(),
         "a colliding client id on another account is indistinguishable from unknown"
     );
+}
+
+/// #114 item 1: `AppState::new` re-runs `MicrostructureConfig::validate()` on the
+/// live path (before spawning any actor), so a config that arrived deserialized
+/// (bypassing the `resolve` proof) with an out-of-domain spec knob fails fast with a
+/// typed `AppStateError::Microstructure`, never serving a request.
+#[tokio::test]
+async fn test_appstate_new_rejects_invalid_microstructure_before_spawning_actors() {
+    // Start from the neutral default, then poison one persisted spec knob past the
+    // durable BIGINT (i64) domain via a serde round-trip — the same path a hostile /
+    // legacy bundle takes to reach `AppState` without going through `resolve`.
+    let mut json = serde_json::to_value(MicrostructureConfig::default())
+        .expect("the default microstructure serializes");
+    json["default_specs"]["max_price_cents"] = serde_json::json!(u64::MAX);
+    let hostile: MicrostructureConfig =
+        serde_json::from_value(json).expect("the poisoned microstructure deserializes");
+
+    let config = AppStateConfig::new(["BTC"])
+        .with_lineage(LineageId::new("run-ms-invalid"))
+        .with_microstructure(hostile);
+    match AppState::new(config) {
+        Err(AppStateError::Microstructure(_)) => {}
+        Err(other) => panic!("expected AppStateError::Microstructure, got {other:?}"),
+        Ok(_) => panic!("an invalid microstructure config must not build an AppState"),
+    }
 }
 
 /// A gateway stand-in submits a crossing pair through the ONLY path and reads the

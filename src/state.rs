@@ -152,10 +152,15 @@ pub enum AppStateError {
     /// runtime). Only reachable when `DATABASE_URL` is set.
     #[error(transparent)]
     Db(#[from] DbError),
-    /// The venue microstructure (#044) could not be applied to a book at creation —
-    /// the resolved contract specs were rejected by the upstream builder. Unreachable
-    /// for a resolver-validated config (the config seam proves it at load); surfaced
-    /// rather than unwrapped.
+    /// The venue microstructure (#044) failed validation on the live path (#114
+    /// item 1): a spec knob is out of range (a zero tick / lot / min-price / max-qty,
+    /// a `max_price_cents` below `min_price_cents`, or a persisted knob above the
+    /// durable `BIGINT` domain), or the fee schedule fails the checked-fee proof
+    /// against the venue-default or a per-underlying/per-symbol widest notional.
+    /// [`AppState::new`] re-runs [`MicrostructureConfig::validate`](crate::microstructure::MicrostructureConfig::validate)
+    /// **before spawning any actor**, so a config that arrived resolved OR
+    /// deserialized directly (bypassing `resolve`) fails fast at boot rather than at
+    /// the first fill.
     #[error(transparent)]
     Microstructure(#[from] MicrostructureConfigError),
     /// Boot-time journal recovery (#85) failed for an underlying whose durable
@@ -1003,6 +1008,16 @@ impl AppState {
         // and the admission seam.
         let microstructure = Arc::new(microstructure);
 
+        // Re-run the resolver's validation on the LIVE path (#114 item 1) BEFORE any
+        // actor is spawned. `AppStateConfig::microstructure` may arrive already
+        // resolved OR deserialized directly (bypassing `resolve` and therefore the
+        // spec-range + checked-fee proof), so the live venue must prove it the same
+        // way the replay/bundle path does — a degenerate fee/spec config fails fast
+        // at boot with a typed `AppStateError::Microstructure`, never serving a
+        // request or reaching a leaf
+        // ([05 §4.1](../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
+        microstructure.validate()?;
+
         // The one shared venue clock (#028): the rate limiter, every actor's
         // `venue_ts`, and the simulator's `SimStep.now_ms` all read this SAME
         // advancing clock, so a single seeded clock decides every timestamp and
@@ -1230,7 +1245,12 @@ impl AppState {
                     Arc::clone(&executions),
                     Arc::clone(&positions),
                     Arc::clone(&marks),
-                ),
+                )
+                // The venue fee schedule feeds the executions store's net-of-fee
+                // `edge_cents` analytic (#114 item 3) — the SAME schedule the leaf
+                // applied to the fill, so the recomputed edge is exact. A live-only
+                // projection input, excluded from the replay oracle.
+                .with_fee_schedule(microstructure.fee_schedule()),
                 WsFanOut::new(Arc::clone(&subscriptions)),
             );
             let header = JournalHeader::new(lineage_id.clone());

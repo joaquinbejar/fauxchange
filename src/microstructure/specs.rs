@@ -157,13 +157,21 @@ impl ResolvedContractSpecs {
         self.max_order_qty
     }
 
+    /// The durable `BIGINT` (`i64`) domain ceiling every persisted-cents knob must
+    /// stay within so a fill records losslessly in the durable store.
+    pub const DB_DOMAIN_CEILING: u64 = i64::MAX as u64;
+
     /// Validates every knob is in range: tick / lot / min-price / max-qty at least
-    /// one, and the `max_price_cents` cap at or above the `min_price_cents` floor.
+    /// one, the persisted `max_price_cents` / `max_order_qty` at or below the
+    /// durable `BIGINT` (`i64`) domain, and the `max_price_cents` cap at or above
+    /// the `min_price_cents` floor.
     ///
     /// # Errors
     ///
     /// - [`MicrostructureConfigError::SpecKnobZero`] for a zero tick / lot /
     ///   min-price / max-qty;
+    /// - [`MicrostructureConfigError::SpecKnobAboveDbDomain`] if `max_price_cents`
+    ///   or `max_order_qty` exceeds `i64::MAX` (the durable `BIGINT` domain);
     /// - [`MicrostructureConfigError::MaxPriceBelowMin`] if the cap is below the
     ///   floor.
     pub fn validate(&self) -> Result<(), MicrostructureConfigError> {
@@ -175,6 +183,23 @@ impl ResolvedContractSpecs {
         ] {
             if value == 0 {
                 return Err(MicrostructureConfigError::SpecKnobZero { field });
+            }
+        }
+        // The two persisted knobs must fit the durable BIGINT (i64) domain, so a
+        // fill admitted against them is never rejected by the store's ValueRange at
+        // commit. `max_price_cents` also anchors the widest notional the checked-fee
+        // proof bounds, so an over-domain price would fail loud there too — this
+        // gives the specific, actionable diagnostic first, at boot.
+        for (field, value) in [
+            ("max_price_cents", self.max_price_cents),
+            ("max_order_qty", self.max_order_qty),
+        ] {
+            if value > Self::DB_DOMAIN_CEILING {
+                return Err(MicrostructureConfigError::SpecKnobAboveDbDomain {
+                    field,
+                    value,
+                    ceiling: Self::DB_DOMAIN_CEILING,
+                });
             }
         }
         if self.max_price_cents < self.min_price_cents {
@@ -358,6 +383,58 @@ mod tests {
                 max: 500,
             })
         );
+    }
+
+    #[test]
+    fn test_resolve_rejects_max_price_above_db_domain() {
+        // A persisted `max_price_cents` above the durable BIGINT (i64) domain is a
+        // typed startup rejection — an over-domain price would be admitted yet
+        // rejected by the durable store's ValueRange at the first fill (#114 item 2).
+        let over_domain = (i64::MAX as u64) + 1;
+        assert_eq!(
+            ContractSpecsConfig {
+                max_price_cents: Some(over_domain),
+                ..ContractSpecsConfig::default()
+            }
+            .resolve_over(ResolvedContractSpecs::baseline()),
+            Err(MicrostructureConfigError::SpecKnobAboveDbDomain {
+                field: "max_price_cents",
+                value: over_domain,
+                ceiling: i64::MAX as u64,
+            })
+        );
+    }
+
+    #[test]
+    fn test_resolve_rejects_max_order_qty_above_db_domain() {
+        // The mirror bound: an over-domain `max_order_qty` is refused at boot.
+        let over_domain = (i64::MAX as u64) + 1;
+        assert_eq!(
+            ContractSpecsConfig {
+                max_order_qty: Some(over_domain),
+                ..ContractSpecsConfig::default()
+            }
+            .resolve_over(ResolvedContractSpecs::baseline()),
+            Err(MicrostructureConfigError::SpecKnobAboveDbDomain {
+                field: "max_order_qty",
+                value: over_domain,
+                ceiling: i64::MAX as u64,
+            })
+        );
+    }
+
+    #[test]
+    fn test_db_domain_ceiling_is_admissible() {
+        // Exactly `i64::MAX` is inside the domain (the ceiling is inclusive).
+        let resolved = ContractSpecsConfig {
+            max_price_cents: Some(i64::MAX as u64),
+            max_order_qty: Some(i64::MAX as u64),
+            ..ContractSpecsConfig::default()
+        }
+        .resolve_over(ResolvedContractSpecs::baseline())
+        .expect("the i64::MAX ceiling itself is admissible");
+        assert_eq!(resolved.max_price_cents(), i64::MAX as u64);
+        assert_eq!(resolved.max_order_qty(), i64::MAX as u64);
     }
 
     #[test]
