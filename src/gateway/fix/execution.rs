@@ -16,7 +16,7 @@ use super::enums::{
     OrderSide,
 };
 use super::error::FixDecodeError;
-use super::header::StandardHeader;
+use super::header::{StandardHeader, UtcTimestamp};
 use super::price::{
     parse_decimal_to_cents, parse_signed_decimal_to_cents, render_cents_to_decimal,
     render_signed_cents_to_decimal,
@@ -64,6 +64,13 @@ pub struct ExecutionReport {
     pub price: Option<Cents>,
     /// `SecondaryExecID (527)` — the `underlying_sequence` join key.
     pub secondary_exec_id: SequenceNumber,
+    /// `TransactTime (60)` — the venue event-time carrier, rendered from the
+    /// report's `venue_ts` (the deterministic injected venue clock, never
+    /// wall-clock). It completes the 4th cross-surface fill **observation join
+    /// key** (`execution_id`/`underlying_sequence`/`liquidity`/`venue_ts`) on the
+    /// FIX report, so REST≡WS≡FIX observation parity is 4-of-4
+    /// ([fix-dialect §2.2](../../../docs/specs/fix-dialect.md#22-order-entry-and-execution)).
+    pub transact_time: UtcTimestamp,
     /// `Commission (12)` — the per-leg fee (signed; a maker rebate is negative).
     pub commission: Option<SignedCents>,
     /// `CommType (13)` — `3` (absolute) when a `Commission` is present.
@@ -133,6 +140,10 @@ impl FixBody for ExecutionReport {
             last_px: decode_optional_price(fields, tags::LAST_PX)?,
             price: decode_optional_price(fields, tags::PRICE)?,
             secondary_exec_id: SequenceNumber::new(fields.req_u64(tags::SECONDARY_EXEC_ID)?),
+            transact_time: UtcTimestamp::parse(
+                tags::TRANSACT_TIME,
+                fields.req_str(tags::TRANSACT_TIME)?,
+            )?,
             commission,
             comm_type,
             last_liquidity_ind,
@@ -160,6 +171,7 @@ impl FixBody for ExecutionReport {
             writer.str(tags::PRICE, &render_cents_to_decimal(price));
         }
         writer.u64(tags::SECONDARY_EXEC_ID, self.secondary_exec_id.get());
+        writer.str(tags::TRANSACT_TIME, self.transact_time.as_str());
         if let Some(commission) = self.commission {
             writer.str(
                 tags::COMMISSION,
@@ -377,6 +389,8 @@ mod tests {
             last_px: Some(Cents::new(50005)),
             price: Some(Cents::new(50005)),
             secondary_exec_id: SequenceNumber::new(7),
+            transact_time: UtcTimestamp::parse(tags::TRANSACT_TIME, "20240329-12:00:00.000")
+                .expect("ts"),
             commission: Some(SignedCents::new(-10)),
             comm_type: Some(CommType::Absolute),
             last_liquidity_ind: Some(LastLiquidityInd::Maker),
@@ -393,6 +407,11 @@ mod tests {
         // Composite ids, the underlying_sequence join key, and the signed rebate.
         assert!(wire.contains("\u{1}37=run-1:BTC:7:0\u{1}"), "{wire}");
         assert!(wire.contains("\u{1}527=7\u{1}"), "{wire}");
+        // TransactTime(60): the 4th observation join key (venue event-time carrier).
+        assert!(
+            wire.contains("\u{1}60=20240329-12:00:00.000\u{1}"),
+            "{wire}"
+        );
         assert!(wire.contains("\u{1}12=-0.10\u{1}"), "{wire}");
         match decode(&bytes) {
             Ok(DecodedMessage::ExecutionReport(back)) => assert_eq!(back, report),
@@ -437,6 +456,7 @@ mod tests {
         writer.u64(tags::LEAVES_QTY, 0);
         writer.u64(tags::CUM_QTY, 3);
         writer.u64(tags::SECONDARY_EXEC_ID, 7);
+        writer.str(tags::TRANSACT_TIME, "20240329-12:00:00.000");
         add_fee(&mut writer);
         writer.finish()
     }
