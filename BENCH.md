@@ -644,9 +644,13 @@ third).
 > as a DoS / write-≤-read-symmetry ceiling. That serialization walks each
 > record's `owner: Hash32` field through the upstream `pricelevel::Hash32` serde
 > impl, whose `Hash32::to_hex()` allocates ~32 tiny `String`s per hash (one
-> `format!("{:02x}")` per byte). A call-stack profiler (`benches/alloc_dhat.rs`,
-> `dhat`, added by `#126`) attributes **~111 allocs/op (~57 % of the turn)** to
-> that single `to_hex` path. So `77.374`/`82.657` describe **pre-`#34` code**
+> `format!("{:02x}")` per byte). This runs **more than twice per turn**: beyond
+> the two record wrappers, the *event* record also serializes one `owner: Hash32`
+> **per fill leg** (a crossing match produces two legs, a sweep more), so a
+> fill-bearing turn walks ~3.4 `to_hex` calls, not two — which is why the
+> measured cost exceeds the naive `2 × 32 = 64`. A call-stack profiler
+> (`benches/alloc_dhat.rs`, `dhat`, added by `#126`) attributes **~111 allocs/op
+> (~57 % of the turn)** to that single `to_hex` path. So `77.374`/`82.657` describe **pre-`#34` code**
 > and never applied to the tree they were committed against; the honest
 > steady-state on the current tree is the re-measured cluster below (stable,
 > two independent profilers agree). Full reconciliation and the per-call-site
