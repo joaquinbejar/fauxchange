@@ -16,9 +16,13 @@
 //!
 //! The index is a **deterministic function of the journaled `AddOrder` stream**:
 //! every placement carries its `(account, client_order_id, order_id)`, so the
-//! mapping is fully reconstructable by re-executing the journal. On restart the
-//! index is **rebuilt during recovery** (#085) from those same commands — there is
-//! no separate durable copy to keep in sync. It is never journaled itself, never
+//! mapping is fully reconstructable by re-executing the journal. The recovery
+//! seam that rebuilds it — [`recover_with_index`](crate::exchange::recover_with_index)
+//! — is implemented and tested here; on restart the index **will be rebuilt
+//! during #085 boot recovery** from those same commands once #085 wires that
+//! recovery into `AppState::new` (until then a restart against a non-empty
+//! journal still fails loud, as #085 tracks). There is no separate durable copy
+//! to keep in sync. It is never journaled itself, never
 //! read on the sequenced decision path, and never affects a book mutation, a fill,
 //! or a [`VenueOutcome`](crate::exchange::VenueOutcome) — so it sits **outside**
 //! the replay-equality scope exactly like mark prices do. Populating it is a pure
@@ -58,6 +62,18 @@ use crate::models::{AccountId, ClientOrderId, VenueOrderId};
 /// still updated (an upsert never trips the ceiling).
 pub const DEFAULT_MAX_CLORDID_INDEX_ENTRIES: usize = 1_000_000;
 
+/// The per-**account** ceiling on distinct `(account, ClOrdID)` entries — a
+/// **fairness / noisy-neighbor** bound layered under the venue-wide
+/// [`DEFAULT_MAX_CLORDID_INDEX_ENTRIES`]. Without it a single account could place
+/// enough unique-`ClOrdID` orders to exhaust the shared index for every other
+/// account (the index has no eviction), so one account's footprint is capped to a
+/// fraction of the global ceiling — many accounts must be busy at once before the
+/// venue-wide ceiling can be reached. A new key past a single account's own cap is
+/// refused with [`ClOrdIdIndexError::AccountFull`] (the order still sequences and
+/// reports; it is only no longer cross-session-correlatable), exactly like the
+/// venue-wide `Full` degrade.
+pub const DEFAULT_MAX_CLORDID_PER_ACCOUNT: usize = 65_536;
+
 /// The order metadata one `(account, ClOrdID)` resolves to — everything a gateway
 /// needs to route a cancel/replace and render its report without re-reading the
 /// single-writer book: the venue order id, its contract symbol, side, and the
@@ -86,6 +102,18 @@ pub enum ClOrdIdIndexError {
         /// The ceiling that was hit.
         max: usize,
     },
+    /// The **authenticated account** is at its per-account distinct-key ceiling
+    /// and the key is new — a fairness bound so one account cannot monopolize the
+    /// shared index (a degraded-path drop for that account only, never a failed
+    /// order, and never observable to any other account).
+    #[error(
+        "client-order-id index is full for this account ({max} entries); \
+         order not cross-session correlatable"
+    )]
+    AccountFull {
+        /// The per-account ceiling that was hit.
+        max: usize,
+    },
 }
 
 /// The venue-wide, account-scoped `(account, ClOrdID) → order_id` index.
@@ -95,26 +123,54 @@ pub enum ClOrdIdIndexError {
 /// / REST surfaces resolve from it. The critical section is a single `HashMap`
 /// operation under a [`std::sync::Mutex`] — held only for the insert/lookup, never
 /// across an `.await`.
+#[derive(Debug, Default)]
+struct Inner {
+    /// The `(account, ClOrdID) → order` map.
+    map: HashMap<(AccountId, ClientOrderId), ClOrdIdRecord>,
+    /// The number of distinct keys held per account — the per-account fairness
+    /// counter, kept atomically with `map` under the one lock. It only ever grows
+    /// (the index has no eviction yet), exactly like `map`.
+    per_account: HashMap<AccountId, usize>,
+}
+
 #[derive(Debug)]
 pub struct ClOrdIdIndex {
-    inner: Mutex<HashMap<(AccountId, ClientOrderId), ClOrdIdRecord>>,
+    inner: Mutex<Inner>,
     max_entries: usize,
+    max_per_account: usize,
 }
 
 impl ClOrdIdIndex {
-    /// Builds an empty index with the given distinct-key ceiling.
+    /// Builds an empty index with the given venue-wide distinct-key ceiling and no
+    /// tighter per-account bound (the per-account cap equals the venue-wide one, so
+    /// the venue-wide ceiling governs). Prefer [`with_default_ceiling`](Self::with_default_ceiling)
+    /// for the production path, which layers the [`DEFAULT_MAX_CLORDID_PER_ACCOUNT`]
+    /// fairness bound.
     #[must_use]
     pub fn new(max_entries: usize) -> Self {
+        Self::with_ceilings(max_entries, max_entries)
+    }
+
+    /// Builds an empty index with an explicit venue-wide ceiling AND a per-account
+    /// sub-quota (`max_per_account` is clamped to at most `max_entries`).
+    #[must_use]
+    pub fn with_ceilings(max_entries: usize, max_per_account: usize) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner::default()),
             max_entries,
+            max_per_account: max_per_account.min(max_entries),
         }
     }
 
-    /// Builds an empty index with the [`DEFAULT_MAX_CLORDID_INDEX_ENTRIES`] ceiling.
+    /// Builds an empty index with the [`DEFAULT_MAX_CLORDID_INDEX_ENTRIES`]
+    /// venue-wide ceiling and the [`DEFAULT_MAX_CLORDID_PER_ACCOUNT`] per-account
+    /// fairness bound.
     #[must_use]
     pub fn with_default_ceiling() -> Self {
-        Self::new(DEFAULT_MAX_CLORDID_INDEX_ENTRIES)
+        Self::with_ceilings(
+            DEFAULT_MAX_CLORDID_INDEX_ENTRIES,
+            DEFAULT_MAX_CLORDID_PER_ACCOUNT,
+        )
     }
 
     /// Records (or upserts) the order a client placed under `(account, cl_ord_id)`.
@@ -128,24 +184,47 @@ impl ClOrdIdIndex {
     /// # Errors
     ///
     /// [`ClOrdIdIndexError::Full`] if the key is new and the index is at its
-    /// `max_entries` ceiling.
+    /// venue-wide `max_entries` ceiling; [`ClOrdIdIndexError::AccountFull`] if the
+    /// key is new and the account is at its per-account sub-quota (checked after
+    /// the venue-wide ceiling, so a saturated venue reports `Full`).
     pub fn record(
         &self,
         account: AccountId,
         cl_ord_id: ClientOrderId,
         record: ClOrdIdRecord,
     ) -> Result<(), ClOrdIdIndexError> {
-        let mut map = self
+        let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (account, cl_ord_id);
-        if !map.contains_key(&key) && map.len() >= self.max_entries {
+        // Existing key: upsert in place — no ceiling/count change (a same-key
+        // idempotency retry or a recovery re-execution re-records the identical
+        // value, and must never be refused).
+        if let Some(slot) = inner.map.get_mut(&key) {
+            *slot = record;
+            return Ok(());
+        }
+        // New key: the venue-wide ceiling first (a saturated venue reports `Full`),
+        // then the per-account fairness sub-quota.
+        if inner.map.len() >= self.max_entries {
             return Err(ClOrdIdIndexError::Full {
                 max: self.max_entries,
             });
         }
-        map.insert(key, record);
+        let account_count = inner.per_account.get(&key.0).copied().unwrap_or(0);
+        if account_count >= self.max_per_account {
+            return Err(ClOrdIdIndexError::AccountFull {
+                max: self.max_per_account,
+            });
+        }
+        let next = account_count
+            .checked_add(1)
+            .ok_or(ClOrdIdIndexError::AccountFull {
+                max: self.max_per_account,
+            })?;
+        inner.per_account.insert(key.0.clone(), next);
+        inner.map.insert(key, record);
         Ok(())
     }
 
@@ -162,6 +241,7 @@ impl ClOrdIdIndex {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map
             .get(&key)
             .cloned()
     }
@@ -172,6 +252,7 @@ impl ClOrdIdIndex {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map
             .len()
     }
 
@@ -181,6 +262,7 @@ impl ClOrdIdIndex {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map
             .is_empty()
     }
 }
@@ -358,5 +440,39 @@ mod tests {
         assert_eq!(err, ClOrdIdIndexError::Full { max: 1 });
         // The refused placement left the index untouched.
         assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_per_account_sub_quota_bounds_one_account_and_spares_others() {
+        // Venue-wide ceiling 10, per-account 2: one account cannot monopolize.
+        let index = ClOrdIdIndex::with_ceilings(10, 2);
+        let account_a = AccountId::new("acct-a");
+        let account_b = AccountId::new("acct-b");
+        index
+            .record(account_a.clone(), ClientOrderId::new("a-1"), record("o-a1"))
+            .expect("A first fits");
+        index
+            .record(account_a.clone(), ClientOrderId::new("a-2"), record("o-a2"))
+            .expect("A second fits its quota of 2");
+        // A third NEW key for account A trips the per-account quota, NOT the
+        // venue-wide ceiling (only 2 of 10 global slots are used).
+        let err = index
+            .record(account_a.clone(), ClientOrderId::new("a-3"), record("o-a3"))
+            .expect_err("A third new key hits the per-account sub-quota");
+        assert_eq!(err, ClOrdIdIndexError::AccountFull { max: 2 });
+        // Account B is unaffected — a noisy account A cannot deny B the shared index.
+        index
+            .record(account_b.clone(), ClientOrderId::new("b-1"), record("o-b1"))
+            .expect("B still records despite A being at its per-account quota");
+        // A's existing keys still upsert (never refused).
+        index
+            .record(account_a, ClientOrderId::new("a-1"), record("o-a1b"))
+            .expect("A upsert of an existing key is never refused");
+        assert_eq!(
+            index
+                .resolve(&account_b, &ClientOrderId::new("b-1"))
+                .map(|r| r.order_id),
+            Some(VenueOrderId::new("o-b1"))
+        );
     }
 }

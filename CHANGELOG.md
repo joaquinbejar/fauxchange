@@ -98,8 +98,11 @@ The full versioning and release-process policy lives in the design docs
   - **Account isolation.** The key is `(AccountId, ClientOrderId)`; a colliding
     `ClOrdID` under another account is a different key ⇒ resolves to `None` ⇒ a
     clean `9` / not-found, **indistinguishable** from a genuinely unknown id (no
-    cross-account ownership leak, mirroring #132's masking). The index is
-    bounded (`DEFAULT_MAX_CLORDID_INDEX_ENTRIES`) with a typed `Full` error.
+    cross-account ownership leak, mirroring #132's masking). The index is bounded
+    both venue-wide (`DEFAULT_MAX_CLORDID_INDEX_ENTRIES`, typed `Full`) **and per
+    account** (`DEFAULT_MAX_CLORDID_PER_ACCOUNT`, typed `AccountFull`) — the
+    per-account fairness sub-quota stops one account exhausting the shared index
+    for everyone (a degraded-path drop, never a failed order).
   - Known limitation (documented in code): `VenueCommand::Replace` carries no
     `client_order_id`, so a replace's **new** `ClOrdID` is not journaled and is
     absent from the recovery-rebuilt index; same-session replace re-keying still
