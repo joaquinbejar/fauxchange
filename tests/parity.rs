@@ -2755,9 +2755,9 @@ async fn test_one_committed_fill_renders_identically_on_rest_ws_and_fix() {
         ws_keys, rest_keys,
         "one fill renders identically on REST and WS (all join keys)"
     );
-    // FIX carries `execution_id`, `liquidity`, `underlying_sequence`, `side`,
-    // `quantity`, `price` — every join key EXCEPT `venue_ts` (the FIX dialect has no
-    // venue-timestamp tag, so that key is REST≡WS only).
+    // FIX carries `execution_id`, `liquidity`, `underlying_sequence`, `venue_ts`
+    // (`TransactTime 60`, #104), `side`, `quantity`, `price` — ALL FOUR fill
+    // observation join keys (4-of-4 REST≡WS≡FIX observation parity).
     assert_eq!(
         fix_keys.execution_id, ws_keys.execution_id,
         "FIX ExecID(17) == the shared execution_id"
@@ -2765,6 +2765,10 @@ async fn test_one_committed_fill_renders_identically_on_rest_ws_and_fix() {
     assert_eq!(
         fix_keys.liquidity, ws_keys.liquidity,
         "FIX LastLiquidityInd(851) == liquidity"
+    );
+    assert_eq!(
+        fix_keys.venue_ts, ws_keys.venue_ts,
+        "FIX TransactTime(60) == venue_ts (the 4th observation join key, #104)"
     );
     assert_eq!(
         fix_keys.underlying_sequence, ws_keys.underlying_sequence,

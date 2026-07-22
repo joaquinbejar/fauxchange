@@ -107,6 +107,7 @@ pub fn execution_report_fixture() -> ExecutionReport {
         last_px: Some(Cents::new(50005)),
         price: Some(Cents::new(50005)),
         secondary_exec_id: SequenceNumber::new(7),
+        transact_time: ts(),
         commission: Some(SignedCents::new(-10)),
         comm_type: Some(CommType::Absolute),
         last_liquidity_ind: Some(LastLiquidityInd::Maker),

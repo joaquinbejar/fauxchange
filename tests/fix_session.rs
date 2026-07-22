@@ -679,6 +679,13 @@ async fn test_crossing_order_reports_trade_with_join_keys_and_commission() {
         Some("2"),
         "LastLiquidityInd = Taker"
     );
+    // TransactTime(60) = the venue event-time carrier (venue_ts), the 4th
+    // observation join key (#104) — present and a well-formed FIX UTC timestamp.
+    let transact_time = field(trade, "60").expect("TransactTime(60)");
+    assert!(
+        fauxchange::gateway::fix::header::UtcTimestamp::parse(60, &transact_time).is_ok(),
+        "60 is a FIX UTC timestamp: {transact_time}"
+    );
 }
 
 /// Logs a session in as `(user, pw, sender)` and drains the credential-free ack.

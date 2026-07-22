@@ -47,8 +47,8 @@
 use crate::error::FixRejectReason;
 use crate::error::VenueError;
 use crate::exchange::{
-    Cents, Hash32, LineageId, SequenceNumber, Side as SeamSide, Symbol, TimeInForce as SeamTif,
-    VenueCommand,
+    Cents, EventTimestamp, Hash32, LineageId, SequenceNumber, Side as SeamSide, Symbol,
+    TimeInForce as SeamTif, VenueCommand,
 };
 use crate::gateway::rest::support::add_order_command;
 use crate::models::{
@@ -355,6 +355,11 @@ pub(crate) struct ExecReportSpec {
     pub price: Option<Cents>,
     /// `SecondaryExecID (527)` — the `underlying_sequence` join key.
     pub secondary_exec_id: SequenceNumber,
+    /// `TransactTime (60)` — the venue event-time carrier, rendered from the
+    /// committed command's `venue_ts` (a fill leg carries its own `executed_at`,
+    /// the 4th observation join key). Deterministic injected venue clock, never
+    /// wall-clock.
+    pub transact_time: UtcTimestamp,
     /// `Commission (12)` — the signed per-leg fee.
     pub commission: Option<crate::exchange::SignedCents>,
     /// `CommType (13)`.
@@ -386,6 +391,7 @@ impl ExecReportSpec {
             last_px: self.last_px,
             price: self.price,
             secondary_exec_id: self.secondary_exec_id,
+            transact_time: self.transact_time,
             commission: self.commission,
             comm_type: self.comm_type,
             last_liquidity_ind: self.last_liquidity_ind,
@@ -419,11 +425,19 @@ fn render_placement_reports(
     price: Option<Cents>,
     order_id: &VenueOrderId,
     sequence: SequenceNumber,
+    venue_ts: EventTimestamp,
     lineage: &LineageId,
     underlying: &str,
     tif: SeamTif,
     taker_legs: &[ExecutionRecord],
 ) -> Vec<ExecReportSpec> {
+    // The `New`/`Replaced` accept and the terminal `Canceled` are products of this
+    // one sequenced command, so they carry the command's commit instant; a `Trade`
+    // leg carries its own `executed_at` — the 4th fill observation join key (equal
+    // to the command `venue_ts` by the single-writer invariant, but read from the
+    // fill so the report's TransactTime IS the fill's venue_ts).
+    let command_ts = UtcTimestamp::from_epoch_ms(venue_ts.get());
+
     // Synthetic `ExecID` indices for the non-fill reports, above every fill index
     // (fills use indices `0..leg_count`), so no id collides. These are
     // id-disambiguation indices bounded by the (tiny) fill count, not a sequence
@@ -450,6 +464,7 @@ fn render_placement_reports(
         last_px: None,
         price,
         secondary_exec_id: sequence,
+        transact_time: command_ts.clone(),
         commission: None,
         comm_type: None,
         last_liquidity_ind: None,
@@ -482,6 +497,7 @@ fn render_placement_reports(
             last_px: Some(leg.price_cents),
             price,
             secondary_exec_id: sequence,
+            transact_time: UtcTimestamp::from_epoch_ms(leg.executed_at.get()),
             commission: Some(leg.fee_cents),
             comm_type: Some(CommType::Absolute),
             last_liquidity_ind: Some(liquidity_ind(leg.liquidity)),
@@ -506,6 +522,7 @@ fn render_placement_reports(
             last_px: None,
             price,
             secondary_exec_id: sequence,
+            transact_time: command_ts.clone(),
             commission: None,
             comm_type: None,
             last_liquidity_ind: None,
@@ -519,10 +536,12 @@ fn render_placement_reports(
 
 /// The committed `ExecutionReport (8)` stream for an accepted `NewOrderSingle (D)`.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_new_order_reports(
     order: &NewOrderSingle,
     order_id: &VenueOrderId,
     sequence: SequenceNumber,
+    venue_ts: EventTimestamp,
     lineage: &LineageId,
     underlying: &str,
     tif: SeamTif,
@@ -537,6 +556,7 @@ pub(crate) fn render_new_order_reports(
         order.price,
         order_id,
         sequence,
+        venue_ts,
         lineage,
         underlying,
         tif,
@@ -551,6 +571,7 @@ pub(crate) fn render_replace_reports(
     replace: &OrderCancelReplaceRequest,
     new_order_id: &VenueOrderId,
     sequence: SequenceNumber,
+    venue_ts: EventTimestamp,
     lineage: &LineageId,
     underlying: &str,
     taker_legs: &[ExecutionRecord],
@@ -568,6 +589,7 @@ pub(crate) fn render_replace_reports(
         },
         new_order_id,
         sequence,
+        venue_ts,
         lineage,
         underlying,
         SeamTif::Gtc,
@@ -590,6 +612,7 @@ pub(crate) fn render_cancel_report(
     side: OrderSide,
     order_id: VenueOrderId,
     sequence: SequenceNumber,
+    venue_ts: EventTimestamp,
     lineage: &LineageId,
     underlying: &str,
 ) -> ExecReportSpec {
@@ -606,6 +629,7 @@ pub(crate) fn render_cancel_report(
         last_px: None,
         price: None,
         secondary_exec_id: sequence,
+        transact_time: UtcTimestamp::from_epoch_ms(venue_ts.get()),
         commission: None,
         comm_type: None,
         last_liquidity_ind: None,
@@ -632,6 +656,7 @@ pub(crate) fn render_mass_cancel_leg_report(
     side: OrderSide,
     order_id: VenueOrderId,
     sequence: SequenceNumber,
+    venue_ts: EventTimestamp,
     lineage: &LineageId,
     underlying: &str,
     index: u32,
@@ -649,6 +674,7 @@ pub(crate) fn render_mass_cancel_leg_report(
         last_px: None,
         price: None,
         secondary_exec_id: sequence,
+        transact_time: UtcTimestamp::from_epoch_ms(venue_ts.get()),
         commission: None,
         comm_type: None,
         last_liquidity_ind: None,
@@ -674,6 +700,7 @@ pub(crate) fn render_status_report(
     order_id: VenueOrderId,
     quantity: u64,
     cum: u64,
+    read_ts: EventTimestamp,
     last_leg: Option<&ExecutionRecord>,
     lineage: &LineageId,
     underlying: &str,
@@ -696,6 +723,11 @@ pub(crate) fn render_status_report(
     let sequence = last_leg
         .map(|leg| leg.underlying_sequence)
         .unwrap_or(SequenceNumber::new(0));
+    // `TransactTime (60)`: the most recent fill's `executed_at` when the order has
+    // traded, else the read-clock instant for a resting/unfilled order — a
+    // deterministic venue-clock read, never wall-clock.
+    let transact_time =
+        UtcTimestamp::from_epoch_ms(last_leg.map_or(read_ts, |leg| leg.executed_at).get());
     ExecReportSpec {
         order_id,
         exec_id: lineage.execution_id(underlying, sequence, 0),
@@ -709,6 +741,7 @@ pub(crate) fn render_status_report(
         last_px: last_leg.map(|leg| leg.price_cents),
         price: None,
         secondary_exec_id: sequence,
+        transact_time,
         commission: None,
         comm_type: None,
         last_liquidity_ind: None,
@@ -864,6 +897,7 @@ mod tests {
             &limit_d(FixTif::Gtc),
             &order_id,
             SequenceNumber::new(7),
+            EventTimestamp::new(1_711_713_600_000),
             &lineage,
             "BTC",
             SeamTif::Gtc,
@@ -886,6 +920,7 @@ mod tests {
             &limit_d(FixTif::Gtc),
             &order_id,
             SequenceNumber::new(7),
+            EventTimestamp::new(1_711_713_600_000),
             &lineage,
             "BTC",
             SeamTif::Gtc,
@@ -906,6 +941,15 @@ mod tests {
         );
         assert_eq!(trade.comm_type, Some(CommType::Absolute));
         assert_eq!(trade.last_liquidity_ind, Some(LastLiquidityInd::Taker));
+        // TransactTime(60): the accept report carries the command's commit instant,
+        // while the Trade leg carries the FILL's own `executed_at` — the 4th
+        // observation join key. `taker_leg` stamps `executed_at = 0`, distinct from
+        // the command `venue_ts` driven above, proving the Trade uses the fill's time.
+        assert_eq!(
+            specs[0].transact_time,
+            UtcTimestamp::from_epoch_ms(1_711_713_600_000)
+        );
+        assert_eq!(trade.transact_time, UtcTimestamp::from_epoch_ms(0));
         // The Trade report's ExecID is the fill's execution_id; the New report's is
         // synthesized above the fill index, so they never collide.
         assert_ne!(specs[0].exec_id, trade.exec_id);
@@ -923,6 +967,7 @@ mod tests {
             &limit_d(FixTif::Ioc),
             &order_id,
             SequenceNumber::new(7),
+            EventTimestamp::new(1_711_713_600_000),
             &lineage,
             "BTC",
             SeamTif::Ioc,
@@ -945,6 +990,7 @@ mod tests {
             &limit_d(FixTif::Ioc),
             &order_id,
             SequenceNumber::new(7),
+            EventTimestamp::new(1_711_713_600_000),
             &lineage,
             "BTC",
             SeamTif::Ioc,
@@ -968,6 +1014,7 @@ mod tests {
             &limit_d(FixTif::Gtc),
             &order_id,
             SequenceNumber::new(7),
+            EventTimestamp::new(1_711_713_600_000),
             &lineage,
             "BTC",
             SeamTif::Gtc,

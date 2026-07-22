@@ -25,9 +25,9 @@
 //! - **The FIX fill projection** ([`fix_report_projection`]): the join keys a FIX
 //!   `ExecutionReport (8)` carries — `execution_id` (`ExecID 17`), `liquidity`
 //!   (`LastLiquidityInd 851`), `underlying_sequence` (`SecondaryExecID 527`),
-//!   `side`, `quantity`, `price` — for observation parity against the REST / WS
-//!   projections. FIX carries **no** `venue_ts` in this dialect, so that join key is
-//!   REST≡WS only (documented at the call site).
+//!   `venue_ts` (`TransactTime 60`, #104), `side`, `quantity`, `price` — for
+//!   observation parity against the REST / WS projections. With `TransactTime (60)`
+//!   the FIX report carries all four fill observation join keys (4-of-4 REST≡WS≡FIX).
 
 #![allow(dead_code)]
 
@@ -870,8 +870,8 @@ pub async fn drive_fix_orders(harness: &FixParityHarness, steps: &[Step]) -> Vec
 // ============================================================================
 
 /// The join keys a FIX `ExecutionReport (8)` `Trade` carries — the FIX projection
-/// of one fill leg. FIX does **not** carry `venue_ts` in this dialect, so it is
-/// absent here (that join key is REST≡WS only).
+/// of one fill leg. `TransactTime (60)` carries `venue_ts` (#104), so all four fill
+/// observation join keys are present (4-of-4 REST≡WS≡FIX observation parity).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixReportProjection {
     /// `ExecID (17)` — the composite execution id.
@@ -880,6 +880,9 @@ pub struct FixReportProjection {
     pub liquidity: String,
     /// `SecondaryExecID (527)` — the `underlying_sequence` join key.
     pub underlying_sequence: u64,
+    /// `TransactTime (60)` — the `venue_ts` join key, parsed back to epoch ms
+    /// through the same UTC-timestamp seam that renders it.
+    pub venue_ts: u64,
     /// `Side (54)` mapped to the wire word (`buy` / `sell`).
     pub side: String,
     /// `LastQty (32)`.
@@ -913,10 +916,16 @@ pub fn fix_report_projection(frame: &[u8]) -> Option<FixReportProjection> {
     let price = fauxchange::gateway::fix::price::parse_decimal_to_cents(&field(frame, "31")?)
         .ok()?
         .get();
+    // TransactTime(60) carries `venue_ts`; parse it back to epoch ms through the same
+    // UTC-timestamp seam that renders it, so the projection is the fill's `venue_ts`.
+    let venue_ts = fauxchange::gateway::fix::header::UtcTimestamp::parse(60, &field(frame, "60")?)
+        .ok()?
+        .to_epoch_ms()?;
     Some(FixReportProjection {
         execution_id: field(frame, "17")?,
         liquidity,
         underlying_sequence: field(frame, "527")?.parse().ok()?,
+        venue_ts,
         side,
         quantity: field(frame, "32")?.parse().ok()?,
         price,

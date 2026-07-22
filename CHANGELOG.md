@@ -165,6 +165,18 @@ The full versioning and release-process policy lives in the design docs
     stale cancel renders a masked `9`, not a false `Canceled`; the rebuilt index
     after restart resolves the same `ClOrdID`s deterministically (including a
     replace); REST/FIX parity at the shared seam.
+- **`TransactTime(60)` on FIX `ExecutionReport(8)` — 4-of-4 observation join
+  keys** (#104). #41 found the FIX report rendered 3 of the 4 fill-observation
+  join keys (`ExecID 17`, `SecondaryExecID 527`, `LastLiquidityInd 851`) but not
+  `venue_ts`. The report now carries `TransactTime(60)` as the venue event-time
+  carrier, populated from `venue_ts` (the deterministic injected venue clock,
+  never wall-clock) via the same `UtcTimestamp` formatter the inbound
+  `NewOrderSingle(D)`'s tag 60 uses — so REST≡WS≡FIX now agree on all four join
+  keys directly on the wire. A `Trade` leg carries the fill's own `executed_at`;
+  accept/terminal/cancel carry the command commit `venue_ts`. Round-trips
+  (`encode∘decode`), goldens regenerated, `docs/specs/fix-dialect.md` §2.2
+  updated. (Tag 60 is now a required field on the report's decode path — the
+  `fix_decode` fuzz target was rebuilt.)
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;

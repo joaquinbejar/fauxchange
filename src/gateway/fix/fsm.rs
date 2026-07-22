@@ -77,7 +77,7 @@ use super::store::{
     FixSessionStore, ResetTrigger, SequenceResetEvent, SessionCounters, SessionKey, StoredOutbound,
 };
 use super::{DecodedMessage, FixBody, session};
-use crate::exchange::event::SequenceNumber;
+use crate::exchange::event::{EventTimestamp, SequenceNumber};
 use crate::models::WsMessage;
 use tokio::sync::broadcast;
 
@@ -852,6 +852,7 @@ impl SessionFsm {
                         last_px: None,
                         price: order.price,
                         secondary_exec_id: SequenceNumber::new(0),
+                        transact_time: UtcTimestamp::from_epoch_ms(now_ms),
                         commission: None,
                         comm_type: None,
                         last_liquidity_ind: None,
@@ -1089,6 +1090,7 @@ impl SessionFsm {
                 last_px: None,
                 price,
                 secondary_exec_id: SequenceNumber::new(0),
+                transact_time: UtcTimestamp::from_epoch_ms(now_ms),
                 commission: None,
                 comm_type: None,
                 last_liquidity_ind: None,
@@ -2218,6 +2220,7 @@ impl VenueFixSession {
             order.order_id.clone(),
             order.quantity,
             cum,
+            EventTimestamp::new(now_ms),
             legs.last(),
             self.state.lineage_id(),
             &underlying,
@@ -2356,6 +2359,7 @@ impl VenueFixSession {
                         &order,
                         &order_id,
                         receipt.underlying_sequence,
+                        receipt.venue_ts,
                         self.state.lineage_id(),
                         &underlying,
                         tif,
@@ -2543,6 +2547,11 @@ impl VenueFixSession {
                 order_flow::fix_side(swept.leg.side),
                 swept.leg.order_id.clone(),
                 swept.sequence,
+                // The aggregated swept legs carry no per-leg commit `venue_ts`, so a
+                // mass-cancel leg's `TransactTime (60)` is the render-turn venue-clock
+                // instant (`now_ms`, the injected venue clock the FIX handler runs on —
+                // never wall-clock, deterministic on replay) (#104).
+                EventTimestamp::new(now_ms),
                 &lineage,
                 &underlying,
                 index,
@@ -2621,6 +2630,7 @@ impl VenueFixSession {
                             resolved.side,
                             resolved.order_id.clone(),
                             receipt.underlying_sequence,
+                            receipt.venue_ts,
                             self.state.lineage_id(),
                             &underlying,
                         );
@@ -2761,6 +2771,7 @@ impl VenueFixSession {
                             &replace,
                             &new_order_id,
                             receipt.underlying_sequence,
+                            receipt.venue_ts,
                             self.state.lineage_id(),
                             &underlying,
                             &legs,
