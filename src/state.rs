@@ -1258,7 +1258,10 @@ impl AppState {
         // is the `AppState`'s, like the actors').
         let market_maker = Arc::new(
             MarketMakerEngine::new(
-                ActorCommandSink::new(handles.clone()),
+                // The requote sink admits each generated quote against the venue
+                // price band (#109) with the SAME resolved config the submit seam
+                // uses, so a band-violating requote never rests on a leaf.
+                ActorCommandSink::new(handles.clone(), Arc::clone(&microstructure)),
                 lineage_id.clone(),
                 Quoter::default(),
             )
@@ -1281,7 +1284,14 @@ impl AppState {
         let simulator = PriceSimulator::new(
             assets,
             simulation,
-            VenueStepSink::new(handles.clone(), Arc::clone(&market_maker)),
+            // The step sink admits each simulated reference price against the venue
+            // band (#109) with the SAME resolved config the submit seam uses, so an
+            // out-of-band sim price is rejected before it is sequenced or requotes.
+            VenueStepSink::new(
+                handles.clone(),
+                Arc::clone(&market_maker),
+                Arc::clone(&microstructure),
+            ),
             clock.clone(),
         );
 

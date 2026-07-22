@@ -18,18 +18,27 @@
 //! The **venue-owned price band** (`min_price_cents` / `max_price_cents`) is *not*
 //! applied here: the upstream `ContractSpecs` / `ValidationConfig` carries no price
 //! bound, so the band is enforced separately via
-//! [`MicrostructureConfig::admit_price`], **before matching**, at the **gateway
-//! order-admission seam** (`AppState::submit`) and the **replay re-execution seam**
-//! (the recovery reducer that reconstructs a book from a journal / bundle). It is
-//! **not yet** applied to the venue's internal order producer, the **market-maker
-//! requote sink** (`ActorCommandSink`), which submits generated `AddOrder`s straight
-//! onto the actors — so a market-maker quote (including one induced by a simulator
-//! price step) can currently rest outside the band. Because the fee seam is checked
-//! (`FeeSchedule::try_calculate_fee`), this is fail-safe today, and the
-//! behavioural choice for an over-band internal quote (drop / clamp / reject) plus
-//! the enforcement is tracked as follow-up **#109**. (The price-simulator sink
-//! forwards `SimStep` price updates, which carry no limit price, so the band does
-//! not apply to it.)
+//! [`MicrostructureConfig::admit_price`], **before matching**, at **every**
+//! order-producer seam using that **one** shared check — the **gateway
+//! order-admission seam** (`AppState::submit`), the **replay re-execution seam**
+//! (the recovery reducer that reconstructs a book from a journal / bundle), and,
+//! since **#109**, the venue's two internal producers: the **market-maker requote
+//! sink** ([`ActorCommandSink`](crate::market_maker::ActorCommandSink)) and the
+//! **price-simulator step sink** ([`VenueStepSink`](crate::simulation::VenueStepSink)).
+//! A band-violating market-maker quote is **dropped** before it is submitted (never
+//! posted, never journaled; the in-band side of the requote still quotes), and a
+//! simulation step whose reference price falls outside the band is **rejected**
+//! (never sequenced, drives no requote) — each consistent with `admit_price`'s reject
+//! semantics and each a pure function of config + price, so the decision is identical
+//! on a live run and on replay (the journal simply never contains the dropped item).
+//! The band spans **both** what a resting order carries (`AddOrder`/`Replace` limit
+//! prices) **and** a `SimStep` reference price: `check_price_band` admits a `SimStep`
+//! against the band too, so a reference price entered via REST `insert_price`
+//! (submitted as a `SimStep` through `AppState::submit`) is band-checked identically
+//! to the simulation producer — there is no producer that can inject an out-of-band
+//! price. The band is therefore a true venue-wide admission invariant, which makes the
+//! checked-fee proof (`FeeSchedule::try_calculate_fee`) unconditional rather than
+//! conditional on the gateway/replay seams alone.
 //! ([05 §4.1](../../../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
 
 use option_chain_orderbook::UnderlyingOrderBook;

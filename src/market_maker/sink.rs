@@ -18,13 +18,28 @@
 //! the requote's `orderbook_delta`. That marker is a venue-wide contract consumed
 //! by both this domain and the WS service, so it lives in [`crate::exchange`]
 //! beside the [`VenueCommand`] it tags ([02 §6](../../docs/02-matching-architecture.md)).
+//!
+//! ## The requote is admitted against the venue price band (#109)
+//!
+//! Before the forwarder hands a requote to its actor it runs the **same**
+//! [`check_price_band`] the gateway order seam ([`crate::state::AppState::submit`])
+//! runs — never a second, forked band check. A requote whose limit price falls
+//! outside the underlying's `[min_price_cents, max_price_cents]` band is **dropped**
+//! (never posted, never journaled), logged at `debug`; a cancel (no limit price)
+//! and the in-band side (a separate command) pass through untouched, so the maker
+//! keeps quoting the side that fits. The decision is a pure function of the resolved
+//! config and the price — no wall-clock, RNG, or map-iteration order — so a quote
+//! dropped on a live run is dropped identically on replay: the journal simply never
+//! contains it, and re-execution reproduces the same stream
+//! ([05 §4.1](../../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use crate::exchange::{ActorHandle, SymbolParser, VenueCommand};
+use crate::exchange::{ActorHandle, SymbolParser, VenueCommand, check_price_band};
+use crate::microstructure::MicrostructureConfig;
 
 /// The sink a market maker routes its generated commands into — the sequenced
 /// order path.
@@ -64,17 +79,29 @@ pub struct ActorCommandSink {
 
 impl ActorCommandSink {
     /// Builds the sink over the venue's per-underlying actor handles and spawns
-    /// its forwarder task. Must be called within a `tokio` runtime.
+    /// its forwarder task, admitting each requote against `microstructure`'s price
+    /// band (#109). Must be called within a `tokio` runtime.
     #[must_use]
-    pub fn new(handles: HashMap<Arc<str>, ActorHandle>) -> Arc<Self> {
-        Self::with_capacity(handles, DEFAULT_SINK_CAPACITY)
+    pub fn new(
+        handles: HashMap<Arc<str>, ActorHandle>,
+        microstructure: Arc<MicrostructureConfig>,
+    ) -> Arc<Self> {
+        Self::with_capacity(handles, microstructure, DEFAULT_SINK_CAPACITY)
     }
 
     /// Builds the sink with an explicit bounded forwarder capacity.
     #[must_use]
-    pub fn with_capacity(handles: HashMap<Arc<str>, ActorHandle>, capacity: usize) -> Arc<Self> {
+    pub fn with_capacity(
+        handles: HashMap<Arc<str>, ActorHandle>,
+        microstructure: Arc<MicrostructureConfig>,
+        capacity: usize,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel(capacity.max(1));
-        let forwarder = Forwarder { handles, rx };
+        let forwarder = Forwarder {
+            handles,
+            rx,
+            microstructure,
+        };
         tokio::spawn(forwarder.run());
         Arc::new(Self { tx })
     }
@@ -101,6 +128,9 @@ impl CommandSink for ActorCommandSink {
 struct Forwarder {
     handles: HashMap<Arc<str>, ActorHandle>,
     rx: mpsc::Receiver<VenueCommand>,
+    /// The resolved venue microstructure — the source of the price band each
+    /// requote is admitted against before it reaches a leaf (#109).
+    microstructure: Arc<MicrostructureConfig>,
 }
 
 impl Forwarder {
@@ -117,6 +147,21 @@ impl Forwarder {
                 );
                 continue;
             };
+            // Admit the requote against the venue-owned price band using the SAME
+            // `check_price_band` the gateway submit seam runs (#109) — never a
+            // second band check. A band-violating quote is DROPPED before `submit`
+            // (never posted, never journaled); a cancel and the in-band side (a
+            // separate command) carry no violation and pass. The drop is a pure
+            // function of config + price, so it is identical on a live run and on
+            // replay: the out-of-band quote is simply never in the journal.
+            if let Err(error) = check_price_band(&self.microstructure, &command) {
+                tracing::debug!(
+                    underlying = %underlying,
+                    error = %error,
+                    "market-maker requote is outside the venue price band; dropping (not posting)"
+                );
+                continue;
+            }
             if let Err(error) = handle.submit(command).await {
                 // Best-effort: a rejected requote (full mailbox, sealed underlying)
                 // is dropped; the next price tick requotes.
@@ -146,25 +191,34 @@ fn routable_underlying(command: &VenueCommand) -> Option<String> {
 mod tests {
     use super::*;
     use crate::exchange::{
-        Cents, EventTimestamp, MARKET_MAKER_OWNER, STPMode, Side, Symbol, TimeInForce,
-        market_maker_account,
+        ActorConfig, Cents, EventTimestamp, FixedClock, InMemoryVenueJournal, JournalHeader,
+        JournalRecord, LineageId, MARKET_MAKER_OWNER, MatchingExecutor, NoopFanOut, STPMode, Side,
+        Symbol, TimeInForce, market_maker_account, spawn_underlying_actor,
     };
     use crate::models::{OrderType, VenueOrderId};
+
+    const BTC_CALL: &str = "BTC-20351231-50000-C";
 
     fn sym(raw: &str) -> Symbol {
         Symbol::parse(raw).expect("valid fixture symbol")
     }
 
     fn mm_add(symbol: &str) -> VenueCommand {
+        mm_add_priced(symbol, "mm-1", Side::Buy, 100)
+    }
+
+    /// A market-maker `AddOrder` at `price` cents on `side` — the shape the engine
+    /// enqueues per requote leg (bid and ask are separate commands).
+    fn mm_add_priced(symbol: &str, order_id: &str, side: Side, price: u64) -> VenueCommand {
         VenueCommand::AddOrder {
             symbol: sym(symbol),
-            order_id: VenueOrderId::new("mm-1"),
+            order_id: VenueOrderId::new(order_id),
             account: market_maker_account(),
             owner: MARKET_MAKER_OWNER,
             client_order_id: None,
-            side: Side::Buy,
+            side,
             order_type: OrderType::Limit,
-            limit_price: Some(Cents::new(100)),
+            limit_price: Some(Cents::new(price)),
             quantity: 1,
             time_in_force: TimeInForce::Gtc,
             stp_mode: STPMode::None,
@@ -182,6 +236,109 @@ mod tests {
                 now_ms: EventTimestamp::new(1),
             }),
             None
+        );
+    }
+
+    /// The limit prices of every `AddOrder` **command** journaled onto `handle`'s
+    /// stream — the write-ahead record is appended before matching, so a command
+    /// that reached the actor appears here whether or not the leaf accepted it. A
+    /// requote dropped at the sink is absent entirely.
+    async fn journaled_add_prices(handle: &ActorHandle) -> Vec<u64> {
+        let snapshot = handle.snapshot().await.expect("journal snapshot");
+        snapshot
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                JournalRecord::Command(command) => match &command.command {
+                    VenueCommand::AddOrder {
+                        limit_price: Some(price),
+                        ..
+                    } => Some(price.get()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A band-violating requote (an ask above `max_price_cents`) is DROPPED at the
+    /// sink and never reaches the leaf — its command is never journaled — while the
+    /// in-band bid on the same requote still posts (#109). Proven against a real
+    /// single-underlying actor: the sink forwards onto it, and only the admitted
+    /// command lands in its write-ahead journal.
+    #[tokio::test]
+    async fn test_out_of_band_requote_is_dropped_and_in_band_side_still_posts() {
+        let lineage = LineageId::new("run-mm-band");
+        let (handle, _join) = spawn_underlying_actor(
+            ActorConfig::new("BTC", lineage.clone(), 64),
+            InMemoryVenueJournal::new(JournalHeader::new(lineage)),
+            MatchingExecutor::new("BTC"),
+            NoopFanOut,
+            FixedClock::new(EventTimestamp::new(1_700_000_000_000)),
+        );
+        let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::new();
+        handles.insert(Arc::from("BTC"), handle.clone());
+
+        // The baseline band caps at 100_000_000 cents. The sink admits each requote
+        // against that SAME band the gateway submit seam uses.
+        let sink = ActorCommandSink::new(handles, Arc::new(MicrostructureConfig::default()));
+        // A requote's two legs, as the engine emits them: an in-band bid and an
+        // out-of-band ask (above the cap).
+        sink.enqueue(mm_add_priced(BTC_CALL, "mm-bid", Side::Buy, 50_000));
+        sink.enqueue(mm_add_priced(BTC_CALL, "mm-ask", Side::Sell, 200_000_000));
+
+        // Drain the forwarder, then read the journal: only the in-band bid was
+        // submitted and journaled; the out-of-band ask was dropped at the sink and
+        // never reached the leaf.
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            journaled_add_prices(&handle).await,
+            vec![50_000],
+            "the in-band bid posts; the out-of-band ask is dropped before the leaf"
+        );
+    }
+
+    /// Determinism: the SAME requote command + config yields the SAME admit/drop
+    /// decision on a live run and on a replay — the band is a pure function of
+    /// config + price, with no clock/RNG/iteration-order input (#109). Two fresh
+    /// actors driven with the identical command stream journal the identical
+    /// admitted commands.
+    #[tokio::test]
+    async fn test_band_drop_is_identical_across_two_runs() {
+        async fn run() -> Vec<u64> {
+            let lineage = LineageId::new("run-mm-det");
+            let (handle, _join) = spawn_underlying_actor(
+                ActorConfig::new("BTC", lineage.clone(), 64),
+                InMemoryVenueJournal::new(JournalHeader::new(lineage)),
+                MatchingExecutor::new("BTC"),
+                NoopFanOut,
+                FixedClock::new(EventTimestamp::new(1_700_000_000_000)),
+            );
+            let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::new();
+            handles.insert(Arc::from("BTC"), handle.clone());
+            let sink = ActorCommandSink::new(handles, Arc::new(MicrostructureConfig::default()));
+            // In-band, out-of-band, in-band — the middle command must drop on both.
+            sink.enqueue(mm_add_priced(BTC_CALL, "a", Side::Buy, 50_000));
+            sink.enqueue(mm_add_priced(BTC_CALL, "b", Side::Sell, 200_000_000));
+            sink.enqueue(mm_add_priced(BTC_CALL, "c", Side::Buy, 60_000));
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            journaled_add_prices(&handle).await
+        }
+
+        let live = run().await;
+        let replay = run().await;
+        assert_eq!(
+            live, replay,
+            "the band decision is identical live and on replay"
+        );
+        assert_eq!(
+            live,
+            vec![50_000, 60_000],
+            "both in-band legs post in order; the out-of-band leg is dropped on both runs"
         );
     }
 }
