@@ -213,14 +213,15 @@ async fn run(
     // ---- open-loop, coordinated-omission-corrected measurement ----------------
     //
     // Deliberately on a FRESH actor / fresh in-memory journal, not the one the
-    // closed-loop section just grew to `warmup_ops + measured_ops` records —
-    // see "hp1_command_append" / "hp1_event_append" above: this in-memory
-    // journal's `append` does an O(current size) linear scan for its
-    // `(sequence, kind)` uniqueness check, so chaining the open-loop phase
-    // onto the already-grown journal would confound "genuine open-loop
-    // queueing delay" with "journal-size-dependent service-time growth" — two
-    // different, both real, effects this bench keeps visibly separate rather
-    // than blending into one number (see BENCH.md's HP-1 interpretation).
+    // closed-loop section just grew to `warmup_ops + measured_ops` records.
+    // Since #091 this journal's `append` is O(1) — an index-backed
+    // `(sequence, kind)` uniqueness check plus a size-check fast path replaced
+    // the old O(current size) linear scan + per-append serialize (BENCH.md
+    // §3.7) — so service time no longer grows with journal depth. The fresh
+    // actor is retained anyway as clean methodology: it keeps "genuine
+    // open-loop queueing delay" isolated from any residual warm-cache / grown-
+    // `Vec` effects of the closed-loop phase, so the open-loop number stays a
+    // single, unconfounded measurement (see BENCH.md's HP-1 interpretation).
     //
     // `support::openloop::wait_until` paces to genuine microsecond accuracy
     // (a coarse `tokio::time::sleep` for the bulk of the wait, then a

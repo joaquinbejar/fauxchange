@@ -321,6 +321,30 @@ The full versioning and release-process policy lives in the design docs
     and two same-seed runs reorder identically; disabled-latency journal is
     byte-identical to FIFO; the buffer is bounded under flood; all three clock
     modes order by virtual deadline.
+- **Restored the in-memory HP-1 append tail latency** (#91). `InMemoryVenueJournal::append`
+  carried two measured tail costs (BENCH.md): a full `serde_json::to_string`
+  serialize on **every** append (the `check_record_size` ceiling) and an
+  O(journal-depth) uniqueness linear scan. Both are now latency fixes with
+  **identical guarantees** (no correctness/semantics change):
+  - **Index-backed uniqueness (O(1)).** A `HashMap<(SequenceNumber, RecordKind),
+    usize>` maps each key to its slot; `append` does one lookup instead of the
+    O(depth) scan (idempotent re-append no-op vs typed `Conflict` unchanged). The
+    `Vec` stays the ordered source of truth — the index is **only** a uniqueness
+    accelerator, never iterated for output, so no map-iteration order enters the
+    journal and determinism is intact.
+  - **Size-check fast path.** A cheap, allocation-free **conservative upper-bound**
+    on the serialized size (`BASE + 6×Σ(string bytes) + 512×(elements)`, the
+    ×6 the worst-case JSON escape expansion) is checked first; the exact
+    `serde_json` serialize runs **only** when the estimate exceeds the ceiling.
+    Because `estimate ≥ true size` always, `estimate ≤ ceiling ⇒ true ≤ ceiling`
+    (safe skip) and every over-ceiling record falls through to the exact refusal
+    — the #34 write-≤-read symmetry stays **exact**.
+  - **Measured (BENCH.md §3.7):** command-append p50 **158 µs → 125 ns**
+    (~1267×), full-turn p99 **1.11 ms → 33 µs** (~34×), and p99.9 / p99.99 now
+    both well inside 1 ms where they were previously past the ceiling. Honest A/B
+    on the same machine (the "before" reproduced by reverting only the two
+    `append` changes).
+
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;
