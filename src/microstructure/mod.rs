@@ -17,6 +17,7 @@ mod apply;
 mod config;
 mod error;
 mod fees;
+mod ingress;
 mod latency;
 mod specs;
 mod stp;
@@ -25,6 +26,10 @@ pub use apply::apply_to_underlying;
 pub use config::{FileMicrostructure, MicrostructureConfig, MicrostructureProfile};
 pub use error::{LatencyConfigError, MicrostructureConfigError, PriceBoundError};
 pub use fees::FeeConfig;
+pub use ingress::{
+    DEFAULT_INGRESS_BUFFER_CAPACITY, IngressBufferFull, IngressReorderBuffer, IngressStamp,
+    MAX_INGRESS_OFFSET_US, ReleaseKey, release_deadline_us,
+};
 pub use latency::{FileLatency, LatencyConfig, LatencyModel, LatencyOffset};
 pub use specs::{ContractSpecsConfig, PriceBounds, ResolvedContractSpecs};
 pub use stp::{StpConfig, StpMode};
