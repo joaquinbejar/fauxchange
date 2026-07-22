@@ -83,7 +83,7 @@ use crate::exchange::{
     InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader,
     JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink, MassCancelScope,
     MatchingExecutor, PositionsStore, Receipt, Recovered, SequenceNumber, StoreFanOut, Symbol,
-    TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_price_band,
+    TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_order_admission,
     recover_into, spawn_matching_actor_with_registry_and_index,
     spawn_underlying_actor_with_clordid_index,
 };
@@ -2151,19 +2151,24 @@ impl AppState {
         })
     }
 
-    /// Admits a price-bearing order command against the venue-owned price band
-    /// (`[min_price_cents, max_price_cents]`, #044) resolved for the command's
-    /// underlying — the admission seam that runs **before matching** so an over-band
-    /// price never reaches a leaf and is never journaled
-    /// ([05 §4.1](../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
+    /// Admits an order command against the venue-owned **per-symbol** contract-spec
+    /// gate — the price band (`[min_price_cents, max_price_cents]`, #044) **and** the
+    /// tick / lot / max-quantity (#114 item 5), resolved for the command's full
+    /// **symbol** (symbol-specific → underlying → venue-default) — the admission seam
+    /// that runs **before matching** so a per-symbol-violating order never reaches a
+    /// leaf and is never journaled
+    /// ([05 §4.1](../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable),
+    /// [05 §7](../docs/05-microstructure-config.md#7-contract-specs-tick-and-lot)).
     ///
-    /// Only `AddOrder` / `Replace` carrying a `limit_price` are checked; a market
-    /// order (no limit price) and every non-order command carry no price to admit.
-    /// Delegates to the **shared** [`check_price_band`] so the live submit seam and
-    /// the replay/recovery re-execution seam enforce the venue-owned band identically
-    /// (a non-parsing symbol is skipped here and rejected by [`route`](Self::route)).
+    /// Only `AddOrder` / `Replace` (and a `SimStep` reference price, band-only) carry
+    /// anything to admit; every other command is a no-op. Delegates to the **shared**
+    /// [`check_order_admission`] so the live submit seam and the replay/recovery
+    /// re-execution seam enforce the identical per-symbol gate (a non-parsing symbol
+    /// is skipped here and rejected by [`route`](Self::route)). The typed
+    /// [`OrderAdmissionError`](crate::microstructure::OrderAdmissionError) maps onto
+    /// [`VenueError::InvalidOrder`] (→ REST 400 / FIX reject).
     fn admit_command_price(&self, command: &VenueCommand) -> Result<(), VenueError> {
-        check_price_band(&self.microstructure, command)
+        check_order_admission(&self.microstructure, command)
             .map_err(|error| VenueError::InvalidOrder(error.to_string()))
     }
 

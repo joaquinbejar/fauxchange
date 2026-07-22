@@ -20,7 +20,9 @@ use option_chain_orderbook::{FeeSchedule, STPMode, SymbolParser};
 use serde::{Deserialize, Serialize};
 
 use crate::exchange::Cents;
-use crate::microstructure::error::{MicrostructureConfigError, PriceBoundError};
+use crate::microstructure::error::{
+    MicrostructureConfigError, OrderAdmissionError, PriceBoundError,
+};
 use crate::microstructure::fees::FeeConfig;
 use crate::microstructure::latency::{FileLatency, LatencyConfig};
 use crate::microstructure::specs::{ContractSpecsConfig, PriceBounds, ResolvedContractSpecs};
@@ -369,6 +371,60 @@ impl MicrostructureConfig {
     #[inline]
     pub fn admit_price(&self, underlying: &str, price: Cents) -> Result<(), PriceBoundError> {
         self.profile_for(underlying).admit_price(price)
+    }
+
+    /// Admits `price` for a full option `symbol` against the venue-owned price band,
+    /// resolving the band in the **symbol-specific → underlying → venue-default**
+    /// fallback order (#114 item 5) via [`specs_for_symbol`](Self::specs_for_symbol)
+    /// — so a per-symbol price band genuinely gates order acceptance, not only the
+    /// per-underlying one.
+    ///
+    /// A **pure function** of the shared config (the symbol → underlying mapping is
+    /// the upstream [`SymbolParser`], both override maps are point lookups), so the
+    /// same order resolves the same band decision live and on replay.
+    ///
+    /// # Errors
+    ///
+    /// A [`PriceBoundError`] if `price` falls outside the resolved per-symbol
+    /// `[min_price_cents, max_price_cents]` band.
+    #[inline]
+    pub fn admit_price_for_symbol(
+        &self,
+        symbol: &str,
+        price: Cents,
+    ) -> Result<(), PriceBoundError> {
+        self.specs_for_symbol(symbol).price_bounds().admit(price)
+    }
+
+    /// Admits a full order (`limit_price` + `quantity`) for a full option `symbol`
+    /// against the resolved **per-symbol** contract-spec gate — the venue-owned price
+    /// band, tick, lot, and max order quantity — resolving in the **symbol-specific →
+    /// underlying → venue-default** fallback order (#114 item 5) via
+    /// [`specs_for_symbol`](Self::specs_for_symbol).
+    ///
+    /// This is the admission the sequenced order path runs **before** the leaf so a
+    /// per-symbol tick / lot / max-quantity / price-band override genuinely
+    /// accepts/rejects an order. The upstream `orderbook-rs` `ContractSpecs` applies
+    /// only **per underlying** at the leaf (verified against the pinned upstream), so
+    /// this venue-owned check closes the per-symbol gap; the leaf continues to enforce
+    /// the per-underlying tick / lot / max-quantity, so net acceptance is the
+    /// intersection (a per-symbol override **tighter** than its underlying is the
+    /// enforceable direction). A **pure function** of the shared config, identical live
+    /// and on replay.
+    ///
+    /// # Errors
+    ///
+    /// An [`OrderAdmissionError`] naming the specific violation (band, tick, lot, or
+    /// max quantity) for the resolved per-symbol specs.
+    #[inline]
+    pub fn admit_order_for_symbol(
+        &self,
+        symbol: &str,
+        limit_price: Option<Cents>,
+        quantity: u64,
+    ) -> Result<(), OrderAdmissionError> {
+        self.specs_for_symbol(symbol)
+            .admit_order(limit_price, quantity)
     }
 
     /// A stable, deterministic fingerprint of the resolved config content — the
@@ -749,6 +805,148 @@ mod tests {
         assert_eq!(
             config.profile_for_symbol("BTC-20240329-50000-C").specs(),
             sym
+        );
+    }
+
+    #[test]
+    fn test_admit_order_for_symbol_resolves_per_symbol_then_underlying_then_default() {
+        // #114 item 5 at the ORDER level: a per-symbol override tighter than its
+        // underlying genuinely gates order acceptance, and an unlisted symbol falls
+        // back symbol → underlying → venue-default.
+        let file = FileMicrostructure {
+            specs: Some(ContractSpecsConfig {
+                // Venue default: a wide 1-cent tick, 1-lot, up to 1_000 contracts.
+                max_order_qty: Some(1_000),
+                ..ContractSpecsConfig::default()
+            }),
+            ..FileMicrostructure::default()
+        };
+        let mut specs = BTreeMap::new();
+        // BTC underlying: a looser-than-default 2_000-contract cap.
+        specs.insert(
+            "BTC".to_string(),
+            ContractSpecsConfig {
+                max_order_qty: Some(2_000),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        // One BTC contract: a TIGHTER per-symbol override — 5-cent tick, 2-lot, 10 max.
+        specs.insert(
+            "BTC-20240329-50000-C".to_string(),
+            ContractSpecsConfig {
+                tick_size_cents: Some(5),
+                lot_size: Some(2),
+                max_order_qty: Some(10),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let config = MicrostructureConfig::resolve(&file, &specs).expect("resolves");
+
+        // The overridden symbol: an order satisfying the tighter per-symbol profile is
+        // admitted; one that satisfies the (looser) underlying but violates the
+        // per-symbol tick / lot / max is rejected with the SPECIFIC per-symbol error.
+        let sym = "BTC-20240329-50000-C";
+        assert_eq!(
+            config.admit_order_for_symbol(sym, Some(Cents::new(500)), 4),
+            Ok(())
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(sym, Some(Cents::new(503)), 4),
+            Err(OrderAdmissionError::OffTick {
+                price: 503,
+                tick: 5
+            }),
+            "off the per-symbol 5-cent tick (on the underlying 1-cent tick) is rejected"
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(sym, Some(Cents::new(500)), 3),
+            Err(OrderAdmissionError::OffLot {
+                quantity: 3,
+                lot: 2
+            }),
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(sym, Some(Cents::new(500)), 50),
+            Err(OrderAdmissionError::AboveMaxQty {
+                quantity: 50,
+                max: 10
+            }),
+            "50 contracts clears the underlying 2_000 cap but violates the per-symbol 10 cap"
+        );
+
+        // A different BTC contract (no per-symbol override) falls back to the BTC
+        // underlying: 1-cent tick, 1-lot, 2_000 cap — 50 contracts is admitted here.
+        let other = "BTC-20240329-60000-C";
+        assert_eq!(
+            config.admit_order_for_symbol(other, Some(Cents::new(503)), 3),
+            Ok(())
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(other, Some(Cents::new(500)), 50),
+            Ok(())
+        );
+
+        // An ETH contract (no per-symbol, no per-underlying) falls back to the venue
+        // default: 1_000 cap — 50 admitted, 1_500 rejected.
+        let eth = "ETH-20240329-3000-C";
+        assert_eq!(
+            config.admit_order_for_symbol(eth, Some(Cents::new(500)), 50),
+            Ok(())
+        );
+        assert_eq!(
+            config.admit_order_for_symbol(eth, Some(Cents::new(500)), 1_500),
+            Err(OrderAdmissionError::AboveMaxQty {
+                quantity: 1_500,
+                max: 1_000
+            }),
+        );
+    }
+
+    #[test]
+    fn test_admit_price_for_symbol_resolves_per_symbol_band() {
+        // A per-symbol price band narrower than its underlying genuinely gates the
+        // symbol, while a sibling contract keeps the underlying's band.
+        let file = FileMicrostructure::default();
+        let mut specs = BTreeMap::new();
+        specs.insert(
+            "BTC".to_string(),
+            ContractSpecsConfig {
+                min_price_cents: Some(100),
+                max_price_cents: Some(100_000),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        specs.insert(
+            "BTC-20240329-50000-C".to_string(),
+            ContractSpecsConfig {
+                min_price_cents: Some(1_000),
+                max_price_cents: Some(2_000),
+                ..ContractSpecsConfig::default()
+            },
+        );
+        let config = MicrostructureConfig::resolve(&file, &specs).expect("resolves");
+
+        // The overridden symbol: inside [1_000, 2_000] admitted, outside rejected.
+        assert_eq!(
+            config.admit_price_for_symbol("BTC-20240329-50000-C", Cents::new(1_500)),
+            Ok(())
+        );
+        assert_eq!(
+            config.admit_price_for_symbol("BTC-20240329-50000-C", Cents::new(3_000)),
+            Err(PriceBoundError::AboveMax {
+                price: 3_000,
+                max: 2_000
+            })
+        );
+        // A sibling contract keeps the BTC underlying band [100, 100_000] — 3_000 is in.
+        assert_eq!(
+            config.admit_price_for_symbol("BTC-20240329-60000-C", Cents::new(3_000)),
+            Ok(())
+        );
+        // Determinism: the resolution is a pure function of config.
+        assert_eq!(
+            config.admit_order_for_symbol("BTC-20240329-50000-C", Some(Cents::new(1_500)), 1),
+            config.admit_order_for_symbol("BTC-20240329-50000-C", Some(Cents::new(1_500)), 1),
         );
     }
 

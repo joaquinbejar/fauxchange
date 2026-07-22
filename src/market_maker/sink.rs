@@ -23,15 +23,21 @@
 //!
 //! Before the forwarder hands a requote to its actor it runs the **same**
 //! [`check_price_band`] the gateway order seam ([`crate::state::AppState::submit`])
-//! runs — never a second, forked band check. A requote whose limit price falls
-//! outside the underlying's `[min_price_cents, max_price_cents]` band is **dropped**
-//! (never posted, never journaled), logged at `debug`; a cancel (no limit price)
-//! and the in-band side (a separate command) pass through untouched, so the maker
-//! keeps quoting the side that fits. The decision is a pure function of the resolved
-//! config and the price — no wall-clock, RNG, or map-iteration order — so a quote
-//! dropped on a live run is dropped identically on replay: the journal simply never
-//! contains it, and re-execution reproduces the same stream
+//! resolves the band through — never a second, forked band check. The band is
+//! resolved by the requote's full **symbol** (symbol → underlying → venue-default,
+//! #114 item 5), so a per-symbol price band gates the maker too. A requote whose
+//! limit price falls outside the resolved `[min_price_cents, max_price_cents]` band is
+//! **dropped** (never posted, never journaled), logged at `debug`; a cancel (no limit
+//! price) and the in-band side (a separate command) pass through untouched, so the
+//! maker keeps quoting the side that fits. The decision is a pure function of the
+//! resolved config and the price — no wall-clock, RNG, or map-iteration order — so a
+//! quote dropped on a live run is dropped identically on replay: the journal simply
+//! never contains it, and re-execution reproduces the same stream
 //! ([05 §4.1](../../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
+//! (The gateway order seam additionally enforces the per-symbol **tick / lot /
+//! max-quantity** via [`check_order_admission`](crate::exchange::check_order_admission)
+//! — the maker's own generated quotes are already tick/lot-shaped, so it shares only
+//! the band check here.)
 
 use std::collections::HashMap;
 use std::sync::Arc;

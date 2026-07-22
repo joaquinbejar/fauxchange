@@ -28,7 +28,9 @@ use option_chain_orderbook::ContractSpecs;
 use serde::{Deserialize, Serialize};
 
 use crate::exchange::Cents;
-use crate::microstructure::error::{MicrostructureConfigError, PriceBoundError};
+use crate::microstructure::error::{
+    MicrostructureConfigError, OrderAdmissionError, PriceBoundError,
+};
 
 /// `[instruments."<SYM>".specs]` / `[microstructure.specs]` — the declarative
 /// contract-spec knobs, each optional so an unset knob inherits the venue default.
@@ -256,6 +258,60 @@ impl ResolvedContractSpecs {
             min: Cents::new(self.min_price_cents),
             max: Cents::new(self.max_price_cents),
         }
+    }
+
+    /// Admits a full order (`limit_price` + `quantity`) against these resolved specs:
+    /// the venue-owned **price band**, the **tick** (price a whole multiple), the
+    /// **lot** (quantity a whole multiple), and the **max order quantity** — the
+    /// venue-owned per-symbol admission the sequenced order path runs **before** the
+    /// leaf (#114 item 5).
+    ///
+    /// A **pure function** of the resolved specs (no wall-clock / RNG), so the same
+    /// order resolves the same accept/reject decision live and on replay. `limit_price`
+    /// is `None` for a market order, which carries no price to band- or tick-check;
+    /// the lot and max-quantity checks always apply. The tick / lot moduli are guarded
+    /// against a zero divisor (a validated config has both `>= 1`, but a directly
+    /// **deserialized** [`ResolvedContractSpecs`] bypasses [`validate`](Self::validate)),
+    /// so a degenerate spec never panics on the admission path.
+    ///
+    /// # Errors
+    ///
+    /// An [`OrderAdmissionError`]: [`PriceBand`](OrderAdmissionError::PriceBand) when
+    /// the price is outside the band, [`OffTick`](OrderAdmissionError::OffTick) when
+    /// the price is off-tick, [`OffLot`](OrderAdmissionError::OffLot) when the quantity
+    /// is off-lot, or [`AboveMaxQty`](OrderAdmissionError::AboveMaxQty) when the
+    /// quantity exceeds the maximum.
+    pub fn admit_order(
+        &self,
+        limit_price: Option<Cents>,
+        quantity: u64,
+    ) -> Result<(), OrderAdmissionError> {
+        if let Some(price) = limit_price {
+            // Band first (the venue-owned cap), then tick alignment.
+            self.price_bounds().admit(price)?;
+            let value = price.get();
+            // The zero guard keeps a degenerate (deserialized, unvalidated) tick from
+            // dividing by zero; a validated config always has `tick >= 1`.
+            if self.tick_size_cents != 0 && !value.is_multiple_of(self.tick_size_cents) {
+                return Err(OrderAdmissionError::OffTick {
+                    price: value,
+                    tick: self.tick_size_cents,
+                });
+            }
+        }
+        if self.lot_size != 0 && !quantity.is_multiple_of(self.lot_size) {
+            return Err(OrderAdmissionError::OffLot {
+                quantity,
+                lot: self.lot_size,
+            });
+        }
+        if quantity > self.max_order_qty {
+            return Err(OrderAdmissionError::AboveMaxQty {
+                quantity,
+                max: self.max_order_qty,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -500,6 +556,82 @@ mod tests {
                 min: 100,
             })
         );
+    }
+
+    #[test]
+    fn test_admit_order_enforces_band_tick_lot_and_max_qty() {
+        // A resolved spec with a 5-cent tick, 2-contract lot, [100, 1_000] band, and a
+        // 10-contract max order — the per-symbol gate `admit_order` runs before the leaf.
+        let specs = ContractSpecsConfig {
+            tick_size_cents: Some(5),
+            lot_size: Some(2),
+            min_price_cents: Some(100),
+            max_price_cents: Some(1_000),
+            max_order_qty: Some(10),
+        }
+        .resolve_over(ResolvedContractSpecs::baseline())
+        .expect("resolves");
+
+        // A price + quantity satisfying every knob is admitted.
+        assert_eq!(specs.admit_order(Some(Cents::new(500)), 4), Ok(()));
+        // Band edges are inclusive.
+        assert_eq!(specs.admit_order(Some(Cents::new(100)), 2), Ok(()));
+        assert_eq!(specs.admit_order(Some(Cents::new(1_000)), 10), Ok(()));
+
+        // Off-tick price (503 not a multiple of 5).
+        assert_eq!(
+            specs.admit_order(Some(Cents::new(503)), 4),
+            Err(OrderAdmissionError::OffTick {
+                price: 503,
+                tick: 5,
+            })
+        );
+        // Off-lot quantity (3 not a multiple of 2).
+        assert_eq!(
+            specs.admit_order(Some(Cents::new(500)), 3),
+            Err(OrderAdmissionError::OffLot {
+                quantity: 3,
+                lot: 2,
+            })
+        );
+        // Above the max order quantity.
+        assert_eq!(
+            specs.admit_order(Some(Cents::new(500)), 12),
+            Err(OrderAdmissionError::AboveMaxQty {
+                quantity: 12,
+                max: 10,
+            })
+        );
+        // Below the band floor — the band is folded in as the `PriceBand` variant.
+        assert_eq!(
+            specs.admit_order(Some(Cents::new(50)), 4),
+            Err(OrderAdmissionError::PriceBand(PriceBoundError::BelowMin {
+                price: 50,
+                min: 100,
+            }))
+        );
+        // A market order (no limit price) skips band + tick but still lot/max-checks.
+        assert_eq!(specs.admit_order(None, 4), Ok(()));
+        assert_eq!(
+            specs.admit_order(None, 3),
+            Err(OrderAdmissionError::OffLot {
+                quantity: 3,
+                lot: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn test_admit_order_never_divides_by_zero_on_degenerate_deserialized_specs() {
+        // A directly-deserialized `ResolvedContractSpecs` bypasses `validate`, so a
+        // hostile bundle could carry a zero tick / lot. `admit_order` must never panic
+        // on the modulo (rules/global_rules.md: no panic on inbound) — it guards the
+        // zero divisor and simply skips that knob's alignment check.
+        let degenerate: ResolvedContractSpecs = serde_json::from_str(
+            r#"{"tick_size_cents":0,"lot_size":0,"min_price_cents":1,"max_price_cents":100000000,"max_order_qty":1000000}"#,
+        )
+        .expect("deserializes");
+        assert_eq!(degenerate.admit_order(Some(Cents::new(3)), 3), Ok(()));
     }
 
     #[test]
