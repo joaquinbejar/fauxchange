@@ -809,8 +809,8 @@ impl Default for RecordingController {
 mod tests {
     use super::*;
     use crate::exchange::{
-        ActorConfig, Cents, EventTimestamp, FixedClock, Hash32, LineageId, NoopFanOut, STPMode,
-        Side, TimeInForce, UnderlyingActor, VenueCommand, VenueOutcome,
+        ActorConfig, Cents, EventTimestamp, FixedClock, Hash32, LineageId, NoopFanOut, RejectKind,
+        STPMode, Side, TimeInForce, UnderlyingActor, VenueCommand, VenueOutcome,
     };
     use crate::models::{AccountId, OrderType};
     use crate::simulation::clock::ClockMode;
@@ -1124,9 +1124,7 @@ mod tests {
                     event.underlying_sequence,
                     event.venue_ts,
                     event.command.clone(),
-                    VenueOutcome::Rejected {
-                        reason: "corrupted-by-test".to_string(),
-                    },
+                    VenueOutcome::rejected(RejectKind::Internal, "corrupted-by-test"),
                 );
             }
         }

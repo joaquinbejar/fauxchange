@@ -76,8 +76,8 @@ pub use self::boundary::{
     STPMode, Side, SymbolParser, TimeInForce, TimestampMs,
 };
 pub use self::envelope::{
-    AddOutcome, CancelReason, CancelledLeg, Fill, MassCancelScope, MassCancelType, VenueCommand,
-    VenueEvent, VenueOutcome,
+    AddOutcome, CancelReason, CancelledLeg, Fill, MassCancelScope, MassCancelType, RejectKind,
+    VenueCommand, VenueEvent, VenueOutcome,
 };
 pub use self::event::{EventTimestamp, SequenceNumber};
 pub use self::executor::{

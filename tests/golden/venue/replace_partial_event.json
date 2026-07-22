@@ -16,6 +16,7 @@
     "Replace": {
       "add": {
         "Rejected": {
+          "kind": "NotFillable",
           "reason": "order was not fillable and did not rest"
         }
       },

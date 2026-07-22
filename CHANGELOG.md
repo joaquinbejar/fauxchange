@@ -11,6 +11,25 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Surfaced the sequenced `VenueOutcome` to callers across REST/WS/FIX** (#118).
+  `Receipt` now carries the observed outcome + a `FanoutSummary`, so a gateway
+  renders the OBSERVED result — an order into a halted/`Settling`/`Expired`
+  instrument reports `Rejected` (not a false `Accepted`/`New`), an illegal
+  instrument-status toggle returns `409`, and a partial venue-global control
+  fan-out reports `ok_count`/`total`/`fully_applied` — never the requested state.
+- **Rendered the stored terminal report on an idempotent resend** (#99) — a
+  resend projects the original fills from the receipt's captured `VenueOutcome`
+  (`taker_fill_legs`) instead of a store read-back keyed on the freshly-minted
+  order id, so both REST and FIX return the true stored terminal report.
+- **A sequenced market-maker kill now cancels standing quotes** (#117) — the
+  application-layer control path emits a separate journaled owner-scoped
+  `MassCancel{ByUser(MARKET_MAKER_OWNER)}` (replay-safe, emitted once live and
+  reproduced on replay) so a kill matches the live `set_enabled(false)` semantics.
+- **Wired the explicit venue-wide mass-cancel** (#97) — REST cancel-all + FIX
+  `OrderMassCancelRequest(q)` route an owner-scoped `MassCancel` through the
+  sequenced path and render the real result (`r` accepted + one
+  `ExecutionReport(8) Canceled` per swept order); an account can cancel only its
+  own orders (owner-scoped).
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;
@@ -2252,6 +2271,14 @@ The full versioning and release-process policy lives in the design docs
 
 ### Security
 
+- **Typed reject discriminant + not-owner≡not-found masking** (#132). A journaled
+  typed `RejectKind` replaces the string-matched reject reason, and the existence
+  kinds (`NotOwner`/`NotFound`/`NotResting`) render byte-identically at the client
+  boundary across REST/WS/FIX for cancel AND replace — closing the BOLA/IDOR
+  order-enumeration side channel (order ids are deterministically minted). The
+  true kind + reason stay in the journal/`tracing` as a detective control. Adds
+  `RejectKind` to the journaled `Rejected` outcome, back-compatible via
+  `#[serde(default)]` so a pre-#132 durable journal still replays.
 - **REST/WS JSON decoder fuzz targets, the journal/bundle deserialiser fuzz
   target, and the final `SECURITY.md` — the v1.0 security gate** (#52). Three
   `cargo fuzz` targets extend the FIX-primary fuzz set (#42) with the

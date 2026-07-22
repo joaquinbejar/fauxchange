@@ -269,7 +269,7 @@ async fn test_order_into_halted_instrument_surfaces_rejected_through_submit() {
         .await
         .expect("the actor turn commits even though the command is a captured Rejected");
     match &rejected.outcome {
-        Some(VenueOutcome::Rejected { reason }) => {
+        Some(VenueOutcome::Rejected { reason, .. }) => {
             assert!(
                 reason.contains("Halted"),
                 "reason names the status: {reason}"

@@ -238,7 +238,7 @@ async fn test_scenario_halt_starves_order_entry_and_replays_the_journaled_reject
         })
         .expect("the halted-strike order is journaled");
     match &halted_event.outcome {
-        VenueOutcome::Rejected { reason } => assert!(
+        VenueOutcome::Rejected { reason, .. } => assert!(
             reason.contains("Halted"),
             "the reject names the halt status: {reason}"
         ),

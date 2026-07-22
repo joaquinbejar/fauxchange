@@ -112,6 +112,7 @@
             },
             "outcome": {
               "Rejected": {
+                "kind": "Internal",
                 "reason": "tampered-on-disk"
               }
             }

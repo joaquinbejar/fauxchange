@@ -888,6 +888,93 @@ async fn test_cancel_response_carries_typed_sequence() {
 }
 
 #[tokio::test]
+async fn test_cross_account_cancel_is_masked_identically_to_a_nonexistent_id() {
+    // #132 BOLA/IDOR mask: an authenticated account cancelling ANOTHER account's
+    // resting order must get a response BYTE-IDENTICAL to cancelling a nonexistent
+    // id — so a distinct not-owner reply can never be a cross-account
+    // existence/ownership enumeration oracle over the deterministically-minted
+    // order ids. The victim's order must survive untouched.
+    let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
+    let victim = token(&state, "trader-1");
+    let attacker = token(&state, "trader-2");
+
+    // trader-1 rests a real order and learns its venue order id.
+    let (status, place) = send(
+        &state,
+        build_request(
+            "POST",
+            &format!("{CONTRACT}/orders"),
+            Some(&victim),
+            Some(limit_body("buy", 50_000, 3)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let victim_order_id = match place["order_id"].as_str() {
+        Some(id) => id.to_string(),
+        None => panic!("place response must carry an order_id"),
+    };
+
+    // trader-2 (a DIFFERENT account) cancels trader-1's order by its id → NotOwner.
+    let (owned_status, owned_body) = send(
+        &state,
+        build_request(
+            "DELETE",
+            &format!("{CONTRACT}/orders/{victim_order_id}"),
+            Some(&attacker),
+            None,
+        ),
+    )
+    .await;
+    // trader-2 cancels a genuinely nonexistent id → NotFound.
+    let (missing_status, missing_body) = send(
+        &state,
+        build_request(
+            "DELETE",
+            &format!("{CONTRACT}/orders/definitely-not-a-real-order-id"),
+            Some(&attacker),
+            None,
+        ),
+    )
+    .await;
+
+    // Byte-identical: same status, same success flag, same message — no oracle.
+    assert_eq!(owned_status, missing_status, "same HTTP status");
+    assert_eq!(
+        owned_body["success"],
+        serde_json::json!(false),
+        "a cross-account cancel reports success:false, never a false success"
+    );
+    assert_eq!(
+        owned_body["success"], missing_body["success"],
+        "not-owner and not-found share the success flag"
+    );
+    assert_eq!(
+        owned_body["message"], missing_body["message"],
+        "not-owner and not-found render a BYTE-IDENTICAL message (the mask)"
+    );
+
+    // The victim's order SURVIVED — trader-1 cancels it for real (proves the
+    // attacker's attempt never mutated the book).
+    let (status, own_cancel) = send(
+        &state,
+        build_request(
+            "DELETE",
+            &format!("{CONTRACT}/orders/{victim_order_id}"),
+            Some(&victim),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        own_cancel["success"],
+        serde_json::json!(true),
+        "the owner's cancel succeeds — the order was untouched by the cross-account attempt"
+    );
+}
+
+#[tokio::test]
 async fn test_bulk_place_item_carries_sequence() {
     let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
     let bearer = token(&state, "trader-1");

@@ -49,7 +49,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::VenueError;
-use crate::exchange::envelope::{VenueCommand, VenueEvent, VenueOutcome};
+use crate::exchange::envelope::{RejectKind, VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::event::{EventTimestamp, SequenceNumber};
 use crate::exchange::executor::MatchingExecutor;
 use crate::exchange::identity::LineageId;
@@ -147,9 +147,10 @@ pub struct PlaceholderExecutor;
 impl CommandExecutor for PlaceholderExecutor {
     #[inline]
     fn execute(&mut self, _context: ExecutionContext<'_>) -> VenueOutcome {
-        VenueOutcome::Rejected {
-            reason: "matching not wired yet (pending #007)".to_string(),
-        }
+        VenueOutcome::rejected(
+            RejectKind::Internal,
+            "matching not wired yet (pending #007)",
+        )
     }
 }
 
@@ -1560,9 +1561,10 @@ mod tests {
     impl CommandExecutor for OversizedOutcomeExecutor {
         fn execute(&mut self, _context: ExecutionContext<'_>) -> VenueOutcome {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            VenueOutcome::Rejected {
-                reason: "x".repeat(crate::exchange::MAX_JOURNAL_RECORD_BYTES),
-            }
+            VenueOutcome::rejected(
+                RejectKind::Internal,
+                "x".repeat(crate::exchange::MAX_JOURNAL_RECORD_BYTES),
+            )
         }
     }
 

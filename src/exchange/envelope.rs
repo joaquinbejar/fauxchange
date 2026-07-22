@@ -225,6 +225,67 @@ pub struct CancelledLeg {
 }
 
 // ============================================================================
+// Reject discriminant (venue-owned typed reject vocabulary)
+// ============================================================================
+
+/// The **typed** discriminant of a captured [`VenueOutcome::Rejected`] /
+/// [`AddOutcome::Rejected`], so a gateway keys its client rendering on a **type**,
+/// not a fragile string-match of the human `reason` (#132). The human `reason`
+/// stays alongside for the journal + `tracing`; the wire mapping never parses it.
+///
+/// **Security (BOLA/IDOR mask, #132/#118).** `VenueOrderId`s are minted
+/// deterministically/sequentially, so a distinct not-owner vs not-found reply would
+/// let an authenticated caller enumerate which ids hold a live resting order owned
+/// by *another* account. The gateway therefore collapses [`RejectKind::NotOwner`],
+/// [`RejectKind::NotFound`], and [`RejectKind::NotResting`] to ONE indistinguishable
+/// client reject on the cancel/replace path (see
+/// [`VenueError::masked_cancel_reject`](crate::VenueError::masked_cancel_reject)),
+/// while the true kind — especially `NotOwner` — is journaled and traced as a
+/// detective control for repeated cross-account attempts. Because the mapping keys
+/// on this enum, refactoring the human `reason` string can never silently break the
+/// mask.
+///
+/// Wire form is the `PascalCase` variant name (this enum is carried in the durable
+/// journal, so it round-trips symmetrically like [`CancelReason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RejectKind {
+    /// The referenced order (or its leaf) does not exist on the venue.
+    NotFound,
+    /// The referenced order exists but is owned by a **different** account — an
+    /// authorization failure enforced on the shared sequenced path **before** any
+    /// book mutation. Masked as [`RejectKind::NotFound`] at the client boundary so
+    /// it is not a cross-account existence/ownership oracle; the true kind stays
+    /// internal (journal + `tracing`).
+    NotOwner,
+    /// The referenced order is owned by the caller but is no longer resting
+    /// (already filled / cancelled / gone). Masked as [`RejectKind::NotFound`] at
+    /// the client boundary.
+    NotResting,
+    /// An order targeted an instrument that is not `Active` (halted / settling /
+    /// expired) and so is not accepting orders — the sequenced instrument-status
+    /// gate.
+    InstrumentNotActive,
+    /// A business-validation failure minted on the sequenced path (a reused
+    /// `client_order_id`, a missing limit price, an unresolvable / cross-underlying
+    /// symbol, an illegal instrument-status transition, an unresolvable mass-cancel
+    /// scope).
+    InvalidOrder,
+    /// A marketable order that could neither fill nor rest — a killed `IOC` / `FOK`,
+    /// or the add leg of a replace that did not become marketable.
+    NotFillable,
+    /// A failure surfaced from the upstream matching stack as a reject reason; its
+    /// cause is redacted at the client boundary. Also the [`Default`] — the kind a
+    /// **pre-#132 journal record** (which carried only a `reason`, no `kind`) decodes
+    /// to, so an older durable journal still replays (`#[serde(default)]` on the
+    /// `kind` field); the kind is cosmetic on replay (masking renders no client
+    /// output), and `Internal` is the most-redacted, safest neutral for an unknown
+    /// legacy reject.
+    #[default]
+    Internal,
+}
+
+// ============================================================================
 // Add outcome — the add leg of a (possibly non-atomic) placement
 // ============================================================================
 
@@ -270,9 +331,25 @@ pub enum AddOutcome {
     /// The add was rejected; nothing rests, nothing filled, and — because an STP
     /// removal is itself a book mutation — no resting leg was removed either.
     Rejected {
-        /// The client-safe reason.
+        /// The **typed** reject discriminant the gateway keys its client rendering
+        /// on (#132).
+        #[serde(default)] // a pre-#132 record has no `kind` → RejectKind::Internal
+        kind: RejectKind,
+        /// The human reason, for the journal + `tracing` — never string-matched.
         reason: String,
     },
+}
+
+impl AddOutcome {
+    /// Constructs a rejected add leg with a typed [`RejectKind`] and the human
+    /// `reason` (journal + `tracing`). The gateway keys on `kind`, not the string.
+    #[must_use]
+    pub fn rejected(kind: RejectKind, reason: impl Into<String>) -> Self {
+        AddOutcome::Rejected {
+            kind,
+            reason: reason.into(),
+        }
+    }
 }
 
 // ============================================================================
@@ -397,7 +474,14 @@ pub enum VenueOutcome {
     /// The command was rejected; the book is untouched and no fill executed
     /// ([ADR-0009 §1](../../../docs/adr/0009-lossless-venue-envelope-outcomes.md)).
     Rejected {
-        /// The client-safe reason.
+        /// The **typed** reject discriminant the gateway keys its client rendering
+        /// on — never a string-match of `reason` (#132). The authorization-sensitive
+        /// existence kinds ([`RejectKind::NotOwner`] / [`RejectKind::NotFound`] /
+        /// [`RejectKind::NotResting`]) are masked identically at the client boundary.
+        #[serde(default)] // a pre-#132 record has no `kind` → RejectKind::Internal
+        kind: RejectKind,
+        /// The human reason, kept for the journal + `tracing` — never on the wire
+        /// verbatim for a masked kind, and never string-matched by a gateway.
         reason: String,
     },
     /// A **client-order-id idempotent retry** (#099): the account + `ClOrdID` key
@@ -426,6 +510,18 @@ pub enum VenueOutcome {
 }
 
 impl VenueOutcome {
+    /// Constructs a rejected outcome with a typed [`RejectKind`] discriminant and
+    /// the human `reason` (journal + `tracing`). The gateway keys on `kind`, never
+    /// the string, so refactoring the reason text can never silently change the
+    /// wire mapping / mask (#132).
+    #[must_use]
+    pub fn rejected(kind: RejectKind, reason: impl Into<String>) -> Self {
+        VenueOutcome::Rejected {
+            kind,
+            reason: reason.into(),
+        }
+    }
+
     /// The just-submitted aggressor's own **taker** fill legs as `(price,
     /// quantity)` pairs in capture order — the immediate execution of *this*
     /// add, projected directly from the captured terminal outcome.
@@ -1072,9 +1168,7 @@ mod tests {
         // back.
         let outcome = VenueOutcome::Replace {
             cancelled: true,
-            add: AddOutcome::Rejected {
-                reason: "post-only would cross".to_string(),
-            },
+            add: AddOutcome::rejected(RejectKind::NotFillable, "post-only would cross"),
         };
         assert_serde_identity(&outcome);
     }
@@ -1143,9 +1237,58 @@ mod tests {
             evicted: vec![lineage.venue_order_id("BTC", SequenceNumber::new(1), 0)],
         });
         assert_serde_identity(&VenueOutcome::ControlApplied { swept: vec![] });
-        assert_serde_identity(&VenueOutcome::Rejected {
-            reason: "instrument halted".to_string(),
-        });
+        assert_serde_identity(&VenueOutcome::rejected(
+            RejectKind::InstrumentNotActive,
+            "instrument halted",
+        ));
+    }
+
+    #[test]
+    fn test_reject_kind_round_trips_pascal_case() {
+        for kind in [
+            RejectKind::NotFound,
+            RejectKind::NotOwner,
+            RejectKind::NotResting,
+            RejectKind::InstrumentNotActive,
+            RejectKind::InvalidOrder,
+            RejectKind::NotFillable,
+            RejectKind::Internal,
+        ] {
+            let outcome = VenueOutcome::rejected(kind, "reason text");
+            assert_serde_identity(&outcome);
+        }
+        // The wire form is the PascalCase variant name.
+        assert_eq!(
+            serde_json::to_value(RejectKind::NotOwner).ok(),
+            Some(serde_json::json!("NotOwner"))
+        );
+    }
+
+    #[test]
+    fn test_pre_132_rejected_record_without_kind_decodes_to_internal() {
+        // A durable journal record written by a PRE-#132 binary carried a `Rejected`
+        // with only a `reason` and no `kind`. `#[serde(default)]` on the field keeps
+        // that record decodable (→ RejectKind::Internal) so an older journal still
+        // replays, rather than failing decode. New records always carry the kind.
+        let legacy = serde_json::json!({ "Rejected": { "reason": "some old reason" } });
+        let decoded: VenueOutcome = serde_json::from_value(legacy).expect("legacy decodes");
+        assert_eq!(
+            decoded,
+            VenueOutcome::Rejected {
+                kind: RejectKind::Internal,
+                reason: "some old reason".to_string()
+            }
+        );
+        let legacy_add = serde_json::json!({ "Rejected": { "reason": "old add reason" } });
+        let decoded_add: AddOutcome =
+            serde_json::from_value(legacy_add).expect("legacy add decodes");
+        assert_eq!(
+            decoded_add,
+            AddOutcome::Rejected {
+                kind: RejectKind::Internal,
+                reason: "old add reason".to_string()
+            }
+        );
     }
 
     #[test]

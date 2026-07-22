@@ -82,8 +82,8 @@ use crate::exchange::boundary::{
     Hash32, InstrumentStatus, OptionStyle, OrderId, STPMode, Side, TimeInForce, TimestampMs,
 };
 use crate::exchange::envelope::{
-    AddOutcome, CancelReason, CancelledLeg, Fill, MassCancelScope, MassCancelType, VenueCommand,
-    VenueOutcome,
+    AddOutcome, CancelReason, CancelledLeg, Fill, MassCancelScope, MassCancelType, RejectKind,
+    VenueCommand, VenueOutcome,
 };
 use crate::exchange::event::{EventTimestamp, SequenceNumber};
 use crate::exchange::instrument_status::InstrumentStatusRegistry;
@@ -539,9 +539,10 @@ impl MatchingExecutor {
                 };
             }
             // Conflicting reuse of the same key: refuse rather than rebind it.
-            return VenueOutcome::Rejected {
-                reason: "client_order_id was reused with a different order".to_string(),
-            };
+            return VenueOutcome::rejected(
+                RejectKind::InvalidOrder,
+                "client_order_id was reused with a different order",
+            );
         }
 
         let outcome = self.execute_add_order(
@@ -588,7 +589,7 @@ impl MatchingExecutor {
     ) -> VenueOutcome {
         let leaf = match self.resolve_leaf_vivify(symbol) {
             Ok(leaf) => leaf,
-            Err(reason) => return VenueOutcome::Rejected { reason },
+            Err(reason) => return VenueOutcome::rejected(RejectKind::InvalidOrder, reason),
         };
 
         // Instrument-status gate (#47): an order into a non-`Active` instrument is
@@ -598,12 +599,10 @@ impl MatchingExecutor {
         // so the rejection is a deterministic function of the journaled
         // `SetInstrumentStatus` stream — no wall clock, RNG, or iteration order.
         if !self.instrument_status.is_accepting_orders(symbol) {
-            return VenueOutcome::Rejected {
-                reason: instrument_not_active_reason(
-                    symbol,
-                    self.instrument_status.status_of(symbol),
-                ),
-            };
+            return VenueOutcome::rejected(
+                RejectKind::InstrumentNotActive,
+                instrument_not_active_reason(symbol, self.instrument_status.status_of(symbol)),
+            );
         }
 
         match order_type {
@@ -620,9 +619,10 @@ impl MatchingExecutor {
                 let price = match limit_price {
                     Some(price) => price,
                     None => {
-                        return VenueOutcome::Rejected {
-                            reason: "limit order requires a limit price".to_string(),
-                        };
+                        return VenueOutcome::rejected(
+                            RejectKind::InvalidOrder,
+                            "limit order requires a limit price",
+                        );
                     }
                 };
                 let add = self.run_add(
@@ -644,9 +644,7 @@ impl MatchingExecutor {
                         stp_cancelled: add.stp_cancelled,
                     }
                 } else {
-                    VenueOutcome::Rejected {
-                        reason: reject_reason(add.reason),
-                    }
+                    VenueOutcome::rejected(RejectKind::NotFillable, reject_reason(add.reason))
                 }
             }
         }
@@ -925,25 +923,21 @@ impl MatchingExecutor {
         let leaf = match self.resolve_leaf_read(symbol) {
             Some(leaf) => leaf,
             None => {
-                return VenueOutcome::Rejected {
-                    reason: "order not found".to_string(),
-                };
+                return VenueOutcome::rejected(RejectKind::NotFound, "order not found");
             }
         };
         let engine_id = match self.venue_to_engine.get(venue_order_id).copied() {
             Some(engine_id) => engine_id,
             None => {
-                return VenueOutcome::Rejected {
-                    reason: "order not found".to_string(),
-                };
+                return VenueOutcome::rejected(RejectKind::NotFound, "order not found");
             }
         };
         // Ownership gate, BEFORE any mutation: the requesting account must own the
-        // resting order, or the cancel is refused with the book untouched.
+        // resting order, or the cancel is refused with the book untouched. The typed
+        // `NotOwner` kind is masked as `NotFound` at the CLIENT boundary (#132) but
+        // journaled + traced verbatim here as a detective control.
         if !self.account_owns(engine_id, account) {
-            return VenueOutcome::Rejected {
-                reason: NOT_ORDER_OWNER_REASON.to_string(),
-            };
+            return VenueOutcome::rejected(RejectKind::NotOwner, NOT_ORDER_OWNER_REASON);
         }
         match leaf.cancel_order(engine_id) {
             Ok(true) => {
@@ -952,12 +946,8 @@ impl MatchingExecutor {
                     order_id: venue_order_id.clone(),
                 }
             }
-            Ok(false) => VenueOutcome::Rejected {
-                reason: "order is not resting".to_string(),
-            },
-            Err(error) => VenueOutcome::Rejected {
-                reason: error.to_string(),
-            },
+            Ok(false) => VenueOutcome::rejected(RejectKind::NotResting, "order is not resting"),
+            Err(error) => VenueOutcome::rejected(RejectKind::Internal, error.to_string()),
         }
     }
 
@@ -997,7 +987,7 @@ impl MatchingExecutor {
     ) -> VenueOutcome {
         let leaf = match self.resolve_leaf_vivify(symbol) {
             Ok(leaf) => leaf,
-            Err(reason) => return VenueOutcome::Rejected { reason },
+            Err(reason) => return VenueOutcome::rejected(RejectKind::InvalidOrder, reason),
         };
 
         // Resolve the target resting order. An unknown target rejects the WHOLE
@@ -1006,18 +996,16 @@ impl MatchingExecutor {
         let engine_id = match self.venue_to_engine.get(order_id).copied() {
             Some(engine_id) => engine_id,
             None => {
-                return VenueOutcome::Rejected {
-                    reason: "order not found".to_string(),
-                };
+                return VenueOutcome::rejected(RejectKind::NotFound, "order not found");
             }
         };
 
         // Ownership gate, BEFORE any mutation: the requesting account must own the
-        // target order, exactly as on the cancel path.
+        // target order, exactly as on the cancel path. The typed `NotOwner` kind is
+        // masked as `NotFound` at the CLIENT boundary (#132) but journaled + traced
+        // verbatim here as a detective control.
         if !self.account_owns(engine_id, account) {
-            return VenueOutcome::Rejected {
-                reason: NOT_ORDER_OWNER_REASON.to_string(),
-            };
+            return VenueOutcome::rejected(RejectKind::NotOwner, NOT_ORDER_OWNER_REASON);
         }
 
         // The replacement inherits the cancelled order's STP owner (the `Replace`
@@ -1032,9 +1020,7 @@ impl MatchingExecutor {
         // Cancel leg. If it does not remove the target order, reject the WHOLE
         // replace and do NOT run the add leg.
         if !matches!(leaf.cancel_order(engine_id), Ok(true)) {
-            return VenueOutcome::Rejected {
-                reason: "order is not resting".to_string(),
-            };
+            return VenueOutcome::rejected(RejectKind::NotResting, "order is not resting");
         }
         self.remove_resting(engine_id);
 
@@ -1056,9 +1042,10 @@ impl MatchingExecutor {
                 );
                 classify_add_leg(result)
             }
-            None => AddOutcome::Rejected {
-                reason: "replacement add requires a limit price".to_string(),
-            },
+            None => AddOutcome::rejected(
+                RejectKind::InvalidOrder,
+                "replacement add requires a limit price",
+            ),
         };
 
         VenueOutcome::Replace {
@@ -1086,16 +1073,14 @@ impl MatchingExecutor {
     ) -> VenueOutcome {
         // Validate + vivify the target leaf (cross-underlying / parse guard).
         if let Err(reason) = self.resolve_leaf_vivify(symbol) {
-            return VenueOutcome::Rejected { reason };
+            return VenueOutcome::rejected(RejectKind::InvalidOrder, reason);
         }
         match self.instrument_status.try_transition(symbol, status) {
             Ok(applied) => VenueOutcome::InstrumentStatusChanged {
                 symbol: symbol.clone(),
                 status: applied,
             },
-            Err(error) => VenueOutcome::Rejected {
-                reason: error.to_string(),
-            },
+            Err(error) => VenueOutcome::rejected(RejectKind::InvalidOrder, error.to_string()),
         }
     }
 
@@ -1139,9 +1124,10 @@ impl MatchingExecutor {
         } = scope
             && let Err(error) = format_expiration_yyyymmdd(expiry)
         {
-            return VenueOutcome::Rejected {
-                reason: format!("mass-cancel scope expiry is unresolvable: {error}"),
-            };
+            return VenueOutcome::rejected(
+                RejectKind::InvalidOrder,
+                format!("mass-cancel scope expiry is unresolvable: {error}"),
+            );
         }
 
         // A `ByUser` / `BySide` client sweep is pinned to the requesting account;
@@ -1966,9 +1952,7 @@ fn reject_reason(reason: String) -> String {
 /// Classifies a completed add into a replace leg's [`AddOutcome`].
 fn classify_add_leg(add: AddResult) -> AddOutcome {
     if !add_has_mutation(&add) {
-        return AddOutcome::Rejected {
-            reason: reject_reason(add.reason),
-        };
+        return AddOutcome::rejected(RejectKind::NotFillable, reject_reason(add.reason));
     }
     if add.resting_quantity > 0 {
         AddOutcome::Rested {
@@ -2380,7 +2364,7 @@ mod tests {
             ),
         );
         match outcome {
-            VenueOutcome::Rejected { reason } => assert!(reason.contains("cross-underlying")),
+            VenueOutcome::Rejected { reason, .. } => assert!(reason.contains("cross-underlying")),
             other => panic!("expected Rejected, got {other:?}"),
         }
     }
@@ -2502,9 +2486,17 @@ mod tests {
             Ok(records) => records,
             Err(e) => panic!("in-memory read is infallible: {e}"),
         };
-        // The attacker's cancel (seq 1) journaled a Rejected outcome...
+        // The attacker's cancel (seq 1) journaled a Rejected outcome carrying the
+        // TYPED `NotOwner` kind AND the verbatim internal reason — the true cause is
+        // preserved in the journal + tracing as a detective control, even though the
+        // gateway masks it as not-found on the wire (#132).
         match outcome_at(&records, 1) {
-            VenueOutcome::Rejected { reason } => {
+            VenueOutcome::Rejected { kind, reason } => {
+                assert_eq!(
+                    kind,
+                    RejectKind::NotOwner,
+                    "the journal records the TRUE kind"
+                );
                 assert_eq!(reason, NOT_ORDER_OWNER_REASON.to_string());
             }
             other => panic!("expected the attacker's cancel to be Rejected, got {other:?}"),
@@ -2958,7 +2950,12 @@ mod tests {
             },
         );
         match outcome {
-            VenueOutcome::Rejected { reason } => {
+            VenueOutcome::Rejected { kind, reason } => {
+                assert_eq!(
+                    kind,
+                    RejectKind::NotOwner,
+                    "the journal records the TRUE kind"
+                );
                 assert_eq!(reason, NOT_ORDER_OWNER_REASON.to_string());
             }
             other => panic!("expected a not-owner Rejected, got {other:?}"),
@@ -3471,7 +3468,7 @@ mod tests {
             &add_with_cloid(&lin, 1, "acct", 0x11, Side::Sell, 50_000, 9, "key-1"),
         );
         match outcome {
-            VenueOutcome::Rejected { reason } => assert!(reason.contains("client_order_id")),
+            VenueOutcome::Rejected { reason, .. } => assert!(reason.contains("client_order_id")),
             other => panic!("expected a conflicting-reuse rejection, got {other:?}"),
         }
     }

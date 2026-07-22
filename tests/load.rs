@@ -177,8 +177,9 @@ use conformance::{
 use fauxchange::VenueError;
 use fauxchange::exchange::{
     ActorConfig, Cents, EventTimestamp, FixedClock, Hash32, JournalError, JournalHeader,
-    JournalRecord, LineageId, NoopFanOut, STPMode, SequenceNumber, Side, Symbol, TimeInForce,
-    VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_record_size, spawn_matching_actor,
+    JournalRecord, LineageId, NoopFanOut, RejectKind, STPMode, SequenceNumber, Side, Symbol,
+    TimeInForce, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_record_size,
+    spawn_matching_actor,
 };
 use fauxchange::microstructure::LatencyConfig;
 use fauxchange::models::{AccountId, OrderType, VenueOrderId, WsMessage};
@@ -937,9 +938,7 @@ fn verify_restart_from_journal(
                 event.underlying_sequence,
                 event.venue_ts,
                 event.command.clone(),
-                VenueOutcome::Rejected {
-                    reason: "corrupted-by-soak-restart-check".to_string(),
-                },
+                VenueOutcome::rejected(RejectKind::Internal, "corrupted-by-soak-restart-check"),
             );
             patched = true;
         }

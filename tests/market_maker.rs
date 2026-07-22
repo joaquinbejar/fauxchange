@@ -322,7 +322,7 @@ fn test_order_into_halted_strike_is_rejected() {
         outcomes[0]
     );
     match &outcomes[1] {
-        VenueOutcome::Rejected { reason } => {
+        VenueOutcome::Rejected { reason, .. } => {
             assert!(
                 reason.contains("Halted") || reason.contains("not accepting"),
                 "the reject names the halt: {reason}"

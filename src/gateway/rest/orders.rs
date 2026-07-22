@@ -34,7 +34,7 @@ use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 
 use crate::auth::Authorized;
-use crate::error::VenueError;
+use crate::error::{CANCEL_REJECT_MASKED_REASON, VenueError};
 use crate::exchange::{
     MassCancelScope, MassCancelType, STPMode, SymbolParser, VenueCommand, VenueOutcome,
 };
@@ -186,7 +186,7 @@ pub async fn place_limit_order(
     // terminal (`VenueOutcome::terminal`), so a stored reject reads as a reject and a
     // stored fill as its fills — never a fresh empty accept.
     let (status, filled, message) = match receipt.outcome.as_ref().map(VenueOutcome::terminal) {
-        Some(VenueOutcome::Rejected { reason }) => {
+        Some(VenueOutcome::Rejected { reason, .. }) => {
             (LimitOrderStatus::Rejected, 0u64, reason.clone())
         }
         outcome => {
@@ -358,6 +358,8 @@ pub async fn cancel_order(
     let style = parse_style(&style)?;
     let symbol = build_symbol(&underlying, &expiration, strike, style)?;
     let account = auth.claims.account().clone();
+    // The client's OWN referenced order id — safe to log (never a cross-account leak).
+    let order_id_for_log = order_id.clone();
 
     let receipt = state
         .submit(VenueCommand::CancelOrder {
@@ -369,17 +371,24 @@ pub async fn cancel_order(
 
     // Render the OBSERVED outcome (#118): `success` is true only for a `Cancelled`
     // outcome; an unknown / unowned / already-gone order is a journaled `Rejected`
-    // and reports `success:false` with the reason, never a false success. `sequence`
-    // remains the typed cross-surface correlation key (#018 cannot parse prose).
+    // and reports `success:false` with a UNIFORM masked reason, never a false
+    // success. `sequence` remains the typed cross-surface correlation key.
     let (success, message) = match &receipt.outcome {
         Some(VenueOutcome::Cancelled { .. }) => (true, "order cancelled".to_string()),
-        // Uniform client-safe reject: do NOT echo which of not-found / not-owner /
-        // already-gone occurred — with deterministically-minted order ids that would
-        // be a cross-account existence/ownership enumeration oracle (BOLA/IDOR). The
-        // specific reason stays in the journal/tracing; the typed reject discriminant
-        // + full gateway masking land in #132.
-        Some(VenueOutcome::Rejected { .. }) => {
-            (false, "order not found or not cancellable".to_string())
+        // Mask keyed on the TYPED RejectKind (#132), never a string-match: not-owner,
+        // not-found, and already-gone all render IDENTICALLY here — with
+        // deterministically-minted order ids a distinct reply would be a cross-account
+        // existence/ownership enumeration oracle (BOLA/IDOR). The true kind (esp.
+        // NotOwner) stays internal — journaled + traced as a detective control.
+        Some(VenueOutcome::Rejected { kind, reason }) => {
+            tracing::info!(
+                order_id = %order_id_for_log,
+                reject_kind = ?kind,
+                internal_reason = %reason,
+                "REST cancel rejected on the sequenced order path; emitting a uniform \
+                 client-safe reject (not-owner ≡ not-found, #132)"
+            );
+            (false, CANCEL_REJECT_MASKED_REASON.to_string())
         }
         _ => (true, "cancel accepted and sequenced".to_string()),
     };

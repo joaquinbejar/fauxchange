@@ -82,9 +82,9 @@ use fauxchange::exchange::{
     InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
     JournalCommand, JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook,
     MassCancelScope, MassCancelType, MatchingExecutor, NoopFanOut, PositionsStore, RecordKind,
-    STPMode, SequenceNumber, Side, SignedCents, StoreFanOut, Symbol, SymbolError, SymbolParser,
-    TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand, VenueEvent, VenueJournal,
-    VenueOutcome, recover, validate_venue_expiry,
+    RejectKind, STPMode, SequenceNumber, Side, SignedCents, StoreFanOut, Symbol, SymbolError,
+    SymbolParser, TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand, VenueEvent,
+    VenueJournal, VenueOutcome, recover, validate_venue_expiry,
 };
 use fauxchange::gateway::fix::enums::{OrdType as FixOrdType, OrderSide, TimeInForce as FixTif};
 use fauxchange::gateway::fix::header::{StandardHeader, UtcTimestamp};
@@ -489,9 +489,7 @@ fn corrupt_event_at(recording: &Recording, target: SequenceNumber) -> InMemoryVe
                     event.underlying_sequence,
                     event.venue_ts,
                     event.command.clone(),
-                    VenueOutcome::Rejected {
-                        reason: "corrupted-by-test".to_string(),
-                    },
+                    VenueOutcome::rejected(RejectKind::Internal, "corrupted-by-test"),
                 );
                 append(&mut journal, JournalRecord::event(corrupted));
             }
@@ -1610,7 +1608,7 @@ fn test_order_into_halted_instrument_is_rejected_and_replays() {
 
     // The halted-call add is a no-op Rejected; the put add rests.
     match &recording.events[1].outcome {
-        VenueOutcome::Rejected { reason } => {
+        VenueOutcome::Rejected { reason, .. } => {
             assert!(
                 reason.contains("Halted"),
                 "reason names the status: {reason}"

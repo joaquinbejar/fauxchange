@@ -40,7 +40,7 @@
 use option_chain_orderbook::SymbolParser;
 
 use crate::exchange::actor::{CommandExecutor, ExecutionContext};
-use crate::exchange::envelope::{VenueCommand, VenueEvent};
+use crate::exchange::envelope::{AddOutcome, RejectKind, VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::event::SequenceNumber;
 use crate::exchange::executor::MatchingExecutor;
 use crate::exchange::identity::LineageId;
@@ -257,9 +257,11 @@ fn recover_from_records(
             outcome,
         );
         // The stored event (when present) is the integrity oracle, not an apply
-        // source: a mismatch halts, never a silent divergent resume.
+        // source: a mismatch halts, never a silent divergent resume. The compare
+        // tolerates ONLY a pre-#132 legacy reject that decoded to `Internal`
+        // (see `stored_event_matches`) — every other difference is corruption.
         if let Some(stored) = stored_event_at(records, command.sequence)
-            && stored != &derived
+            && !stored_event_matches(stored, &derived)
         {
             return Err(JournalError::Corruption {
                 underlying: underlying.to_string(),
@@ -278,6 +280,64 @@ fn recover_from_records(
         executor,
         last_sequence,
     })
+}
+
+/// Whether a re-derived event matches the stored oracle event, tolerating ONLY a
+/// **legacy** (pre-#132) reject whose `RejectKind` decoded to the `Internal`
+/// default.
+///
+/// A pre-#132 binary recorded a reject as `{ reason }` with no `kind`; that
+/// decodes (via `#[serde(default)]`, [envelope](crate::exchange::VenueOutcome))
+/// to [`RejectKind::Internal`]. A #132+ recovery re-derives the SPECIFIC kind
+/// (`NotFound`, `NotOwner`, …), so a plain exact compare would flag every such
+/// legacy record as [`JournalError::Corruption`] and refuse to recover an
+/// otherwise-valid journal (#132). This upgrades a stored **legacy `Internal`**
+/// reject kind to the re-derived kind before comparing, so the (absent) legacy
+/// kind is the ONLY tolerated difference — the reject `reason` and everything
+/// else must still match exactly.
+///
+/// It can never mask a real corruption: the sequenced executor is deterministic,
+/// so a #132+ journal's *genuine* `Internal` reject re-derives `Internal` and
+/// needs no upgrade, and a stored kind that is already specific is compared
+/// as-is (a specific-vs-different stored kind stays a mismatch).
+fn stored_event_matches(stored: &VenueEvent, derived: &VenueEvent) -> bool {
+    stored == derived || upgrade_legacy_reject_kind(stored, derived) == *derived
+}
+
+/// Clones `stored`, upgrading a legacy [`RejectKind::Internal`] reject kind to the
+/// re-derived kind — the top-level [`VenueOutcome::Rejected`] and the
+/// [`VenueOutcome::Replace`] add leg — for the legacy-tolerant compare in
+/// [`stored_event_matches`]. A stored kind that is not `Internal` is left
+/// untouched, so a genuine kind divergence still fails the compare.
+fn upgrade_legacy_reject_kind(stored: &VenueEvent, derived: &VenueEvent) -> VenueEvent {
+    let mut out = stored.clone();
+    match (&mut out.outcome, &derived.outcome) {
+        (
+            VenueOutcome::Rejected { kind, .. },
+            VenueOutcome::Rejected {
+                kind: derived_kind, ..
+            },
+        ) if *kind == RejectKind::Internal => {
+            *kind = *derived_kind;
+        }
+        (
+            VenueOutcome::Replace {
+                add: AddOutcome::Rejected { kind, .. },
+                ..
+            },
+            VenueOutcome::Replace {
+                add:
+                    AddOutcome::Rejected {
+                        kind: derived_kind, ..
+                    },
+                ..
+            },
+        ) if *kind == RejectKind::Internal => {
+            *kind = *derived_kind;
+        }
+        _ => {}
+    }
+    out
 }
 
 /// The write-ahead command records in ascending `underlying_sequence` order — the
@@ -307,7 +367,7 @@ fn stored_event_at(records: &[JournalRecord], sequence: SequenceNumber) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::envelope::{VenueCommand, VenueOutcome};
+    use crate::exchange::envelope::{RejectKind, VenueCommand, VenueOutcome};
     use crate::exchange::event::EventTimestamp;
     use crate::exchange::identity::{JournalHeader, VENUE_ENVELOPE_SCHEMA};
     use crate::exchange::journal::{InMemoryVenueJournal, VenueJournal};
@@ -430,9 +490,7 @@ mod tests {
                 SequenceNumber::new(0),
                 TS,
                 command,
-                VenueOutcome::Rejected {
-                    reason: "corrupted-by-test".to_string(),
-                },
+                VenueOutcome::rejected(RejectKind::Internal, "corrupted-by-test"),
             )))
             .expect("append corrupted event");
 
@@ -445,6 +503,62 @@ mod tests {
                 assert_eq!(sequence, SequenceNumber::new(0));
             }
             other => panic!("expected a Corruption halt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_recover_tolerates_a_legacy_pre_132_reject_without_kind() {
+        // A pre-#132 journal recorded a reject with no `kind`, which decodes to
+        // `RejectKind::Internal`. Recovery re-derives the SPECIFIC kind; the compare
+        // must upgrade the legacy `Internal` to that kind and RECOVER, not report the
+        // record as corruption (#132). Same-reason is required — only the absent
+        // legacy kind is tolerated.
+        let command = cancel(0);
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+        let derived = ex.execute(ExecutionContext {
+            underlying: UNDERLYING,
+            lineage_id: &lineage(),
+            sequence: SequenceNumber::new(0),
+            venue_ts: TS,
+            command: &command,
+        });
+        let (specific_kind, reason) = match &derived {
+            VenueOutcome::Rejected { kind, reason } => (*kind, reason.clone()),
+            other => panic!("a cancel of an unknown order must reject, got {other:?}"),
+        };
+        assert_ne!(
+            specific_kind,
+            RejectKind::Internal,
+            "the live reject carries a specific kind (else this test is vacuous)"
+        );
+
+        // A LEGACY stored event: the SAME reason, kind defaulted to `Internal`.
+        let mut journal = journal_with_header(JournalHeader::new(lineage()));
+        journal
+            .append(JournalRecord::command(
+                SequenceNumber::new(0),
+                TS,
+                command.clone(),
+            ))
+            .expect("append command");
+        journal
+            .append(JournalRecord::event(VenueEvent::new(
+                SequenceNumber::new(0),
+                TS,
+                command,
+                VenueOutcome::rejected(RejectKind::Internal, reason),
+            )))
+            .expect("append legacy event");
+
+        match recover(&journal, UNDERLYING) {
+            Ok(recovered) => match &recovered.events[0].outcome {
+                VenueOutcome::Rejected { kind, .. } => assert_eq!(
+                    *kind, specific_kind,
+                    "recovery re-derives the specific kind for the recovered event"
+                ),
+                other => panic!("expected a re-derived Rejected, got {other:?}"),
+            },
+            Err(e) => panic!("a legacy pre-#132 reject must recover, not corrupt: {e:?}"),
         }
     }
 
