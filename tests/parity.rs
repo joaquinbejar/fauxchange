@@ -1794,24 +1794,24 @@ async fn test_order_entry_parity_rejected_order_journals_nothing_on_both() {
 async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
     // The shared idempotency key `(account, client_order_id)` / `(account, ClOrdID)`:
     // a byte-identical retry after an ambiguous ack returns the STORED TERMINAL RESULT
-    // and opens NO second order, on BOTH surfaces. The two surfaces dedup at DIFFERENT
-    // layers, which is a journaling-granularity difference, NOT an economic divergence:
-    //   * FIX dedups at the gateway (the session `ClOrdID → order_id` correlation), so
-    //     no second command reaches the sequencer — ONE journaled event.
-    //   * REST dedups inside the executor (`add_with_idempotency`) AFTER the write-ahead
-    //     journal, so the retry is journaled as a no-op replay — TWO events, the second
-    //     replaying the first's stored terminal with an untouched book.
-    // The ECONOMIC parity that matters holds on both: exactly one order is opened, and
-    // the retry returns the stored terminal result. (The sequence-namespace nuance —
-    // REST's retry consumes an `underlying_sequence`, FIX's does not — is reported to
-    // the lead for the architect to rule on the parity contract's scope.)
+    // and opens NO second order, on BOTH surfaces. With #103 the two surfaces now
+    // dedup at the SAME layer — BEFORE the sequencer — so the retry consumes no
+    // `underlying_sequence` and neither surface journals a second event:
+    //   * FIX dedups at the gateway (the session `ClOrdID → order_id` correlation).
+    //   * REST dedups at the shared cross-protocol pre-submit index
+    //     (`AppState::resolve_client_order_id` over the same `(account, ClOrdID)`
+    //     index #098), so the sequential resend never reaches the actor.
+    // The executor's post-sequencer `add_with_idempotency` (`VenueOutcome::Duplicate`)
+    // remains the backstop for the genuinely-concurrent race; here the sequential
+    // retry short-circuits earlier.
     let rest = cfix::rest_parity_venue();
     let trader = token(&rest, "trader-1");
     let body = serde_json::json!({
         "side": "sell", "price": 50_000, "quantity": 3, "client_order_id": "idem-key-1"
     });
+    let mut rest_responses = Vec::new();
     for attempt in 0..2 {
-        let (status, _) = send(
+        let (status, response) = send(
             &rest,
             build_request(
                 "POST",
@@ -1826,7 +1826,19 @@ async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
             StatusCode::OK,
             "REST submit #{attempt} is accepted (the retry returns the stored result)"
         );
+        rest_responses.push(response);
     }
+    // The deduped retry echoes the ORIGINAL placement's FULL canonical identity —
+    // both order_id AND sequence — rendered from the shared `(account, ClOrdID)` index
+    // record, never a freshly-minted retry id or a fabricated sequence.
+    assert_eq!(
+        rest_responses[1]["order_id"], rest_responses[0]["order_id"],
+        "the retry echoes the ORIGINAL order id"
+    );
+    assert_eq!(
+        rest_responses[1]["sequence"], rest_responses[0]["sequence"],
+        "the retry echoes the ORIGINAL placement sequence"
+    );
     let rest_events = journaled_events(&rest, "BTC").await;
 
     let harness = cfix::FixParityHarness::start().await;
@@ -1840,35 +1852,13 @@ async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
         .await;
     let fix_events = journaled_events(harness.state(), "BTC").await;
 
-    // REST journals the retry as a post-journal no-op replay (executor dedup): two
-    // events, the second replaying the first's stored terminal with an untouched book.
+    // BOTH surfaces dedup the retry BEFORE the sequencer (#103): exactly ONE journaled
+    // event on each, the resend never reaching the actor and consuming no sequence.
     assert_eq!(
         rest_events.len(),
-        2,
-        "REST journals original + deduped-replay retry"
+        1,
+        "REST dedups the retry before the sequencer (pre-submit index)"
     );
-    // The REST retry is journaled as an idempotent `Duplicate` (#099): it echoes the
-    // ORIGINAL placement's terminal sequence and boxes the stored terminal, so every
-    // fan-out projection treats it as a no-op (no double-fold, no phantom id) while
-    // the book stays untouched.
-    match &rest_events[1].outcome {
-        VenueOutcome::Duplicate {
-            original_sequence,
-            terminal,
-            ..
-        } => {
-            assert_eq!(
-                *original_sequence, rest_events[0].underlying_sequence,
-                "the retry echoes the ORIGINAL terminal sequence, not the retry turn's"
-            );
-            assert_eq!(
-                terminal.as_ref(),
-                &rest_events[0].outcome,
-                "the Duplicate boxes the first placement's stored terminal (no second order)"
-            );
-        }
-        other => panic!("the REST retry must be an idempotent Duplicate, got {other:?}"),
-    }
     // FIX dedups before the sequencer (gateway ClOrdID correlation): one journaled
     // event, the resend never reaching the actor.
     assert_eq!(
@@ -1876,12 +1866,326 @@ async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
         1,
         "FIX dedups the retry before the sequencer"
     );
-    // The economic parity that matters: the ONE order opened is IDENTICAL across
-    // surfaces, and neither retry opened a second order — the shared idempotency key
-    // returns the stored terminal result on both.
+    // The one opened order is IDENTICAL across surfaces, at the SAME sequence — the
+    // shared pre-submit idempotency key aligns the surfaces exactly.
     assert_eq!(
         rest_events[0].outcome, fix_events[0].outcome,
         "the one opened order is identical across REST and FIX (idempotency parity)"
+    );
+    assert_eq!(
+        rest_events[0].underlying_sequence, fix_events[0].underlying_sequence,
+        "the one opened order carries the same underlying_sequence on both surfaces"
+    );
+    assert_streams_parity("rest", &rest_events, "fix", &fix_events);
+}
+
+#[tokio::test]
+async fn test_order_entry_parity_interleaved_duplicate_retry_same_sequence_progression() {
+    // The core #103 acceptance: a duplicate retry INTERLEAVED with new same-underlying
+    // orders yields the SAME `underlying_sequence` progression on REST and FIX. The
+    // scenario is A(k1), B(k2), retry-A(k1, byte-identical), C(k3) — all on `BTC`, all
+    // by trader-1. The retry must consume NO sequence on either surface, so both
+    // journal exactly [A@0, B@1, C@2] and the subsequent order C lands at the SAME
+    // sequence per surface (03 §7 item 1). Before #103 the REST retry consumed seq 2
+    // (a post-journal no-op) and pushed C to seq 3, diverging from FIX.
+    //
+    // A/B/C differ in price so none crosses (all resting sells) — the outcomes are
+    // three plain resting adds, identical across surfaces under normalization.
+
+    // --- REST arm ---------------------------------------------------------
+    let rest = cfix::rest_parity_venue();
+    let trader = token(&rest, "trader-1");
+    let place = |cl: &str, price: u64, qty: u64| {
+        serde_json::json!({
+            "side": "sell", "price": price, "quantity": qty, "client_order_id": cl
+        })
+    };
+    for body in [
+        place("k1", 50_000, 3), // A
+        place("k2", 50_100, 2), // B
+        place("k1", 50_000, 3), // retry A (byte-identical) — dedups pre-submit
+        place("k3", 50_200, 1), // C
+    ] {
+        let (status, response) = send(
+            &rest,
+            build_request(
+                "POST",
+                &format!("{CONTRACT}/orders"),
+                Some(&trader),
+                Some(body),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "every REST place (incl the deduped retry) is accepted, got {response}"
+        );
+    }
+    let rest_events = journaled_events(&rest, "BTC").await;
+
+    // --- FIX arm ----------------------------------------------------------
+    let harness = cfix::FixParityHarness::start().await;
+    let mut fix = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let _ = fix.place_limit("k1", "2", 50_000, 3, "1").await; // A
+    let _ = fix.place_limit("k2", "2", 50_100, 2, "1").await; // B
+    let _ = fix.place_limit("k1", "2", 50_000, 3, "1").await; // retry A — dedups pre-submit
+    let _ = fix.place_limit("k3", "2", 50_200, 1, "1").await; // C
+    let fix_events = journaled_events(harness.state(), "BTC").await;
+
+    // The interleaved duplicate consumed NO sequence on either surface: three
+    // journaled events, sequences [0, 1, 2], identical progression across surfaces.
+    assert_eq!(
+        rest_events.len(),
+        3,
+        "REST journals A, B, C — the retry consumed no sequence"
+    );
+    assert_eq!(
+        fix_events.len(),
+        3,
+        "FIX journals A, B, C — the retry consumed no sequence"
+    );
+    let rest_seqs: Vec<u64> = rest_events
+        .iter()
+        .map(|e| e.underlying_sequence.get())
+        .collect();
+    let fix_seqs: Vec<u64> = fix_events
+        .iter()
+        .map(|e| e.underlying_sequence.get())
+        .collect();
+    assert_eq!(
+        rest_seqs,
+        vec![0, 1, 2],
+        "the retry consumed no sequence; C lands at seq 2"
+    );
+    assert_eq!(
+        rest_seqs, fix_seqs,
+        "REST and FIX share the SAME underlying_sequence progression under interleaving"
+    );
+    assert_streams_parity("rest", &rest_events, "fix", &fix_events);
+}
+
+#[tokio::test]
+async fn test_resting_retry_response_echoes_the_original_nonzero_sequence() {
+    // A purely-RESTING (zero-fill) deduped retry must render the ORIGINAL placement's
+    // NON-ZERO `underlying_sequence`, not a fabricated 0. The response `sequence` for a
+    // resting order cannot be recovered from fills (there are none), so it comes from
+    // the `(account, ClOrdID)` index record's stored placement sequence — the full
+    // canonical identity, matching the post-submit `VenueOutcome::Duplicate` (#142).
+    let rest = cfix::rest_parity_venue();
+    let trader = token(&rest, "trader-1");
+    let uri = format!("{CONTRACT}/orders");
+
+    // A warm-up resting order (no client_order_id) at seq 0, so the keyed order A below
+    // commits at a NON-ZERO sequence.
+    let (status, _) = send(
+        &rest,
+        build_request(
+            "POST",
+            &uri,
+            Some(&trader),
+            Some(serde_json::json!({"side":"sell","price":49_000,"quantity":1})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A: a resting sell carrying a client_order_id — commits at seq 1.
+    let body = serde_json::json!({
+        "side":"sell","price":50_000,"quantity":3,"client_order_id":"resting-k"
+    });
+    let (status, first) = send(
+        &rest,
+        build_request("POST", &uri, Some(&trader), Some(body.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["status"], "accepted", "A rests, got {first}");
+    assert_eq!(
+        first["sequence"], 1,
+        "A commits at a NON-ZERO sequence (behind the warm-up), got {first}"
+    );
+
+    // The byte-identical retry dedups pre-submit and echoes A's FULL identity —
+    // order_id AND the non-zero sequence 1, never a fabricated 0.
+    let (status, retry) = send(
+        &rest,
+        build_request("POST", &uri, Some(&trader), Some(body)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        retry["order_id"], first["order_id"],
+        "the resting retry echoes the ORIGINAL order id"
+    );
+    assert_eq!(
+        retry["sequence"], first["sequence"],
+        "the resting retry echoes the ORIGINAL non-zero sequence (1), never a fabricated 0"
+    );
+    assert_eq!(retry["sequence"], 1);
+
+    // The retry consumed no sequence: the journal holds exactly the warm-up + A.
+    let events = journaled_events(&rest, "BTC").await;
+    assert_eq!(
+        events.len(),
+        2,
+        "the deduped resting retry journaled nothing (no sequence consumed)"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_identical_retries_open_one_order_with_the_canonical_identity() {
+    // The #103 race safety net (the reviewer's fix, #142): two BYTE-IDENTICAL retries
+    // fired CONCURRENTLY can both miss the (post-journal-published) pre-submit index
+    // and reach the actor. Exactly ONE order must open, BOTH responses must carry the
+    // ORIGINAL (canonical) order id — never a freshly-minted, never-added id — and the
+    // executions store must hold EXACTLY the original legs (no double fan-out). It is
+    // fine if one request is pre-submit-deduped and the other is the actor's
+    // `VenueOutcome::Duplicate`; both paths render the same canonical identity and the
+    // Duplicate is a projection no-op, so the invariants hold under any interleaving.
+    let taker_account = AccountId::new("trader-2");
+    let rest = cfix::rest_parity_venue();
+    let maker = token(&rest, "trader-1");
+    let taker = token(&rest, "trader-2");
+    let uri = format!("{CONTRACT}/orders");
+
+    // A resting maker sell of 10 @ 50_000 — ample depth, so a DOUBLE fill (both
+    // retries entering the book) would leave TWO taker legs, not one.
+    let (status, _) = send(
+        &rest,
+        build_request(
+            "POST",
+            &uri,
+            Some(&maker),
+            Some(serde_json::json!({"side":"sell","price":50_000,"quantity":10})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Fire two byte-identical keyed taker buys concurrently.
+    let body = serde_json::json!({
+        "side":"buy","price":50_000,"quantity":2,"client_order_id":"race-dup"
+    });
+    let (a, b) = tokio::join!(
+        send(
+            &rest,
+            build_request("POST", &uri, Some(&taker), Some(body.clone())),
+        ),
+        send(
+            &rest,
+            build_request("POST", &uri, Some(&taker), Some(body.clone())),
+        ),
+    );
+    let (status_a, resp_a) = a;
+    let (status_b, resp_b) = b;
+    assert_eq!(status_a, StatusCode::OK, "first concurrent retry: {resp_a}");
+    assert_eq!(
+        status_b,
+        StatusCode::OK,
+        "second concurrent retry: {resp_b}"
+    );
+
+    // BOTH responses carry the SAME canonical order id — the winner's, never a
+    // never-added phantom id (the loser rendered `Duplicate`/pre-submit, not its own
+    // freshly-minted id).
+    assert_eq!(
+        resp_a["order_id"], resp_b["order_id"],
+        "both concurrent retries render the ONE canonical order id, never a phantom"
+    );
+    // Each renders the ONE order's stored terminal — filled 2 (against the 10 maker).
+    assert_eq!(
+        resp_a["filled_quantity"], 2,
+        "resp_a renders the one order's fills"
+    );
+    assert_eq!(
+        resp_b["filled_quantity"], 2,
+        "resp_b renders the one order's fills"
+    );
+
+    // No double fan-out: the executions store holds EXACTLY the one taker leg (a
+    // second entering order would have folded a second leg / a 4-lot fill).
+    let taker_legs = rest
+        .executions()
+        .list(&taker_account, &ExecutionFilter::default())
+        .expect("taker legs");
+    assert_eq!(
+        taker_legs.len(),
+        1,
+        "exactly one order opened; no double fan-out under the concurrent race"
+    );
+    assert_eq!(
+        taker_legs[0].quantity, 2,
+        "the one taker leg filled 2, not 4"
+    );
+}
+
+#[tokio::test]
+async fn test_conflicting_reuse_of_client_order_id_is_a_rejected_outcome_not_a_false_accept() {
+    // #103 conflicting-reuse: the same `(account, ClOrdID)` reused with DIFFERENT
+    // economics is NOT a fast-path hit and NOT a false accept — the pre-submit index
+    // holds `symbol`/`side`/`quantity`, so a differing quantity misses the fast path
+    // and submits, where the actor's full-fingerprint idempotency map rejects it as a
+    // conflicting reuse. The handler renders the OBSERVED reject (200 body,
+    // `status: rejected`), never a fabricated accept and never a phantom resting order.
+    let rest = cfix::rest_parity_venue();
+    let trader = token(&rest, "trader-1");
+    let uri = format!("{CONTRACT}/orders");
+
+    // A: a resting sell 3 @ 50_000 under key `reuse-k` — accepted, indexed.
+    let (status, first) = send(
+        &rest,
+        build_request(
+            "POST",
+            &uri,
+            Some(&trader),
+            Some(serde_json::json!({
+                "side":"sell","price":50_000,"quantity":3,"client_order_id":"reuse-k"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["status"], "accepted", "A rests, got {first}");
+
+    // Reuse `reuse-k` with a DIFFERENT quantity (5): a conflicting reuse. It misses
+    // the pre-submit fast path (quantity differs from the indexed 3) and the actor
+    // rejects it.
+    let (status, reuse) = send(
+        &rest,
+        build_request(
+            "POST",
+            &uri,
+            Some(&trader),
+            Some(serde_json::json!({
+                "side":"sell","price":50_000,"quantity":5,"client_order_id":"reuse-k"
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        reuse["status"], "rejected",
+        "a conflicting reuse is the OBSERVED reject, never a false accept: {reuse}"
+    );
+    assert_eq!(reuse["filled_quantity"], 0);
+    assert!(
+        reuse["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("client_order_id")),
+        "the reject names the conflicting-reuse reason, got {reuse}"
+    );
+
+    // Exactly ONE order rests: A (Added) and the conflicting reuse (Rejected) — the
+    // reuse opened no second resting order.
+    let events = journaled_events(&rest, "BTC").await;
+    let added = events
+        .iter()
+        .filter(|event| matches!(event.outcome, VenueOutcome::Added { .. }))
+        .count();
+    assert_eq!(
+        added, 1,
+        "only A rests; the conflicting reuse opened no order"
     );
 }
 

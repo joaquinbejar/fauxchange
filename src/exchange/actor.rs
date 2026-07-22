@@ -604,7 +604,13 @@ where
         // an idempotent `Duplicate` retry derives no mutation, so a retry's
         // freshly-minted order id never overwrites the canonical one (#099/#098).
         if let Some(index) = self.clordid_index.as_ref() {
-            apply_committed_correlation(index, &self.underlying, &event.command, &event.outcome);
+            apply_committed_correlation(
+                index,
+                &self.underlying,
+                event.underlying_sequence,
+                &event.command,
+                &event.outcome,
+            );
         }
 
         // Step 5: fan-out ONLY after the paired event is journaled. An authoritative

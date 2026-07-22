@@ -11,6 +11,50 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **REST pre-submit idempotency dedup — aligns the `underlying_sequence`
+  progression with FIX on retries** (#103). The #41 parity suite surfaced a
+  cross-surface asymmetry: a REST idempotent retry **consumed** an
+  `underlying_sequence` (the executor deduped AFTER the write-ahead journal, so the
+  retry was journaled as an idempotent `VenueOutcome::Duplicate` — one sequence
+  spent), while a FIX retry did not (the gateway deduped BEFORE submit ⇒ no
+  sequence consumed). Economic parity held, but a duplicate interleaved with new
+  same-underlying orders shifted the subsequent `underlying_sequence` differently
+  per surface. REST `place_limit_order` / `place_market_order` now consult a
+  **pre-submit** dedup on `(account, client_order_id)` **before** minting an id or
+  submitting — resolving the venue-shared `(account, ClOrdID) → order` index (#98)
+  via `AppState::resolve_client_order_id`. A byte-identical retry (matching
+  `symbol`/`side`/`quantity`) returns the STORED terminal report — the FULL canonical
+  identity (the original `order_id` **and** its committed `underlying_sequence`, both
+  carried on the index `ClOrdIdRecord`) plus its committed fills re-read from the
+  executions store — with **no** submit and **no** sequence consumed, exactly as the
+  FIX gateway does (#39). Because the sequence is stored on the record (populated by
+  `apply_committed_correlation` from the committed event, so live and recovery derive
+  it identically), even a purely-**resting** (zero-fill) retry echoes the original
+  sequence — never a fabricated `0` — matching the post-submit
+  `VenueOutcome::Duplicate` (#142) `rendered_identity`. A placement with no
+  `client_order_id` is never dedupable.
+  - **Race safety net (#142).** The correlation is published POST-journal, so a
+    *sequential* retry always observes it; two *concurrent* retries can both miss it
+    and submit, where the actor's own idempotency map dedups the loser to
+    `VenueOutcome::Duplicate` and the post-submit path renders the canonical identity
+    (never a never-added id) with no re-fan-out. The race is correct — it just
+    consumes a sequence in that rare window. This is a fast path in front of the
+    journaled guard, not a replacement.
+  - **Conflicting reuse.** The index holds only `order_id`/`symbol`/`side`/
+    `quantity` (no price/TIF), so a same-key reuse with a differing
+    `symbol`/`side`/`quantity` is NOT a fast-path hit — it submits and the actor's
+    full-fingerprint idempotency map rejects it (`client_order_id was reused`),
+    rendered as the observed `rejected` outcome; a price/TIF-only reuse under a
+    matching `symbol`/`side`/`quantity` is treated as an idempotent replay (a
+    documented, deliberately-minimal-index limitation).
+  - **Scope.** Pre-submit dedup covers `Added` / `Market` placements (the ones
+    published into the index). A sequenced-**`Rejected`** first placement's retry is
+    not indexed, so it falls through and the actor's `Duplicate` backstop reports the
+    stored terminal (consuming a backstop-guarded sequence); economic parity still
+    holds. Determinism holds: the index is a deterministic function of the journal
+    (rebuilt from the journaled `AddOrder` stream on recovery, a deduped retry never
+    journaled) and account-scoped (a cross-account `client_order_id` collision is
+    never a hit). Parity test: A/B/retry-A/C over REST and FIX both journal `[0,1,2]`.
 - **Surfaced the sequenced `VenueOutcome` to callers across REST/WS/FIX** (#118).
   `Receipt` now carries the observed outcome + a `FanoutSummary`, so a gateway
   renders the OBSERVED result — an order into a halted/`Settling`/`Expired`

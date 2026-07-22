@@ -53,6 +53,7 @@ use std::sync::Mutex;
 
 use crate::exchange::boundary::Side;
 use crate::exchange::envelope::{AddOutcome, VenueCommand, VenueOutcome};
+use crate::exchange::event::SequenceNumber;
 use crate::exchange::symbol::Symbol;
 use crate::models::{AccountId, ClientOrderId, VenueOrderId};
 
@@ -79,9 +80,10 @@ pub const DEFAULT_MAX_CLORDID_PER_ACCOUNT: usize = 65_536;
 
 /// The order metadata one `(account, ClOrdID)` resolves to — everything a gateway
 /// needs to route a cancel/replace and render its report without re-reading the
-/// single-writer book: the venue order id, its contract symbol, side, and the
-/// placed quantity. `side` is the protocol-neutral upstream [`Side`] (the value
-/// the executor holds), converted to the wire enum at the surface that renders it.
+/// single-writer book: the venue order id, its contract symbol, side, the placed
+/// quantity, and the committed `underlying_sequence` of the placement. `side` is
+/// the protocol-neutral upstream [`Side`] (the value the executor holds), converted
+/// to the wire enum at the surface that renders it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClOrdIdRecord {
     /// The venue order id the gateway minted for the original placement.
@@ -92,6 +94,15 @@ pub struct ClOrdIdRecord {
     pub side: Side,
     /// The placed quantity, in **contracts**.
     pub quantity: u64,
+    /// The `underlying_sequence` the placement committed at — the ORIGINAL order's
+    /// sequence in its underlying's total order. It is the **full** other half of the
+    /// canonical identity (with `order_id`): a pre-submit-deduplicated idempotent
+    /// retry renders BOTH, so a client correlating on `sequence` gets the original
+    /// placement's sequence even for a purely-resting (zero-fill) order — matching the
+    /// post-submit `VenueOutcome::Duplicate` (#142) `rendered_identity`. Because it is
+    /// taken from the committed event, the live actor and journal recovery derive the
+    /// identical value (a pure function of the journal).
+    pub sequence: SequenceNumber,
 }
 
 /// The typed failure of an index write.
@@ -334,6 +345,7 @@ impl Default for ClOrdIdIndex {
 pub(crate) fn apply_committed_correlation(
     index: &ClOrdIdIndex,
     underlying: &str,
+    sequence: SequenceNumber,
     command: &VenueCommand,
     outcome: &VenueOutcome,
 ) {
@@ -363,6 +375,7 @@ pub(crate) fn apply_committed_correlation(
                     symbol: symbol.clone(),
                     side: *side,
                     quantity: *quantity,
+                    sequence,
                 },
             );
         }
@@ -404,6 +417,10 @@ pub(crate) fn apply_committed_correlation(
                         symbol: symbol.clone(),
                         side: *side,
                         quantity: *quantity,
+                        // The replacement order's own placement sequence — this
+                        // Replace command's committed turn (the new order entered the
+                        // book here).
+                        sequence,
                     },
                 );
             }
@@ -446,6 +463,7 @@ mod tests {
             symbol: sym(),
             side: Side::Buy,
             quantity: 5,
+            sequence: SequenceNumber::new(0),
         }
     }
 
@@ -635,12 +653,15 @@ mod tests {
         apply_committed_correlation(
             &index,
             "BTC",
+            SequenceNumber::new(0),
             &add_cmd("acct-a", "cl-1", "order-orig"),
             &added(),
         );
         assert_eq!(
-            index.resolve(&account, &clid).map(|r| r.order_id),
-            Some(VenueOrderId::new("order-orig"))
+            index
+                .resolve(&account, &clid)
+                .map(|r| (r.order_id, r.sequence)),
+            Some((VenueOrderId::new("order-orig"), SequenceNumber::new(0)))
         );
 
         // The retry: the SAME command key but a NEW order id, whose captured outcome
@@ -651,12 +672,20 @@ mod tests {
             original_sequence: SequenceNumber::new(0),
             terminal: Box::new(added()),
         };
-        apply_committed_correlation(&index, "BTC", &retry_cmd, &duplicate);
+        apply_committed_correlation(
+            &index,
+            "BTC",
+            SequenceNumber::new(1),
+            &retry_cmd,
+            &duplicate,
+        );
 
         assert_eq!(
-            index.resolve(&account, &clid).map(|r| r.order_id),
-            Some(VenueOrderId::new("order-orig")),
-            "a Duplicate retry must NOT overwrite the canonical order id"
+            index
+                .resolve(&account, &clid)
+                .map(|r| (r.order_id, r.sequence)),
+            Some((VenueOrderId::new("order-orig"), SequenceNumber::new(0))),
+            "a Duplicate retry must NOT overwrite the canonical order id OR its sequence"
         );
         assert_eq!(index.len(), 1);
     }
@@ -672,6 +701,7 @@ mod tests {
         apply_committed_correlation(
             &index,
             "BTC",
+            SequenceNumber::new(0),
             &add_cmd("acct-a", "orig", "order-orig"),
             &added(),
         );
@@ -697,14 +727,20 @@ mod tests {
                 stp_cancelled: vec![],
             },
         };
-        apply_committed_correlation(&index, "BTC", &replace_cmd, &replace_outcome);
+        apply_committed_correlation(
+            &index,
+            "BTC",
+            SequenceNumber::new(1),
+            &replace_cmd,
+            &replace_outcome,
+        );
 
         assert_eq!(
             index
                 .resolve(&account, &ClientOrderId::new("new"))
-                .map(|r| r.order_id),
-            Some(VenueOrderId::new("order-new")),
-            "the replacement ClOrdID resolves to the new order id"
+                .map(|r| (r.order_id, r.sequence)),
+            Some((VenueOrderId::new("order-new"), SequenceNumber::new(1))),
+            "the replacement ClOrdID resolves to the new order id at the replace's sequence"
         );
         assert!(
             index
@@ -724,6 +760,7 @@ mod tests {
         apply_committed_correlation(
             &index,
             "BTC",
+            SequenceNumber::new(0),
             &add_cmd("acct-a", "orig", "order-orig"),
             &added(),
         );
@@ -744,6 +781,7 @@ mod tests {
         apply_committed_correlation(
             &index,
             "BTC",
+            SequenceNumber::new(1),
             &replace_cmd,
             &VenueOutcome::rejected(crate::exchange::RejectKind::NotOwner, "not your order"),
         );

@@ -394,8 +394,9 @@ async fn case_same_payload_retry() -> CaseOutcome {
     let rest = VenueServer::start().await.map_err(|e| e.to_string())?;
     let fix = VenueServer::start().await.map_err(|e| e.to_string())?;
 
-    // REST: a byte-identical retry (shared idempotency key) returns the stored
-    // terminal — journaled as a post-journal no-op replay (two events).
+    // REST: a byte-identical retry (shared idempotency key) dedups BEFORE the
+    // sequencer (#103) — the pre-submit index returns the stored terminal without
+    // submitting, so the retry consumes no sequence and journals nothing (one event).
     let trader = rest.token("trader-1")?;
     let body = json!({
         "side": "sell", "price": 50_000, "quantity": 3, "client_order_id": "idem-key-1"
@@ -427,34 +428,12 @@ async fn case_same_payload_retry() -> CaseOutcome {
         .await?;
     let fix_events = journaled_events(fix.state(), UNDERLYING).await?;
 
+    // #103: BOTH surfaces dedup the retry before the sequencer — exactly one journaled
+    // event on each, at the same underlying_sequence.
     require(
-        rest_events.len() == 2,
-        "REST journals original + deduped-replay retry",
+        rest_events.len() == 1,
+        "REST dedups the sequential retry before the sequencer (pre-submit index #103)",
     )?;
-    // The REST retry is journaled as an idempotent `Duplicate` (#099): it echoes the
-    // ORIGINAL terminal sequence and boxes the stored terminal, so every fan-out
-    // projection treats it as a no-op (no double-fold, no phantom id).
-    match &rest_events[1].outcome {
-        VenueOutcome::Duplicate {
-            original_sequence,
-            terminal,
-            ..
-        } => {
-            require(
-                *original_sequence == rest_events[0].underlying_sequence,
-                "the REST retry must echo the ORIGINAL terminal sequence, not the retry turn's",
-            )?;
-            require(
-                terminal.as_ref() == &rest_events[0].outcome,
-                "the REST retry Duplicate must box the stored terminal result",
-            )?;
-        }
-        other => {
-            return Err(format!(
-                "the REST retry must be an idempotent Duplicate, got {other:?}"
-            ));
-        }
-    }
     require(
         fix_events.len() == 1,
         "FIX dedups the retry before the sequencer",
@@ -462,6 +441,10 @@ async fn case_same_payload_retry() -> CaseOutcome {
     require(
         rest_events[0].outcome == fix_events[0].outcome,
         "the one opened order must be identical across REST and FIX",
+    )?;
+    require(
+        rest_events[0].underlying_sequence == fix_events[0].underlying_sequence,
+        "the one opened order must carry the same underlying_sequence across surfaces",
     )
 }
 

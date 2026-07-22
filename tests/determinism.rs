@@ -3256,6 +3256,153 @@ async fn test_fee_stp_sensitive_scenario_replays_exactly_from_bundle() {
     }
 }
 
+/// #103 determinism: the REST pre-submit dedup seam is a deterministic function of
+/// the journal. A byte-identical retry short-circuits in the REST handler at
+/// [`AppState::resolve_client_order_id`] — the venue-shared `(account, ClOrdID) →
+/// order` index (#098) the handler consults BEFORE minting/submitting — and never
+/// reaches the actor, so it is **absent from the journal**. This test proves the
+/// two facts that make that safe: (1) after a placement commits, the seam resolves
+/// its CANONICAL identity (the index is published post-journal, so a sequential
+/// retry always observes it); and (2) the journal is exactly `[A@0, B@1]` and
+/// replays identically — a deduped retry, being handler-short-circuited, produces
+/// no journaled event, so it consumes no `underlying_sequence`. This closes the #041
+/// asymmetry (the old REST retry was a post-journal no-op that consumed a sequence).
+/// The executor's post-sequencer idempotency map (`VenueOutcome::Duplicate`) remains
+/// the backstop for the genuinely-concurrent race.
+#[tokio::test]
+async fn test_rest_presubmit_dedup_seam_is_journal_deterministic_and_replays_identically() {
+    let state = ms_state(ms_config(0, 0, StpMode::Off));
+    let account = AccountId::new("trader");
+    let cl = ClientOrderId::new("dedup-k1");
+    let symbol = Symbol::parse(MS_CALL_A).expect("A parses");
+
+    // Warm-up W (no client_order_id): a resting bid far below the ask, landing at
+    // sequence 0 — so the keyed order A below commits at a NON-ZERO sequence. This is
+    // what proves the record carries A's REAL placement sequence (1), never a
+    // fabricated `SequenceNumber::START` (0).
+    state
+        .submit(VenueCommand::AddOrder {
+            symbol: symbol.clone(),
+            order_id: VenueOrderId::new("order-W"),
+            account: account.clone(),
+            owner: Hash32([0x11; 32]),
+            client_order_id: None,
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(40_000)),
+            quantity: 1,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        })
+        .await
+        .expect("W sequences");
+
+    // Order A: a purely-resting sell carrying `dedup-k1`. It lands at sequence 1.
+    let receipt_a = state
+        .submit(VenueCommand::AddOrder {
+            symbol: symbol.clone(),
+            order_id: VenueOrderId::new("order-A"),
+            account: account.clone(),
+            owner: Hash32([0x11; 32]),
+            client_order_id: Some(cl.clone()),
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(50_000)),
+            quantity: 3,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        })
+        .await
+        .expect("A sequences");
+    assert_eq!(
+        receipt_a.underlying_sequence,
+        SequenceNumber::new(1),
+        "A commits at a NON-ZERO sequence (behind the warm-up)"
+    );
+
+    // The pre-submit fast-path seam is now populated with A's FULL CANONICAL identity
+    // (published post-journal, before `submit().await` returned) — the original
+    // order_id AND its committed `underlying_sequence`, so a byte-identical retry
+    // resolves here and the REST handler returns the stored terminal (original id +
+    // original sequence) WITHOUT submitting — consuming no sequence. A is a
+    // purely-resting zero-fill order, so this is exactly the case the response
+    // `sequence` could NOT be recovered from fills: it comes from `record.sequence`.
+    // The index deliberately holds only the routing fields (order_id / symbol / side /
+    // quantity) + sequence, never price/TIF, so a conflicting-economics reuse of the
+    // same key is NOT a fast-path hit.
+    let record = state
+        .resolve_client_order_id(&account, &cl)
+        .expect("A's correlation is published post-journal");
+    assert_eq!(record.order_id, VenueOrderId::new("order-A"));
+    assert_eq!(record.symbol, symbol);
+    assert_eq!(record.side, Side::Sell);
+    assert_eq!(record.quantity, 3);
+    assert_eq!(
+        record.sequence, receipt_a.underlying_sequence,
+        "the record carries A's ORIGINAL committed sequence (1), even zero-fill"
+    );
+    assert_ne!(
+        record.sequence,
+        SequenceNumber::START,
+        "a resting retry's sequence is the REAL placement sequence, never a fabricated 0"
+    );
+
+    // Order B (distinct client id): consumes the NEXT sequence — 2, not 3 — the
+    // deduped retry (handler-short-circuited above) submitted nothing, so it consumed
+    // no sequence between A and B.
+    let receipt_b = state
+        .submit(VenueCommand::AddOrder {
+            symbol: symbol.clone(),
+            order_id: VenueOrderId::new("order-B"),
+            account: account.clone(),
+            owner: Hash32([0x11; 32]),
+            client_order_id: Some(ClientOrderId::new("dedup-k2")),
+            side: Side::Sell,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(50_100)),
+            quantity: 2,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        })
+        .await
+        .expect("B sequences");
+    assert_eq!(
+        receipt_b.underlying_sequence,
+        SequenceNumber::new(2),
+        "the deduped retry consumed no sequence; B lands at 2"
+    );
+
+    // Replay from the exported bundle reconstructs the IDENTICAL event stream (the
+    // recovery oracle halts on any divergence), so the deduped retry is a
+    // deterministic function of the journal: absent live, absent on replay — exactly
+    // ONE journaled event per placed order (W, A, B), never a phantom retry event.
+    // Because `apply_committed_correlation` runs identically on recovery, the rebuilt
+    // index resolves A's canonical identity (id + sequence 1) byte-for-byte.
+    let bundle = state.export_bundle().await.expect("export bundle");
+    let report = replay_bundle(&bundle).expect("dedup scenario replays exactly");
+    let replay = report.underlying(UNDERLYING).expect("BTC replay");
+    assert_eq!(
+        replay.events.len(),
+        3,
+        "exactly three journaled events (W, A, B) — the deduped retry produced none"
+    );
+    let replay_seqs: Vec<u64> = replay
+        .events
+        .iter()
+        .map(|event| event.underlying_sequence.get())
+        .collect();
+    assert_eq!(
+        replay_seqs,
+        vec![0, 1, 2],
+        "the journal holds W@0, A@1 and B@2 with no retry event between them"
+    );
+    // Both resting sells rest (no cross with the 40_000 bid): A's 3 @ 50_000 is the
+    // best ask, 5 total.
+    let top = replay.top_of_book(&symbol);
+    assert_eq!(top.best_ask, Some(Cents::new(50_000)));
+    assert_eq!(top.ask_depth, 5);
+}
+
 /// A resolved venue microstructure whose **BTC** carries a per-underlying spec
 /// override (tick 5) over the venue default — the #046 per-instrument profile
 /// surface. The scenario prices (50_000 / 51_000) are on-tick multiples of 5.

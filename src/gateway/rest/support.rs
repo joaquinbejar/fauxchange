@@ -244,6 +244,54 @@ pub(crate) fn taker_legs_for_order(
         .collect()
 }
 
+/// The `(fills, filled)` stored-fill projection a pre-submit deduplicated retry
+/// renders. A dedicated alias keeps the [`replay_terminal`] signature within
+/// clippy's `type_complexity` bound.
+pub(crate) type ReplayFills = (Vec<(Cents, u64)>, u64);
+
+/// The `(fills, filled)` a **pre-submit deduplicated retry** (#103) renders from the
+/// ORIGINAL placement's committed taker legs — read from the shared executions store
+/// keyed on the **canonical** `order_id` the `(account, ClOrdID)` index resolved to,
+/// NEVER a freshly-minted retry id.
+///
+/// A byte-identical retry short-circuits at the gateway (mirroring the FIX
+/// pre-submit guard, #039) and returns this stored terminal WITHOUT submitting, so
+/// it consumes no `underlying_sequence`. The projection is the same taker-leg fold
+/// the FIX `render_tracked_status` uses, so REST ≡ FIX on the deduped retry:
+///
+/// - `fills` — the `(price, quantity)` taker legs in journal order (the original
+///   aggressing fills; a resting-only order has none);
+/// - `filled` — their **checked** sum (never `Iterator::sum`, which panics-in-debug
+///   / wraps-in-release).
+///
+/// The response's `sequence` is NOT derived here — it is the ORIGINAL placement's
+/// `underlying_sequence`, carried on the resolved [`ClOrdIdRecord`](crate::exchange::ClOrdIdRecord),
+/// so a purely-resting (zero-fill) retry still renders the full canonical identity
+/// (original `order_id` + original `sequence`), matching the post-submit
+/// `VenueOutcome::Duplicate` (#142) `rendered_identity`.
+///
+/// # Errors
+///
+/// [`VenueError::Overflow`] if the checked fill sum overflows `u64` (unreachable for
+/// a real order — the sum is bounded by the order quantity — but kept checked per
+/// `rules/global_rules.md`).
+pub(crate) fn replay_terminal(
+    state: &Arc<AppState>,
+    account: &AccountId,
+    order_id: &VenueOrderId,
+) -> Result<ReplayFills, VenueError> {
+    let legs = taker_legs_for_order(state, account, order_id);
+    let fills: Vec<(Cents, u64)> = legs
+        .iter()
+        .map(|leg| (leg.price_cents, leg.quantity))
+        .collect();
+    let filled = fills
+        .iter()
+        .try_fold(0u64, |acc, (_, quantity)| acc.checked_add(*quantity))
+        .ok_or(VenueError::Overflow)?;
+    Ok((fills, filled))
+}
+
 /// The volume-weighted average price over a set of `(price, quantity)` fill
 /// legs, in **integer cents** — `Ok(None)` when there were no fills. Realized
 /// money — kept as `Cents` on the wire, never a float (the review-fixed contract).
