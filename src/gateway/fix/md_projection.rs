@@ -25,16 +25,41 @@ use super::marketdata::{IncrementalEntry, SnapshotEntry};
 use crate::models::{BookSide, PriceLevelChange, PriceLevelData, WsMessage};
 
 /// Which book sides a FIX market-data subscription asked for, derived from the
-/// `MDEntryType (269)` group (`0` = Bid, `1` = Offer). A `2` = Trade entry type is
-/// admitted at decode but selects neither book side (the trade-tape projection over
-/// FIX MD is deferred — a `V` that asks for **no** book side is rejected with `Y`,
-/// not silently served).
+/// `MDEntryType (269)` group (`0` = Bid, `1` = Offer). A `2` = Trade entry type
+/// selects neither book side: the trade tape is **permanently out** of FIX MD (a
+/// trade print carries no book snapshot and rides its own separate
+/// `instrument_sequence` namespace, distinct from the orderbook's `RptSeq`, so
+/// it cannot ride the `W`/`X` model — [`requests_trade_tape`] gates it and the
+/// subscribe path rejects any `V` carrying a Trade entry type with `Y`
+/// (`MDReqRejReason = 8`) **before** this projection is built). In the serve path,
+/// therefore, only Bid/Offer ever reach here; the `MdEntryType::Trade` arm below is
+/// exhaustiveness-only ([fix-dialect §2.3](../../../docs/specs/fix-dialect.md#23-market-data-subscription-surfaces-03-54)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RequestedSides {
     /// The request asked for the bid side (`MDEntryType = 0`).
     pub bids: bool,
     /// The request asked for the offer side (`MDEntryType = 1`).
     pub asks: bool,
+}
+
+/// Whether a decoded `MDEntryType (269)` group requests the Trade tape (`269 = 2`)
+/// — the FIX MD orderbook surface does **not** serve it. A trade print (the WS
+/// `trades` / `fills` channel) is an append-only event stream with no book snapshot
+/// and its **own** per-instrument `instrument_sequence` namespace, distinct from the
+/// orderbook's. FIX `W`/`X` carries exactly one `RptSeq (83)` — the orderbook's — so
+/// serving the tape would multiplex a **second** on-the-wire sequence namespace under
+/// one `MDReqID`, breaking the invariant that the orderbook is the only on-the-wire
+/// `RptSeq` on a FIX MD subscription. The trade tape over FIX MD is therefore
+/// **permanently out**; per-fill detail reaches a FIX client via
+/// `ExecutionReport (8)` on its own session. A `V` requesting a Trade entry type —
+/// alone **or** mixed with a book side — is rejected whole with `Y`
+/// (`MDReqRejReason = 8`), never silently served or partially dropped
+/// ([fix-dialect §2.3](../../../docs/specs/fix-dialect.md#23-market-data-subscription-surfaces-03-54)).
+#[must_use]
+pub fn requests_trade_tape(entry_types: &[MdEntryType]) -> bool {
+    entry_types
+        .iter()
+        .any(|entry_type| matches!(entry_type, MdEntryType::Trade))
 }
 
 impl RequestedSides {
@@ -218,6 +243,24 @@ mod tests {
         assert!(!sides.bids);
         assert!(!sides.asks);
         assert!(!sides.any());
+    }
+
+    #[test]
+    fn test_requests_trade_tape_detects_trade_alone_or_mixed_not_book_only() {
+        // Trade alone → the trade-tape request the subscribe path rejects (281=8).
+        assert!(requests_trade_tape(&[MdEntryType::Trade]));
+        // Mixed (a book side AND a Trade) → still a trade-tape request: the Trade
+        // entry type is never silently dropped, the whole `V` is rejected.
+        assert!(requests_trade_tape(&[
+            MdEntryType::Bid,
+            MdEntryType::Offer,
+            MdEntryType::Trade,
+        ]));
+        // Book-only → served; no trade tape.
+        assert!(!requests_trade_tape(&[
+            MdEntryType::Bid,
+            MdEntryType::Offer
+        ]));
     }
 
     #[test]
