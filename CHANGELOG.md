@@ -71,6 +71,15 @@ The full versioning and release-process policy lives in the design docs
   ~180–205 (with the dhat call-site breakdown); the `bench_regression_gate.py`
   ceilings were already grounded in the true numbers and are unchanged (the gate
   was honestly armed against the fresh baseline).
+- **Set the HP-3 (FIX parse/encode) numeric DESIGN TARGET** (#107). The FIX wire
+  dialect is now pinned, so the deferred HP-3 budget is stated (docs/07 §3-HP3;
+  BENCH.md §11): **decode p99 ≤ 5 µs, encode p99 ≤ 2 µs** on dev-laptop-class
+  hardware — ~2–4× headroom over the #43-measured `p99`/`p99.9` (decode
+  1.08–2.54 µs, encode 0.58–0.75 µs; #140 re-measured tighter on `ironfix`
+  0.3.1), deliberately loose so it flags a real order-of-magnitude regression on
+  the untrusted parse path without churning on the disclosed `p99.99` scheduler
+  noise (the "measure first, then set the target with headroom" discipline #020
+  used for HP-1).
 
 ### Added
 
