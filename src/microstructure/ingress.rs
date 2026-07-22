@@ -173,24 +173,40 @@ impl std::fmt::Display for IngressBufferFull {
 
 impl std::error::Error for IngressBufferFull {}
 
+/// The venue instant `now_ms` (or `now_ms·1000 + offset`) exceeded `u64`
+/// microseconds — an astronomically-unreachable range violation (a venue clock past
+/// ~584 million years). Returned as a **typed range error** rather than a
+/// manufactured `u64::MAX` deadline: a `u64::MAX` deadline could never be released
+/// (`drain_below` releases only deadlines strictly below `now_us`, and the venue
+/// clock also tops out at `u64::MAX`), permanently stranding the admitted command —
+/// and a saturated fallback violates the checked-arithmetic rule (#111 review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("ingress release deadline overflowed u64 microseconds (venue instant out of range)")]
+pub struct ReleaseDeadlineOverflow;
+
 /// The delayed **virtual arrival deadline**, in microseconds, for a command that
 /// arrived at venue instant `now_ms` (venue-clock milliseconds) carrying the seeded
 /// `offset`.
 ///
 /// The offset is **clamped** to [`MAX_INGRESS_OFFSET_US`] first — a hostile draw
 /// (including the non-finite fail-safe [`u64::MAX`]) cannot push the deadline past a
-/// bounded horizon. The `ms → µs` promotion and the add are **checked**, saturating
-/// to `u64::MAX` only as a documented fail-safe (the clamp already bounds the
-/// offset, and a realistic venue instant is far below the promotion overflow point),
-/// never a silent wrap.
-#[must_use]
-#[inline]
-pub fn release_deadline_us(now_ms: u64, offset: LatencyOffset) -> u64 {
+/// bounded horizon. The `ms → µs` promotion and the add are **checked**; an overflow
+/// is a typed [`ReleaseDeadlineOverflow`] (never a manufactured `u64::MAX` deadline
+/// that could never be released, nor a silent wrap).
+///
+/// # Errors
+///
+/// [`ReleaseDeadlineOverflow`] if `now_ms·1000 + offset` exceeds `u64` — unreachable
+/// for any real venue clock (it would need `now_ms` past ~584 million years).
+pub fn release_deadline_us(
+    now_ms: u64,
+    offset: LatencyOffset,
+) -> Result<u64, ReleaseDeadlineOverflow> {
     let offset_us = offset.micros().min(MAX_INGRESS_OFFSET_US);
     now_ms
         .checked_mul(1_000)
         .and_then(|base_us| base_us.checked_add(offset_us))
-        .unwrap_or(u64::MAX)
+        .ok_or(ReleaseDeadlineOverflow)
 }
 
 /// A bounded, deadline-ordered ingress reorder buffer for **one** underlying,
@@ -319,11 +335,14 @@ mod tests {
     fn test_release_deadline_is_arrival_plus_offset() {
         // 1_000 ms → 1_000_000 µs, plus a 250 µs offset.
         assert_eq!(
-            release_deadline_us(1_000, LatencyOffset::from_micros(250)),
+            release_deadline_us(1_000, LatencyOffset::from_micros(250)).expect("in range"),
             1_000 * 1_000 + 250
         );
         // A zero offset is exactly the arrival instant in µs.
-        assert_eq!(release_deadline_us(1_000, LatencyOffset::ZERO), 1_000_000);
+        assert_eq!(
+            release_deadline_us(1_000, LatencyOffset::ZERO).expect("in range"),
+            1_000_000
+        );
     }
 
     #[test]
@@ -331,18 +350,19 @@ mod tests {
         // A `u64::MAX` offset (the non-finite fail-safe) is clamped to the horizon,
         // not left to hold the command forever.
         let hostile = LatencyOffset::from_micros(u64::MAX);
-        let deadline = release_deadline_us(1_000, hostile);
+        let deadline = release_deadline_us(1_000, hostile).expect("in range");
         assert_eq!(deadline, 1_000 * 1_000 + MAX_INGRESS_OFFSET_US);
         assert!(deadline < u64::MAX, "the clamp bounds the deadline");
     }
 
     #[test]
-    fn test_release_deadline_saturates_rather_than_wrapping() {
-        // An absurd virtual instant near the u64 ceiling saturates the ms→µs
-        // promotion to u64::MAX (a documented fail-safe) — never a silent wrap.
+    fn test_release_deadline_out_of_range_is_a_typed_error_not_a_saturated_deadline() {
+        // An absurd virtual instant near the u64 ceiling would overflow the ms→µs
+        // promotion. It is a typed `ReleaseDeadlineOverflow` — NEVER a manufactured
+        // `u64::MAX` deadline that could never be released (#111 review).
         assert_eq!(
             release_deadline_us(u64::MAX, LatencyOffset::from_micros(1)),
-            u64::MAX
+            Err(ReleaseDeadlineOverflow)
         );
     }
 
@@ -445,13 +465,21 @@ mod tests {
         // Insert the LATE one first (it "arrived" first in wall order).
         buffer
             .insert(
-                key(release_deadline_us(now_ms, late.1), "sess", 0),
+                key(
+                    release_deadline_us(now_ms, late.1).expect("in range"),
+                    "sess",
+                    0,
+                ),
                 "late-arrival-large-offset",
             )
             .unwrap();
         buffer
             .insert(
-                key(release_deadline_us(now_ms, early.1), "sess", 1),
+                key(
+                    release_deadline_us(now_ms, early.1).expect("in range"),
+                    "sess",
+                    1,
+                ),
                 "early-deadline-small-offset",
             )
             .unwrap();

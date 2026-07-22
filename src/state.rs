@@ -1611,7 +1611,10 @@ impl AppState {
         // admission plus the clamped offset (checked; a hostile offset is bounded to
         // the horizon so the buffer cannot hold a command forever).
         let now_ms = self.clock.now_ms().get();
-        let deadline_us = release_deadline_us(now_ms, offset);
+        // A range overflow (an astronomically-unreachable venue instant) is a typed
+        // rejection, never a manufactured `u64::MAX` deadline that could never be
+        // released (#111 review).
+        let deadline_us = release_deadline_us(now_ms, offset).map_err(|_| VenueError::Overflow)?;
         // The checked monotonic arrival counter — the tie-break's total-order key.
         let arrival_sequence = self.next_arrival_sequence()?;
         let key = ReleaseKey::new(deadline_us, Arc::clone(&stamp.session_id), arrival_sequence);
