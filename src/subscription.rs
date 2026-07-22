@@ -1082,6 +1082,8 @@ mod tests {
                 swept: vec![CancelledLeg {
                     order_id: VenueOrderId::new("mm-1"),
                     owner: Hash32([0xEE; 32]),
+                    symbol: sym(),
+                    side: SeamSide::Sell,
                     reason: CancelReason::MassCancel,
                 }],
             },

@@ -331,6 +331,16 @@ pub fn cancel_frame(
     frame_with_body(body.as_bytes())
 }
 
+/// An `OrderMassCancelRequest (q)` — `All (530=7)` cancels the account's whole
+/// resting set; a `Symbol (55)` would make it a per-security (`530=1`) sweep.
+#[must_use]
+pub fn mass_cancel_frame(sender: &str, seq: u64, cl_ord_id: &str) -> Vec<u8> {
+    let body = format!(
+        "35=q\x0149={sender}\x0156={VENUE}\x0134={seq}\x0152=20240329-12:00:00.000\x0111={cl_ord_id}\x01530=7\x01"
+    );
+    frame_with_body(body.as_bytes())
+}
+
 /// An `OrderCancelReplaceRequest (G)` referencing `orig_cl_ord_id`.
 #[must_use]
 pub fn replace_frame(
@@ -504,6 +514,45 @@ pub async fn recv_frames(stream: &mut TcpStream, timeout: Duration) -> Vec<Vec<u
     split_frames(&buf)
 }
 
+/// Reads **every** reply frame of a multi-frame burst — the reader an
+/// `OrderMassCancelRequest (q)` reply needs, where the venue emits an
+/// `OrderMassCancelReport (r)` **followed by** one `ExecutionReport (8)` per swept
+/// order, each frame written + flushed separately by the acceptor's writer loop so
+/// they may land in distinct TCP reads.
+///
+/// Unlike [`recv_frames`] (which returns on the FIRST read that yields any complete
+/// frame — correct for a single-frame reply, but it would drop the trailing `8`s
+/// here), this **accumulates** bytes across reads and only returns once an idle gap
+/// (a 200 ms read timeout with at least one buffered frame) signals the burst is
+/// complete, or the overall `window` elapses. A real FIX client accumulates bytes
+/// across reads exactly like this; the production writer flushing per frame is not a
+/// defect.
+pub async fn recv_all_frames(stream: &mut TcpStream, window: Duration) -> Vec<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 4096];
+    while tokio::time::Instant::now() < deadline {
+        let read =
+            tokio::time::timeout(Duration::from_millis(200), stream.read(&mut scratch)).await;
+        match read {
+            Ok(Ok(0)) => break, // EOF
+            // Keep accumulating — do NOT return on the first frame; more frames of
+            // the same burst may still be in flight.
+            Ok(Ok(n)) => buf.extend_from_slice(&scratch[..n]),
+            Ok(Err(_)) => break,
+            Err(_elapsed) => {
+                // An idle gap: if the burst has produced at least one complete frame,
+                // it is finished — return everything accumulated so far.
+                let frames = split_frames(&buf);
+                if !frames.is_empty() {
+                    return frames;
+                }
+            }
+        }
+    }
+    split_frames(&buf)
+}
+
 /// The value of scalar `tag` in a FIX frame (`SOH`-delimited `tag=value`).
 #[must_use]
 pub fn field(frame: &[u8], tag: &str) -> Option<String> {
@@ -601,6 +650,23 @@ impl FixClient {
         let frame = cancel_frame(&self.sender, self.seq, orig_cl_ord_id, cl_ord_id, side);
         self.seq += 1;
         self.round_trip(frame).await
+    }
+
+    /// Sends an `OrderMassCancelRequest (q)` (`All` scope) and reads the reply —
+    /// the accepted `OrderMassCancelReport (r)` plus one `ExecutionReport (8)`
+    /// `Canceled` per swept order, or a single `r Rejected`.
+    ///
+    /// The reply is a multi-frame burst (`r` then N `8`s), each flushed separately
+    /// by the acceptor, so this drains via [`recv_all_frames`] rather than
+    /// [`round_trip`]'s first-batch [`recv_frames`] — otherwise the trailing `8`s
+    /// that land in a later TCP read are dropped.
+    pub async fn mass_cancel(&mut self, cl_ord_id: &str) -> Vec<Vec<u8>> {
+        let frame = mass_cancel_frame(&self.sender, self.seq, cl_ord_id);
+        self.seq += 1;
+        if let Err(e) = self.stream.write_all(&frame).await {
+            panic!("write must succeed: {e}");
+        }
+        recv_all_frames(&mut self.stream, REPLY_TIMEOUT).await
     }
 
     /// Replaces a resting order (`G`).

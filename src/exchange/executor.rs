@@ -1107,14 +1107,25 @@ impl MatchingExecutor {
     /// ([ADR-0009 §4](../../../docs/adr/0009-lossless-venue-envelope-outcomes.md)).
     ///
     /// The venue registry — not the upstream count-only aggregate — is the source
-    /// of the per-order `(venue_order_id, owner)` identity the FIX
+    /// of the per-order `(venue_order_id, owner, symbol, side)` identity the FIX
     /// `OrderMassCancelReport` + per-order `ExecutionReport`s need. The affected
     /// list is **sorted by venue order id**, a deterministic sweep order
     /// independent of map-iteration order, so a replay reproduces it exactly.
+    ///
+    /// ## Cross-account isolation (SECURITY)
+    ///
+    /// A CLIENT mass cancel is scoped to its own `account`: the STP `owner` a
+    /// `ByUser` filter names is **not** an authorization identity (multiple
+    /// accounts may share one STP owner), so a `ByUser` / `BySide` sweep also
+    /// requires `record.account == command.account` — an account can only ever
+    /// hit its OWN orders. `MassCancelType::All` is the venue-internal
+    /// expiry/lifecycle sweep (never a client path) and stays account-agnostic so
+    /// an expiry roll cancels every account's orders on the instrument.
     fn execute_mass_cancel(
         &mut self,
         scope: &MassCancelScope,
         cancel_type: &MassCancelType,
+        account: &AccountId,
     ) -> VenueOutcome {
         // Resolve the scope's expiration to its canonical `YYYYMMDD` once (an
         // `Expiration` / `Strike` scope); a malformed scope expiry is a rejected
@@ -1133,8 +1144,15 @@ impl MatchingExecutor {
             };
         }
 
+        // A `ByUser` / `BySide` client sweep is pinned to the requesting account;
+        // only the account-agnostic `All` lifecycle sweep crosses accounts.
+        let account_scope = match cancel_type {
+            MassCancelType::All => None,
+            MassCancelType::ByUser(_) | MassCancelType::BySide(_) => Some(account),
+        };
+
         VenueOutcome::MassCancelled {
-            affected: self.sweep_matching(scope, cancel_type),
+            affected: self.sweep_matching(scope, cancel_type, account_scope),
         }
     }
 
@@ -1147,14 +1165,23 @@ impl MatchingExecutor {
     /// Shared by [`execute_mass_cancel`](Self::execute_mass_cancel) and by the
     /// coupled owner-scoped market-maker sweep a **kill** control runs inside its
     /// own turn (`MarketMakerControl { enabled: Some(false), .. }`), so both record
-    /// the identical `(venue_order_id, owner, MassCancel)` triple. The affected list
-    /// is **sorted by venue order id**, a deterministic sweep order independent of
-    /// map-iteration order, so a replay reproduces it exactly — no wall-clock, no
-    /// RNG. The caller resolves any scope-expiry rejection before invoking this.
+    /// the identical `(venue_order_id, owner, symbol, side, MassCancel)` shape. The
+    /// affected list is **sorted by venue order id**, a deterministic sweep order
+    /// independent of map-iteration order, so a replay reproduces it exactly — no
+    /// wall-clock, no RNG. The caller resolves any scope-expiry rejection before
+    /// invoking this.
+    ///
+    /// `account_scope` is `Some(account)` for a CLIENT `ByUser` / `BySide` sweep —
+    /// an extra `record.account == account` gate so a caller can only hit its OWN
+    /// orders even when several accounts share one STP owner (the owner is not an
+    /// authorization identity, SECURITY). It is `None` for the venue-internal
+    /// `All` expiry sweep and the market-maker owner sweep, both of which are
+    /// account-agnostic by design.
     fn sweep_matching(
         &mut self,
         scope: &MassCancelScope,
         cancel_type: &MassCancelType,
+        account_scope: Option<&AccountId>,
     ) -> Vec<CancelledLeg> {
         // Resolve the scope's expiration to its canonical `YYYYMMDD` for the
         // `mass_cancel_matches` filter; an unresolvable expiry simply matches
@@ -1170,11 +1197,17 @@ impl MatchingExecutor {
         // Collect the matching resting orders (id + identity) from the venue
         // registry. Collected into a Vec and sorted below, so the HashMap iteration
         // order never reaches the sweep / event order.
-        let mut targets: Vec<(OrderId, Symbol, VenueOrderId, Hash32)> = self
+        let mut targets: Vec<(OrderId, Symbol, VenueOrderId, Hash32, Side)> = self
             .resting
             .iter()
             .filter(|(_, record)| {
-                mass_cancel_matches(record, scope, scope_expiry.as_deref(), cancel_type)
+                mass_cancel_matches(
+                    record,
+                    scope,
+                    scope_expiry.as_deref(),
+                    cancel_type,
+                    account_scope,
+                )
             })
             .map(|(engine_id, record)| {
                 (
@@ -1182,13 +1215,14 @@ impl MatchingExecutor {
                     record.symbol.clone(),
                     record.venue_order_id.clone(),
                     record.owner,
+                    record.side,
                 )
             })
             .collect();
         targets.sort_by(|a, b| a.2.as_str().cmp(b.2.as_str()));
 
         let mut affected: Vec<CancelledLeg> = Vec::with_capacity(targets.len());
-        for (engine_id, symbol, venue_order_id, owner) in targets {
+        for (engine_id, symbol, venue_order_id, owner, side) in targets {
             let Some(leaf) = self.resolve_leaf_read(&symbol) else {
                 continue;
             };
@@ -1197,6 +1231,8 @@ impl MatchingExecutor {
                 affected.push(CancelledLeg {
                     order_id: venue_order_id,
                     owner,
+                    symbol,
+                    side,
                     reason: CancelReason::MassCancel,
                 });
             }
@@ -1379,6 +1415,8 @@ impl MatchingExecutor {
                 self.resting.get(id).map(|record| CancelledLeg {
                     order_id: record.venue_order_id.clone(),
                     owner: record.owner,
+                    symbol: record.symbol.clone(),
+                    side: record.side,
                     reason: CancelReason::SelfTradePrevention,
                 })
             })
@@ -1780,9 +1818,14 @@ impl CommandExecutor for MatchingExecutor {
                     });
                 }
                 let swept = if *enabled == Some(false) {
+                    // The market-maker owner sweep is a venue-internal owner sweep
+                    // (the MM owner IS the authorization boundary here), so it
+                    // passes `None` — its behaviour is unchanged by the client
+                    // account gate.
                     self.sweep_matching(
                         &MassCancelScope::Underlying,
                         &MassCancelType::ByUser(MARKET_MAKER_OWNER),
+                        None,
                     )
                 } else {
                     Vec::new()
@@ -1799,8 +1842,10 @@ impl CommandExecutor for MatchingExecutor {
                 self.execute_set_instrument_status(symbol, *status)
             }
             VenueCommand::MassCancel {
-                scope, cancel_type, ..
-            } => self.execute_mass_cancel(scope, cancel_type),
+                scope,
+                cancel_type,
+                account,
+            } => self.execute_mass_cancel(scope, cancel_type, account),
             VenueCommand::EvictExpiredOrders { now_ms } => self.execute_evict_expired(*now_ms),
         }
     }
@@ -1835,19 +1880,35 @@ fn instrument_not_active_reason(symbol: &Symbol, status: InstrumentStatus) -> St
     format!("instrument {symbol} is {status} and is not accepting orders")
 }
 
-/// Whether a resting order matches a mass-cancel `scope` + `cancel_type`.
+/// Whether a resting order matches a mass-cancel `scope` + `cancel_type`, within
+/// an optional owning-`account` gate.
 ///
 /// `scope_expiry` is the scope expiration pre-formatted to canonical `YYYYMMDD`
 /// (present for an `Expiration` / `Strike` scope), so the per-order predicate does
 /// no fallible formatting. A resting order whose own symbol fails to parse is
 /// excluded (it can never match a hierarchy scope) — defensive under the
 /// single-writer invariant, where every registered symbol was already parsed.
+///
+/// `account_scope` is `Some(account)` for a CLIENT sweep: the STP `owner` a
+/// `ByUser` filter names is NOT an authorization identity (multiple accounts may
+/// share one STP owner), so the record must ALSO belong to the requesting account
+/// — a caller can never reach another account's order (SECURITY). It is `None`
+/// for the account-agnostic `All` lifecycle/expiry sweep and the market-maker
+/// owner sweep.
 fn mass_cancel_matches(
     record: &RestingRecord,
     scope: &MassCancelScope,
     scope_expiry: Option<&str>,
     cancel_type: &MassCancelType,
+    account_scope: Option<&AccountId>,
 ) -> bool {
+    // Account gate first: even a `ByUser(owner)` match must not cross accounts
+    // that happen to share the STP owner.
+    if let Some(account) = account_scope
+        && record.account != *account
+    {
+        return false;
+    }
     let type_matches = match cancel_type {
         MassCancelType::All => true,
         MassCancelType::BySide(side) => record.side == *side,
@@ -2170,6 +2231,16 @@ mod tests {
         }
     }
 
+    /// A client mass-cancel over the whole underlying, filtered by `cancel_type`
+    /// and requested by `account`.
+    fn mass_cancel(cancel_type: MassCancelType, account: &str) -> VenueCommand {
+        VenueCommand::MassCancel {
+            scope: MassCancelScope::Underlying,
+            cancel_type,
+            account: AccountId::new(account),
+        }
+    }
+
     // ---- add happy paths -------------------------------------------------
 
     #[test]
@@ -2443,6 +2514,101 @@ mod tests {
         assert!(
             matches!(outcome_at(&records, 2), VenueOutcome::Cancelled { .. }),
             "the owner's cancel must succeed, proving the order survived the attacker"
+        );
+    }
+
+    #[test]
+    fn test_client_by_user_mass_cancel_is_account_scoped_even_with_shared_stp_owner() {
+        // SECURITY (#97 finding 1): two accounts share ONE STP owner. A client
+        // `ByUser` cancel-all must sweep ONLY the requesting account's orders — the
+        // STP owner is not an authorization identity. And the venue-internal `All`
+        // expiry sweep, being account-agnostic, still cancels BOTH accounts' orders.
+        const SHARED_OWNER: u8 = 0x55;
+        let lin = lineage();
+        let mut ex = MatchingExecutor::new(UNDERLYING);
+
+        // seq 0: account-a rests a sell at 50_000; seq 1: account-b rests a sell at
+        // 50_100 — SAME STP owner, DIFFERENT account. Different prices so neither
+        // crosses the other (both are asks).
+        let a = run(
+            &mut ex,
+            &lin,
+            0,
+            &add(
+                &lin,
+                0,
+                "account-a",
+                SHARED_OWNER,
+                Side::Sell,
+                50_000,
+                1,
+                TimeInForce::Gtc,
+            ),
+        );
+        assert!(matches!(a, VenueOutcome::Added { .. }), "A's add rests");
+        let b = run(
+            &mut ex,
+            &lin,
+            1,
+            &add(
+                &lin,
+                1,
+                "account-b",
+                SHARED_OWNER,
+                Side::Sell,
+                50_100,
+                1,
+                TimeInForce::Gtc,
+            ),
+        );
+        assert!(matches!(b, VenueOutcome::Added { .. }), "B's add rests");
+        let a_order = lin.venue_order_id(UNDERLYING, SequenceNumber::new(0), 0);
+        let b_order = lin.venue_order_id(UNDERLYING, SequenceNumber::new(1), 0);
+
+        // seq 2: account-a's ByUser cancel-all sweeps ONLY A's order, even though B
+        // shares the STP owner the filter names.
+        let outcome = run(
+            &mut ex,
+            &lin,
+            2,
+            &mass_cancel(MassCancelType::ByUser(owner(SHARED_OWNER)), "account-a"),
+        );
+        match outcome {
+            VenueOutcome::MassCancelled { affected } => {
+                assert_eq!(affected.len(), 1, "only account-a's order is swept");
+                assert_eq!(affected[0].order_id, a_order);
+                // The leg carries the resting order's own symbol/side (#97 finding 3).
+                assert_eq!(affected[0].symbol, sym());
+                assert_eq!(affected[0].side, Side::Sell);
+            }
+            other => panic!("expected MassCancelled, got {other:?}"),
+        }
+        // B's order survives: its ask level is still on the book.
+        assert_eq!(
+            ex.top_of_book(&sym()).best_ask,
+            Some(Cents::new(50_100)),
+            "account-b's order was never touched by account-a's cancel-all"
+        );
+
+        // seq 3: the account-agnostic `All` lifecycle/expiry sweep cancels B's
+        // surviving order regardless of the account it names.
+        let outcome = run(
+            &mut ex,
+            &lin,
+            3,
+            &mass_cancel(MassCancelType::All, "lifecycle"),
+        );
+        match outcome {
+            VenueOutcome::MassCancelled { affected } => {
+                assert_eq!(affected.len(), 1, "All sweeps the surviving B order");
+                assert_eq!(affected[0].order_id, b_order);
+            }
+            other => panic!("expected MassCancelled, got {other:?}"),
+        }
+        assert_eq!(
+            ex.top_of_book(&sym()).best_ask,
+            None,
+            "the All sweep emptied the book across accounts"
         );
     }
 

@@ -199,8 +199,15 @@ pub struct Fill {
 /// ([ADR-0009 §4](../../../docs/adr/0009-lossless-venue-envelope-outcomes.md)).
 ///
 /// Recorded as a named struct (an object on the wire) rather than a positional
-/// tuple so the journal stays field-named and `deny_unknown_fields`-strict; it
-/// captures exactly the ADR-0009 `(order_id, owner, reason)` triple.
+/// tuple so the journal stays field-named and `deny_unknown_fields`-strict. It
+/// carries the resting order's own `symbol` + `side` alongside the ADR-0009
+/// `(order_id, owner, reason)` triple: a gateway rendering a per-order
+/// cancellation report (the FIX `ExecutionReport (8) Canceled`) needs the
+/// instrument + side, and reverse-resolving them from a per-session correlation
+/// map would silently drop any order the current session did not place (a REST
+/// placement by the same account, or a prior FIX session). The executor
+/// populates both losslessly from the resting-order registry, so they are
+/// journaled in the outcome and a replay reproduces them (#97).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CancelledLeg {
@@ -208,6 +215,11 @@ pub struct CancelledLeg {
     pub order_id: VenueOrderId,
     /// The STP owner hash of the cancelled order.
     pub owner: Hash32,
+    /// The cancelled order's contract symbol — the instrument a per-order
+    /// cancellation report renders against.
+    pub symbol: Symbol,
+    /// The cancelled order's side (the upstream matching-seam [`Side`]).
+    pub side: Side,
     /// Why it was cancelled.
     pub reason: CancelReason,
 }
@@ -734,6 +746,8 @@ mod tests {
         CancelledLeg {
             order_id: lineage.venue_order_id("BTC", seq, 0),
             owner: owner(0x22),
+            symbol: sym("BTC-20240329-50000-C"),
+            side: Side::Sell,
             reason: CancelReason::SelfTradePrevention,
         }
     }
@@ -1093,11 +1107,15 @@ mod tests {
             CancelledLeg {
                 order_id: lineage.venue_order_id("BTC", SequenceNumber::new(1), 0),
                 owner: owner(0x11),
+                symbol: sym("BTC-20240329-50000-C"),
+                side: Side::Buy,
                 reason: CancelReason::MassCancel,
             },
             CancelledLeg {
                 order_id: lineage.venue_order_id("BTC", SequenceNumber::new(2), 0),
                 owner: owner(0x11),
+                symbol: sym("BTC-20240329-50000-C"),
+                side: Side::Sell,
                 reason: CancelReason::MassCancel,
             },
         ];
@@ -1150,6 +1168,8 @@ mod tests {
         let swept = vec![CancelledLeg {
             order_id: lineage.venue_order_id("BTC", SequenceNumber::new(1), 0),
             owner: owner(0xEE),
+            symbol: sym("BTC-20240329-50000-C"),
+            side: Side::Buy,
             reason: CancelReason::MassCancel,
         }];
         let outcome = VenueOutcome::ControlApplied {

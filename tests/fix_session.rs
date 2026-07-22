@@ -533,7 +533,14 @@ async fn test_new_order_single_market_against_empty_book_reports_new_then_cancel
         .write_all(&new_order_frame(TRADER_SENDER, VENUE, 2))
         .await
         .expect("order");
-    let reply = recv_frames(&mut client, Duration::from_secs(3)).await;
+    // New (150=0) and the killed-remainder Canceled (150=4) are written as separate
+    // frames with a gap; wait for the Canceled so a single read can't race past it
+    // (a CPU-loaded binary widens the gap) — assertions on the returned set are
+    // unchanged.
+    let reply = recv_frames_until(&mut client, Duration::from_secs(3), |f| {
+        field(f, "150").as_deref() == Some("4")
+    })
+    .await;
     assert!(
         !any_msg_type(&reply, "3"),
         "an application order is never a session Reject(3), got {reply:?}"

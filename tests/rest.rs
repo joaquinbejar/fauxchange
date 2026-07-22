@@ -302,6 +302,135 @@ async fn test_limit_order_journals_an_add_order_command() {
     );
 }
 
+// ---- cancel-all (owner-scoped mass cancel, #097) --------------------------
+
+/// The cancel-all endpoint URI.
+const CANCEL_ALL: &str = "/api/v1/orders/cancel-all";
+
+/// Rests `count` non-crossing buy limits for `account` on the fixture contract,
+/// each at a distinct price so all rest (an empty book has no ask to cross).
+async fn rest_n_buys(state: &Arc<AppState>, account: &str, count: u64) {
+    let bearer = token(state, account);
+    let uri = format!("{CONTRACT}/orders");
+    for i in 0..count {
+        let (status, body) = send(
+            state,
+            build_request(
+                "POST",
+                &uri,
+                Some(&bearer),
+                // Prices well below any ask, distinct per order → all rest, none fill.
+                Some(limit_body("buy", 40_000 + i, 1)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "resting buy must be accepted");
+        assert_eq!(body["status"], "accepted", "the buy must rest, not fill");
+    }
+}
+
+#[tokio::test]
+async fn test_cancel_all_cancels_the_accounts_resting_orders_and_reports_count() {
+    let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
+    rest_n_buys(&state, "trader-1", 3).await;
+
+    let bearer = token(&state, "trader-1");
+    let (status, body) = send(
+        &state,
+        build_request("DELETE", CANCEL_ALL, Some(&bearer), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an owner-scoped cancel-all succeeds"
+    );
+    assert_eq!(
+        body["canceled_count"], 3,
+        "cancel-all cancels every one of the account's resting orders"
+    );
+    assert_eq!(body["failed_count"], 0);
+
+    // A second cancel-all has nothing left to sweep.
+    let (status, body) = send(
+        &state,
+        build_request("DELETE", CANCEL_ALL, Some(&bearer), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["canceled_count"], 0,
+        "a repeat cancel-all reports zero — the orders are already gone"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_all_is_owner_scoped_and_never_touches_another_account() {
+    let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
+    rest_n_buys(&state, "trader-1", 2).await;
+    rest_n_buys(&state, "trader-2", 3).await;
+
+    // trader-2 cancels all of ITS OWN orders — trader-1's must be untouched.
+    let (status, body) = send(
+        &state,
+        build_request("DELETE", CANCEL_ALL, Some(&token(&state, "trader-2")), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["canceled_count"], 3,
+        "trader-2 sweeps exactly its own three orders"
+    );
+
+    // trader-1's two orders survive: its own cancel-all still finds two.
+    let (status, body) = send(
+        &state,
+        build_request("DELETE", CANCEL_ALL, Some(&token(&state, "trader-1")), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["canceled_count"], 2,
+        "trader-1's orders were never touched by trader-2's cancel-all"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_all_requires_trade_permission() {
+    let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
+    let (status, _) = send(
+        &state,
+        build_request("DELETE", CANCEL_ALL, Some(&token(&state, "reader-1")), None),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cancel-all is a mutating op — a Read-only caller is 403"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_all_refuses_a_filtered_request() {
+    let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);
+    let bearer = token(&state, "trader-1");
+    let (status, _) = send(
+        &state,
+        build_request(
+            "DELETE",
+            &format!("{CANCEL_ALL}?side=buy"),
+            Some(&bearer),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a filtered cancel-all is refused, never a silent over-broad sweep"
+    );
+}
+
 #[tokio::test]
 async fn test_crossing_order_reports_fills_from_the_sequenced_path() {
     let state = venue(DEFAULT_RATE_LIMIT_PER_WINDOW);

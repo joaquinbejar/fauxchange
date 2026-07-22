@@ -1345,6 +1345,8 @@ fn test_normalize_strips_stp_cancelled_order_id_but_keeps_owner_and_reason() {
             stp_cancelled: vec![CancelledLeg {
                 order_id: VenueOrderId::new("resting-self"),
                 owner: Hash32([0x22; 32]),
+                symbol: sym(),
+                side: SeamSide::Sell,
                 reason: CancelReason::SelfTradePrevention,
             }],
         },
@@ -2265,6 +2267,8 @@ fn stp_event(aggressor: &str, resting: &str) -> VenueEvent {
             stp_cancelled: vec![CancelledLeg {
                 order_id: VenueOrderId::new(resting),
                 owner: Hash32([0x22; 32]),
+                symbol: sym(),
+                side: SeamSide::Sell,
                 reason: CancelReason::SelfTradePrevention,
             }],
         },
@@ -2733,4 +2737,221 @@ async fn test_fix_conformance_script_logout_5_on_credential_failure_redacts_text
             "the presented password must never appear in a reply frame"
         );
     }
+}
+
+/// Every `ExecutionReport (8)` `Canceled (150=4)` in `frames`, in wire order.
+fn canceled_reports(frames: &[Vec<u8>]) -> Vec<&Vec<u8>> {
+    frames
+        .iter()
+        .filter(|f| {
+            cfix::msg_type(f).as_deref() == Some("8")
+                && cfix::field(f, "150").as_deref() == Some("4")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_fix_mass_cancel_q_accepts_and_reports_one_8_per_swept_order() {
+    // (#97) A committed `OrderMassCancelRequest (q)` renders `OrderMassCancelReport (r)`
+    // ACCEPTED (not the old honest Rejected) plus one `ExecutionReport (8) Canceled`
+    // per swept resting order (03 §5.3). trader-1 rests three GTC buys, then mass-cancels.
+    let harness = cfix::FixParityHarness::start().await;
+    let mut client = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    for i in 0..3 {
+        let reply = client
+            .place_limit(&format!("mc-a-{i}"), "1", 40_000 + i, 1, "1")
+            .await;
+        assert!(
+            cfix::any_msg_type(&reply, "8"),
+            "each resting buy is acked with an ExecutionReport(8), got {reply:?}"
+        );
+    }
+
+    let reply = client.mass_cancel("mc-a-q").await;
+    assert!(
+        !cfix::any_msg_type(&reply, "3"),
+        "a mass cancel is never a session Reject(3), got {reply:?}"
+    );
+    let r = match cfix::find_msg(&reply, "r") {
+        Some(r) => r,
+        None => panic!("a committed q must render an OrderMassCancelReport(r), got {reply:?}"),
+    };
+    assert_eq!(
+        cfix::field(r, "531").as_deref(),
+        Some("7"),
+        "MassCancelResponse is ACCEPTED (All=7), never the honest Rejected(0)"
+    );
+    assert_eq!(
+        cfix::field(r, "533").as_deref(),
+        Some("3"),
+        "TotalAffectedOrders is the true swept count"
+    );
+
+    let canceled = canceled_reports(&reply);
+    assert_eq!(
+        canceled.len(),
+        3,
+        "exactly one ExecutionReport(8) Canceled per swept order, got {reply:?}"
+    );
+    for report in &canceled {
+        assert_eq!(
+            cfix::field(report, "55").as_deref(),
+            Some("BTC-20240329-50000-C"),
+            "each per-order 8 carries the swept order's Symbol"
+        );
+        assert_eq!(
+            cfix::field(report, "39").as_deref(),
+            Some("4"),
+            "OrdStatus is Canceled"
+        );
+        assert!(
+            cfix::field(report, "37").is_some(),
+            "each per-order 8 carries the venue OrderID(37)"
+        );
+    }
+
+    // A second mass cancel has nothing left to sweep: r accepted, zero affected, no 8s.
+    let reply = client.mass_cancel("mc-a-q2").await;
+    let r = cfix::find_msg(&reply, "r").expect("a repeat q still renders an r");
+    assert_eq!(
+        cfix::field(r, "533").as_deref(),
+        Some("0"),
+        "a repeat mass cancel reports zero affected — the orders are already gone"
+    );
+    assert_eq!(
+        canceled_reports(&reply).len(),
+        0,
+        "a repeat mass cancel emits no per-order 8"
+    );
+}
+
+#[tokio::test]
+async fn test_fix_mass_cancel_q_is_owner_scoped_across_accounts() {
+    // (#97) Owner scoping: trader-2's `q` sweeps ONLY trader-2's orders; trader-1's
+    // resting orders are untouched and are still cancellable by trader-1's own `q`.
+    let harness = cfix::FixParityHarness::start().await;
+    let mut trader1 = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let mut trader2 = cfix::FixClient::logon(harness.addr(), cfix::TRADER2).await;
+
+    // trader-1 rests two, trader-2 rests three — all resting GTC buys on one book.
+    let mut trader1_ids = Vec::new();
+    for i in 0..2 {
+        let reply = trader1
+            .place_limit(&format!("iso-1-{i}"), "1", 41_000 + i, 1, "1")
+            .await;
+        let new = cfix::find_msg(&reply, "8").expect("trader-1 buy is acked with an 8");
+        trader1_ids.push(cfix::field(new, "37").expect("the 8 carries an OrderID(37)"));
+    }
+    for i in 0..3 {
+        let _ = trader2
+            .place_limit(&format!("iso-2-{i}"), "1", 42_000 + i, 1, "1")
+            .await;
+    }
+
+    // trader-2 mass-cancels: exactly its own three, none of trader-1's.
+    let reply = trader2.mass_cancel("iso-2-q").await;
+    let r = cfix::find_msg(&reply, "r").expect("trader-2's q renders an r");
+    assert_eq!(
+        cfix::field(r, "533").as_deref(),
+        Some("3"),
+        "trader-2 sweeps exactly its own three orders"
+    );
+    assert_eq!(canceled_reports(&reply).len(), 3);
+    // The swept ids must NOT disclose or include any of trader-1's orders.
+    let swept_wire: String = reply
+        .iter()
+        .map(|f| String::from_utf8_lossy(f).into_owned())
+        .collect();
+    for id in &trader1_ids {
+        assert!(
+            !swept_wire.contains(id.as_str()),
+            "trader-2's mass cancel must not touch or disclose trader-1's order {id}"
+        );
+    }
+
+    // trader-1's two orders survive: its OWN q still finds exactly two.
+    let reply = trader1.mass_cancel("iso-1-q").await;
+    let r = cfix::find_msg(&reply, "r").expect("trader-1's q renders an r");
+    assert_eq!(
+        cfix::field(r, "533").as_deref(),
+        Some("2"),
+        "trader-1's orders were never touched by trader-2's cancel-all"
+    );
+    assert_eq!(canceled_reports(&reply).len(), 2);
+}
+
+#[tokio::test]
+async fn test_fix_mass_cancel_q_reports_8_for_an_order_not_placed_this_session() {
+    // (#97 finding 3) A resting order the current FIX session did NOT place — here a
+    // placement submitted straight onto the sequenced path (exactly like a REST
+    // client or a prior FIX session) — is swept by a FIX `q` and MUST still receive
+    // its own `ExecutionReport(8) Canceled`. The swept leg now carries the resting
+    // order's own Symbol/Side (journaled in the outcome), so the render no longer
+    // depends on this session's placement tracking, and the `r` 533 count equals the
+    // number of `8`s.
+    let harness = cfix::FixParityHarness::start().await;
+
+    // A REST-equivalent placement for trader-1, NOT tracked by any FIX session.
+    let symbol = match Symbol::parse(CALL) {
+        Ok(s) => s,
+        Err(e) => panic!("fixture symbol parses: {e:?}"),
+    };
+    let placed_id = VenueOrderId::new("rest-side-mc-1");
+    let receipt = harness
+        .state()
+        .submit(VenueCommand::AddOrder {
+            symbol,
+            order_id: placed_id.clone(),
+            account: AccountId::new(cfix::TRADER1.account),
+            owner: Hash32([cfix::TRADER1.owner_byte; 32]),
+            client_order_id: None,
+            side: SeamSide::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(39_000)),
+            quantity: 1,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        })
+        .await;
+    assert!(
+        receipt.is_ok(),
+        "the sequenced (REST-equivalent) placement must commit: {receipt:?}"
+    );
+
+    // trader-1 logs on fresh and mass-cancels: the sweep hits the order this session
+    // never tracked in `placed`.
+    let mut client = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let reply = client.mass_cancel("mc-untracked-q").await;
+
+    let r = match cfix::find_msg(&reply, "r") {
+        Some(r) => r,
+        None => panic!("a committed q must render an r, got {reply:?}"),
+    };
+    assert_eq!(
+        cfix::field(r, "533").as_deref(),
+        Some("1"),
+        "TotalAffectedOrders counts the untracked order"
+    );
+    let canceled = canceled_reports(&reply);
+    assert_eq!(
+        canceled.len(),
+        1,
+        "the untracked order still gets its own 8 — count matches r's 533, got {reply:?}"
+    );
+    let report = canceled[0];
+    assert_eq!(
+        cfix::field(report, "55").as_deref(),
+        Some(CALL),
+        "the 8 carries the swept order's Symbol from the journaled leg, not session tracking"
+    );
+    assert_eq!(
+        cfix::field(report, "54").as_deref(),
+        Some("1"),
+        "the 8 carries the swept order's Side (Buy) from the journaled leg"
+    );
+    assert_eq!(
+        cfix::field(report, "37").as_deref(),
+        Some(placed_id.as_str()),
+        "the 8 references the REST-placed venue OrderID(37)"
+    );
 }

@@ -943,6 +943,8 @@ fn test_golden_venue_add_order_stp_cancelled_event() {
         stp_cancelled: vec![CancelledLeg {
             order_id: self_maker_id,
             owner: taker_owner,
+            symbol: sym("BTC-20240329-50000-C"),
+            side: SeamSide::Sell,
             reason: CancelReason::SelfTradePrevention,
         }],
     };

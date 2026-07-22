@@ -374,7 +374,7 @@ proptest! {
 
         let order_id = lineage_id.venue_order_id(underlying.as_str(), sequence, 0);
         let command = VenueCommand::AddOrder {
-            symbol,
+            symbol: symbol.clone(),
             order_id: order_id.clone(),
             account: AccountId::new("taker"),
             owner: taker_owner,
@@ -428,6 +428,8 @@ proptest! {
                     i,
                 ),
                 owner: maker_owner,
+                symbol: symbol.clone(),
+                side: maker_side,
                 reason: CancelReason::SelfTradePrevention,
             })
             .collect();

@@ -44,18 +44,19 @@ use ironfix_core::types::{CompId, SeqNum};
 use crate::auth::{AccountStore, RateLimitKey, RateLimitTier, RevocationOracle};
 use crate::error::{FixReject, FixRejectContext, FixRejectReason, VenueError};
 use crate::exchange::{
-    AddOutcome, Cents, Symbol, SymbolParser, TimeInForce as SeamTif, VenueOutcome,
+    AddOutcome, Cents, FanoutSummary, MassCancelScope, MassCancelType, Symbol, SymbolParser,
+    TimeInForce as SeamTif, VenueCommand, VenueOutcome,
 };
 use crate::gateway::rest::support::{
     immediate_execution_records, mint_order_id, owner_for, taker_legs_for_order,
 };
 use crate::models::{AccountId, ClientOrderId, ExecutionId, Permission, VenueOrderId};
-use crate::state::AppState;
+use crate::state::{AppState, SweptLeg};
 
 use super::codec::{FieldWriter, tags};
 use super::enums::{
-    CxlRejResponseTo, ExecType, MassCancelResponse, OrdStatus, OrdType, OrderSide,
-    SubscriptionRequestType, TimeInForce as FixTif,
+    CxlRejResponseTo, ExecType, MassCancelRequestType, MassCancelResponse, OrdStatus, OrdType,
+    OrderSide, SubscriptionRequestType, TimeInForce as FixTif,
 };
 use super::error::SessionRejectReason;
 use super::execution::{
@@ -68,7 +69,8 @@ use super::marketdata::{
 };
 use super::md_projection::{self, RequestedSides};
 use super::order::{
-    NewOrderSingle, OrderCancelReplaceRequest, OrderCancelRequest, OrderStatusRequest,
+    NewOrderSingle, OrderCancelReplaceRequest, OrderCancelRequest, OrderMassCancelRequest,
+    OrderStatusRequest,
 };
 use super::order_flow::{self, ExecReportSpec};
 use super::store::{
@@ -1082,9 +1084,9 @@ impl SessionFsm {
     }
 
     /// Emits an `OrderMassCancelReport (r)` `Rejected` — the honest response to an
-    /// `OrderMassCancelRequest (q)` while venue-wide mass-cancel routing is not
-    /// wired (the per-underlying submit path does not route a mass cancel, exactly
-    /// as the REST cancel-all handler returns `400`).
+    /// `OrderMassCancelRequest (q)` the venue refused (a rate-limited caller, an
+    /// unresolved owner, or a sweep every targeted underlying rejected). It carries
+    /// no affected orders, so it never discloses any account's book (#97).
     ///
     /// # Errors
     ///
@@ -1103,6 +1105,57 @@ impl SessionFsm {
             .encode()
         })?;
         Ok(Reaction::emit(vec![frame]))
+    }
+
+    /// Emits an accepted `OrderMassCancelReport (r)` (echoing the request scope in
+    /// `MassCancelResponse (531)`) carrying the full swept `affected_orders` set,
+    /// then one sequenced, resend-persisted `ExecutionReport (8) Canceled` per
+    /// `spec` — the render side of a committed
+    /// `OrderMassCancelRequest (q)` ([03 §5.3](../../../docs/03-protocol-surfaces.md#53-order-entry-and-execution-reports)).
+    ///
+    /// The `r` is emitted **first** (the acknowledgement), then the per-order
+    /// reports; every frame is stamped with the next checked sender `MsgSeqNum` and
+    /// stored for resend exactly like every other venue-originated frame.
+    /// `total_affected_orders` is the length of the swept set — the honest count of
+    /// every order cancelled, independent of how many the session could render an
+    /// `8` for.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError`] on counter exhaustion or a store failure while emitting.
+    pub(crate) fn emit_mass_cancel_accepted(
+        &mut self,
+        response: MassCancelResponse,
+        affected_orders: Vec<VenueOrderId>,
+        specs: Vec<ExecReportSpec>,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        // Checked (rule 9/13): the advertised `TotalAffectedOrders (533)` MUST agree
+        // with the encoded `affected_orders` list, so a count that will not fit the
+        // FIX `u32` field is a propagated typed error (sealing the session) — NEVER
+        // a silent `u32::MAX` clamp that would disagree with the list. Unreachable in
+        // practice (the swept set is bounded by resting orders), a fail-safe.
+        let total_affected_orders =
+            u32::try_from(affected_orders.len()).map_err(|_| SessionError::SequenceExhausted)?;
+        let report = self.emit(now_ms, |header| {
+            OrderMassCancelReport {
+                header,
+                mass_cancel_response: response,
+                total_affected_orders,
+                affected_orders,
+            }
+            .encode()
+        })?;
+        // Capacity is a hint only (not correctness): a `checked_add` that would
+        // overflow falls back to `specs.len()`, which never implies a wrong count —
+        // the authoritative `total_affected_orders` above is separately checked.
+        let mut frames = Vec::with_capacity(specs.len().checked_add(1).unwrap_or(specs.len()));
+        frames.push(report);
+        for spec in specs {
+            let frame = self.emit(now_ms, |header| spec.into_report(header).encode())?;
+            frames.push(frame);
+        }
+        Ok(Reaction::emit(frames))
     }
 
     /// Emits a `BusinessMessageReject (j)` for a well-formed application message
@@ -2047,7 +2100,9 @@ impl VenueFixSession {
             DecodedMessage::OrderCancelReplaceRequest(replace) => {
                 self.route_replace(replace, now_ms).await
             }
-            DecodedMessage::OrderMassCancelRequest(_) => self.fsm.emit_mass_cancel_rejected(now_ms),
+            DecodedMessage::OrderMassCancelRequest(request) => {
+                self.route_mass_cancel(request, now_ms).await
+            }
             DecodedMessage::OrderStatusRequest(status) => self.route_status(status, now_ms),
             DecodedMessage::MarketDataRequest(request) => self.route_market_data(request, now_ms),
             // `handle_active` only routes application messages here (unreachable).
@@ -2211,6 +2266,137 @@ impl VenueFixSession {
             &reject,
             now_ms,
         )
+    }
+
+    /// `OrderMassCancelRequest (q)` → the **owner-scoped**
+    /// [`VenueCommand::MassCancel`] (#97): the caller can only ever sweep ITS OWN
+    /// resting orders ([`MassCancelType::ByUser`] keyed on the account's STP owner),
+    /// never another account's — the executor's owner filter enforces the isolation,
+    /// so the reject/report never discloses another account's orders. `All (530=7)`
+    /// sweeps the account's whole resting set across the venue; `Security (530=1)`
+    /// sweeps one book (`Symbol (55)`). A committed sweep renders
+    /// `OrderMassCancelReport (r)` accepted plus one `ExecutionReport (8) Canceled`
+    /// per swept order ([03 §5.3](../../../docs/03-protocol-surfaces.md#53-order-entry-and-execution-reports));
+    /// a rate-limited, unresolved-owner, or failed request renders `r Rejected`.
+    async fn route_mass_cancel(
+        &mut self,
+        request: OrderMassCancelRequest,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        let Some(account) = self.fsm.account.clone() else {
+            return Ok(Reaction::cont());
+        };
+        // Rate limit every mutating op on every protocol (rule 6): a throttled `q`
+        // is an honest `r Rejected`, never a silent sweep.
+        if self.rate_limited() {
+            return self.fsm.emit_mass_cancel_rejected(now_ms);
+        }
+        let owner = match owner_for(&self.state, &account) {
+            Ok(owner) => owner,
+            Err(_) => return self.fsm.emit_mass_cancel_rejected(now_ms),
+        };
+        // Map the request scope onto the venue command scope + the echoed response
+        // label. Both scopes are owner-scoped by `ByUser(owner)`.
+        let (scope, response) = match request.mass_cancel_request_type {
+            MassCancelRequestType::All => (MassCancelScope::Underlying, MassCancelResponse::All),
+            MassCancelRequestType::Security => {
+                // Decode guarantees a `Symbol` for a per-security scope; be total.
+                let Some(symbol) = request.symbol.clone() else {
+                    return self.fsm.emit_mass_cancel_rejected(now_ms);
+                };
+                (MassCancelScope::Book(symbol), MassCancelResponse::Security)
+            }
+        };
+        let command = VenueCommand::MassCancel {
+            scope,
+            cancel_type: MassCancelType::ByUser(owner),
+            account,
+        };
+        match self.state.submit_mass_cancel(command).await {
+            Ok(delivery) => {
+                self.render_mass_cancel(response, &delivery.swept, delivery.fanout, now_ms)
+            }
+            Err(_) => self.fsm.emit_mass_cancel_rejected(now_ms),
+        }
+    }
+
+    /// Renders an accepted [`OrderMassCancelReport (r)`] plus one
+    /// [`ExecutionReport (8) Canceled`] per swept order ([03 §5.3](../../../docs/03-protocol-surfaces.md#53-order-entry-and-execution-reports)).
+    ///
+    /// The affected set is the deterministic, venue-id-sorted [`MassCancelled`]
+    /// outcome; the `r` report carries **every** swept order id (the honest count).
+    /// Each per-order `8` renders the order's `Symbol`/`Side` **directly from the
+    /// swept leg** — the [`CancelledLeg`](crate::exchange::CancelledLeg) now carries
+    /// the resting order's own `symbol`/`side`, journaled in the outcome — so EVERY
+    /// swept order gets its `8`, including one this session did not place (a REST
+    /// placement by the same account, or a prior FIX session). Any matching
+    /// session-tracked entry is still dropped from `self.placed` (the order is gone
+    /// from the book), so a later `F` on it is a masked reject.
+    ///
+    /// `fanout` is the venue-global delivery summary. On a NON-full fan-out the
+    /// per-order `8`s for what WAS swept are still emitted (those cancellations are
+    /// real) and the `r` carries the honest affected count, but the partial delivery
+    /// is `WARN`-logged — FIX has no structured partial-delivery field, so it is not
+    /// presented as a clean full success; the structured signal lives on REST.
+    fn render_mass_cancel(
+        &mut self,
+        response: MassCancelResponse,
+        affected: &[SweptLeg],
+        fanout: FanoutSummary,
+        now_ms: u64,
+    ) -> Result<Reaction, SessionError> {
+        // A partial venue-wide fan-out is a reportable state (#97 finding 2): warn
+        // rather than present the sweep as a clean full success. FIX has no
+        // structured partial-delivery field; the per-order `8`s below are still the
+        // real cancellations, and the structured `fully_applied` signal is on REST.
+        if !fanout.fully_applied() {
+            tracing::warn!(
+                ok_underlyings = fanout.ok_count,
+                total_underlyings = fanout.total,
+                swept = affected.len(),
+                "FIX mass-cancel fan-out was partial across underlyings; live orders \
+                 may remain on the rejected underlyings"
+            );
+        }
+        let lineage = self.state.lineage_id().clone();
+        let affected_ids: Vec<VenueOrderId> = affected
+            .iter()
+            .map(|swept| swept.leg.order_id.clone())
+            .collect();
+        // Render each swept leg's `8` directly from the journaled `symbol`/`side` on
+        // the outcome — no session-tracked reverse resolution, so no swept order is
+        // ever silently skipped. The composite `ExecID` is collision-free (per-leg
+        // underlying + the swept command's `underlying_sequence` join key + index).
+        let mut specs: Vec<ExecReportSpec> = Vec::with_capacity(affected.len());
+        let mut index: u32 = 0;
+        for swept in affected {
+            // Drop any session-tracked correlation for this order: it is gone from
+            // the book, so a later `F`/`G` on it must masked-reject.
+            let tracked = self
+                .placed
+                .iter()
+                .find(|(_, placed)| placed.order_id == swept.leg.order_id)
+                .map(|(cl_ord_id, _)| cl_ord_id.clone());
+            if let Some(cl_ord_id) = tracked {
+                self.placed.remove(&cl_ord_id);
+            }
+            let underlying = underlying_of_symbol(&swept.leg.symbol);
+            specs.push(order_flow::render_mass_cancel_leg_report(
+                swept.leg.symbol.clone(),
+                order_flow::fix_side(swept.leg.side),
+                swept.leg.order_id.clone(),
+                swept.sequence,
+                &lineage,
+                &underlying,
+                index,
+            ));
+            // Checked (rule 9); the affected set is bounded by resting orders.
+            index = index
+                .checked_add(1)
+                .ok_or(SessionError::SequenceExhausted)?;
+        }
+        self.fsm
+            .emit_mass_cancel_accepted(response, affected_ids, specs, now_ms)
     }
 
     /// `OrderCancelRequest (F)` → [`VenueCommand::CancelOrder`], resolving the
