@@ -691,8 +691,11 @@ stream is byte-identical — asserted by
   materialised only at the serialize seam.
 - The underlying ticker is interned once at registration as an `Arc<str>` on
   each `QuotableInstrument` and cloned (a refcount bump) into each per-leg
-  `RestingQuote`, replacing the two `String` allocations per instrument the
-  old `underlying.to_string()` calls made every tick.
+  `RestingQuote`, replacing the per-leg `String` allocations the old
+  `underlying.to_string()` calls made in the quote loop every tick. (The
+  `update_price` ENTRY path's own two `underlying.to_string()` calls — the
+  prices-map key and the `PriceUpdated` event — are NOT removed by this pass;
+  see "What remains" below.)
 - `requote_symbol` gathers an underlying's contracts into a **reused
   per-engine scratch buffer** of `Arc<QuotableInstrument>` clones instead of
   deep-cloning the whole `Vec<QuotableInstrument>` (with its owned `Symbol` /
@@ -700,10 +703,20 @@ stream is byte-identical — asserted by
   per-contract deep copy while still releasing the `instruments` read lock
   before the quote loop (no lock across a sink enqueue / broadcast, rule 8).
 
-**What remains, honestly re-scoped (still non-zero, upstream-/DTO-bound).** The
-residual 232 allocs/op are dominated by two costs the venue's own plumbing
-cannot remove without either an upstream change or a DTO wire-form change that
-`#122` deliberately does not make:
+**What remains — HYPOTHESISED contributors, not a measured attribution.** The
+`alloc_profile` counter is **process-wide** and no call-stack profiler was run,
+so the breakdown below is a **source-reading hypothesis** about where the
+residual 232 allocs/op most likely come from — NOT a per-call-site measurement.
+It is not evidence that these are the dominant costs or that venue plumbing has
+reached any "floor"; attributing the 232 to concrete call sites needs the
+call-stack-profiler follow-up (#138). Read the list as candidates to
+investigate, not as measured shares. In particular, `update_price` itself
+(`src/market_maker/engine.rs`) **still visibly allocates two owned underlying
+`String`s per tick** — one for the prices-map `insert` key and one for the
+`MarketMakerEvent::PriceUpdated { symbol }` broadcast — so the entry path is
+demonstrably NOT at a wire-safe allocation floor; those two are a known,
+removable venue-plumbing residual (a follow-up, not claimed already-minimal).
+The likely larger contributors, by source inspection:
 
 - the **`optionstratlib` Black-Scholes evaluation** — 10 real
   `Quoter::generate_quote` calls per tick, each building an
@@ -723,9 +736,12 @@ cannot remove without either an upstream change or a DTO wire-form change that
   don't do it." Named as a follow-up, not silently absorbed.
 
 The zero-steady-state-allocation DESIGN TARGET therefore remains **open** for
-this path, now at a smaller, honestly-disclosed gap (232, down from 343), with
-the reducible venue plumbing taken to its wire-safe floor and the remainder
-attributed to the upstream pricing kernel and the DTO id representation.
+this path, now at a smaller, MEASURED gap (232 allocs/op, down from 343 — the
+number is measured; the per-call-site breakdown above is not). The remainder is
+NOT claimed to be at any "wire-safe floor": `update_price` still allocates two
+owned underlying strings per tick (above), and the split between the pricing
+kernel, the DTO id representation, and that entry-path residual is a hypothesis
+pending the #138 call-stack-attribution follow-up, not a measured attribution.
 
 **Method and what this does / does not prove.** This is a **process-wide**
 allocation-pressure profile of the measured loop (every allocation on any
