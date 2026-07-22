@@ -1466,6 +1466,22 @@ mod tests {
                 account: AccountId::new("acct-1"),
             },
         ));
+        // A string field packed with control bytes (` `) — serde_json escapes
+        // EACH to the 6-byte `\u00XX` form, the worst-case expansion the
+        // `JSON_STRING_ESCAPE_FACTOR = 6` soundness proof rests on. This pins that
+        // factor EMPIRICALLY: were it ever lowered (e.g. to 2), the estimate would
+        // under-count this record's ~6× string and `estimate >= actual` would fail
+        // here — so the load-bearing DoS-ceiling bound cannot silently regress.
+        let control_bytes = "\u{0}".repeat(2_000);
+        records.push(JournalRecord::command(
+            SequenceNumber::new(1),
+            EventTimestamp::new(1),
+            VenueCommand::CancelOrder {
+                symbol: sym("BTC-20240329-50000-C"),
+                order_id: crate::models::VenueOrderId::new(control_bytes),
+                account: AccountId::new("acct-1"),
+            },
+        ));
         for record in &records {
             let actual = match serde_json::to_string(record) {
                 Ok(json) => json.len(),

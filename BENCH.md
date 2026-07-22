@@ -313,6 +313,8 @@ bench-regression gate over HP-1.
 
 ### 3.7 `#091` — index-backed uniqueness + size-check fast path (the append tail-latency fix)
 
+Recorded 2026-07-22 (M4 Max dev laptop, same host/toolchain as §3.1/§3.6).
+
 `#091` replaced the two measured in-memory-append tail-latency costs §3.1/§3.6
 diagnosed with equal-guarantee accelerators (`src/exchange/journal.rs`):
 
@@ -344,7 +346,8 @@ here was reproduced **on this same machine in the same session** by temporarily
 reverting *only* the two `append` changes (the linear scan + the unconditional
 serialize) — a genuine A/B, not a cross-machine comparison. It closely
 reproduces the committed §3.6 post-`#34` baseline (`hp1_command_append` p50
-158 µs here vs §3.6's 160 µs; full-turn p99 1.11 ms vs §3.6's 1.24 ms), which
+158 µs here, squarely inside §3.6's post-`#34` ~156–162 µs; full-turn p99
+1.11 ms vs §3.6's 1.24 ms), which
 validates the "before" as a faithful stand-in for the shipped pre-`#091` code.
 Two runs each (same `HP1_WARMUP_OPS=5000 HP1_MEASURED_OPS=100000` config, same
 seed, same toolchain), reported run 1 with run 2 in parentheses for run-to-run
