@@ -1885,8 +1885,10 @@ impl std::fmt::Debug for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::{Cents, Hash32, MassCancelType, STPMode, Side, Symbol, TimeInForce};
-    use crate::models::{AccountId, OrderType, VenueOrderId};
+    use crate::exchange::{
+        Cents, Hash32, MassCancelType, STPMode, Side, Symbol, TimeInForce, VenueOutcome,
+    };
+    use crate::models::{AccountId, ClientOrderId, OrderType, VenueOrderId};
 
     fn config(underlyings: &[&str]) -> AppStateConfig {
         AppStateConfig::new(underlyings.iter().copied()).with_lineage(LineageId::new("run-1"))
@@ -1932,6 +1934,34 @@ mod tests {
             account: AccountId::new(account),
             owner: Hash32([owner; 32]),
             client_order_id: None,
+            side,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(price)),
+            quantity,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        }
+    }
+
+    /// An `AddOrder` carrying a `client_order_id` — the account-scoped
+    /// idempotency key an idempotent resend reuses.
+    #[allow(clippy::too_many_arguments)]
+    fn add_keyed(
+        symbol: &str,
+        order_id: &str,
+        account: &str,
+        owner: u8,
+        side: Side,
+        price: u64,
+        quantity: u64,
+        client_order_id: &str,
+    ) -> VenueCommand {
+        VenueCommand::AddOrder {
+            symbol: sym(symbol),
+            order_id: VenueOrderId::new(order_id),
+            account: AccountId::new(account),
+            owner: Hash32([owner; 32]),
+            client_order_id: Some(ClientOrderId::new(client_order_id)),
             side,
             order_type: OrderType::Limit,
             limit_price: Some(Cents::new(price)),
@@ -2276,6 +2306,123 @@ mod tests {
         assert_eq!(taker.len(), 1);
         assert_eq!(taker[0].price_cents, Cents::new(50_000));
         assert_eq!(taker[0].quantity, 2);
+    }
+
+    // ---- #099: an idempotent resend surfaces the STORED terminal outcome --
+
+    #[tokio::test]
+    async fn test_idempotent_resend_receipt_carries_the_stored_terminal_outcome() {
+        // #118 threaded the FRESH command's captured outcome onto the `Receipt`;
+        // #099 asserts the RESEND path reuses that same seam: on a dedup hit the
+        // executor returns the STORED terminal outcome (the original fills, the
+        // canonical order/exec ids), and it is surfaced byte-identically on the
+        // resend's `Receipt.outcome` — never a recomputed / read-back approximation.
+        let state = new_state(config(&["BTC"]));
+        let symbol = "BTC-20240329-50000-C";
+
+        // Resting maker sell 2, then a crossing taker buy 3 KEYED with a ClOrdID —
+        // it fills 2 and rests 1.
+        match state
+            .submit(add(symbol, "maker-1", "maker", 0x11, Side::Sell, 50_000, 2))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => panic!("maker submit failed: {e}"),
+        }
+        let original = match state
+            .submit(add_keyed(
+                symbol,
+                "taker-1",
+                "taker",
+                0x22,
+                Side::Buy,
+                50_000,
+                3,
+                "dup",
+            ))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => panic!("original taker submit failed: {e}"),
+        };
+        let original_outcome = original
+            .outcome
+            .clone()
+            .expect("an order submit always carries a captured outcome");
+        assert!(
+            matches!(
+                &original_outcome,
+                VenueOutcome::Added { fills, resting_quantity: 1, .. } if fills.len() == 2
+            ),
+            "the original crossing add fills 2 (two legs) and rests 1, got {original_outcome:?}"
+        );
+        let legs_after_original = state.executions().len();
+        assert_eq!(
+            legs_after_original, 2,
+            "one crossing match records exactly two execution legs"
+        );
+
+        // Resend the byte-identical taker: SAME account + ClOrdID, a FRESH order id
+        // (the standard retry after a dropped ack). The executor dedups.
+        let resend = match state
+            .submit(add_keyed(
+                symbol,
+                "taker-RESEND",
+                "taker",
+                0x22,
+                Side::Buy,
+                50_000,
+                3,
+                "dup",
+            ))
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => panic!("resend submit failed: {e}"),
+        };
+
+        // (a) The resend's receipt carries an idempotent `Duplicate` echoing the
+        // ORIGINAL identity + terminal sequence and boxing the STORED terminal
+        // outcome — the canonical order/exec ids and the ORIGINAL fills — not a
+        // recomputed fresh outcome or a phantom retry id (#099).
+        match resend.outcome.as_ref() {
+            Some(VenueOutcome::Duplicate {
+                original_sequence,
+                terminal,
+                ..
+            }) => {
+                assert_eq!(
+                    *original_sequence, original.underlying_sequence,
+                    "the resend echoes the ORIGINAL terminal sequence, not the resend turn's"
+                );
+                assert_eq!(
+                    terminal.as_ref(),
+                    &original_outcome,
+                    "the Duplicate boxes the stored terminal outcome"
+                );
+            }
+            other => panic!("the resend receipt must be an idempotent Duplicate, got {other:?}"),
+        }
+
+        // (b) The dedup opened NO second order: the store still holds exactly the
+        // two original legs — no phantom fill.
+        assert_eq!(
+            state.executions().len(),
+            legs_after_original,
+            "the resend opened no second order (no phantom fill in the store)"
+        );
+
+        // (c) The projected taker legs are the ORIGINAL fill, never an empty fresh
+        // read-back keyed on the resend's fresh order id / sequence.
+        assert_eq!(
+            resend
+                .outcome
+                .as_ref()
+                .map(VenueOutcome::taker_fill_legs)
+                .unwrap_or_default(),
+            vec![(Cents::new(50_000), 2)],
+            "the resend renders the ORIGINAL taker fill from the stored outcome"
+        );
     }
 
     // ---- clock coordinator (#028) ----------------------------------------

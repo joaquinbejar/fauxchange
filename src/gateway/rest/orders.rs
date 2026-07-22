@@ -20,10 +20,13 @@
 //! `Rejected` reported as `Rejected` (never a false `Accepted` for a resting TIF),
 //! and a cancel of an unknown / unowned / already-gone order reports
 //! `success:false` with the reject reason. For an accepted placement the fill
-//! counts are still read back from the shared executions store and the limit-order
-//! status derived from those fills plus the time-in-force (`limit_status`) so a
-//! killed `IOC`/`FOK` also reports `Rejected`. The `underlying_sequence` remains on
-//! every response for cross-surface correlation.
+//! counts are projected from the receipt's captured `VenueOutcome` taker legs
+//! (`VenueOutcome::taker_fill_legs`) — never a store read-back keyed on the
+//! freshly-minted order id — so an idempotent resend renders the STORED terminal
+//! report (the original fills), and the limit-order status is derived from those
+//! fills plus the time-in-force (`limit_status`) so a killed `IOC`/`FOK` also
+//! reports `Rejected` (#099). The `underlying_sequence` remains on every response
+//! for cross-surface correlation.
 
 use std::sync::Arc;
 
@@ -35,8 +38,8 @@ use crate::error::VenueError;
 use crate::exchange::{STPMode, SymbolParser, VenueCommand, VenueOutcome};
 use crate::gateway::rest::middleware::require;
 use crate::gateway::rest::support::{
-    add_order_command, build_symbol, immediate_fills, mint_order_id, owner_for, parse_style,
-    seam_side, seam_tif, vwap_cents,
+    add_order_command, build_symbol, mint_order_id, owner_for, parse_style, seam_side, seam_tif,
+    vwap_cents,
 };
 use crate::models::{
     BulkCancelRequest, BulkCancelResponse, BulkCancelResultItem, BulkOrderRequest,
@@ -66,9 +69,10 @@ fn remaining(total: u64, taken: u64) -> u64 {
 }
 
 /// The honest limit-order status derivable from the **observed fills** and the
-/// **time-in-force alone** — the only signals the gateway has (the
-/// `Receipt` carries no `VenueOutcome`, so resting vs killed cannot be observed
-/// directly). `GTC`/`GTD` rest their unfilled remainder, so a zero-fill result
+/// **time-in-force alone**: the [`Receipt`](crate::exchange::Receipt)'s captured
+/// [`VenueOutcome`](crate::exchange::VenueOutcome) carries the taker fill legs but
+/// not a resting-vs-killed flag, so that distinction is derived from the fills plus
+/// the time-in-force. `GTC`/`GTD` rest their unfilled remainder, so a zero-fill result
 /// is `Accepted`; `IOC`/`FOK` never rest, so a zero-fill result is `Rejected`
 /// (killed) — this is what fixes the "FOK-killed reported as Accepted" hazard.
 fn limit_status(tif: TimeInForce, filled: u64, quantity: u64) -> (LimitOrderStatus, &'static str) {
@@ -162,16 +166,42 @@ pub async fn place_limit_order(
         ))
         .await?;
 
-    // Render the OBSERVED outcome, not the requested state (#118): an order into a
-    // halted / `Settling` / `Expired` instrument is a journaled `Rejected` — surface
-    // that reject rather than deriving a false `Accepted` for a resting TIF.
-    let (status, filled, message) = match &receipt.outcome {
+    // On an idempotent resend the canonical identity is the ORIGINAL placement's
+    // order id + terminal sequence, never this retry turn's freshly-minted id (which
+    // never entered the book) (#099); `rendered_identity` picks the original on a
+    // `Duplicate` and the fresh ids otherwise.
+    let (rendered_order_id, rendered_sequence) = match &receipt.outcome {
+        Some(outcome) => {
+            let (id, seq) = outcome.rendered_identity(&order_id, receipt.underlying_sequence);
+            (id.clone(), seq)
+        }
+        None => (order_id.clone(), receipt.underlying_sequence),
+    };
+
+    // Render the OBSERVED, effective-terminal outcome, not the requested state
+    // (#118): an order into a halted / `Settling` / `Expired` instrument is a
+    // journaled `Rejected`; an idempotent retry unwraps to the ORIGINAL placement's
+    // terminal (`VenueOutcome::terminal`), so a stored reject reads as a reject and a
+    // stored fill as its fills — never a fresh empty accept.
+    let (status, filled, message) = match receipt.outcome.as_ref().map(VenueOutcome::terminal) {
         Some(VenueOutcome::Rejected { reason }) => {
             (LimitOrderStatus::Rejected, 0u64, reason.clone())
         }
-        _ => {
-            let fills = immediate_fills(&state, &account, &order_id, receipt.underlying_sequence);
-            let filled: u64 = fills.iter().map(|(_, q)| q).sum();
+        outcome => {
+            // Project the immediate fills straight from the captured terminal
+            // outcome, not a store read-back keyed on the freshly-minted order id
+            // and this turn's sequence (#099). On an idempotent resend the executor
+            // returns the STORED terminal outcome (the original order's fills), so
+            // this renders the true original terminal report instead of an empty
+            // fresh read-back; on a fresh add it is the identical taker-leg set the
+            // store fan-out folded from this same event.
+            let fills = outcome
+                .map(VenueOutcome::taker_fill_legs)
+                .unwrap_or_default();
+            let filled: u64 = fills
+                .iter()
+                .try_fold(0u64, |acc, (_, quantity)| acc.checked_add(*quantity))
+                .ok_or(VenueError::Overflow)?;
             let (status, message) = limit_status(
                 request.time_in_force.unwrap_or_default(),
                 filled,
@@ -182,11 +212,11 @@ pub async fn place_limit_order(
     };
 
     Ok(Json(PlaceLimitOrderResponse {
-        order_id,
+        order_id: rendered_order_id,
         status,
         filled_quantity: filled,
         remaining_quantity: remaining(request.quantity, filled),
-        sequence: receipt.underlying_sequence,
+        sequence: rendered_sequence,
         message,
     }))
 }
@@ -243,7 +273,27 @@ pub async fn place_market_order(
         ))
         .await?;
 
-    let fills = immediate_fills(&state, &account, &order_id, receipt.underlying_sequence);
+    // On an idempotent resend echo the ORIGINAL placement's order id + terminal
+    // sequence, never this retry turn's freshly-minted id (#099).
+    let (rendered_order_id, rendered_sequence) = match &receipt.outcome {
+        Some(outcome) => {
+            let (id, seq) = outcome.rendered_identity(&order_id, receipt.underlying_sequence);
+            (id.clone(), seq)
+        }
+        None => (order_id.clone(), receipt.underlying_sequence),
+    };
+
+    // Project the immediate fills straight from the captured terminal outcome, not
+    // a store read-back keyed on the freshly-minted order id and this turn's
+    // sequence (#099): an idempotent market resend renders the STORED terminal
+    // outcome (the original fills), never an empty fresh read-back. On a market
+    // (`IOC`) add the observed outcome is `Market`/`Rejected`; the taker legs it
+    // carries are the identical set the store fan-out folded from this same event.
+    // `taker_fill_legs` unwraps a `Duplicate` to its stored terminal.
+    let fills = match &receipt.outcome {
+        Some(outcome) => outcome.taker_fill_legs(),
+        None => Vec::new(),
+    };
     // Checked fold (never `Iterator::sum`, which panics-in-debug / wraps-in-release):
     // the filled quantity is bounded by the order quantity, so overflow is
     // unreachable, but the arithmetic stays checked per rules/global_rules.md.
@@ -265,12 +315,12 @@ pub async fn place_market_order(
         .collect();
 
     Ok(Json(PlaceMarketOrderResponse {
-        order_id,
+        order_id: rendered_order_id,
         status,
         filled_quantity: filled,
         remaining_quantity: remaining(request.quantity, filled),
         average_price,
-        sequence: receipt.underlying_sequence,
+        sequence: rendered_sequence,
         fills: fill_prints,
     }))
 }

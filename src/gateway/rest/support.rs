@@ -244,22 +244,6 @@ pub(crate) fn taker_legs_for_order(
         .collect()
 }
 
-/// The immediate fills of a just-submitted aggressing order as `(price,
-/// quantity)` legs in journal order — the REST-handler projection of
-/// [`immediate_execution_records`].
-#[must_use]
-pub(crate) fn immediate_fills(
-    state: &Arc<AppState>,
-    account: &AccountId,
-    order_id: &VenueOrderId,
-    sequence: SequenceNumber,
-) -> Vec<(Cents, u64)> {
-    immediate_execution_records(state, account, order_id, sequence)
-        .into_iter()
-        .map(|record| (record.price_cents, record.quantity))
-        .collect()
-}
-
 /// The volume-weighted average price over a set of `(price, quantity)` fill
 /// legs, in **integer cents** — `Ok(None)` when there were no fills. Realized
 /// money — kept as `Cents` on the wire, never a float (the review-fixed contract).

@@ -1845,10 +1845,28 @@ async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
         2,
         "REST journals original + deduped-replay retry"
     );
-    assert_eq!(
-        rest_events[1].outcome, rest_events[0].outcome,
-        "the REST retry replays the stored terminal result (no second order)"
-    );
+    // The REST retry is journaled as an idempotent `Duplicate` (#099): it echoes the
+    // ORIGINAL placement's terminal sequence and boxes the stored terminal, so every
+    // fan-out projection treats it as a no-op (no double-fold, no phantom id) while
+    // the book stays untouched.
+    match &rest_events[1].outcome {
+        VenueOutcome::Duplicate {
+            original_sequence,
+            terminal,
+            ..
+        } => {
+            assert_eq!(
+                *original_sequence, rest_events[0].underlying_sequence,
+                "the retry echoes the ORIGINAL terminal sequence, not the retry turn's"
+            );
+            assert_eq!(
+                terminal.as_ref(),
+                &rest_events[0].outcome,
+                "the Duplicate boxes the first placement's stored terminal (no second order)"
+            );
+        }
+        other => panic!("the REST retry must be an idempotent Duplicate, got {other:?}"),
+    }
     // FIX dedups before the sequencer (gateway ClOrdID correlation): one journaled
     // event, the resend never reaching the actor.
     assert_eq!(
@@ -1863,6 +1881,163 @@ async fn test_order_entry_parity_same_payload_retry_is_idempotent_on_both() {
         rest_events[0].outcome, fix_events[0].outcome,
         "the one opened order is identical across REST and FIX (idempotency parity)"
     );
+}
+
+#[tokio::test]
+async fn test_idempotent_resend_after_fill_renders_stored_terminal_report_on_rest_and_fix() {
+    // #099: an idempotent resend AFTER A FILL renders the STORED terminal report —
+    // the ORIGINAL fills — on BOTH surfaces, and opens no second order. REST projects
+    // it from the receipt's captured `VenueOutcome` (never a fresh read-back keyed on
+    // the resend's fresh order id); FIX re-renders it from the shared executions store
+    // keyed on the canonical order id. The resend creates NO new execution, so both
+    // surfaces surface the identical ORIGINAL leg — byte-identical in its join keys
+    // (execution_id, underlying_sequence, liquidity) across surfaces.
+    let taker_account = AccountId::new("trader-2");
+
+    // ---- REST arm: maker sell 2, taker buy 3 keyed "dup" (fills 2, rests 1) ----
+    let rest = cfix::rest_parity_venue();
+    let maker = token(&rest, "trader-1");
+    let taker = token(&rest, "trader-2");
+    let uri = format!("{CONTRACT}/orders");
+    let (status, _) = send(
+        &rest,
+        build_request(
+            "POST",
+            &uri,
+            Some(&maker),
+            Some(serde_json::json!({"side":"sell","price":50_000,"quantity":2})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, first) = send(
+        &rest,
+        build_request(
+            "POST",
+            &uri,
+            Some(&taker),
+            Some(serde_json::json!({"side":"buy","price":50_000,"quantity":3,"client_order_id":"dup"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["status"], "partial");
+    assert_eq!(first["filled_quantity"], 2);
+    let rest_taker_legs = rest
+        .executions()
+        .list(&taker_account, &ExecutionFilter::default())
+        .expect("rest taker legs");
+    assert_eq!(
+        rest_taker_legs.len(),
+        1,
+        "the original fill records one taker leg"
+    );
+
+    // Resend the byte-identical keyed taker.
+    let (status, resend) = send(
+        &rest,
+        build_request(
+            "POST",
+            &uri,
+            Some(&taker),
+            Some(serde_json::json!({"side":"buy","price":50_000,"quantity":3,"client_order_id":"dup"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        resend["status"], "partial",
+        "REST resend renders the STORED partial terminal, not a fresh `accepted`"
+    );
+    assert_eq!(
+        resend["filled_quantity"], 2,
+        "REST resend shows the ORIGINAL filled 2, not a read-back 0 (#099)"
+    );
+    // The phantom-identity fix (#099): the resend echoes the ORIGINAL placement's
+    // order id + terminal sequence — the id that actually entered the book — never
+    // the freshly-minted retry id (which never rested) or this turn's sequence.
+    assert_eq!(
+        resend["order_id"], first["order_id"],
+        "REST resend echoes the ORIGINAL order id, not a freshly-minted retry id (#099)"
+    );
+    assert_eq!(
+        resend["sequence"], first["sequence"],
+        "REST resend echoes the ORIGINAL terminal sequence, not the retry turn's (#099)"
+    );
+    assert_eq!(
+        rest.executions()
+            .list(&taker_account, &ExecutionFilter::default())
+            .expect("rest taker legs after resend")
+            .len(),
+        1,
+        "the REST resend opened no second execution"
+    );
+
+    // ---- FIX arm: the same scenario over D messages ----
+    let harness = cfix::FixParityHarness::start().await;
+    let mut maker_fix = cfix::FixClient::logon(harness.addr(), cfix::TRADER1).await;
+    let mut taker_fix = cfix::FixClient::logon(harness.addr(), cfix::TRADER2).await;
+    let _ = maker_fix.place_limit("maker-p", "2", 50_000, 2, "1").await;
+    let first_fix = taker_fix.place_limit("dup", "1", 50_000, 3, "1").await;
+    assert!(
+        first_fix
+            .iter()
+            .any(|f| cfix::msg_type(f).as_deref() == Some("8")
+                && cfix::field(f, "150").as_deref() == Some("F")),
+        "the FIX taker partially fills (a Trade), got {first_fix:?}"
+    );
+    let fix_taker_legs = harness
+        .state()
+        .executions()
+        .list(&taker_account, &ExecutionFilter::default())
+        .expect("fix taker legs");
+    assert_eq!(fix_taker_legs.len(), 1);
+
+    // Resend the byte-identical taker (same ClOrdID, new MsgSeqNum).
+    let resend_fix = taker_fix.place_limit("dup", "1", 50_000, 3, "1").await;
+    let report = resend_fix
+        .iter()
+        .find(|f| cfix::msg_type(f).as_deref() == Some("8"))
+        .unwrap_or_else(|| panic!("expected a status ExecutionReport, got {resend_fix:?}"));
+    assert_eq!(
+        cfix::field(report, "14").as_deref(),
+        Some("2"),
+        "FIX resend CumQty is the ORIGINAL 2, not a fabricated 0"
+    );
+    assert_ne!(
+        cfix::field(report, "150").as_deref(),
+        Some("0"),
+        "FIX resend is not a fabricated ExecType=New"
+    );
+    assert_eq!(
+        harness
+            .state()
+            .executions()
+            .list(&taker_account, &ExecutionFilter::default())
+            .expect("fix taker legs after resend")
+            .len(),
+        1,
+        "the FIX resend opened no second execution"
+    );
+
+    // ---- cross-surface parity: the resend's terminal report join keys ----
+    let rest_leg = &rest_taker_legs[0];
+    let fix_leg = &fix_taker_legs[0];
+    assert_eq!(
+        rest_leg.execution_id, fix_leg.execution_id,
+        "execution_id is byte-identical across REST and FIX resend"
+    );
+    assert_eq!(
+        rest_leg.underlying_sequence, fix_leg.underlying_sequence,
+        "underlying_sequence is byte-identical across REST and FIX resend"
+    );
+    assert_eq!(
+        rest_leg.liquidity, fix_leg.liquidity,
+        "liquidity is byte-identical across REST and FIX resend"
+    );
+    assert_eq!(rest_leg.price_cents, fix_leg.price_cents);
+    assert_eq!(rest_leg.quantity, fix_leg.quantity);
+    assert_eq!(rest_leg.side, fix_leg.side);
 }
 
 #[tokio::test]
