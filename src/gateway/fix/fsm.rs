@@ -1052,12 +1052,14 @@ impl SessionFsm {
     /// # Errors
     ///
     /// [`SessionError`] on counter exhaustion or a store failure.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_cancel_reject_error(
         &mut self,
         order_id: VenueOrderId,
         orig_cl_ord_id: ClientOrderId,
         cl_ord_id: ClientOrderId,
         response_to: CxlRejResponseTo,
+        ord_status: OrdStatus,
         reject: &FixReject,
         now_ms: u64,
     ) -> Result<Reaction, SessionError> {
@@ -1069,7 +1071,7 @@ impl SessionFsm {
                 order_id,
                 cl_ord_id,
                 orig_cl_ord_id,
-                ord_status: OrdStatus::Rejected,
+                ord_status,
                 cxl_rej_response_to: response_to,
                 cxl_rej_reason: reason,
                 text,
@@ -2427,6 +2429,7 @@ impl VenueFixSession {
             orig_cl_ord_id.clone(),
             cl_ord_id.clone(),
             response_to,
+            OrdStatus::Rejected,
             &reject,
             now_ms,
         )
@@ -2470,8 +2473,10 @@ impl VenueFixSession {
     /// the reason in `Text (58)`: the cancel leg already proved ownership, so the add-leg
     /// rejection is order-/instrument-level (bad replacement price, halted/settling
     /// instrument) and carries no cross-account signal to mask (#132). It is reported as
-    /// a rejected `G` (`OrderCancelReject (9)`, [03 §5](../../../docs/03-protocol-surfaces.md));
-    /// the caller has already dropped the original tracking because the order is gone.
+    /// a rejected `G` (`OrderCancelReject (9)`, [03 §5](../../../docs/03-protocol-surfaces.md))
+    /// carrying `OrdStatus (39) = Canceled` — the cancel leg committed, so the original's
+    /// terminal state IS canceled, not `Rejected`; the caller has already dropped the
+    /// original tracking because the order is gone.
     fn reject_replace_add(
         &mut self,
         order_id: VenueOrderId,
@@ -2486,12 +2491,18 @@ impl VenueFixSession {
             "partial replace: cancel leg committed but the replacement add was rejected; \
              original is gone, no new order rests"
         );
-        self.reject_cancel(
+        // The cancel leg already committed, so the original order's terminal state is
+        // `Canceled` — reporting `Rejected` here would falsely describe it as never
+        // accepted and diverge the client's FIX state from the venue (#132).
+        let reject = VenueError::InvalidOrder(reason.to_string())
+            .fix_reject(FixRejectContext::CancelReplace);
+        self.fsm.emit_cancel_reject_error(
             order_id,
-            orig_cl_ord_id,
-            cl_ord_id,
+            orig_cl_ord_id.clone(),
+            cl_ord_id.clone(),
             CxlRejResponseTo::OrderCancelReplaceRequest,
-            &VenueError::InvalidOrder(reason.to_string()),
+            OrdStatus::Canceled,
+            &reject,
             now_ms,
         )
     }

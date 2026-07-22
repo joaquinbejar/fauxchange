@@ -1969,6 +1969,11 @@ async fn test_fix_partial_replace_failure_is_a_cancel_reject_never_a_false_repla
         Some("2"),
         "CxlRejReason Broker/Exchange Option — the named add-leg reason, not the unknown-order mask (1)"
     );
+    assert_eq!(
+        cfix::field(reject, "39").as_deref(),
+        Some("4"),
+        "OrdStatus Canceled — the cancel leg committed, so the original is gone, not Rejected (8)"
+    );
 
     // The rejected replacement was never tracked: a cancel of its ClOrdID is the uniform
     // masked reject (unknown order), proving no phantom correlation was created.
