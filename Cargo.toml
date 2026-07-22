@@ -317,7 +317,12 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 # ceiling by policy (not a security check). Why safe: same MINOR series (0.3.x),
 # no API break in the surface `fauxchange` consumes (build + clippy + the FIX
 # conformance/fuzz suites all pass); NO new crate enters the tree — a patch bump
-# of crates already resolved; `cargo audit` / `cargo deny` clean.
+# of crates already resolved; `cargo audit` / `cargo deny` clean. (The relock also
+# incidentally shifts a few UNRELATED transitive edges — e.g. `errno` / `rustix` /
+# `tempfile` pick an already-resolved `windows-sys 0.52/0.59` and `getrandom 0.3`
+# instead of `0.61`/`0.4` — a resolver reshuffle among versions already present in
+# the tree on `main`; it adds/removes NO package version and is Windows-inert here,
+# so `cargo audit` / `cargo deny` stay clean either way.)
 ironfix-core = "0.3.1"
 ironfix-tagvalue = "0.3.1"
 ironfix-dictionary = "0.3.1"
@@ -329,7 +334,7 @@ ironfix-dictionary = "0.3.1"
 # the connection lifecycle are new venue work over this codec. Published on
 # crates.io at `0.3.1` (verified `cargo tree -p ironfix-transport` resolves at
 # `0.3.1` against the crates.io sparse index; `deny.toml [sources]` allows ONLY
-# that registry — no git / path dep). Audit note: `ironfix-transport` 0.3.0's own
+# that registry — no git / path dep). Audit note: `ironfix-transport` 0.3.1's own
 # dependencies — `ironfix-core`, `ironfix-tagvalue`, `thiserror`, `tokio`,
 # `tokio-util`, `bytes`, `memchr`, `tracing` — are ALL already resolved in the
 # tree (verified against `Cargo.lock`), so it adds only the one new crate edge,
