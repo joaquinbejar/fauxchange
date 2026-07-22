@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE fix_session_counters\n            SET next_sender_seq = $4, updated_at = now()\n            WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3278f20140d7a56010287ec7d8f52735d638d660fa5065e14736c9ff1a6ed400"
+}

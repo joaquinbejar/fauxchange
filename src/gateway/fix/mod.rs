@@ -32,6 +32,7 @@ pub mod marketdata;
 pub mod md_projection;
 pub mod order;
 pub mod order_flow;
+pub mod pg_store;
 pub mod price;
 pub mod session;
 pub mod store;
@@ -54,6 +55,7 @@ pub use fsm::{
     SessionConfig, SessionError, SessionFsm, SessionPhase, VenueFixSession, VenueFixSessionFactory,
 };
 pub use header::{StandardHeader, UtcTimestamp};
+pub use pg_store::{PgFixSessionStore, select_fix_session_store};
 pub use price::{
     CENTS_SCALE, PriceScale, PriceSeamError, parse_decimal_to_cents, parse_signed_decimal_to_cents,
     render_cents_to_decimal, render_signed_cents_to_decimal,

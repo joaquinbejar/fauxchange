@@ -395,15 +395,22 @@ impl SessionFsm {
             UtcTimestamp::from_epoch_ms(now_ms),
         );
         let frame = build(header);
-        if let Some(key) = self.key.clone() {
-            self.store.store_outbound(&key, seq, &frame)?;
-        }
-        // Checked, non-wrapping: an increment past u64::MAX seals the session.
+        // Checked, non-wrapping: an increment past u64::MAX seals the session —
+        // computed BEFORE the durable write so an overflow never touches the store.
         let next = seq.checked_add(1).ok_or(SessionError::SequenceExhausted)?;
-        self.counters.next_sender_seq = next;
         if let Some(key) = self.key.clone() {
-            self.store.save_counters(&key, self.counters)?;
+            // ONE atomic durable op stores the frame at `seq` AND advances the
+            // outbound counter to `next` (#149 finding 1B): a crash can no longer
+            // leave the frame stored with the counter un-advanced, which would make
+            // the next frame REUSE `seq` (a duplicate outbound `MsgSeqNum`, a FIX
+            // session-fatal violation). Only the outbound counter is persisted here;
+            // the inbound counter's durable advance is deferred to the post-effect
+            // persist (finding 1A). The in-memory counter advances only AFTER the
+            // store commits, so a store failure leaves in-memory and durable in step.
+            self.store
+                .store_outbound_and_advance(&key, seq, &frame, next)?;
         }
+        self.counters.next_sender_seq = next;
         self.last_outbound_ms = now_ms;
         Ok(frame)
     }
@@ -416,7 +423,43 @@ impl SessionFsm {
         Ok(())
     }
 
-    /// Advances the inbound (target) counter for a consumed message, checked.
+    /// Durably persists the current counters as the **deferred inbound advance** for
+    /// a routed order-entry mutation — called by the async router ONLY after the
+    /// exchange effect is durably committed (`AppState::submit` returned `Ok`), so the
+    /// durable `next_target_seq` becomes permanent exactly when (and only when) the
+    /// effect does ([#149](https://github.com/joaquinbejar/fauxchange/issues/149)
+    /// finding 1A). Before this point a crash leaves the durable `next_target_seq` at
+    /// the routed message's own seq, so the client's resend is re-admitted and
+    /// idempotently reprocessed (the merged exchange-side `ClOrdID` guard dedups a
+    /// resent order) — never a silently-dropped order.
+    pub(crate) fn persist_inbound(&self) -> Result<(), SessionError> {
+        self.persist_counters()
+    }
+
+    /// Advances the inbound (target) counter for a consumed message **in memory
+    /// only**, checked — WITHOUT a durable persist. Used for a routed order-entry
+    /// mutation whose durable inbound advance is deferred until its exchange effect
+    /// commits (finding 1A): gap detection of subsequent inbound frames within the
+    /// live session reads the advanced in-memory counter, while the durable persist
+    /// waits for [`persist_inbound`](Self::persist_inbound). Mirrors
+    /// [`consume_inbound`](Self::consume_inbound)'s phase transition.
+    fn advance_inbound_in_memory(&mut self) -> Result<(), SessionError> {
+        let next = self
+            .counters
+            .next_target_seq
+            .checked_add(1)
+            .ok_or(SessionError::SequenceExhausted)?;
+        self.counters.next_target_seq = next;
+        if self.phase == SessionPhase::AwaitingResend {
+            self.phase = SessionPhase::Active;
+        }
+        Ok(())
+    }
+
+    /// Advances the inbound (target) counter for a consumed message, checked, and
+    /// persists it durably (the immediate path for synchronously-handled messages —
+    /// session admin, permission / attribution rejects, and reads that mutate nothing
+    /// durable).
     fn advance_inbound(&mut self) -> Result<(), SessionError> {
         let next = self
             .counters
@@ -700,10 +743,21 @@ impl SessionFsm {
             return Ok(ActiveDisposition::Reacted(reaction));
         }
 
-        // The message is consumed at the session level regardless of the async
-        // path's outcome; the async router emits its reports/rejects/market data on
-        // the same outbound counter.
-        self.consume_inbound()?;
+        // Consume the inbound seq for the routed message. For an order-entry
+        // MUTATION (D/F/G/q) the DURABLE inbound advance is DEFERRED (#149 finding
+        // 1A): advance the in-memory counter now (so gap detection of subsequent
+        // frames is correct within the live session), but persist it durably only
+        // AFTER the async route's `submit` durably commits the exchange effect, via
+        // [`persist_inbound`](Self::persist_inbound). A crash before that leaves the
+        // durable `next_target_seq` at this message's seq, so the client's resend is
+        // re-admitted and idempotently reprocessed — never a silently-dropped order.
+        // A READ (`H`/`V`) mutates nothing durable, so it consumes (advances +
+        // persists) immediately, exactly like a synchronous message.
+        if is_order_entry_mutation(&message) {
+            self.advance_inbound_in_memory()?;
+        } else {
+            self.consume_inbound()?;
+        }
 
         // D/F/G/q/H → the async order router (#039); `V` → the async market-data
         // router (#040). Both need `AppState` (the sequenced order path / the shared
@@ -1502,6 +1556,22 @@ fn is_order_entry_message(message: &DecodedMessage) -> bool {
     )
 }
 
+/// Whether `message` is an order-entry **mutation** routed onto the sequenced
+/// exchange path (`D`/`F`/`G`/`q`) — the messages whose durable inbound-seq
+/// consumption is DEFERRED until the exchange effect commits (#149 finding 1A).
+/// `OrderStatusRequest (H)` and `MarketDataRequest (V)` are reads (no durable
+/// mutation) and are excluded, so they consume their inbound seq immediately.
+#[must_use]
+fn is_order_entry_mutation(message: &DecodedMessage) -> bool {
+    matches!(
+        message,
+        DecodedMessage::NewOrderSingle(_)
+            | DecodedMessage::OrderCancelRequest(_)
+            | DecodedMessage::OrderCancelReplaceRequest(_)
+            | DecodedMessage::OrderMassCancelRequest(_)
+    )
+}
+
 /// The permission a message class requires, or `None` for session admin
 /// ([ADR-0007 §2](../../../docs/adr/0007-fix-credentials-and-account-model.md),
 /// [03 §6](../../../docs/03-protocol-surfaces.md#6-authentication)). There is **no
@@ -2194,33 +2264,44 @@ impl VenueFixSession {
                 // `Rejected` — REST renders that as `Rejected`, so FIX MUST emit
                 // `8 Rejected`, NOT a `New`. A rejected order is NOT tracked as placed,
                 // so no phantom `F`/`G` correlation is created.
-                if let Some(VenueOutcome::Rejected { reason, .. }) = &receipt.outcome {
-                    return self.reject_new_order_outcome(&order, reason, now_ms);
-                }
-                self.track_placed(
-                    order.cl_ord_id.clone(),
-                    order_id.clone(),
-                    order.symbol.clone(),
-                    order.side,
-                    order.order_qty,
-                    fingerprint,
-                );
-                let legs = immediate_execution_records(
-                    &self.state,
-                    &account,
-                    &order_id,
-                    receipt.underlying_sequence,
-                );
-                let specs = order_flow::render_new_order_reports(
-                    &order,
-                    &order_id,
-                    receipt.underlying_sequence,
-                    self.state.lineage_id(),
-                    &underlying,
-                    tif,
-                    &legs,
-                );
-                self.fsm.emit_report_specs(specs, now_ms)
+                let reaction = if let Some(VenueOutcome::Rejected { reason, .. }) = &receipt.outcome
+                {
+                    self.reject_new_order_outcome(&order, reason, now_ms)?
+                } else {
+                    self.track_placed(
+                        order.cl_ord_id.clone(),
+                        order_id.clone(),
+                        order.symbol.clone(),
+                        order.side,
+                        order.order_qty,
+                        fingerprint,
+                    );
+                    let legs = immediate_execution_records(
+                        &self.state,
+                        &account,
+                        &order_id,
+                        receipt.underlying_sequence,
+                    );
+                    let specs = order_flow::render_new_order_reports(
+                        &order,
+                        &order_id,
+                        receipt.underlying_sequence,
+                        self.state.lineage_id(),
+                        &underlying,
+                        tif,
+                        &legs,
+                    );
+                    self.fsm.emit_report_specs(specs, now_ms)?
+                };
+                // The exchange effect (a journaled place OR a journaled place-rejection)
+                // is now durably committed AND the reports/reject are durably stored, so
+                // persist the DEFERRED inbound-seq consumption (#149 finding 1A). A crash
+                // before here re-admits the client's resend for idempotent reprocessing;
+                // a crash after is safe (effect durable, resend dedups). A submit `Err`
+                // (below) does NOT persist — the effect never committed, so the resend
+                // must reprocess.
+                self.fsm.persist_inbound()?;
+                Ok(reaction)
             }
             Err(error) => self.reject_new_order(&order, &error, now_ms),
         }
@@ -2314,7 +2395,13 @@ impl VenueFixSession {
         };
         match self.state.submit_mass_cancel(command).await {
             Ok(delivery) => {
-                self.render_mass_cancel(response, &delivery.swept, delivery.fanout, now_ms)
+                let reaction =
+                    self.render_mass_cancel(response, &delivery.swept, delivery.fanout, now_ms)?;
+                // The mass-cancel sweep is durably committed; persist the deferred
+                // inbound-seq consumption post-effect (#149 finding 1A). The submit
+                // `Err` arm (below) does NOT persist.
+                self.fsm.persist_inbound()?;
+                Ok(reaction)
             }
             Err(_) => self.fsm.emit_mass_cancel_rejected(now_ms),
         }
@@ -2440,28 +2527,35 @@ impl VenueFixSession {
                 // of an unowned / already-gone order is an `Ok(Receipt)` whose captured
                 // outcome is `Rejected` — emit a masked `OrderCancelReject (9)`, not a
                 // `Canceled`, and keep the session correlation (do not drop tracking).
-                if let Some(VenueOutcome::Rejected { kind, reason }) = &receipt.outcome {
-                    let masked = Self::masked_cancel_error(&placed.order_id, *kind, reason);
-                    return self.reject_cancel(
-                        placed.order_id.clone(),
-                        &cancel.orig_cl_ord_id,
-                        &cancel.cl_ord_id,
-                        CxlRejResponseTo::OrderCancelRequest,
-                        &masked,
-                        now_ms,
-                    );
-                }
-                let underlying = underlying_of_symbol(&placed.symbol);
-                let spec = order_flow::render_cancel_report(
-                    placed.symbol.clone(),
-                    placed.side,
-                    placed.order_id.clone(),
-                    receipt.underlying_sequence,
-                    self.state.lineage_id(),
-                    &underlying,
-                );
-                self.placed.remove(&cancel.orig_cl_ord_id);
-                self.fsm.emit_report_specs(vec![spec], now_ms)
+                let reaction =
+                    if let Some(VenueOutcome::Rejected { kind, reason }) = &receipt.outcome {
+                        let masked = Self::masked_cancel_error(&placed.order_id, *kind, reason);
+                        self.reject_cancel(
+                            placed.order_id.clone(),
+                            &cancel.orig_cl_ord_id,
+                            &cancel.cl_ord_id,
+                            CxlRejResponseTo::OrderCancelRequest,
+                            &masked,
+                            now_ms,
+                        )?
+                    } else {
+                        let underlying = underlying_of_symbol(&placed.symbol);
+                        let spec = order_flow::render_cancel_report(
+                            placed.symbol.clone(),
+                            placed.side,
+                            placed.order_id.clone(),
+                            receipt.underlying_sequence,
+                            self.state.lineage_id(),
+                            &underlying,
+                        );
+                        self.placed.remove(&cancel.orig_cl_ord_id);
+                        self.fsm.emit_report_specs(vec![spec], now_ms)?
+                    };
+                // The cancel's exchange effect is durably committed; persist the
+                // deferred inbound-seq consumption post-effect (#149 finding 1A). The
+                // submit `Err` arm (below) does NOT persist.
+                self.fsm.persist_inbound()?;
+                Ok(reaction)
             }
             Err(error) => self.reject_cancel(
                 placed.order_id.clone(),
@@ -2523,7 +2617,7 @@ impl VenueFixSession {
                 // Render the OBSERVED outcome (#118), never a false `Replaced`. A replace has
                 // TWO distinct failure shapes the order path captures losslessly, and each
                 // renders differently because the ORIGINAL order ends in a different state:
-                match &receipt.outcome {
+                let reaction = match &receipt.outcome {
                     // Whole-replace refusal (the cancel leg never removed the target: unknown
                     // / unowned / already-gone original). The ORIGINAL still rests untouched,
                     // so keep its tracking (do not re-key) and emit the TYPED masked
@@ -2531,14 +2625,14 @@ impl VenueFixSession {
                     // the reject can never distinguish not-found vs not-owner (#118/#132).
                     Some(VenueOutcome::Rejected { kind, reason }) => {
                         let masked = Self::masked_cancel_error(&placed.order_id, *kind, reason);
-                        return self.reject_cancel(
+                        self.reject_cancel(
                             placed.order_id.clone(),
                             &replace.orig_cl_ord_id,
                             &replace.cl_ord_id,
                             CxlRejResponseTo::OrderCancelReplaceRequest,
                             &masked,
                             now_ms,
-                        );
+                        )?
                     }
                     // Partial-replace failure (cancel succeeded, replacement add rejected —
                     // the defined non-atomic `Replace { cancelled: true, add: Rejected }`
@@ -2555,41 +2649,47 @@ impl VenueFixSession {
                         if *cancelled {
                             self.placed.remove(&replace.orig_cl_ord_id);
                         }
-                        return self.reject_replace_add(
+                        self.reject_replace_add(
                             placed.order_id.clone(),
                             &replace.orig_cl_ord_id,
                             &replace.cl_ord_id,
                             reason,
                             now_ms,
-                        );
+                        )?
                     }
-                    _ => {}
-                }
-                // The old order is replaced; re-key tracking under the new ClOrdID.
-                self.placed.remove(&replace.orig_cl_ord_id);
-                self.track_placed(
-                    replace.cl_ord_id.clone(),
-                    new_order_id.clone(),
-                    replace.symbol.clone(),
-                    replace.side,
-                    replace.order_qty,
-                    OrderFingerprint::of_replace(&replace),
-                );
-                let legs = immediate_execution_records(
-                    &self.state,
-                    &account,
-                    &new_order_id,
-                    receipt.underlying_sequence,
-                );
-                let specs = order_flow::render_replace_reports(
-                    &replace,
-                    &new_order_id,
-                    receipt.underlying_sequence,
-                    self.state.lineage_id(),
-                    &underlying,
-                    &legs,
-                );
-                self.fsm.emit_report_specs(specs, now_ms)
+                    _ => {
+                        // The old order is replaced; re-key tracking under the new ClOrdID.
+                        self.placed.remove(&replace.orig_cl_ord_id);
+                        self.track_placed(
+                            replace.cl_ord_id.clone(),
+                            new_order_id.clone(),
+                            replace.symbol.clone(),
+                            replace.side,
+                            replace.order_qty,
+                            OrderFingerprint::of_replace(&replace),
+                        );
+                        let legs = immediate_execution_records(
+                            &self.state,
+                            &account,
+                            &new_order_id,
+                            receipt.underlying_sequence,
+                        );
+                        let specs = order_flow::render_replace_reports(
+                            &replace,
+                            &new_order_id,
+                            receipt.underlying_sequence,
+                            self.state.lineage_id(),
+                            &underlying,
+                            &legs,
+                        );
+                        self.fsm.emit_report_specs(specs, now_ms)?
+                    }
+                };
+                // The replace's exchange effect is durably committed; persist the
+                // deferred inbound-seq consumption post-effect (#149 finding 1A). The
+                // submit `Err` arm (below) does NOT persist.
+                self.fsm.persist_inbound()?;
+                Ok(reaction)
             }
             Err(error) => self.reject_cancel(
                 placed.order_id.clone(),
@@ -3630,6 +3730,222 @@ mod tests {
             }
             other => panic!("expected Route(NewOrderSingle), got {other:?}"),
         }
+    }
+
+    /// A store that can be told to FAIL [`store_outbound_and_advance`](FixSessionStore::store_outbound_and_advance)
+    /// atomically (persisting nothing), delegating every other call to an inner
+    /// in-memory store — so a test can prove `emit` never reuses a `MsgSeqNum` across
+    /// a mid-emit failure (#149 finding 1B).
+    #[derive(Debug)]
+    struct FailAdvanceStore {
+        inner: super::super::store::InMemoryFixSessionStore,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailAdvanceStore {
+        fn new() -> Self {
+            Self {
+                inner: super::super::store::InMemoryFixSessionStore::new(),
+                fail: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl FixSessionStore for FailAdvanceStore {
+        fn load_counters(
+            &self,
+            key: &SessionKey,
+        ) -> Result<SessionCounters, super::super::store::SessionStoreError> {
+            self.inner.load_counters(key)
+        }
+        fn save_counters(
+            &self,
+            key: &SessionKey,
+            counters: SessionCounters,
+        ) -> Result<(), super::super::store::SessionStoreError> {
+            self.inner.save_counters(key, counters)
+        }
+        fn store_outbound(
+            &self,
+            key: &SessionKey,
+            seq: u64,
+            frame: &[u8],
+        ) -> Result<(), super::super::store::SessionStoreError> {
+            self.inner.store_outbound(key, seq, frame)
+        }
+        fn store_outbound_and_advance(
+            &self,
+            key: &SessionKey,
+            seq: u64,
+            frame: &[u8],
+            next_sender_seq: u64,
+        ) -> Result<(), super::super::store::SessionStoreError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                // Atomic failure: persist NOTHING — no frame, no counter advance.
+                return Err(super::super::store::SessionStoreError::Backend(
+                    "injected mid-emit failure",
+                ));
+            }
+            self.inner
+                .store_outbound_and_advance(key, seq, frame, next_sender_seq)
+        }
+        fn outbound_range(
+            &self,
+            key: &SessionKey,
+            begin: u64,
+            end: u64,
+        ) -> Result<Vec<StoredOutbound>, super::super::store::SessionStoreError> {
+            self.inner.outbound_range(key, begin, end)
+        }
+        fn record_reset(
+            &self,
+            key: &SessionKey,
+            event: SequenceResetEvent,
+            counters: SessionCounters,
+        ) -> Result<(), super::super::store::SessionStoreError> {
+            self.inner.record_reset(key, event, counters)
+        }
+        fn reset_events(
+            &self,
+            key: &SessionKey,
+        ) -> Result<Vec<SequenceResetEvent>, super::super::store::SessionStoreError> {
+            self.inner.reset_events(key)
+        }
+    }
+
+    #[test]
+    fn test_emit_never_reuses_msg_seq_num_across_a_failed_store() {
+        // #149 finding 1B: `emit` stores the frame AND advances the outbound counter
+        // in ONE atomic store op. When that op fails, NEITHER is applied, so a retry
+        // reuses the same seq WITHOUT ever producing two frames at one MsgSeqNum — the
+        // duplicate-MsgSeqNum window the old `store_outbound` + `save_counters` pair
+        // left open is closed.
+        let store = Arc::new(FailAdvanceStore::new());
+        let mut fsm = SessionFsm::new(config(), Arc::clone(&store) as Arc<dyn FixSessionStore>, 0);
+        fsm.on_inbound(&header(CLIENT, VENUE, 1), 0);
+        fsm.admit_logon(
+            AccountId::new("acct-1"),
+            vec![Permission::Trade],
+            0,
+            30,
+            false,
+            1,
+            0,
+        )
+        .expect("admit");
+        // After the logon ack, the next outbound seq is 2.
+        assert_eq!(fsm.counters().next_sender_seq, 2);
+
+        // Inject a mid-emit store failure: a TestRequest would emit a Heartbeat.
+        store.set_fail(true);
+        let test = DecodedMessage::TestRequest(session::TestRequest {
+            header: header(CLIENT, VENUE, 2),
+            test_req_id: "TR-1".to_string(),
+        });
+        let err = fsm
+            .handle_active(test, 0, false)
+            .expect_err("the emit must fail");
+        assert!(
+            matches!(err, SessionError::Store(_)),
+            "a store failure seals the session, got {err:?}"
+        );
+        // The outbound counter did NOT advance, and NO frame was stored at seq 2.
+        assert_eq!(
+            fsm.counters().next_sender_seq,
+            2,
+            "no advance on a failed atomic emit"
+        );
+        assert!(
+            store
+                .outbound_range(&reconnect_key(), 2, 2)
+                .expect("range")
+                .is_empty(),
+            "no frame stored at the un-advanced seq"
+        );
+
+        // Recover: the same inbound seq 2 (never consumed) drives one clean emit at
+        // outbound seq 2 — used exactly once, never a duplicate.
+        store.set_fail(false);
+        let test2 = DecodedMessage::TestRequest(session::TestRequest {
+            header: header(CLIENT, VENUE, 2),
+            test_req_id: "TR-2".to_string(),
+        });
+        fsm.handle_active(test2, 0, false).expect("emit ok");
+        assert_eq!(
+            fsm.counters().next_sender_seq,
+            3,
+            "outbound seq advanced exactly once after recovery"
+        );
+        let at_2 = store.outbound_range(&reconnect_key(), 2, 2).expect("range");
+        assert_eq!(
+            at_2.len(),
+            1,
+            "exactly one frame at MsgSeqNum 2 — the seq is never reused"
+        );
+    }
+
+    #[test]
+    fn test_routed_mutation_defers_durable_inbound_advance_until_effect_commits() {
+        // #149 finding 1A: a routed order-entry MUTATION (D/F/G/q) advances the
+        // inbound counter IN MEMORY (so gap detection of the next frame is correct)
+        // but must NOT persist it durably until the exchange effect commits. Proven at
+        // the FSM seam: after `handle_active` routes the `D`, the in-memory counter is
+        // advanced yet the DURABLE counter still points at the routed message's own
+        // seq — so a crash here re-admits the client's resend (which the merged
+        // exchange-side ClOrdID idempotency reprocesses), never dropping it as
+        // already-seen.
+        let store = store();
+        let mut fsm = active_fsm(Arc::clone(&store), vec![Permission::Trade]);
+        // After admit at logon seq 1: durable + in-memory next_target = 2.
+        assert_eq!(
+            store
+                .load_counters(&reconnect_key())
+                .expect("load")
+                .next_target_seq,
+            2,
+            "logon consumed inbound seq 1, durably"
+        );
+
+        // Route a `D` at the expected inbound seq 2.
+        match fsm
+            .handle_active(new_order(2, None), 0, false)
+            .expect("handle")
+        {
+            ActiveDisposition::Route(message) => {
+                assert!(matches!(*message, DecodedMessage::NewOrderSingle(_)));
+            }
+            other => panic!("expected Route(NewOrderSingle), got {other:?}"),
+        }
+
+        // In memory: advanced (gap detection of the NEXT frame sees 3).
+        assert_eq!(
+            fsm.counters().next_target_seq,
+            3,
+            "in-memory advanced for gap detection"
+        );
+        // Durable: NOT advanced (deferred) — the store still admits a resend at seq 2.
+        assert_eq!(
+            store
+                .load_counters(&reconnect_key())
+                .expect("load")
+                .next_target_seq,
+            2,
+            "durable inbound advance is DEFERRED until the exchange effect commits"
+        );
+
+        // The async router persists the deferred advance ONLY after `submit` commits.
+        fsm.persist_inbound().expect("persist post-effect");
+        assert_eq!(
+            store
+                .load_counters(&reconnect_key())
+                .expect("load")
+                .next_target_seq,
+            3,
+            "post-effect persist makes the inbound consumption durable"
+        );
     }
 
     #[test]
