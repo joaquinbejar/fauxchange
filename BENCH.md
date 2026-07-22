@@ -2,9 +2,9 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); §5 re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix (see §5's methodology note); §5's allocation numbers are further disclosed as a **not-yet-met** target, not a passed one (see §5's target-status note, tracked #126/#138) |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§5 only); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`), on routinely-rebased working trees at those dates |
-| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #138); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
+| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); the allocation profile (§6) re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix, the HP-4 requote section reduced 343→232 allocs/op by `#122` (§6/§12), then the actor-turn baseline **corrected + root-caused 2026-07-22 (`#126`, RESOLVED)** — the §6 sections 1/2 baseline was stale pre-`#34` code carried over, the true steady-state is ~180–205 allocs/op, attributed by a new `dhat` call-stack bench (`benches/alloc_dhat.rs`), see §6's Baseline-correction + Root-cause blocks and §13.3; the allocation numbers remain a **not-yet-met** zero-alloc target (dominant term is upstream `Hash32::to_hex`, follow-up #165) |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§6 alloc profile, first stats_alloc run); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`); 2026-07-22 (§6 requote reduced `#122`; sections 1/2 re-measured + root-caused, §13.3 resolved, `#126`), on routinely-rebased working trees at those dates |
+| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #165); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
 > **Every number in this document is a DESIGN TARGET comparison, never an
@@ -22,7 +22,7 @@
 > "re-measured on \<date\> at \<some SHA\>"; the SHA that produced a given
 > number stops identifying the tree as soon as the branch moves. The
 > authoritative, commit-pinned re-measurement happens on the release-pinned
-> tree (#138).
+> tree (#165).
 
 ## 1. Run conditions
 
@@ -286,10 +286,12 @@ consistent across two independent quantiles × two independent call sites ×
 two independent runs is not plausibly pure noise, even though the
 `#020` baseline's OWN disclosed repeat-run variance (§3.1: p99 932 µs vs
 1 050 µs, ~+13 %) means the exact percentage in any one run should not be
-read too precisely. The likely mechanism, named but **not measured
-individually** (no call-stack profiler available, matching §6's disclosed
-limitation): `check_record_size` adds an allocation (`serde_json::to_string`
-builds a fresh `String`, immediately dropped) on EVERY append, on top of the
+read too precisely. The mechanism — since `#126`, **confirmed** by the
+`dhat` call-stack profiler (`benches/alloc_dhat.rs`; §6's Root cause block
+attributes ~57 % of the actor turn's allocations to exactly this path):
+`check_record_size` adds an allocation (`serde_json::to_string` builds a fresh
+`String`, immediately dropped — and serializing the record's `owner: Hash32`
+drags in the upstream per-byte `Hash32::to_hex`) on EVERY append, on top of the
 PRE-EXISTING `O(current journal depth)` linear scan (§3.1's own diagnosed
 tail driver) — the two are structurally likely to COMPOUND rather than
 merely add, since more append-time allocation pressure plausibly interacts
@@ -575,8 +577,10 @@ closed-loop full-turn p50** (§5.1, ~0.56–0.60 ms), despite 0 rejections (so
 the mailbox never saturated — this is not the fail-fast-under-load behavior
 `benches/support/openloop.rs`'s doc comment describes) and despite the 10 ms
 interval being an order of magnitude above the closed-loop service time. Two
-candidate, **unattributed** explanations (no call-stack profiler available,
-matching §6): (1) **connection/pool cold-start** — the open-loop section's
+candidate, **unattributed** explanations (no *latency* call-stack profiler
+such as `perf`/Instruments available here — `#126`'s `dhat` bench attributes
+allocations, not wall-time, so it does not help with this sojourn anomaly):
+(1) **connection/pool cold-start** — the open-loop section's
 fresh container gets NO warmup phase (mirroring HP-1's own open-loop section,
 which also skips warmup — §3.5), so the first several of only 500 samples pay
 a real TCP/auth handshake cost the closed-loop section's 200-op warmup phase
@@ -619,40 +623,125 @@ third).
 > — contains zero `unsafe`. `stats_alloc` also tracks `realloc` more precisely
 > than the old counter did (a realloc's byte delta is attributed to growth
 > *or* shrinkage instead of always adding the full new size to "bytes
-> allocated"), so the numbers below were **re-measured, not carried over**;
-> see the run-to-run variance disclosure below before reading the table as a
-> tight point estimate.
+> allocated"), so the numbers were **re-measured, not carried over**, at that
+> `#75`/`#112` allocator swap (commit `ab756ab`). **Caveat (added 2026-07-22):**
+> "re-measured" was true *at `ab756ab`* — but sections 1/2 were then NOT re-run
+> after the later order-path changes (`#34`/`#44`/`#47`), so their committed
+> figures went stale; the Baseline-correction note immediately below supersedes
+> them. See also the run-to-run variance disclosure before reading the table as
+> a tight point estimate.
+
+> **Baseline correction (2026-07-22, `#126` — sections 1/2 RE-MEASURED, and the
+> divergence root-caused).** The first two rows previously read `77.374`
+> (direct) / `82.657` (submit). Those figures were **measured at commit
+> `ab756ab`** (the `#75`/`#112` `stats_alloc` swap — the oldest bench commit)
+> and then **carried over unchanged** through the `#050` BENCH.md edit, which
+> only appended the third (`MarketMakerEngine`) row and never re-ran sections
+> 1/2. Between `ab756ab` and this measurement the **order-path code changed**:
+> `#34` (`9e5a537`) added [`check_record_size`](src/exchange/journal.rs) — a
+> `serde_json::to_string` of **every** journal record on **every** append (two
+> per actor turn: the write-ahead command record and the paired event record) —
+> as a DoS / write-≤-read-symmetry ceiling. That serialization walks each
+> record's `owner: Hash32` field through the upstream `pricelevel::Hash32` serde
+> impl, whose `Hash32::to_hex()` allocates ~32 tiny `String`s per hash (one
+> `format!("{:02x}")` per byte). This runs **more than twice per turn**: beyond
+> the two record wrappers, the *event* record also serializes one `owner: Hash32`
+> **per fill leg** (a crossing match produces two legs, a sweep more), so a
+> fill-bearing turn walks ~3.4 `to_hex` calls, not two — which is why the
+> measured cost exceeds the naive `2 × 32 = 64`. A call-stack profiler
+> (`benches/alloc_dhat.rs`, `dhat`, added by `#126`) attributes **~111 allocs/op
+> (~57 % of the turn)** to that single `to_hex` path. So `77.374`/`82.657` describe **pre-`#34` code**
+> and never applied to the tree they were committed against; the honest
+> steady-state on the current tree is the re-measured cluster below (stable,
+> two independent profilers agree). Full reconciliation and the per-call-site
+> breakdown are in the **Root cause** block after the table.
 
 | Section | allocs/op | bytes_alloc/op |
 |---|---|---|
-| `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **77.374** | 10 881.6 |
-| `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **82.657** | 11 102.3 |
+| `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **~195** (192.036 shown; range 180.4–203.3 over 10 runs) | ~13 300 |
+| `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **~189** (189.532 shown; range 181.0–202.7 over 10 runs) | ~13 250 |
 | `MarketMakerEngine::update_price` steady-state requote (HP-4, `#050`/`#122`, no `tokio` — a 10-contract chain, `CountingSink`) | **232.000** (was 343.000 pre-`#122`) | 3 513.3 (was 6 663.3) |
 
 **Target status: NOT MET — disclosed gap, not partial credit.** docs/07 §4's
 criterion is *zero* steady-state allocation on the common path; the measured
-common actor turn allocates roughly 60–80 times per submitted command. This
+common actor turn allocates **~180–205 times** per submitted command (the
+re-measured cluster, not the stale 60–80 the pre-`#34` baseline showed). This
 is failed-target evidence, reported honestly rather than framed as "close
 enough": the zero-steady-state-allocation DESIGN TARGET is open, and the
-measured numbers below are the disclosed size of that gap, not a partial
-pass. The run-to-run instability of this measurement is itself tracked as an
-open item (#126); a dedicated re-measure once #126 is resolved — ideally
-paired with a call-stack profiler so these ~60–80 allocs/op can be
-attributed to a concrete call site instead of process-wide — is tracked as
-the #138 follow-up.
+measured numbers above are the disclosed size of that gap, not a partial
+pass. As of `#126` the number is now **attributed to concrete call sites**
+(`benches/alloc_dhat.rs`, `dhat`): ~57 % of the turn is the upstream
+`pricelevel::Hash32::to_hex()` per-byte `format!` path, reached through the
+`#34` `check_record_size` serialization — see the **Root cause** block below.
+The gap is largely UPSTREAM (the `to_hex` allocation lives in `pricelevel`,
+which the venue wraps, never forks) and partly a deliberate venue security
+control (`check_record_size` serializes to enforce the per-record DoS
+ceiling). Closing it materially is a design change tracked as the `#165`
+follow-up, not a fix bundled into this reconciliation — the two candidate
+levers are (a) an **upstream** `Hash32::to_hex` that writes hex straight into
+the formatter / a fixed stack buffer instead of one `format!` `String` per
+byte (a `pricelevel` change, benefiting every serializer of a `Hash32`,
+including the durable Postgres journal which pays the same cost); and (b) a
+**venue** change that measures a journal record's size without a full
+serde round-trip on the in-memory hot path (e.g. a byte-counting `io::Write`
+sink, or enforcing the per-record ceiling only where records are already
+serialized) — the latter touches a security control, so it needs `architect`
++ `api-security-auditor` review, not a unilateral edit here.
 
-**Run-to-run variance, disclosed.** Three consecutive runs at the identical
-default configuration (`ALLOC_WARMUP_OPS=5000 ALLOC_MEASURED_OPS=50000`) on
-this host produced allocs/op of 62.577 / 79.710 / 77.374 (direct) and
-61.630 / 79.153 / 82.657 (async) — a wider spread than this document's other
-sections disclose, run to run. The table above reports the third (most
-recent) run; the other two are named here rather than discarded. This is
-consistent with — though not directly measured as caused by — early-lifetime
-container-growth timing (e.g. `DashMap`'s default randomized hasher shifting
-exactly when an internal shard's table resizes within a fixed 50 000-op
-window that starts from a freshly constructed actor each run), the same
-general class of "container still growing" effect §3.4 isolates for the
-journal specifically; not investigated further here.
+**Root cause (`#126`, RESOLVED — the divergence was a stale carried-over
+baseline, not run-to-run instability).** The previously-committed 60–80
+allocs/op and today's ~180–205 are BOTH honest measurements — **of different
+code**. §13.3 disclosed a "~2.3–2.6× divergence with no code change" and
+listed candidate causes (warmup, first-touch, workload size, `stats_alloc`
+drift, a genuine regression); `#126` ruled them out one by one with a
+call-stack profiler and a scaling sweep:
+
+- **Not warmup / first-touch.** `benches/alloc_dhat.rs` builds the `dhat`
+  profiler *after* warmup, so only the steady-state window is recorded, and it
+  still reports 195.4 allocs/op — a per-op steady-state cost, not a one-time
+  lazy-init. Sweeping warmup 500→20 000 and window 5 000→100 000 (via
+  `ALLOC_WARMUP_OPS`/`ALLOC_MEASURED_OPS`) holds the number flat at ~181–198;
+  it does not grow with journal/book depth, so the workload IS in steady state
+  and a larger warmup does not converge it toward 60–80.
+- **Not `stats_alloc` drift.** A completely independent profiler (`dhat`)
+  reproduces the same ~195 allocs/op the `stats_alloc` bench reports — two
+  tools agree, so the counter is not miscounting.
+- **It is a stale baseline over a genuine post-baseline increase.** The 60–80
+  figures were measured at `ab756ab` (topologically the OLDEST bench commit —
+  its `InMemoryVenueJournal::append` went straight to `records.push`, with no
+  serialization) and carried over unchanged through the `#050` edit. `#34`
+  (`9e5a537`) later inserted `check_record_size` — `serde_json::to_string` on
+  every append — on top of that baseline, and it was never re-measured.
+
+**Per-call-site breakdown** (`benches/alloc_dhat.rs`, `dhat` 0.3, 3 000-op
+steady-state window, 195.4 allocs/op total, aggregated leaf-first):
+
+| allocs/op | % | call site (leaf → caller) |
+|---|---|---|
+| **~111** | **57 %** | `pricelevel::Hash32::to_hex` (upstream `src/orders/base.rs:104`) — one `format!("{:02x}")` per byte, ×32 bytes — reached via `Hash32::serialize` inside `check_record_size` → `serde_json::to_string` (`src/exchange/journal.rs:452`), the command record + the event record every turn |
+| ~42 | 21 % | `String::clone` — the `VenueCommand`/`VenueEvent` envelope clones for the write-ahead journal (`command.clone()`, `event.clone()`) plus `Symbol`/`AccountId`/`ClientOrderId`/`VenueOrderId` field clones and the idempotency-map inserts (present since the early envelope work; in the pre-`#34` baseline too) |
+| ~16 | 8 % | upstream `orderbook_rs::OrderBook::untrack_order_by_id` → `dashmap::IterMut` — the matching engine's own owner-index bookkeeping per add |
+| ~6.5 | 3.3 % | `serde_json::to_vec::<JournalRecord>` output buffer (the size-check serializer's own `Vec<u8>`, distinct from the `Hash32::to_hex` intermediates above) |
+| ~6 | 3 % | upstream `pricelevel` / `crossbeam-skiplist` price-level + trade-list + `[u8]::to_vec` allocations per fill (several sub-1/op sites, grouped) |
+| ~0.4 | 0.2 % | `MatchingExecutor::build_fills` (`src/exchange/executor.rs:1238`) — the venue's own fill `Vec` |
+
+The single dominant term — `Hash32::to_hex` at ~57 % — is exactly the cost
+`#34` introduced on the append path and that `ab756ab`'s pre-`#34` baseline
+never paid, which fully accounts for the ~2.3–2.6× jump (60–80 → ~190). It is
+**upstream** allocation (the venue wraps `pricelevel`, never forks it),
+triggered by the venue's `check_record_size` serializing to measure record
+size. The `String::clone` term (~21 %) was present in the 60–80 baseline too,
+so it is not part of the divergence.
+
+**Run-to-run variance, disclosed.** Ten runs at the default configuration
+(`ALLOC_WARMUP_OPS=5000 ALLOC_MEASURED_OPS=50000`) — §13.3's seven plus three
+fresh on 2026-07-22 — produced 180.4–203.3 allocs/op (direct) and 181.0–202.7
+(async); the table reports a representative run and discloses the range. The
+spread is ordinary early-lifetime container-growth timing (`DashMap`'s
+randomized per-instance hasher shifting exactly when an internal shard resizes
+within a fixed window from a freshly constructed actor), the same class of
+effect §3.4 isolates for the journal — a ~±6 % band around ~190, NOT the
+~150 % gap the stale baseline implied.
 
 **The `#050` requote section, disclosed separately.** Unlike the two sections
 above, three consecutive runs of the `MarketMakerEngine::update_price` section
@@ -743,35 +832,28 @@ owned underlying strings per tick (above), and the split between the pricing
 kernel, the DTO id representation, and that entry-path residual is a hypothesis
 pending the #138 call-stack-attribution follow-up, not a measured attribution.
 
-**Method and what this does / does not prove.** This is a **process-wide**
-allocation-pressure profile of the measured loop (every allocation on any
-thread during the window), not a call-stack-scoped instrumentation of
-`handle`/`submit` alone — that needs a call-stack profiler (e.g. `dhat`,
-`heaptrack`, Instruments) this environment does not have available, and no
-such tool was used; **this bench does not attribute allocations to a
-specific call site**, and no claim below should be read as one. What it
-proves is the failed-target finding stated above: the steady-state turn is
-measurably far from the zero-allocation DESIGN TARGET, at roughly 60–80
-allocations per submitted command in both sections, not the `0` the target
-names. (The earlier baseline read the
-async-submit section as allocating *fewer* than the direct section and called
-that "notable"; across these three repeat runs the two sections are close
-enough, and swap ordering run to run, that no reliable direction — async
-higher or lower than direct — is claimed here; the given-workload deltas
-above are within the same run-to-run noise band shown for both sections.)
-Structurally-plausible, **unattributed** candidate contributors, named from
-reading the code (not measured individually, so not claimed as the
-explanation): `VenueCommand::clone()` for the write-ahead journal record
-(`UnderlyingActor::handle`, step 1) clones every owned-`String`-backed field
-(`Symbol`, `AccountId`, `ClientOrderId`); `MatchingExecutor`'s
-`resting`/`venue_to_engine`/`idempotency` maps insert new owned keys per
-order; the upstream matching engine's own allocation behavior is unmeasured
-here and not excluded as a contributor (its *latency* is out of budget per
-docs/07 §7, but this bench does not carry that exclusion through to
-allocation counting). **This non-zero, honestly-reported number is exactly
-the regression-signal baseline docs/07 §4 asks for** — a future PR that
-changes it materially (either direction) without an explanation is the
-signal to investigate with a real call-stack profiler.
+**Method and what this does / does not prove.** `alloc_profile.rs` itself is a
+**process-wide** allocation-pressure profile of the measured loop (every
+allocation on any thread during the window), not a call-stack-scoped
+instrumentation of `handle`/`submit` alone. As of `#126` that call-stack view
+exists as a **separate** bench: `benches/alloc_dhat.rs` swaps the global
+allocator to `dhat::Alloc` (dev-only, behind the OFF-by-default `dhat-heap`
+feature) and attributes each allocation to its call site — the breakdown table
+above is its output. Run it with
+`RUSTFLAGS="-C debuginfo=1" cargo bench --bench alloc_dhat --features dhat-heap`.
+The two benches agree on the total (~195 allocs/op), so `alloc_profile.rs`
+remains the fast, dependency-light regression signal and `alloc_dhat.rs` the
+attribution tool when the signal moves. What the pair proves is the
+failed-target finding stated above: the steady-state turn is measurably far
+from the zero-allocation DESIGN TARGET, at ~180–205 allocations per submitted
+command, not the `0` the target names — and the dominant term is now
+**attributed** (upstream `Hash32::to_hex`, ~57 %), not merely "structurally
+plausible." The two `tokio`-driven sections (direct vs async) sit close enough
+and swap ordering run to run that no reliable direction between them is
+claimed. **This non-zero, attributed number is exactly the regression-signal
+baseline docs/07 §4 asks for** — a future PR that changes it materially
+(either direction) without an explanation is the signal to re-run
+`alloc_dhat.rs` and see which call site moved.
 
 ## 7. Supplementary: `criterion_match_cost` (not BENCH.md evidence)
 
@@ -888,8 +970,10 @@ superseded by §5's real measurements, `#035`), not duplicated here.
 - `benches/hp1_order_path.rs`, `benches/hp2_ws_fanout.rs`,
   `benches/hp3_fix_parse.rs` (`#043`), `benches/hp5_durable_append.rs`
   (`#035`), `benches/mm_requote_hdr.rs` (`#050`), `benches/alloc_profile.rs`,
-  `benches/criterion_match_cost.rs` — the seven registered `[[bench]]`
-  targets (`harness = false`), `Cargo.toml`.
+  `benches/alloc_dhat.rs` (`#126` — the `dhat` call-stack-attributed heap
+  profiler behind the OFF-by-default `dhat-heap` feature; the attribution tool
+  §6's Root cause block uses), `benches/criterion_match_cost.rs` — the eight
+  registered `[[bench]]` targets (`harness = false`), `Cargo.toml`.
 - `benches/support/` — the reusable `bench-hdr` harness: `hdr.rs` (the
   `hdrhistogram` quantile report — unit-tested via `tests/bench_harness.rs`),
   `workload.rs` (the seeded, deterministic command-stream builder; `#050`
@@ -1287,10 +1371,10 @@ genuinely sensitive to load rather than trivially always green.
   not yet at the 20 ms cadence this assertion commits to); or a
   call-stack-attributed allocation breakdown for the 232 allocs/op the
   allocation profile's third section reports (§6 — reduced from 343 by `#122`;
-  the same process-wide, not call-stack-scoped, limitation §6 already discloses
-  for its other two sections. The `#122` reduction is attributed to concrete
-  code changes and verified byte-identical, but the residual 232 is still a
-  process-wide count, not a per-call-site attribution).
+  still a process-wide count, not a per-call-site attribution. The `#126` `dhat`
+  bench `benches/alloc_dhat.rs` now makes such a breakdown possible — it is
+  applied to §6's actor-turn sections 1/2, not yet to this requote section;
+  pointing it at the requote path is a small, tracked follow-up).
 - **CI regression gate**: not armed by this change — `#050` is scope-limited
   to landing the measured baseline and the isolation assertion (a `cargo
   test`, so it runs as a normal, always-on correctness check, not a
@@ -1386,10 +1470,24 @@ reference (p99 33 µs at ~2.2k records) and far below the full-scale §3.1
 figure (p99 932 µs-1.5 ms at ~105k records) — exactly the journal-depth
 dependence §3 already diagnosed, reconfirmed, not contradicted.
 
-### 13.3 A disclosed, unresolved divergence: the allocation profile does NOT reproduce §6's committed numbers today
+### 13.3 A disclosed divergence — now RESOLVED (`#126`): §6's stale, pre-`#34` allocation baseline, carried over unrefreshed
 
-This is the one re-verification result that did **not** land where §6's
-committed baseline says it should, and it is reported honestly rather than
+> **RESOLVED 2026-07-22 (`#126`).** When `#053` armed the gate this divergence
+> was real and unexplained; the root cause is now found and §6's baseline
+> refreshed — see §6's **Root cause** block. In one line: §6's 60–80 allocs/op
+> was measured at `ab756ab` (pre-`#34`, when `InMemoryVenueJournal::append` did
+> no serialization) and carried over unchanged; `#34`'s `check_record_size`
+> (`serde_json::to_string` per append, serializing the `owner: Hash32` through
+> the upstream per-byte `Hash32::to_hex`) added ~111 allocs/op afterward and was
+> never re-measured. Today's ~180–205 is the honest steady-state; the 60–80 was
+> pre-`#34` code. The §13.2 conclusion that `git diff … -- benches/*` was empty
+> was correct but **scoped too narrowly** — it did not diff `src/exchange/`, so
+> it missed `#34`'s append-path change (the actual cause). The runs and gate
+> rationale below are kept as the honest record of the state when the gate was
+> armed; the interpretation is corrected inline.
+
+This was the one `#053` re-verification result that did **not** land where §6's
+committed baseline said it should, and it was reported honestly rather than
 quietly reconciled or overwritten.
 
 Five independent `cargo bench --bench alloc_profile` runs today (default
@@ -1421,24 +1519,38 @@ of these seven runs, matching §6's own three historical runs exactly — ten
 total measurements, zero variance, on the SAME machine as the two sections
 above that show a real, unexplained ~2.3-2.6x shift.
 
-**This is named, not investigated further — the same limitation §6 already
-discloses (no call-stack profiler available in this environment) applies
-here too.** Plausible, **unattributed** candidate causes: `DashMap`'s
-randomized per-instance hasher shifting shard-resize timing more than §6's
-own disclosed run-to-run spread anticipated (§6's hypothesis, but that
-hypothesis was framed around a ~25% spread, not a ~150% one); a change in
-this host's memory-pressure state between the two measurement sessions
-interacting with macOS `libmalloc`'s allocation-vs-realloc decision in a way
-that changes allocator CALL COUNT, not just latency (speculative — allocation
-*count* should, in principle, be a pure function of program logic plus hasher
-seed, not of system memory pressure, but this was not ruled out); or a
-subtlety in how the two measurement sessions differ that this investigation
-did not find. **Filed as [issue #126](https://github.com/joaquinbejar/fauxchange/issues/126)**
-for `matching-expert`/`architect` — with a real call-stack profiler
-(`dhat`/`heaptrack`/Instruments) — mirroring #91's own "measured, disclosed,
-tracked, not root-caused here" precedent; `architect`'s #053 review confirmed
-this is a ship-with-follow-up finding, not a blocker for arming the gate
-itself.
+**Root cause (corrected 2026-07-22, `#126`).** The candidate causes this
+paragraph originally listed as "unattributed" — a `DashMap` hasher-spread
+effect larger than anticipated, a `libmalloc` memory-pressure interaction,
+"a subtlety this investigation did not find" — were all **wrong or moot**. The
+actual cause is a **stale carried-over baseline over a genuine post-baseline
+allocation increase**, proven with `dhat` (`benches/alloc_dhat.rs`, added by
+`#126`) and a scaling sweep (§6's Root cause block):
+
+- The one false premise was "**NO code change between the two measurement
+  sessions**." That was inferred from `git diff … -- benches/alloc_profile.rs
+  benches/support/workload.rs` — a diff scoped to the **bench** files only. It
+  did **not** diff `src/exchange/`. §6's 60–80 was measured at `ab756ab`
+  (topologically the oldest bench commit, pre-`#34`), and `#34` (`9e5a537`)
+  later added `check_record_size` to the append path. So the order-path code
+  DID change between §6's measurement and `#053`'s re-verification — the diff
+  just did not look where the change was.
+- The `DashMap`-hasher hypothesis was right about the *shape* of the true
+  ±6 % run-to-run band (180.4–203.3) but not the *magnitude* of the divergence;
+  the ~150 % gap is the pre-`#34`-vs-current code difference, not hasher noise.
+- `libmalloc` memory pressure is ruled out: `dhat` (a call-stack allocation
+  counter, not a latency tool) independently reproduces ~195 allocs/op, and
+  allocation *count* is a pure function of program logic + hasher seed — the
+  count did not change because of system state, it changed because `#34`'s
+  serialization runs on every append now.
+
+Attribution: ~111 of the ~190 allocs/op (~57 %) is upstream
+`pricelevel::Hash32::to_hex` (one `format!("{:02x}")` per byte, ×32),
+reached through `check_record_size`'s `serde_json::to_string` of each journal
+record's `owner: Hash32`. **[Issue #126](https://github.com/joaquinbejar/fauxchange/issues/126)
+is resolved by this finding**; `architect`'s `#053` review correctly called it
+a ship-with-follow-up, and the follow-up (`#165`) is now a *targeted* alloc
+reduction with a known offending call site, not an open mystery.
 
 **Why the gate's ceiling uses the freshly-observed numbers, not §6's stale
 figure.** A "no regression over the committed §6 baseline" gate taken
@@ -1447,16 +1559,19 @@ change — the same "born red" problem §13.1 names for HP-1 and #91. The
 allocation ceilings in `scripts/bench_regression_gate.py`
 (`ALLOC_CEILINGS_PER_OP`) are therefore set from THIS section's freshly
 re-verified numbers with real margin (450 allocs/op for the direct section,
-~2.2x the highest of the seven fresh runs and ~5.8x §6's own historical
-maximum; 500 for the submit section, similarly), so the gate is honest about
-current, reproducible reality rather than gating against a number that does
-not reproduce on this exact host today. §6's own committed table above is
-left UNCHANGED (this is a disclosed divergence, not a "correction" — a
-future investigation may find §6's number was itself measured under
-unusually favourable conditions, or that today's session has an identifiable
-cause; neither is known yet). The `MarketMakerEngine::update_price` ceiling
-(350) stays tight, matching that section's genuine, ten-run,
-zero-variance reproducibility.
+~2.2x the highest of the seven fresh runs; 500 for the submit section,
+similarly), so the gate is honest about current, reproducible reality rather
+than gating against a number that does not reproduce on this exact host today.
+These ceilings are grounded in the true ~180–205 steady-state, so `#126`'s
+resolution requires **no ceiling change** — only the rationale strings in
+`scripts/bench_regression_gate.py` are updated to drop the "pending-#126"
+caveat now that the baseline is refreshed and root-caused. **§6's committed
+table above has now been CORRECTED** (2026-07-22): the earlier
+`77.374`/`82.657` figures were pre-`#34` code carried over stale, and §6 now
+records the re-measured ~180–205 cluster with the full reconciliation — this
+paragraph's original "left UNCHANGED … neither is known yet" no longer holds.
+The `MarketMakerEngine::update_price` ceiling (343) stays tight, matching that
+section's genuine, ten-run, zero-variance reproducibility.
 
 > **`#122` update (2026-07-22).** The seven-run table above records the
 > pre-`#122` state (MM section `343.000`, correct for 2026-07-19). `#122` has

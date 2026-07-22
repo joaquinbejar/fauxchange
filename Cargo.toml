@@ -363,6 +363,41 @@ tokio-util = { version = "0.7", default-features = false, features = ["codec"] }
 # `1` adds NO new crate version. MIT, maintained by the tokio project; `cargo
 # audit` / `cargo deny` gate it.
 bytes = "1"
+# The CALL-STACK-ATTRIBUTED heap profiler for the `alloc_dhat` bench (#126), an
+# **OPTIONAL** dependency gated by the `dhat-heap` feature (`dhat-heap =
+# ["dep:dhat"]`) — OFF by default, so a plain `cargo build`/`cargo bench` never
+# resolves or compiles `dhat` or its backtrace stack. (Cargo forbids an *optional
+# dev-dependency*, so it lives here as an optional normal dependency — the dhat
+# crate's own documented `dhat-heap` pattern; it is still pulled ONLY when the
+# feature is enabled and never reaches the shipped crate or the container image.)
+# The process-wide `stats_alloc` counter (`benches/alloc_profile.rs`) reports a
+# total allocs/op but CANNOT attribute an allocation to the call site that made
+# it; `dhat::Alloc` is a `GlobalAlloc` wrapper that captures a backtrace per
+# allocation and writes a `dhat-heap.json` program-point tree, giving the
+# per-call-stack counts #126 needs. `src/lib.rs` keeps `#![forbid(unsafe_code)]`
+# unconditionally and this crate's own code carries zero `unsafe` (`dhat`'s own
+# `unsafe impl GlobalAlloc` is vendored inside that crate). Audit note: `dhat`
+# 0.3.3 (MIT OR Apache-2.0, maintained by Nicholas Nethercote — the Valgrind/DHAT
+# author) pulls the standard `backtrace` symbolization stack NEW into the tree
+# ONLY under the feature: `backtrace`, `addr2line`, `gimli`, `object`,
+# `rustc-demangle` (all rust-lang-maintained, MIT/Apache-2.0), plus `mintex`,
+# `rustc-hash`, `thousands`; `cargo audit` / `cargo deny` (#019) gate the whole
+# tree and any new SPDX id is added to `deny.toml`'s allow-list with a reason.
+# Run with `RUSTFLAGS="-C debuginfo=1"` for full symbol names in the breakdown.
+dhat = { version = "0.3", optional = true }
+
+[features]
+# Opt-in toggle for the call-stack-attributed heap profiler in
+# `benches/alloc_dhat.rs` (#126). OFF by default: the shipping build, the normal
+# `cargo bench`/`cargo test`, and the process-wide `stats_alloc` bench
+# (`benches/alloc_profile.rs`) are all unaffected. Enable ONLY for a profiling
+# run — `cargo bench --bench alloc_dhat --features dhat-heap` — which swaps the
+# `alloc_dhat` bench binary's `#[global_allocator]` to `dhat::Alloc` and writes a
+# per-call-site allocation breakdown. The `dhat` crate is a dev-dependency (see
+# its audit note below), so it is compiled only for dev targets (never for
+# `cargo build`/`cargo publish`), and only when this feature — or `--all-features`
+# — is active; the shipping `fauxchange` binary and library never see it.
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 proptest = "1"
@@ -503,6 +538,11 @@ harness = false
 [[bench]]
 name = "alloc_profile"
 path = "benches/alloc_profile.rs"
+harness = false
+
+[[bench]]
+name = "alloc_dhat"
+path = "benches/alloc_dhat.rs"
 harness = false
 
 [[bench]]
