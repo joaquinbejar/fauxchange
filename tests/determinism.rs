@@ -82,7 +82,7 @@ use fauxchange::exchange::{
     InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
     JournalCommand, JournalError, JournalHeader, JournalRecord, LineageId, MarkPriceBook,
     MassCancelScope, MassCancelType, MatchingExecutor, NoopFanOut, PositionsStore, RecordKind,
-    RejectKind, Recovered, STPMode, SequenceNumber, Side, SignedCents, StoreFanOut, Symbol,
+    Recovered, RejectKind, STPMode, SequenceNumber, Side, SignedCents, StoreFanOut, Symbol,
     SymbolError, SymbolParser, TimeInForce, TopOfBook, UnderlyingActor, VenueClock, VenueCommand,
     VenueEvent, VenueJournal, VenueOutcome, recover, recover_into, validate_venue_expiry,
 };

@@ -77,14 +77,13 @@ use crate::auth::{
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, CancelledLeg, EventTimestamp, ExecutionsStore, ExpirationDate, FanOut,
-    FanOutSealed, FanoutSummary, InMemoryExecutionsStore, InMemoryPositionsStore,
-    InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader, JournalSnapshot, LineageId,
-    MarkPriceBook, MarketMakerControlSink, MassCancelScope, MatchingExecutor, Receipt, Recovered,
-    SequenceNumber, StoreFanOut, Symbol, TeeFanOut, VenueCommand, VenueEvent, VenueJournal,
-    VenueOutcome, check_price_band, recover_into,
+    ActorConfig, ActorHandle, CancelledLeg, EventTimestamp, ExecutionsStore, ExpirationDate,
+    FanOut, FanOutSealed, FanoutSummary, InMemoryExecutionsStore, InMemoryPositionsStore,
+    InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader, JournalSnapshot,
+    LineageId, MarkPriceBook, MarketMakerControlSink, MassCancelScope, MatchingExecutor,
+    PositionsStore, Receipt, Recovered, SequenceNumber, StoreFanOut, Symbol, TeeFanOut,
+    VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_price_band, recover_into,
     spawn_matching_actor_with_registry_and_index, spawn_underlying_actor,
-
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
 use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
@@ -806,9 +805,9 @@ fn swept_legs_of(receipt: &Receipt) -> Vec<SweptLeg> {
 /// (`Err(FanOutSealed)`), not swallowed, so [`AppState::new`] fails startup on a
 /// partially-rebuilt store rather than begin serving authoritative stores that do
 /// not match the recovered journal (#131 made `StoreFanOut::emit` fallible).
-fn rebuild_stores_from_events(
-    executions: &Arc<InMemoryExecutionsStore>,
-    positions: &Arc<InMemoryPositionsStore>,
+fn rebuild_stores_from_events<E: ExecutionsStore, P: PositionsStore>(
+    executions: &Arc<E>,
+    positions: &Arc<P>,
     marks: &Arc<MarkPriceBook>,
     events: &[VenueEvent],
 ) -> Result<(), FanOutSealed> {
@@ -3231,6 +3230,106 @@ mod tests {
             state.clock().now_ms().get(),
             start + 500,
             "an explicit Clock advance still moves a stepped clock"
+        );
+    }
+
+    // ---- boot-recovery store rebuild is fallible (#85 review) -------------
+
+    /// An executions store whose `record` always fails — the projection fault boot
+    /// recovery must fail-stop on rather than serve a partially-rebuilt store.
+    struct FaultyExec;
+
+    impl ExecutionsStore for FaultyExec {
+        fn record(
+            &self,
+            _record: crate::models::ExecutionRecord,
+        ) -> Result<(), crate::exchange::StoreError> {
+            Err(crate::exchange::StoreError::Backend("injected".to_string()))
+        }
+        fn get(
+            &self,
+            _execution_id: &crate::models::ExecutionId,
+            _account: &AccountId,
+        ) -> Result<Option<crate::models::ExecutionRecord>, crate::exchange::StoreError> {
+            Ok(None)
+        }
+        fn list(
+            &self,
+            _account: &AccountId,
+            _filter: &crate::exchange::ExecutionFilter,
+        ) -> Result<Vec<crate::models::ExecutionRecord>, crate::exchange::StoreError> {
+            Ok(Vec::new())
+        }
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_stores_from_events_surfaces_a_projection_failure() {
+        // #85 review: boot recovery must FAIL STARTUP (never serve a partial store)
+        // when a projection fails during the store rebuild. `rebuild_stores_from_events`
+        // surfaces the #131 `StoreFanOut` seal as `Err`, which `AppState::new` maps to
+        // a fatal `AppStateError::RecoveryProjectionFailed`.
+        let state = new_state(config(&["BTC"]));
+        // A crossing match → a fill-bearing event in the journal.
+        state
+            .submit(add(
+                "BTC-20240329-50000-C",
+                "mk",
+                "maker",
+                0x11,
+                Side::Sell,
+                50_000,
+                2,
+            ))
+            .await
+            .expect("maker rests");
+        state
+            .submit(add(
+                "BTC-20240329-50000-C",
+                "tk",
+                "taker",
+                0x22,
+                Side::Buy,
+                50_000,
+                2,
+            ))
+            .await
+            .expect("taker crosses");
+        let snap = state.journal_snapshot("BTC").await.expect("BTC snapshot");
+        let events: Vec<VenueEvent> = snap
+            .records
+            .into_iter()
+            .filter_map(|r| match r {
+                JournalRecord::Event(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.outcome,
+                VenueOutcome::Added { fills, .. } if !fills.is_empty()
+            )),
+            "the crossing produced a fill-bearing event to rebuild"
+        );
+
+        // Happy path: in-memory stores rebuild cleanly.
+        let exec_ok = Arc::new(InMemoryExecutionsStore::new());
+        let pos_ok = Arc::new(InMemoryPositionsStore::new());
+        rebuild_stores_from_events(&exec_ok, &pos_ok, &Arc::new(MarkPriceBook::new()), &events)
+            .expect("a clean rebuild returns Ok");
+        assert!(exec_ok.len() >= 2, "the crossing's two legs were rebuilt");
+
+        // Faulty executions store: the rebuild surfaces the seal, projection named.
+        let exec_bad = Arc::new(FaultyExec);
+        let pos = Arc::new(InMemoryPositionsStore::new());
+        let sealed =
+            rebuild_stores_from_events(&exec_bad, &pos, &Arc::new(MarkPriceBook::new()), &events);
+        assert_eq!(
+            sealed.err().map(|s| s.projection),
+            Some("executions"),
+            "a projection failure fails the rebuild rather than serving a partial store"
         );
     }
 }
