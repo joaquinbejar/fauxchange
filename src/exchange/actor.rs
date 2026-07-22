@@ -49,6 +49,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::error::VenueError;
+use crate::exchange::clordid_index::{ClOrdIdIndex, apply_committed_correlation};
 use crate::exchange::envelope::{RejectKind, VenueCommand, VenueEvent, VenueOutcome};
 use crate::exchange::event::{EventTimestamp, SequenceNumber};
 use crate::exchange::executor::MatchingExecutor;
@@ -467,6 +468,15 @@ pub struct UnderlyingActor<J, E, F, C> {
     epoch: u64,
     /// `Some` once sealed — every further command is rejected.
     sealed: Option<SealReason>,
+    /// The **optional** shared account-scoped `(account, ClOrdID) → order_id`
+    /// correlation index (#098). The actor publishes into it **POST-journal** — after
+    /// the paired [`VenueEvent`] durably lands, from the committed `(command,
+    /// outcome)` — so a placement whose event append fails never exposes an
+    /// uncommitted mapping. It is held here (not by the [`CommandExecutor`]) precisely
+    /// so publishing is post-journal; journal recovery rebuilds the identical mapping
+    /// from the same committed events, so live and recovery never diverge. `None`
+    /// where no cross-session correlation is wanted (bare tests, replay validation).
+    clordid_index: Option<Arc<ClOrdIdIndex>>,
 }
 
 impl<J, E, F, C> UnderlyingActor<J, E, F, C>
@@ -476,7 +486,8 @@ where
     F: FanOut,
     C: VenueClock,
 {
-    /// Builds an actor from its config and collaborator seams.
+    /// Builds an actor from its config and collaborator seams, with no cross-session
+    /// correlation index installed (see [`with_clordid_index`](Self::with_clordid_index)).
     #[must_use]
     pub fn new(config: ActorConfig, journal: J, executor: E, fan_out: F, clock: C) -> Self {
         Self {
@@ -489,7 +500,20 @@ where
             next_sequence: config.start_sequence,
             epoch: 0,
             sealed: None,
+            clordid_index: None,
         }
+    }
+
+    /// Installs the shared account-scoped `(account, ClOrdID) → order_id` index
+    /// (#098) this actor publishes into **post-journal**, returning `self` so it
+    /// composes with [`new`](Self::new). Passing `None` is a no-op (the actor
+    /// publishes no correlations). The live [`crate::state::AppState`] wiring shares
+    /// **one** index across every underlying's actor; journal recovery reconstructs
+    /// the same mapping from the journaled events, so it is never installed twice.
+    #[must_use]
+    pub fn with_clordid_index(mut self, clordid_index: Option<Arc<ClOrdIdIndex>>) -> Self {
+        self.clordid_index = clordid_index;
+        self
     }
 
     /// The underlying ticker this actor serves.
@@ -568,6 +592,19 @@ where
                 "post-mutation event append failed; sealing underlying, no fan-out"
             );
             return Err(VenueError::JournalUnavailable);
+        }
+
+        // Publish the cross-session `(account, ClOrdID) → order_id` correlation (#098)
+        // POST-journal: the paired event is now durably committed, so the mapping is a
+        // deterministic function of a journaled event, and journal recovery
+        // (`reduce_into_executor`) rebuilds the IDENTICAL mapping from the same
+        // committed `(command, outcome)`. A command whose event append FAILED sealed
+        // and returned above, so it never reaches here — the index can never expose an
+        // uncommitted mapping. It runs before fan-out (both post-journal, same turn);
+        // an idempotent `Duplicate` retry derives no mutation, so a retry's
+        // freshly-minted order id never overwrites the canonical one (#099/#098).
+        if let Some(index) = self.clordid_index.as_ref() {
+            apply_committed_correlation(index, &self.underlying, &event.command, &event.outcome);
         }
 
         // Step 5: fan-out ONLY after the paired event is journaled. An authoritative
@@ -1027,10 +1064,37 @@ where
     F: FanOut + Send + 'static,
     C: VenueClock + Send + 'static,
 {
+    spawn_underlying_actor_with_clordid_index(config, journal, executor, fan_out, clock, None)
+}
+
+/// Spawns one underlying's actor as a `tokio` task, installing the shared
+/// account-scoped `(account, ClOrdID) → order_id` correlation index (#098) the actor
+/// publishes into **post-journal** — the live wiring
+/// ([`spawn_matching_actor_with_registry_and_index`](crate::exchange::spawn_matching_actor_with_registry_and_index))
+/// and the boot-recovery resume path
+/// ([`crate::state::AppState`]) both use this so a resumed underlying keeps
+/// publishing cross-session correlations for its future live commands. `None` for
+/// the index is exactly [`spawn_underlying_actor`].
+#[must_use]
+pub fn spawn_underlying_actor_with_clordid_index<J, E, F, C>(
+    config: ActorConfig,
+    journal: J,
+    executor: E,
+    fan_out: F,
+    clock: C,
+    clordid_index: Option<Arc<ClOrdIdIndex>>,
+) -> (ActorHandle, JoinHandle<()>)
+where
+    J: VenueJournal + Send + 'static,
+    E: CommandExecutor + Send + 'static,
+    F: FanOut + Send + 'static,
+    C: VenueClock + Send + 'static,
+{
     let capacity = config.mailbox_capacity.max(1);
     let underlying = Arc::clone(&config.underlying);
     let (tx, rx) = mpsc::channel(capacity);
-    let actor = UnderlyingActor::new(config, journal, executor, fan_out, clock);
+    let actor = UnderlyingActor::new(config, journal, executor, fan_out, clock)
+        .with_clordid_index(clordid_index);
     let join = tokio::spawn(actor.run(rx));
     (ActorHandle { tx, underlying }, join)
 }

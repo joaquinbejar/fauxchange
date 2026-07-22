@@ -82,6 +82,34 @@ The full versioning and release-process policy lives in the design docs
     resend log + reset audit survive a simulated process exit (drop store +
     pool, reopen a fresh pool against the same DB, resume numbering); plus an
     in-memory/PG behavioral-parity test over one fixed trait-call scenario.
+- **Durable `(account, ClOrdID) → order_id` index for cross-session
+  cancel/replace** (#98). #39 correlated a FIX `OrigClOrdID` to the venue
+  `order_id` via a **per-session** `HashMap`, so a cancel/replace on a new
+  connection (or after reconnect) answered `9 Unknown order`. This adds an
+  **account-scoped** `ClOrdIdIndex` in `AppState` that both FIX and REST resolve
+  through (`AppState::resolve_client_order_id`), so a client can
+  cancel/replace/status an order it placed in a **prior session**.
+  - **Journal-derived, not a second source of truth.** `(account, ClOrdID) →
+    order_id` is a deterministic function of the journaled `AddOrder` stream
+    (each carries `account`, `client_order_id`, `order_id`), so the index is
+    populated on the sequenced path as a side effect **after** the outcome is
+    captured (the recovery integrity oracle is unaffected) and **rebuilt on #85
+    boot recovery** by re-execution — no PG table, no migration to keep in sync.
+  - **Account isolation.** The key is `(AccountId, ClientOrderId)`; a colliding
+    `ClOrdID` under another account is a different key ⇒ resolves to `None` ⇒ a
+    clean `9` / not-found, **indistinguishable** from a genuinely unknown id (no
+    cross-account ownership leak, mirroring #132's masking). The index is
+    bounded (`DEFAULT_MAX_CLORDID_INDEX_ENTRIES`) with a typed `Full` error.
+  - Known limitation (documented in code): `VenueCommand::Replace` carries no
+    `client_order_id`, so a replace's **new** `ClOrdID` is not journaled and is
+    absent from the recovery-rebuilt index; same-session replace re-keying still
+    works via the per-session map, and the primary cross-session case
+    (cancel/replace an `AddOrder`-placed `ClOrdID` on a new connection) works
+    fully.
+  - Tests: cross-session cancel + replace succeed on a new session; account-B
+    cannot resolve account-A's colliding `ClOrdID`; the rebuilt index after
+    restart resolves the same `ClOrdID`s deterministically; REST/FIX parity at
+    the shared seam.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;
