@@ -89,12 +89,23 @@ The full versioning and release-process policy lives in the design docs
   **account-scoped** `ClOrdIdIndex` in `AppState` that both FIX and REST resolve
   through (`AppState::resolve_client_order_id`), so a client can
   cancel/replace/status an order it placed in a **prior session**.
-  - **Journal-derived, not a second source of truth.** `(account, ClOrdID) →
-    order_id` is a deterministic function of the journaled `AddOrder` stream
-    (each carries `account`, `client_order_id`, `order_id`), so the index is
-    populated on the sequenced path as a side effect **after** the outcome is
-    captured (the recovery integrity oracle is unaffected) and **rebuilt on #85
-    boot recovery** by re-execution — no PG table, no migration to keep in sync.
+  - **Journal-derived, published post-journal.** `(account, ClOrdID) →
+    order_id` is a deterministic function of the journaled `AddOrder` / `Replace`
+    stream, so the **single-writer actor** publishes each correlation as a pure
+    side effect **after** the paired event durably lands (never before — a
+    placement whose event append fails seals the underlying and leaves the index
+    untouched, so it can never expose an uncommitted mapping) and **#85 boot
+    recovery rebuilds the identical mapping** by re-executing the same events
+    through the same derivation. No PG table, no migration to keep in sync; the
+    recovery integrity oracle is unaffected (the index never changes an event).
+  - **Cross-session replace now journaled** (fix for the earlier per-session-only
+    limitation): `VenueCommand::Replace` carries the replacement `ClOrdID` and the
+    retired `OrigClOrdID` (both `#[serde(default)]`, so pre-#098 records still
+    decode). On a committed successful replace the actor publishes
+    `(account, new_ClOrdID) → new_order_id` and **retires** the stale
+    `(account, OrigClOrdID)` entry — reproduced identically on recovery — so a
+    replaced order is cancel/replace-correlatable on a later connection and the old
+    id no longer resolves to a live order.
   - **Account isolation.** The key is `(AccountId, ClientOrderId)`; a colliding
     `ClOrdID` under another account is a different key ⇒ resolves to `None` ⇒ a
     clean `9` / not-found, **indistinguishable** from a genuinely unknown id (no
@@ -103,16 +114,13 @@ The full versioning and release-process policy lives in the design docs
     account** (`DEFAULT_MAX_CLORDID_PER_ACCOUNT`, typed `AccountFull`) — the
     per-account fairness sub-quota stops one account exhausting the shared index
     for everyone (a degraded-path drop, never a failed order).
-  - Known limitation (documented in code): `VenueCommand::Replace` carries no
-    `client_order_id`, so a replace's **new** `ClOrdID` is not journaled and is
-    absent from the recovery-rebuilt index; same-session replace re-keying still
-    works via the per-session map, and the primary cross-session case
-    (cancel/replace an `AddOrder`-placed `ClOrdID` on a new connection) works
-    fully.
   - Tests: cross-session cancel + replace succeed on a new session; account-B
-    cannot resolve account-A's colliding `ClOrdID`; the rebuilt index after
-    restart resolves the same `ClOrdID`s deterministically; REST/FIX parity at
-    the shared seam.
+    cannot resolve account-A's colliding `ClOrdID`; an idempotent add retry never
+    overwrites the canonical mapping; a fault-injected post-mutation event-append
+    failure leaves the index without the uncommitted mapping and seals the actor; a
+    stale cancel renders a masked `9`, not a false `Canceled`; the rebuilt index
+    after restart resolves the same `ClOrdID`s deterministically (including a
+    replace); REST/FIX parity at the shared seam.
 - **Added the v1.0 stability soak** (#54, `tests/load.rs`,
   [BENCH.md §14](BENCH.md#14-stability-soak--flat-memory-no-sequence-gaps-clean-shutdown-restart-from-journal-054-v10)).
   `#[ignore]` + `SOAK=1`-gated (never on the fast CI gate;

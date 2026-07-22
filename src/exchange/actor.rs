@@ -1472,6 +1472,68 @@ mod tests {
         }
     }
 
+    /// A [`CommandExecutor`] that always captures a resting `Added` — enough for the
+    /// actor's post-journal ClOrdID-index publish (#098) to fire on a committed
+    /// `AddOrder`, without wiring the full matching engine.
+    struct AddedExecutor;
+
+    impl CommandExecutor for AddedExecutor {
+        fn execute(&mut self, _context: ExecutionContext<'_>) -> VenueOutcome {
+            VenueOutcome::Added {
+                fills: vec![],
+                resting_quantity: 1,
+                stp_cancelled: vec![],
+            }
+        }
+    }
+
+    // ---- #098 fix 2: the ClOrdID publish is POST-journal ------------------
+
+    #[test]
+    fn test_clordid_publish_is_post_journal_uncommitted_on_a_sealing_event_append_failure() {
+        use crate::exchange::clordid_index::ClOrdIdIndex;
+
+        let account = AccountId::new("acct-1");
+        let clid = ClientOrderId::new("cloid-acct-1");
+
+        // Fault the EVENT append at N=0: the command + book mutation happen, but the
+        // paired event never commits, so the actor SEALS post-mutation — BEFORE the
+        // post-journal correlation publish. The index must be left WITHOUT the
+        // uncommitted mapping (resolve → None).
+        let index = Arc::new(ClOrdIdIndex::with_default_ceiling());
+        let fault = FaultJournal::new(
+            (SequenceNumber::new(0), RecordKind::Event),
+            FaultMode::Confirmed,
+        );
+        let mut actor = UnderlyingActor::new(config(16), fault, AddedExecutor, NoopFanOut, CLOCK)
+            .with_clordid_index(Some(Arc::clone(&index)));
+        match actor.handle(add_order("acct-1", 0, Side::Buy, 50_000, 2)) {
+            Err(VenueError::JournalUnavailable) => {}
+            other => panic!("expected a sealed JournalUnavailable, got {other:?}"),
+        }
+        assert!(
+            index.resolve(&account, &clid).is_none(),
+            "a sealed post-mutation turn must expose NO uncommitted correlation"
+        );
+
+        // Control: the SAME command on a HEALTHY actor publishes post-journal, so the
+        // canonical mapping IS present — proving it is the fault (not a no-op publish)
+        // that kept the index empty above.
+        let healthy_index = Arc::new(ClOrdIdIndex::with_default_ceiling());
+        let mut healthy =
+            UnderlyingActor::new(config(16), journal(), AddedExecutor, NoopFanOut, CLOCK)
+                .with_clordid_index(Some(Arc::clone(&healthy_index)));
+        match healthy.handle(add_order("acct-1", 0, Side::Buy, 50_000, 2)) {
+            Ok(_) => {}
+            Err(e) => panic!("a healthy AddOrder must commit: {e}"),
+        }
+        assert_eq!(
+            healthy_index.resolve(&account, &clid).map(|r| r.order_id),
+            Some(LineageId::new("run-1").venue_order_id("BTC", SequenceNumber::new(0), 0)),
+            "a committed AddOrder publishes its correlation post-journal"
+        );
+    }
+
     #[test]
     fn test_restore_that_would_exhaust_sequence_refuses_before_mutating() {
         // Source venue: a healthy actor with one resting order → the snapshot cut.

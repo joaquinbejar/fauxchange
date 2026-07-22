@@ -14,19 +14,22 @@
 //!
 //! ## It is a derived, journal-scoped artifact — not a second source of truth
 //!
-//! The index is a **deterministic function of the journaled `AddOrder` stream**:
-//! every placement carries its `(account, client_order_id, order_id)`, so the
-//! mapping is fully reconstructable by re-executing the journal. The recovery
-//! seam that rebuilds it — [`recover_with_index`](crate::exchange::recover_with_index)
-//! — is implemented and tested here; on restart the index **will be rebuilt
-//! during #085 boot recovery** from those same commands once #085 wires that
-//! recovery into `AppState::new` (until then a restart against a non-empty
-//! journal still fails loud, as #085 tracks). There is no separate durable copy
-//! to keep in sync. It is never journaled itself, never
-//! read on the sequenced decision path, and never affects a book mutation, a fill,
-//! or a [`VenueOutcome`](crate::exchange::VenueOutcome) — so it sits **outside**
-//! the replay-equality scope exactly like mark prices do. Populating it is a pure
-//! side effect the executor performs **after** the outcome is captured.
+//! The index is a **deterministic function of the journaled `AddOrder` / `Replace`
+//! stream**: every placement carries its `(account, client_order_id, order_id)` and
+//! a replace carries its new + retired `ClOrdID`s, so the mapping is fully
+//! reconstructable by re-executing the journal. The **single derivation**
+//! [`apply_committed_correlation`] is run in exactly two places from the **same**
+//! committed `(command, outcome)` pair: the live single-writer actor runs it
+//! **post-journal** (after the paired [`VenueEvent`](crate::exchange::VenueEvent)
+//! durably lands — so a placement whose event append fails never exposes an
+//! uncommitted mapping), and #085 boot recovery
+//! ([`recover_into`](crate::exchange::recover_into) /
+//! [`recover_with_index`](crate::exchange::recover_with_index)) runs it on each
+//! re-derived, oracle-verified event — so a resumed venue rebuilds byte-for-byte the
+//! mapping the live venue exposed, with no separate durable copy to keep in sync. It
+//! is never journaled itself, never read on the sequenced decision path, and never
+//! affects a book mutation, a fill, or a [`VenueOutcome`](crate::exchange::VenueOutcome)
+//! — so it sits **outside** the replay-equality scope exactly like mark prices do.
 //!
 //! Below the [`DEFAULT_MAX_CLORDID_INDEX_ENTRIES`] ceiling the index **content**
 //! is thus a deterministic function of the journal (the same journal rebuilds the
@@ -49,7 +52,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::exchange::boundary::Side;
-use crate::exchange::envelope::{VenueCommand, VenueOutcome};
+use crate::exchange::envelope::{AddOutcome, VenueCommand, VenueOutcome};
 use crate::exchange::symbol::Symbol;
 use crate::models::{AccountId, ClientOrderId, VenueOrderId};
 
@@ -116,23 +119,24 @@ pub enum ClOrdIdIndexError {
     },
 }
 
-/// The venue-wide, account-scoped `(account, ClOrdID) → order_id` index.
-///
-/// Shared behind an `Arc` in [`crate::state::AppState`]; the per-underlying
-/// executors record into the **same** instance on the sequenced path, and the FIX
-/// / REST surfaces resolve from it. The critical section is a single `HashMap`
-/// operation under a [`std::sync::Mutex`] — held only for the insert/lookup, never
-/// across an `.await`.
+/// The map + per-account counter guarded together under the one lock.
 #[derive(Debug, Default)]
 struct Inner {
     /// The `(account, ClOrdID) → order` map.
     map: HashMap<(AccountId, ClientOrderId), ClOrdIdRecord>,
     /// The number of distinct keys held per account — the per-account fairness
-    /// counter, kept atomically with `map` under the one lock. It only ever grows
-    /// (the index has no eviction yet), exactly like `map`.
+    /// counter, kept atomically with `map` under the one lock. It grows on a
+    /// `record` and shrinks on a `retire`, tracking the live entry set exactly.
     per_account: HashMap<AccountId, usize>,
 }
 
+/// The venue-wide, account-scoped `(account, ClOrdID) → order_id` index.
+///
+/// Shared behind an `Arc` in [`crate::state::AppState`]; the per-underlying **actors**
+/// publish into the **same** instance post-journal on the sequenced path (via
+/// [`apply_committed_correlation`]), and the FIX / REST surfaces resolve from it. The
+/// critical section is a single `HashMap` operation under a [`std::sync::Mutex`] —
+/// held only for the insert/lookup, never across an `.await`.
 #[derive(Debug)]
 pub struct ClOrdIdIndex {
     inner: Mutex<Inner>,
@@ -228,6 +232,36 @@ impl ClOrdIdIndex {
         Ok(())
     }
 
+    /// **Retires** the `(account, cl_ord_id)` entry — removing the correlation so a
+    /// later resolve is a clean [`None`] (#098). Used on a committed **successful
+    /// replace**: the cancel leg removed the original order, so its `OrigClOrdID`
+    /// must no longer resolve to a live order.
+    ///
+    /// The per-account fairness counter is decremented in lockstep (only if the key
+    /// was present), so the count tracks the live entry set exactly and a subsequent
+    /// `record` for the account sees the freed slot. Retiring an absent key is a
+    /// no-op (idempotent) — so a legacy replace whose original was never indexed, or
+    /// a recovery re-run, both leave the index unchanged. It is a deterministic
+    /// function of the committed `(command, outcome)`, so the live actor and #085
+    /// recovery re-execution retire the identical key.
+    pub fn retire(&self, account: &AccountId, cl_ord_id: &ClientOrderId) {
+        let key = (account.clone(), cl_ord_id.clone());
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.map.remove(&key).is_some()
+            && let Some(count) = inner.per_account.get_mut(&key.0)
+        {
+            // Checked (rule 9): the counter tracks live keys, so it is `>= 1` here;
+            // `saturating_sub` is a defensive floor that never underflows.
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                inner.per_account.remove(&key.0);
+            }
+        }
+    }
+
     /// Resolves the order the **authenticated** `account` placed under `cl_ord_id`,
     /// or [`None`] if the account never placed it (or the id is unknown). A
     /// cross-account id is a different key, so it resolves to [`None`] — the caller
@@ -288,12 +322,15 @@ impl Default for ClOrdIdIndex {
 ///   post-journal — so a resumed venue rebuilds byte-for-byte the mapping the live
 ///   venue exposed.
 ///
-/// A placement is recorded only when it carries a `client_order_id` **and** actually
+/// An **add** is recorded only when it carries a `client_order_id` **and** actually
 /// entered the book (`Added` / `Market`, never `Rejected`, and never a `Duplicate`
 /// idempotency retry — a retry's freshly-minted order id must never overwrite the
-/// canonical mapping, #099/#098). A full index is a **degraded-path drop** (the
-/// order still stands, just not cross-session correlatable) — logged `WARN`, never a
-/// failed command.
+/// canonical mapping, #099/#098). A **successful replace** publishes the
+/// replacement's `(account, new_ClOrdID) → new_order_id` and **retires** the stale
+/// `(account, OrigClOrdID)` (its order was cancelled by the replace's cancel leg), so
+/// after a replace the new id resolves and the old id no longer resolves to a live
+/// order. A full index is a **degraded-path drop** (the order still stands, just not
+/// cross-session correlatable) — logged `WARN`, never a failed command.
 pub(crate) fn apply_committed_correlation(
     index: &ClOrdIdIndex,
     underlying: &str,
@@ -328,6 +365,48 @@ pub(crate) fn apply_committed_correlation(
                     quantity: *quantity,
                 },
             );
+        }
+        // A committed replace (#098 fix 4). The outcome is losslessly captured:
+        //   - `cancelled` ⇒ the cancel leg removed the ORIGINAL, so retire its
+        //     `OrigClOrdID` (a later cancel by the old id now resolves to `None`);
+        //   - the add leg `Filled`/`Rested` (not `Rejected`) ⇒ a replacement order
+        //     entered the book, so record `new_ClOrdID → new_order_id`.
+        // A whole-replace refusal is a top-level `VenueOutcome::Rejected` (the cancel
+        // leg never fired), so it falls through untouched — the original stays indexed.
+        // Both mutations are a deterministic function of the committed pair, so the
+        // live actor and #085 recovery re-execution reproduce the identical index.
+        (
+            VenueCommand::Replace {
+                account,
+                client_order_id,
+                orig_client_order_id,
+                new_order_id,
+                symbol,
+                side,
+                quantity,
+                ..
+            },
+            VenueOutcome::Replace { cancelled, add },
+        ) => {
+            if *cancelled && let Some(orig) = orig_client_order_id {
+                index.retire(account, orig);
+            }
+            if !matches!(add, AddOutcome::Rejected { .. })
+                && let Some(new_cl_ord_id) = client_order_id
+            {
+                record_or_warn(
+                    index,
+                    underlying,
+                    account,
+                    new_cl_ord_id,
+                    ClOrdIdRecord {
+                        order_id: new_order_id.clone(),
+                        symbol: symbol.clone(),
+                        side: *side,
+                        quantity: *quantity,
+                    },
+                );
+            }
         }
         _ => {}
     }
@@ -473,6 +552,213 @@ mod tests {
                 .resolve(&account_b, &ClientOrderId::new("b-1"))
                 .map(|r| r.order_id),
             Some(VenueOrderId::new("o-b1"))
+        );
+    }
+
+    // ---- retire ---------------------------------------------------------
+
+    #[test]
+    fn test_retire_removes_the_entry_and_frees_the_account_slot() {
+        // A ceiling of 1 per account proves the slot is genuinely freed: retire, then
+        // a NEW key for the same account fits where it would otherwise be `AccountFull`.
+        let index = ClOrdIdIndex::with_ceilings(10, 1);
+        let account = AccountId::new("acct-a");
+        index
+            .record(
+                account.clone(),
+                ClientOrderId::new("cl-1"),
+                record("order-1"),
+            )
+            .expect("first fits the per-account quota of 1");
+        index.retire(&account, &ClientOrderId::new("cl-1"));
+        assert!(
+            index
+                .resolve(&account, &ClientOrderId::new("cl-1"))
+                .is_none(),
+            "a retired key no longer resolves"
+        );
+        assert_eq!(index.len(), 0, "the entry is gone");
+        // The freed slot lets a new key in — the counter was decremented in lockstep.
+        index
+            .record(
+                account.clone(),
+                ClientOrderId::new("cl-2"),
+                record("order-2"),
+            )
+            .expect("the retired slot is freed for a new key");
+        // Retiring an absent key is a harmless no-op (idempotent).
+        index.retire(&account, &ClientOrderId::new("never-existed"));
+        assert_eq!(index.len(), 1);
+    }
+
+    // ---- apply_committed_correlation (the single derivation) -------------
+
+    use crate::exchange::boundary::{Hash32, STPMode, TimeInForce};
+    use crate::exchange::event::SequenceNumber;
+    use crate::exchange::money::Cents;
+    use crate::models::OrderType;
+
+    fn add_cmd(account: &str, cl_ord_id: &str, order_id: &str) -> VenueCommand {
+        VenueCommand::AddOrder {
+            symbol: sym(),
+            order_id: VenueOrderId::new(order_id),
+            account: AccountId::new(account),
+            owner: Hash32([1; 32]),
+            client_order_id: Some(ClientOrderId::new(cl_ord_id)),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            limit_price: Some(Cents::new(50_000)),
+            quantity: 2,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        }
+    }
+
+    fn added() -> VenueOutcome {
+        VenueOutcome::Added {
+            fills: vec![],
+            resting_quantity: 2,
+            stp_cancelled: vec![],
+        }
+    }
+
+    #[test]
+    fn test_apply_skips_a_duplicate_retry_and_preserves_the_canonical_mapping() {
+        // Fix 1: a matching idempotency retry captures `VenueOutcome::Duplicate`
+        // (NOT Added/Market), so the derivation MUST skip it — the retry's freshly
+        // minted, never-added order id must never overwrite the canonical mapping.
+        let index = ClOrdIdIndex::with_default_ceiling();
+        let account = AccountId::new("acct-a");
+        let clid = ClientOrderId::new("cl-1");
+
+        // The fresh add records the CANONICAL `(acct-a, cl-1) → order-orig`.
+        apply_committed_correlation(
+            &index,
+            "BTC",
+            &add_cmd("acct-a", "cl-1", "order-orig"),
+            &added(),
+        );
+        assert_eq!(
+            index.resolve(&account, &clid).map(|r| r.order_id),
+            Some(VenueOrderId::new("order-orig"))
+        );
+
+        // The retry: the SAME command key but a NEW order id, whose captured outcome
+        // is a `Duplicate` echoing the original identity — the derivation skips it.
+        let retry_cmd = add_cmd("acct-a", "cl-1", "order-retry");
+        let duplicate = VenueOutcome::Duplicate {
+            original_order_id: VenueOrderId::new("order-orig"),
+            original_sequence: SequenceNumber::new(0),
+            terminal: Box::new(added()),
+        };
+        apply_committed_correlation(&index, "BTC", &retry_cmd, &duplicate);
+
+        assert_eq!(
+            index.resolve(&account, &clid).map(|r| r.order_id),
+            Some(VenueOrderId::new("order-orig")),
+            "a Duplicate retry must NOT overwrite the canonical order id"
+        );
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_replace_publishes_new_and_retires_orig() {
+        // Fix 4: a committed successful replace records `(account, new) → new_order_id`
+        // and retires the stale `(account, orig)` (its order was cancelled).
+        let index = ClOrdIdIndex::with_default_ceiling();
+        let account = AccountId::new("acct-a");
+
+        // Seed the ORIGINAL correlation (as an earlier AddOrder would have).
+        apply_committed_correlation(
+            &index,
+            "BTC",
+            &add_cmd("acct-a", "orig", "order-orig"),
+            &added(),
+        );
+
+        let replace_cmd = VenueCommand::Replace {
+            symbol: sym(),
+            order_id: VenueOrderId::new("order-orig"),
+            new_order_id: VenueOrderId::new("order-new"),
+            account: account.clone(),
+            client_order_id: Some(ClientOrderId::new("new")),
+            orig_client_order_id: Some(ClientOrderId::new("orig")),
+            side: Side::Buy,
+            limit_price: Some(Cents::new(49_000)),
+            quantity: 2,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        };
+        let replace_outcome = VenueOutcome::Replace {
+            cancelled: true,
+            add: AddOutcome::Rested {
+                fills: vec![],
+                resting_quantity: 2,
+                stp_cancelled: vec![],
+            },
+        };
+        apply_committed_correlation(&index, "BTC", &replace_cmd, &replace_outcome);
+
+        assert_eq!(
+            index
+                .resolve(&account, &ClientOrderId::new("new"))
+                .map(|r| r.order_id),
+            Some(VenueOrderId::new("order-new")),
+            "the replacement ClOrdID resolves to the new order id"
+        );
+        assert!(
+            index
+                .resolve(&account, &ClientOrderId::new("orig"))
+                .is_none(),
+            "the retired OrigClOrdID no longer resolves to a live order"
+        );
+    }
+
+    #[test]
+    fn test_apply_whole_replace_refusal_leaves_original_indexed() {
+        // A whole-replace refusal captures a top-level `VenueOutcome::Rejected` (the
+        // cancel leg never fired), so the ORIGINAL stays indexed and nothing new is
+        // published — the derivation only mutates on a `VenueOutcome::Replace`.
+        let index = ClOrdIdIndex::with_default_ceiling();
+        let account = AccountId::new("acct-a");
+        apply_committed_correlation(
+            &index,
+            "BTC",
+            &add_cmd("acct-a", "orig", "order-orig"),
+            &added(),
+        );
+
+        let replace_cmd = VenueCommand::Replace {
+            symbol: sym(),
+            order_id: VenueOrderId::new("order-orig"),
+            new_order_id: VenueOrderId::new("order-new"),
+            account: account.clone(),
+            client_order_id: Some(ClientOrderId::new("new")),
+            orig_client_order_id: Some(ClientOrderId::new("orig")),
+            side: Side::Buy,
+            limit_price: Some(Cents::new(49_000)),
+            quantity: 2,
+            time_in_force: TimeInForce::Gtc,
+            stp_mode: STPMode::None,
+        };
+        apply_committed_correlation(
+            &index,
+            "BTC",
+            &replace_cmd,
+            &VenueOutcome::rejected(crate::exchange::RejectKind::NotOwner, "not your order"),
+        );
+        assert_eq!(
+            index
+                .resolve(&account, &ClientOrderId::new("orig"))
+                .map(|r| r.order_id),
+            Some(VenueOrderId::new("order-orig")),
+            "a whole-replace refusal leaves the original correlation intact"
+        );
+        assert!(
+            index
+                .resolve(&account, &ClientOrderId::new("new"))
+                .is_none(),
+            "no new correlation is published for a refused replace"
         );
     }
 }

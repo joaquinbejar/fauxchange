@@ -1059,6 +1059,8 @@ fn test_golden_venue_replace_partial_event() {
         order_id: lineage.venue_order_id("BTC", SequenceNumber::new(5), 0),
         new_order_id: lineage.venue_order_id("BTC", seq, 0),
         account: AccountId::new("acct-1"),
+        client_order_id: Some(ClientOrderId::new("cl-new")),
+        orig_client_order_id: Some(ClientOrderId::new("cl-orig")),
         side: SeamSide::Buy,
         limit_price: Some(Cents::new(40_000)),
         quantity: 2,
@@ -1087,6 +1089,18 @@ fn test_golden_venue_replace_partial_event() {
         serde_json::json!(true)
     );
     assert!(golden["outcome"]["Replace"]["add"]["Rejected"].is_object());
+    // The #098-fix-4 wire addition: a Replace command carries the replacement and
+    // retired client-order ids so #085 recovery rebuilds the cross-session
+    // correlation deterministically (both are `#[serde(default)]`, so a legacy record
+    // without them still decodes).
+    assert_eq!(
+        golden["command"]["Replace"]["client_order_id"],
+        serde_json::json!("cl-new")
+    );
+    assert_eq!(
+        golden["command"]["Replace"]["orig_client_order_id"],
+        serde_json::json!("cl-orig")
+    );
 }
 
 #[test]

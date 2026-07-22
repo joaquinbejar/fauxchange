@@ -956,6 +956,100 @@ async fn test_cancel_of_unknown_order_is_order_cancel_reject_9() {
 }
 
 #[tokio::test]
+async fn test_cross_session_cancel_of_an_already_gone_order_is_masked_9_not_a_false_canceled() {
+    // #098 fix 3: a stale index entry that still RESOLVES (the AddOrder recorded it)
+    // but whose order is no longer resting — cancelled on a prior connection — makes
+    // the sequenced cancel capture a `VenueOutcome::Rejected`. The gateway MUST render
+    // the OBSERVED outcome as an indistinguishable masked `9`, NEVER a false `8
+    // Canceled`. Session 1 places then cancels `stale-1`; session 2 re-cancels it.
+    let harness = Harness::start().await;
+
+    let mut first = logon_trader(harness.addr).await;
+    first
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "stale-1",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("place");
+    let _ = recv_frames_until(&mut first, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
+    first
+        .write_all(&cancel_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            "stale-1",
+            "cxl-first",
+        ))
+        .await
+        .expect("cancel");
+    let canceled = recv_frames_until(&mut first, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("4")
+    })
+    .await;
+    assert!(
+        canceled
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("4")),
+        "session 1 cancels the order (8, ExecType 4), got {canceled:?}"
+    );
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Session 2 — a fresh connection. The venue index still resolves `stale-1` (the
+    // AddOrder recorded it; a cancel does not retire it), but the order is gone, so
+    // the sequenced cancel is `Rejected` → a masked `9`, never an `8 Canceled`.
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut second, Duration::from_secs(3)).await, "A"),
+        "the reconnect is admitted"
+    );
+    second
+        .write_all(&cancel_frame(
+            TRADER_SENDER,
+            VENUE,
+            5,
+            "stale-1",
+            "cxl-second",
+        ))
+        .await
+        .expect("re-cancel");
+    let reply = recv_frames_until(&mut second, Duration::from_secs(10), |f| {
+        matches!(msg_type(f).as_deref(), Some("8") | Some("9"))
+    })
+    .await;
+    assert!(
+        any_msg_type(&reply, "9")
+            && !reply
+                .iter()
+                .any(|f| msg_type(f).as_deref() == Some("8")
+                    && field(f, "150").as_deref() == Some("4")),
+        "a re-cancel of an already-gone order is a masked 9, never a false 8 Canceled, \
+         got {reply:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_cross_session_cancel_of_a_prior_session_order_succeeds() {
     // #098: place a resting order on one FIX connection under a ClOrdID, drop the
     // connection, then cancel that same OrigClOrdID on a NEW connection. Before
@@ -1100,6 +1194,141 @@ async fn test_cross_session_replace_of_a_prior_session_order_succeeds() {
             .any(|f| msg_type(f).as_deref() == Some("8")
                 && field(f, "150").as_deref() == Some("5")),
         "the prior-session order is Replaced (8, ExecType 5), got {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cross_session_replace_rekeys_the_shared_index_new_id_cancels_old_id_masked() {
+    // #098 fix 4: a committed replace must update the JOURNAL-DERIVED shared index —
+    // publish `(account, new_ClOrdID) → new_order_id` and retire the stale
+    // `(account, OrigClOrdID)`. So on a THIRD, fresh connection: a cancel by the NEW
+    // ClOrdID succeeds (the replacement is cross-session correlatable), and a cancel
+    // by the OLD ClOrdID is an indistinguishable masked `9` (its entry was retired —
+    // the original was cancelled by the replace's cancel leg).
+    let harness = Harness::start().await;
+
+    // Session 1 — place a resting sell under `rk-1`.
+    let mut first = logon_trader(harness.addr).await;
+    first
+        .write_all(&limit_order_frame(
+            TRADER_SENDER,
+            VENUE,
+            2,
+            "rk-1",
+            "1",
+            "500.00",
+            3,
+        ))
+        .await
+        .expect("place");
+    let _ = recv_frames_until(&mut first, Duration::from_secs(5), |f| {
+        msg_type(f).as_deref() == Some("8")
+    })
+    .await;
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Session 2 — replace `rk-1` → `rk-2` (rests at the new price).
+    let mut second = connect(harness.addr).await;
+    second
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            3,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut second, Duration::from_secs(3)).await, "A"),
+        "the second logon is admitted"
+    );
+    second
+        .write_all(&replace_frame(
+            TRADER_SENDER,
+            VENUE,
+            4,
+            "rk-1",
+            "rk-2",
+            "450.00",
+            2,
+        ))
+        .await
+        .expect("replace");
+    let replaced = recv_frames_until(&mut second, Duration::from_secs(10), |f| {
+        (msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("5"))
+            || msg_type(f).as_deref() == Some("9")
+    })
+    .await;
+    assert!(
+        replaced
+            .iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("5")),
+        "the replace is Replaced (8, ExecType 5), got {replaced:?}"
+    );
+    drop(second);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Session 3 — a fresh connection resolving ONLY through the shared venue index.
+    let mut third = connect(harness.addr).await;
+    third
+        .write_all(&logon_frame(
+            TRADER_SENDER,
+            VENUE,
+            5,
+            TRADER_USER,
+            TRADER_PW,
+            false,
+        ))
+        .await
+        .expect("logon");
+    assert!(
+        any_msg_type(&recv_frames(&mut third, Duration::from_secs(3)).await, "A"),
+        "the third logon is admitted"
+    );
+
+    // (a) The OLD ClOrdID was retired: a cancel by it is an indistinguishable masked
+    // `9` (never an `8 Canceled`) — it no longer resolves to a live order.
+    third
+        .write_all(&cancel_frame(TRADER_SENDER, VENUE, 6, "rk-1", "cxl-old"))
+        .await
+        .expect("cancel old");
+    let old = recv_frames_until(&mut third, Duration::from_secs(10), |f| {
+        matches!(msg_type(f).as_deref(), Some("8") | Some("9"))
+    })
+    .await;
+    assert!(
+        any_msg_type(&old, "9")
+            && !old
+                .iter()
+                .any(|f| msg_type(f).as_deref() == Some("8")
+                    && field(f, "150").as_deref() == Some("4")),
+        "a cancel by the RETIRED old ClOrdID is a masked 9, never an 8 Canceled, got {old:?}"
+    );
+
+    // (b) The NEW ClOrdID resolves cross-session to the live replacement: a cancel by
+    // it is `8 Canceled` (ExecType 4), not `9`.
+    third
+        .write_all(&cancel_frame(TRADER_SENDER, VENUE, 7, "rk-2", "cxl-new"))
+        .await
+        .expect("cancel new");
+    let new = recv_frames_until(&mut third, Duration::from_secs(10), |f| {
+        (msg_type(f).as_deref() == Some("8") && field(f, "150").as_deref() == Some("4"))
+            || msg_type(f).as_deref() == Some("9")
+    })
+    .await;
+    assert!(
+        !any_msg_type(&new, "9"),
+        "a cancel by the replacement ClOrdID is not 9 Unknown order, got {new:?}"
+    );
+    assert!(
+        new.iter()
+            .any(|f| msg_type(f).as_deref() == Some("8")
+                && field(f, "150").as_deref() == Some("4")),
+        "the replacement order is Canceled (8, ExecType 4) via its new ClOrdID, got {new:?}"
     );
 }
 

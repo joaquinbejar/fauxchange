@@ -82,8 +82,9 @@ use crate::exchange::{
     InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader,
     JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink, MassCancelScope,
     MatchingExecutor, PositionsStore, Receipt, Recovered, SequenceNumber, StoreFanOut, Symbol,
-    TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_price_band, recover_into,
-    spawn_matching_actor_with_registry_and_index, spawn_underlying_actor_with_clordid_index,
+    TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_price_band,
+    recover_into, spawn_matching_actor_with_registry_and_index,
+    spawn_underlying_actor_with_clordid_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
 use crate::microstructure::{MicrostructureConfig, MicrostructureConfigError};
