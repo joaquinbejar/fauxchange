@@ -300,6 +300,8 @@ struct SessionObservations {
     counters_after_reset: SessionCounters,
     resets: Vec<SequenceResetEvent>,
     range_1_1_after_reuse: Vec<StoredOutbound>,
+    counters_after_atomic: SessionCounters,
+    range_after_atomic: Vec<StoredOutbound>,
 }
 
 /// Drives one fixed sequence of `FixSessionStore` trait calls against `store` and
@@ -365,6 +367,17 @@ fn run_fix_session_scenario(store: &dyn FixSessionStore, key: &SessionKey) -> Se
     );
     let range_1_1_after_reuse = store.outbound_range(key, 1, 1).expect("range 1..1");
 
+    // The atomic emit primitive (#149 finding 1B): store a frame at seq 2 AND advance
+    // the OUTBOUND counter to 3 in one op — the frame is present and next_sender is 3,
+    // while next_target is left UNTOUCHED (still 1 from the reset; the inbound advance
+    // is deferred to the post-effect persist). Both backends must agree bit-for-bit.
+    unwrap(
+        "store_outbound_and_advance",
+        store.store_outbound_and_advance(key, 2, b"atomic", 3),
+    );
+    let counters_after_atomic = store.load_counters(key).expect("load after atomic");
+    let range_after_atomic = store.outbound_range(key, 2, 2).expect("range 2..2 atomic");
+
     SessionObservations {
         counters_after_save,
         range_all,
@@ -373,6 +386,8 @@ fn run_fix_session_scenario(store: &dyn FixSessionStore, key: &SessionKey) -> Se
         counters_after_reset,
         resets,
         range_1_1_after_reuse,
+        counters_after_atomic,
+        range_after_atomic,
     }
 }
 
@@ -598,6 +613,129 @@ async fn test_pg_and_in_memory_fix_session_parity() {
             },
         ],
         "a re-used seq appends (no dedup) and reads oldest-first on both backends"
+    );
+    // The atomic emit primitive (#149 finding 1B) is faithful on both backends: the
+    // frame lands AND only the outbound counter advances (inbound left deferred).
+    assert_eq!(
+        pg_obs.counters_after_atomic,
+        SessionCounters {
+            next_sender_seq: 3,
+            next_target_seq: 1,
+        },
+        "store_outbound_and_advance moves ONLY next_sender; next_target is deferred"
+    );
+    assert_eq!(
+        pg_obs.range_after_atomic,
+        vec![
+            // The pre-reset `store_outbound(2, "bbbb")` frame still resides at seq 2
+            // (append semantics, oldest-first), then the atomically-stored frame.
+            StoredOutbound {
+                seq: 2,
+                frame: b"bbbb".to_vec()
+            },
+            StoredOutbound {
+                seq: 2,
+                frame: b"atomic".to_vec()
+            },
+        ],
+        "the atomically-stored frame is present at its seq on both backends"
+    );
+
+    drop(container);
+}
+
+/// The durable key-space bound is serialized across concurrent **new**-key inserts
+/// (#095 finding 2): with the registry pre-filled to exactly `MAX_SESSION_KEYS - 1`,
+/// firing several concurrent first-logons for DISTINCT new keys admits EXACTLY ONE
+/// (reaching the ceiling); the rest are refused with `KeyspaceFull`, and the durable
+/// count never exceeds `MAX_SESSION_KEYS`. Without the transaction-scoped advisory
+/// lock the concurrent inserts would each observe `count < ceiling` under
+/// `READ COMMITTED` and all insert, overshooting the ceiling.
+///
+/// `#[ignore]` + `flavor = "multi_thread"` (same gating + runtime requirement as the
+/// other durable FIX-session tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_pg_fix_keyspace_bound_serialized_across_concurrent_new_keys() {
+    use fauxchange::gateway::fix::{PgFixSessionStore, SessionStoreError};
+    use testcontainers_modules::postgres::Postgres;
+    use testcontainers_modules::testcontainers::{ImageExt, runners::AsyncRunner};
+
+    // The keyspace ceiling the durable store enforces (mirrors the in-memory bound).
+    const MAX_SESSION_KEYS: i64 = 65_536;
+
+    let container = Postgres::default()
+        .with_tag("18-alpine")
+        .start()
+        .await
+        .expect("start postgres:18-alpine container");
+    let host = container.get_host().await.expect("container host");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("container port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let pool_config = DbPoolConfig {
+        max_connections: 8,
+        slow_acquire: std::time::Duration::from_millis(500),
+    };
+    let db = DatabasePool::connect_and_migrate(&url, pool_config)
+        .await
+        .expect("open pool and run migrations");
+
+    // Pre-fill the registry to EXACTLY ceiling - 1 distinct keys in one fast bulk
+    // insert (raw SQL, test-only) — so the next NEW key sits precisely at the boundary.
+    sqlx::query(
+        "INSERT INTO fix_session_counters \
+         (account_id, sender_comp_id, target_comp_id, next_sender_seq, next_target_seq) \
+         SELECT 'fill-' || g::text, 'S', 'T', 1, 1 FROM generate_series(1, $1) g",
+    )
+    .bind(MAX_SESSION_KEYS - 1)
+    .execute(db.pool())
+    .await
+    .expect("bulk-fill the registry to ceiling - 1");
+
+    // Fire N concurrent first-logons for DISTINCT new keys against the boundary.
+    let store = Arc::new(PgFixSessionStore::new(&db).expect("durable store"));
+    let attempts = 8_usize;
+    let mut handles = Vec::with_capacity(attempts);
+    for i in 0..attempts {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            let key = SessionKey::new(AccountId::new(format!("race-{i}")), "CLIENT", "FAUXCHANGE");
+            store.save_counters(&key, SessionCounters::default())
+        }));
+    }
+
+    let mut ok = 0_usize;
+    let mut full = 0_usize;
+    for handle in handles {
+        match handle.await.expect("join") {
+            Ok(()) => ok += 1,
+            Err(SessionStoreError::KeyspaceFull { .. }) => full += 1,
+            Err(other) => panic!("unexpected store error: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        ok, 1,
+        "exactly one concurrent new key is admitted at the boundary"
+    );
+    assert_eq!(
+        full,
+        attempts - 1,
+        "every other concurrent new key is refused KeyspaceFull"
+    );
+
+    // The durable count never exceeded the ceiling — the advisory-locked registry
+    // update serialized the count-check-and-insert.
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM fix_session_counters")
+        .fetch_one(db.pool())
+        .await
+        .expect("count rows");
+    assert_eq!(
+        count, MAX_SESSION_KEYS,
+        "the durable keyspace is exactly at the ceiling, never overshot"
     );
 
     drop(container);

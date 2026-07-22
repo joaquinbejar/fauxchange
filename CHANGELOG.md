@@ -2321,6 +2321,26 @@ The full versioning and release-process policy lives in the design docs
   behavior yet — every module is an empty stub so later issues add code
   into a tree that already compiles.
 
+### Fixed
+
+- **Crash-consistent durable FIX session store** (#149, on #095). Closed three
+  crash windows in the durable (`PgFixSessionStore`) / in-memory session-store
+  contract. (1B) `emit` now stores an outbound frame AND advances
+  `next_sender_seq` in ONE atomic operation via the new
+  `FixSessionStore::store_outbound_and_advance` (one Postgres transaction / one
+  locked in-memory critical section), so a crash can no longer store a frame with
+  the counter un-advanced and REUSE its `MsgSeqNum` (a FIX-fatal duplicate).
+  (1A) A routed order-entry mutation (`D`/`F`/`G`/`q`) now advances the inbound
+  `next_target_seq` in memory (for gap detection) but DEFERS the durable persist
+  until AFTER `AppState::submit` durably commits the exchange effect — so a crash
+  before the journal append leaves the durable counter at the message's own seq,
+  re-admitting the client's resend for idempotent reprocessing (the merged
+  `ClOrdID` guard dedups it) instead of silently dropping the order.
+  (2) New-key creation now serializes on a transaction-scoped Postgres advisory
+  lock, so concurrent first-logons for different keys can no longer each observe
+  `count < ceiling` under `READ COMMITTED` and overshoot `MAX_SESSION_KEYS`; the
+  durable key-space bound now matches the in-memory hard bound.
+
 ### Security
 
 - **Typed reject discriminant + not-owner≡not-found masking** (#132). A journaled

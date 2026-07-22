@@ -188,10 +188,12 @@ impl PgFixSessionStore {
 
     /// The async body behind [`FixSessionStore::save_counters`].
     ///
-    /// A single atomic upsert that ALSO enforces the [`MAX_SESSION_KEYS`] keyspace
-    /// bound: an existing key always updates; a **new** key inserts only while the
-    /// registry is under the ceiling. `rows_affected == 0` therefore means a new key
-    /// was refused at the cap → [`SessionStoreError::KeyspaceFull`].
+    /// Runs in ONE transaction: [`ensure_registered`] (the advisory-locked, keyspace-
+    /// bounded new-key insert — an existing key is a lock-free fast-path), then an
+    /// `UPDATE` of both counters. Serializing new-key creation on the shared advisory
+    /// lock keeps the durable key-space within [`MAX_SESSION_KEYS`] even under
+    /// concurrent first-logons for *different* keys (#095 finding 2); a **new** key
+    /// refused at the ceiling is [`SessionStoreError::KeyspaceFull`].
     async fn save_counters_async(
         &self,
         key: &SessionKey,
@@ -199,41 +201,34 @@ impl PgFixSessionStore {
     ) -> Result<(), SessionStoreError> {
         let next_sender = u64_to_i64(counters.next_sender_seq, "next_sender_seq")?;
         let next_target = u64_to_i64(counters.next_target_seq, "next_target_seq")?;
-        let keyspace = keyspace_ceiling();
 
-        let result = sqlx::query!(
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(backend_err("begin fix save_counters txn"))?;
+
+        ensure_registered(&mut tx, key).await?;
+
+        sqlx::query!(
             r#"
-            INSERT INTO fix_session_counters
-                (account_id, sender_comp_id, target_comp_id, next_sender_seq, next_target_seq)
-            SELECT $1, $2, $3, $4, $5
-            WHERE (
-                EXISTS (
-                    SELECT 1 FROM fix_session_counters
-                    WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3
-                )
-                OR (SELECT count(*) FROM fix_session_counters) < $6
-            )
-            ON CONFLICT (account_id, sender_comp_id, target_comp_id) DO UPDATE SET
-                next_sender_seq = EXCLUDED.next_sender_seq,
-                next_target_seq = EXCLUDED.next_target_seq,
-                updated_at = now()
+            UPDATE fix_session_counters
+            SET next_sender_seq = $4, next_target_seq = $5, updated_at = now()
+            WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3
             "#,
             key.account.as_str(),
             key.sender_comp_id,
             key.target_comp_id,
             next_sender,
             next_target,
-            keyspace,
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
-        .map_err(backend_err("save fix session counters"))?;
+        .map_err(backend_err("update fix session counters"))?;
 
-        if result.rows_affected() == 0 {
-            return Err(SessionStoreError::KeyspaceFull {
-                max: MAX_SESSION_KEYS,
-            });
-        }
+        tx.commit()
+            .await
+            .map_err(backend_err("commit fix save_counters txn"))?;
         Ok(())
     }
 
@@ -306,6 +301,96 @@ impl PgFixSessionStore {
         tx.commit()
             .await
             .map_err(backend_err("commit fix store_outbound txn"))?;
+        Ok(())
+    }
+
+    /// The async body behind [`FixSessionStore::store_outbound_and_advance`].
+    ///
+    /// ONE transaction appends the frame, evicts past the bounds, **and** advances
+    /// the outbound counter — committed together, so a crash can never leave the
+    /// frame stored at `seq` with `next_sender_seq` un-advanced (a reused outbound
+    /// `MsgSeqNum`, #095 finding 1B). Only `next_sender_seq` is written; the inbound
+    /// counter is left to the deferred, post-effect persist (finding 1A).
+    async fn store_outbound_and_advance_async(
+        &self,
+        key: &SessionKey,
+        seq: u64,
+        frame: &[u8],
+        next_sender_seq: u64,
+    ) -> Result<(), SessionStoreError> {
+        let seq = u64_to_i64(seq, "outbound_seq")?;
+        let next_sender = u64_to_i64(next_sender_seq, "next_sender_seq")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(backend_err("begin fix store_outbound_and_advance txn"))?;
+
+        ensure_registered(&mut tx, key).await?;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO fix_session_outbound
+                (account_id, sender_comp_id, target_comp_id, seq, frame)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+            key.account.as_str(),
+            key.sender_comp_id,
+            key.target_comp_id,
+            seq,
+            frame,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(backend_err("insert fix outbound frame"))?;
+
+        // Evict the OLDEST frames past BOTH bounds — identical to `store_outbound`.
+        sqlx::query!(
+            r#"
+            DELETE FROM fix_session_outbound
+            WHERE id IN (
+                SELECT id FROM (
+                    SELECT
+                        id,
+                        row_number() OVER (ORDER BY id DESC) AS rn,
+                        sum(octet_length(frame)) OVER (ORDER BY id DESC ROWS UNBOUNDED PRECEDING)
+                            AS cum_bytes
+                    FROM fix_session_outbound
+                    WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3
+                ) ranked
+                WHERE ranked.rn > $4 OR ranked.cum_bytes > $5
+            )
+            "#,
+            key.account.as_str(),
+            key.sender_comp_id,
+            key.target_comp_id,
+            outbound_count_ceiling(),
+            outbound_bytes_ceiling(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(backend_err("evict fix outbound frames"))?;
+
+        // Advance ONLY the outbound counter, atomically with the frame append. The
+        // key row exists (ensure_registered), so this UPDATE always matches.
+        sqlx::query!(
+            r#"
+            UPDATE fix_session_counters
+            SET next_sender_seq = $4, updated_at = now()
+            WHERE account_id = $1 AND sender_comp_id = $2 AND target_comp_id = $3
+            "#,
+            key.account.as_str(),
+            key.sender_comp_id,
+            key.target_comp_id,
+            next_sender,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(backend_err("advance fix outbound counter"))?;
+
+        tx.commit()
+            .await
+            .map_err(backend_err("commit fix store_outbound_and_advance txn"))?;
         Ok(())
     }
 
@@ -518,6 +603,16 @@ impl FixSessionStore for PgFixSessionStore {
         self.block_on(self.store_outbound_async(key, seq, frame))
     }
 
+    fn store_outbound_and_advance(
+        &self,
+        key: &SessionKey,
+        seq: u64,
+        frame: &[u8],
+        next_sender_seq: u64,
+    ) -> Result<(), SessionStoreError> {
+        self.block_on(self.store_outbound_and_advance_async(key, seq, frame, next_sender_seq))
+    }
+
     fn outbound_range(
         &self,
         key: &SessionKey,
@@ -545,6 +640,18 @@ impl FixSessionStore for PgFixSessionStore {
 // Helpers (keyspace registry, ceilings, conversions, error mapping)
 // ============================================================================
 
+/// The fixed 64-bit key for the transaction-scoped Postgres **advisory lock** that
+/// serializes creation of a **new** FIX session key across concurrent first-logons
+/// ([#095](https://github.com/joaquinbejar/fauxchange/issues/95) finding 2). Under
+/// `READ COMMITTED` two concurrent first-logons for *different* new keys could each
+/// observe `count(*) < ceiling` and both insert, pushing the durable key-space past
+/// [`MAX_SESSION_KEYS`] — the in-memory backend has a hard check-then-insert bound,
+/// and the durable one must match. Taking this transaction-scoped lock before the
+/// count-check-and-insert makes the registry update a serialized critical section;
+/// it releases automatically on commit / rollback. The constant is venue-private and
+/// the only advisory lock the process uses, so it cannot collide.
+const FIX_KEYSPACE_ADVISORY_LOCK: i64 = 0x0FA0_C795_1495_0095;
+
 /// Ensures `key`'s registry row exists in `fix_session_counters` (the unified key
 /// registry, created on first touch with the `1`-based defaults — an in-memory
 /// `Slot`'s default counters), enforcing the [`MAX_SESSION_KEYS`] keyspace bound on
@@ -553,9 +660,15 @@ impl FixSessionStore for PgFixSessionStore {
 /// The session task is the **sole writer for its own key** (documented on
 /// [`FixSessionStore`]), so a "not present, then insert affected 0 rows" outcome for
 /// a given key can only mean the keyspace is at its ceiling (never a same-key race)
-/// — [`SessionStoreError::KeyspaceFull`]. Different keys inserting concurrently can
-/// overshoot the ceiling by at most the (acceptor-bounded) live-session concurrency,
-/// a benign, bounded overshoot for a DoS ceiling.
+/// — [`SessionStoreError::KeyspaceFull`].
+///
+/// **Keyspace serialization (#095 finding 2):** an *existing* key is a lock-free
+/// `EXISTS` fast-path (the hot case: reconnect / steady-state persists never
+/// contend). A *new* key takes the [`FIX_KEYSPACE_ADVISORY_LOCK`] transaction-scoped
+/// advisory lock **before** the count-guarded insert, so two concurrent first-logons
+/// for *different* new keys can no longer both see `count < ceiling` and both insert
+/// past the ceiling — new-key creation is a serialized critical section, the durable
+/// twin of the in-memory store's check-then-insert-under-one-lock bound.
 async fn ensure_registered(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     key: &SessionKey,
@@ -578,6 +691,18 @@ async fn ensure_registered(
     if exists {
         return Ok(());
     }
+
+    // A NEW key: serialize the count-check-and-insert across every concurrent new-key
+    // creation on the shared venue advisory lock, so the global key-space count is
+    // enforced exactly (never overshot under concurrency). Held until this
+    // transaction commits / rolls back.
+    sqlx::query!(
+        r#"SELECT pg_advisory_xact_lock($1)"#,
+        FIX_KEYSPACE_ADVISORY_LOCK
+    )
+    .execute(&mut **tx)
+    .await
+    .map_err(backend_err("lock fix keyspace registry"))?;
 
     let inserted = sqlx::query!(
         r#"

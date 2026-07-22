@@ -231,6 +231,41 @@ pub trait FixSessionStore: Send + Sync + std::fmt::Debug {
         frame: &[u8],
     ) -> Result<(), SessionStoreError>;
 
+    /// Atomically appends one outbound `frame` at `seq` to `key`'s bounded resend
+    /// log **and** advances the durable outbound counter to `next_sender_seq`, as a
+    /// **single all-or-nothing** operation — the crash-consistency guarantee the
+    /// two-call `store_outbound` + `save_counters` sequence could not give
+    /// ([03 §5.2](../../../docs/03-protocol-surfaces.md#52-session-management--the-acceptor-fsm-and-checked-counters)).
+    ///
+    /// The acceptor's `emit` builds a frame at the current `next_sender_seq`, stores
+    /// it for resend, then advances the counter. Splitting that into two store calls
+    /// left a crash window: the frame stored at `seq` with the counter **un-advanced**
+    /// makes the next outbound frame **reuse `seq`** — a duplicate outbound
+    /// `MsgSeqNum (34)`, a FIX session-fatal violation. This method closes the window:
+    /// the PostgreSQL backend commits the frame INSERT and the counter advance in one
+    /// transaction; the in-memory backend applies both under one locked critical
+    /// section. Either both land or neither does, so `seq` is never reused.
+    ///
+    /// It advances **only** the outbound (`next_sender_seq`) counter; the inbound
+    /// (`next_target_seq`) counter is deliberately **not** written here, because for a
+    /// routed order-entry message the durable inbound advance is *deferred* until the
+    /// exchange effect commits (the FSM's post-effect [`save_counters`]). The resend
+    /// log eviction (count + byte bounds) and the [`MAX_SESSION_KEYS`] key-space bound
+    /// hold exactly as [`store_outbound`](Self::store_outbound).
+    ///
+    /// # Errors
+    ///
+    /// [`SessionStoreError::KeyspaceFull`] if a **new** key is refused at the
+    /// ceiling; [`SessionStoreError::Backend`] on a durable-backend failure. On any
+    /// error, neither the frame nor the counter advance is applied.
+    fn store_outbound_and_advance(
+        &self,
+        key: &SessionKey,
+        seq: u64,
+        frame: &[u8],
+        next_sender_seq: u64,
+    ) -> Result<(), SessionStoreError>;
+
     /// Returns the retained outbound frames for `key` whose `MsgSeqNum` is in
     /// `[begin, end]` (an `end` of `0` means "to the latest"), ordered ascending.
     /// A `MsgSeqNum` the bounded log has evicted is simply absent — the caller
@@ -382,6 +417,25 @@ impl FixSessionStore for InMemoryFixSessionStore {
         self.with_slot_mut(key, |slot| slot.push_outbound(seq, frame))
     }
 
+    fn store_outbound_and_advance(
+        &self,
+        key: &SessionKey,
+        seq: u64,
+        frame: &[u8],
+        next_sender_seq: u64,
+    ) -> Result<(), SessionStoreError> {
+        // One locked critical section applies BOTH the append and the counter
+        // advance — the in-memory twin of the durable backend's single transaction,
+        // so a reader (or a later reconnect on the same process) never sees the frame
+        // stored with the outbound counter un-advanced (a reused `MsgSeqNum`). Only
+        // the outbound counter moves; the inbound counter is left to the deferred,
+        // post-effect persist.
+        self.with_slot_mut(key, |slot| {
+            slot.push_outbound(seq, frame);
+            slot.counters.next_sender_seq = next_sender_seq;
+        })
+    }
+
     fn outbound_range(
         &self,
         key: &SessionKey,
@@ -529,6 +583,49 @@ mod tests {
         assert_eq!(store.load_counters(&b).expect("load b").next_sender_seq, 99);
         assert_eq!(store.reset_events(&a).expect("events a").len(), 1);
         assert!(store.reset_events(&b).expect("events b").is_empty());
+    }
+
+    #[test]
+    fn test_store_outbound_and_advance_is_atomic_and_advances_only_next_sender() {
+        // The atomic emit primitive (#149 finding 1B): a single call BOTH stores the
+        // frame at `seq` for resend AND advances the durable outbound counter, so a
+        // later emit can never reuse `seq` (a duplicate outbound `MsgSeqNum`). It must
+        // NOT touch the inbound counter (that persist is deferred, finding 1A).
+        let store = InMemoryFixSessionStore::new();
+        let k = key("acct-1");
+        // Seed a distinct inbound counter so we can prove it is left untouched.
+        store
+            .save_counters(
+                &k,
+                SessionCounters {
+                    next_sender_seq: 1,
+                    next_target_seq: 7,
+                },
+            )
+            .expect("seed");
+
+        store
+            .store_outbound_and_advance(&k, 1, b"one", 2)
+            .expect("emit 1");
+        let after = store.load_counters(&k).expect("load");
+        assert_eq!(after.next_sender_seq, 2, "outbound counter advanced");
+        assert_eq!(after.next_target_seq, 7, "inbound counter left untouched");
+        let stored = store.outbound_range(&k, 1, 1).expect("range");
+        assert_eq!(
+            stored.len(),
+            1,
+            "the frame was stored atomically with the advance"
+        );
+        assert_eq!(stored[0].frame, b"one".to_vec());
+
+        // A second emit at the advanced seq — never a reuse of seq 1.
+        store
+            .store_outbound_and_advance(&k, 2, b"two", 3)
+            .expect("emit 2");
+        assert_eq!(store.load_counters(&k).expect("load").next_sender_seq, 3);
+        let all = store.outbound_range(&k, 0, 0).expect("range all");
+        let seqs: Vec<u64> = all.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, vec![1, 2], "each frame keeps a distinct MsgSeqNum");
     }
 
     #[test]
