@@ -2,8 +2,8 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); the allocation profile (§6) re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix, the HP-4 requote section reduced 343→232 allocs/op by `#122` (§6/§12), then the actor-turn baseline **corrected + root-caused 2026-07-22 (`#126`, RESOLVED)** — the §6 sections 1/2 baseline was stale pre-`#34` code carried over, the true steady-state is ~180–205 allocs/op, attributed by a new `dhat` call-stack bench (`benches/alloc_dhat.rs`), see §6's Baseline-correction + Root-cause blocks and §13.3; the allocation numbers remain a **not-yet-met** zero-alloc target (dominant term is upstream `Hash32::to_hex`, follow-up #165) |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§6 alloc profile, first stats_alloc run); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`); 2026-07-22 (§6 requote reduced `#122`; sections 1/2 re-measured + root-caused, §13.3 resolved, `#126`), on routinely-rebased working trees at those dates |
+| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); the allocation profile (§6) re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix, the HP-4 requote section reduced 343→232 allocs/op by `#122` then 232→172 by `#164` (id interning, §6/§12), then the actor-turn baseline **corrected + root-caused 2026-07-22 (`#126`, RESOLVED)** — the §6 sections 1/2 baseline was stale pre-`#34` code carried over, the true steady-state is ~180–205 allocs/op, attributed by a new `dhat` call-stack bench (`benches/alloc_dhat.rs`), see §6's Baseline-correction + Root-cause blocks and §13.3; the allocation numbers remain a **not-yet-met** zero-alloc target (dominant term is upstream `Hash32::to_hex`, follow-up #165) |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§6 alloc profile, first stats_alloc run); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`); 2026-07-22 (§6 requote reduced `#122`; sections 1/2 re-measured + root-caused, §13.3 resolved, `#126`); 2026-07-23 (§6 requote reduced 232→172 by `#164` id interning), on routinely-rebased working trees at those dates |
 | Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #165); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
@@ -660,7 +660,7 @@ third).
 |---|---|---|
 | `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **~195** (192.036 shown; range 180.4–203.3 over 10 runs) | ~13 300 |
 | `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **~189** (189.532 shown; range 181.0–202.7 over 10 runs) | ~13 250 |
-| `MarketMakerEngine::update_price` steady-state requote (HP-4, `#050`/`#122`, no `tokio` — a 10-contract chain, `CountingSink`) | **232.000** (was 343.000 pre-`#122`) | 3 513.3 (was 6 663.3) |
+| `MarketMakerEngine::update_price` steady-state requote (HP-4, `#050`/`#122`/`#164`, no `tokio` — a 10-contract chain, `CountingSink`) | **172.000** (was 232.000 pre-`#164`, 343.000 pre-`#122`) | 2 865.3 (was 3 513.3 pre-`#164`, 6 663.3 pre-`#122`) |
 
 **Target status: NOT MET — disclosed gap, not partial credit.** docs/07 §4's
 criterion is *zero* steady-state allocation on the common path; the measured
@@ -747,8 +747,9 @@ effect §3.4 isolates for the journal — a ~±6 % band around ~190, NOT the
 above, three consecutive runs of the `MarketMakerEngine::update_price` section
 (`ALLOC_MM_WARMUP_OPS=1000 ALLOC_MM_MEASURED_OPS=5000`) produced the
 **IDENTICAL** `343.000` allocs/op and `6 663.3` bytes/op every time — no
-variance at all (the `#050` baseline; `#122` below has since reduced this
-section to an equally-reproducible `232.000` allocs/op / `3 513.3` bytes/op).
+variance at all (the `#050` baseline; `#122` then `#164` below have since
+reduced this section to an equally-reproducible `172.000` allocs/op / `2 865.3`
+bytes/op).
 This is expected, not suspicious: this section runs entirely
 synchronously with no `tokio` runtime at all (`CountingSink::enqueue` is a
 bare atomic increment), driven by a fixed, seeded price stream against a
@@ -817,20 +818,60 @@ The likely larger contributors, by source inspection:
 - the `AccountId` / `VenueOrderId` owned-`String` clones on the emitted
   commands (the reserved market-maker account tag on 4 commands/instrument,
   plus the minted leg-id clones the two tracking maps hold). These id
-  newtypes are `#[serde(transparent)]` `String`-backed DTOs in `src/models.rs`;
-  interning them to `Arc<str>` the way `Symbol` was done would require either
-  the serde `rc` feature or a hand-rolled `Serialize`/`Deserialize` +
-  `ToSchema` on that DTO surface — a wire/schema change out of scope for this
-  in-plumbing pass and gated by `#122`'s own "if the wire form would change,
-  don't do it." Named as a follow-up, not silently absorbed.
+  newtypes were `#[serde(transparent)]` `String`-backed DTOs in `src/models.rs`;
+  interning them to `Arc<str>` the way `Symbol` was done needs a wire/schema-safe
+  repr, which `#122` left as a named follow-up. **`#164` did exactly this** (see
+  the `#164` block below) — interning both ids as `Arc<str>` with an
+  **allocation-free** `serialize_str` `Serialize` + `#[serde(from = "String")]`
+  `Deserialize` + `#[schema(value_type = String)]`, no serde `rc` feature,
+  byte-identical wire — and caching the reserved MM account once so its per-command
+  tag is a refcount bump.
 
 The zero-steady-state-allocation DESIGN TARGET therefore remains **open** for
-this path, now at a smaller, MEASURED gap (232 allocs/op, down from 343 — the
-number is measured; the per-call-site breakdown above is not). The remainder is
-NOT claimed to be at any "wire-safe floor": `update_price` still allocates two
-owned underlying strings per tick (above), and the split between the pricing
-kernel, the DTO id representation, and that entry-path residual is a hypothesis
-pending the #138 call-stack-attribution follow-up, not a measured attribution.
+this path, now at a smaller, MEASURED gap (172 allocs/op, down from 343 — 232
+pre-`#164`; the number is measured, the per-call-site breakdown above is not).
+The remainder is NOT claimed to be at any "wire-safe floor": `update_price` still
+allocates two owned underlying strings per tick (above), and the split between
+the pricing kernel, the DTO id representation, and that entry-path residual is a
+hypothesis pending the #138 call-stack-attribution follow-up, not a measured
+attribution.
+
+**The `#164` reduction (measured 2026-07-23), disclosed before/after.** `#164`
+drove the `MarketMakerEngine::update_price` section down from **232.000 allocs/op
+/ 3 513.3 bytes/op** to **172.000 allocs/op / 2 865.3 bytes/op** — a measured
+**−60 allocs/op (−25.9%)** and **−648 bytes/op (−18.4%)**, on the same
+host/toolchain/`Cargo.lock` and equally reproducible (`172.000` exactly on every
+re-run, the same zero-variance property as the `#050`/`#122` figures). It
+completes the `AccountId` / `VenueOrderId` follow-up `#122` named above, with two
+**wire-form-preserving** changes (the produced `VenueCommand` stream stays
+byte-identical, still asserted by
+`test_requote_output_is_byte_identical_across_identical_runs`, and the id wire
+bytes are asserted bare-string-identical by
+`models::tests::test_interned_ids_serialize_to_a_bare_string_byte_identical`):
+
+- Both ids now store their string as `Arc<str>` instead of `String`
+  (`src/models.rs`), so the minted leg-id clones the `resting` / `legs` tracking
+  maps hold and the reserved-account tag cloned onto up to four `VenueCommand`s
+  per instrument become reference-count bumps, not heap allocations. Wire form is
+  unchanged **and allocation-free**: a hand-rolled `Serialize` writes the interned
+  `str` directly via `serialize_str`, so serialization never materialises a fresh
+  owned `String` — the requote reduction is genuinely removed, **not shifted into
+  the journal/JSON serialize seam** (#164 review); `Deserialize` re-interns through
+  `String`. JSON/FIX/journal bytes are identical, no serde `rc` feature is pulled,
+  and the OpenAPI schema stays `type: string` via `#[schema(value_type = String)]`
+  (ADR-0012, a local design doc under `docs/adr/`, like the 0001–0011 series). The
+  actor/journal append path is not inflated: it already skips the record serialize
+  entirely on the common under-ceiling path (the `#091` size-check fast path), and
+  even when it does serialize, `serialize_str` adds no per-id allocation.
+- The venue-reserved market-maker `AccountId` is interned **once** on the engine
+  (`mm_account`, `src/market_maker/engine.rs`) and cloned (a refcount bump) onto
+  each requote command, replacing the per-call `market_maker_account()` fresh
+  `Arc` allocation the requote made four times per instrument per tick.
+
+The residual (`optionstratlib` Black-Scholes owned strings, the two entry-path
+`underlying.to_string()` calls, and the upstream `Hash32::to_hex` append-serialize
+term the actor turn carries) is unchanged by `#164`; the append-serialize term is
+`#165`'s target.
 
 **Method and what this does / does not prove.** `alloc_profile.rs` itself is a
 **process-wide** allocation-pressure profile of the measured loop (every
@@ -1375,9 +1416,10 @@ genuinely sensitive to load rather than trivially always green.
   data, §12.1); isolation under an arbitrarily aggressive requote cadence
   (§12.3's 1 ms diagnostic shows the effect is real and grows with load, just
   not yet at the 20 ms cadence this assertion commits to); or a
-  call-stack-attributed allocation breakdown for the 232 allocs/op the
-  allocation profile's third section reports (§6 — reduced from 343 by `#122`;
-  still a process-wide count, not a per-call-site attribution. The `#126` `dhat`
+  call-stack-attributed allocation breakdown for the 172 allocs/op the
+  allocation profile's third section reports (§6 — reduced from 343 by `#122`
+  then to 172 by `#164`'s id interning; still a process-wide count, not a
+  per-call-site attribution. The `#126` `dhat`
   bench `benches/alloc_dhat.rs` now makes such a breakdown possible — it is
   applied to §6's actor-turn sections 1/2, not yet to this requote section;
   pointing it at the requote path is a small, tracked follow-up).
