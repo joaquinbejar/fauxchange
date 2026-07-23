@@ -349,8 +349,15 @@ ironfix-transport = "0.3.1"
 # `tokio_util::codec::Decoder` — the trait `FixCodec` (above) implements and the
 # venue's bounded frame decoder (`src/gateway/fix/acceptor.rs`) wraps to enforce a
 # by-policy byte cap (a DoS/resource ceiling) around `FixCodec` (#037; the
-# hostile-arithmetic precheck retired in #140 now that the codec is checked). Only the `codec` feature
-# is enabled (the `Decoder`/`Encoder` traits + the `BytesMut` framing buffer). Audit
+# hostile-arithmetic precheck retired in #140 now that the codec is checked). Also
+# `tokio_util::sync::CancellationToken` — the per-underlying actor's explicit
+# mid-flight shutdown signal (`src/exchange/actor.rs`, #139) so a graceful drain can
+# return a typed `VenueError::ShuttingDown` for queued-but-unprocessed work. Only the
+# `codec` feature is enabled (the `Decoder`/`Encoder` traits + the `BytesMut` framing
+# buffer); `sync` needs NO feature — in `tokio-util` 0.7.18 `pub mod sync` is
+# unconditional (verified against the pinned crates.io registry source, not a local
+# checkout: 0.7.18 has no `sync` feature and `CancellationToken` compiles with the
+# `codec`-only feature set), so this adds NO feature and NO new crate version. Audit
 # note: `tokio-util` 0.7.18 is ALREADY resolved in the tree (via `sqlx`), so naming
 # it as a direct dependency at `0.7` adds NO new crate version — the same
 # "already in the tree, adds no new version" precedent as `serde_json` / `tower`.

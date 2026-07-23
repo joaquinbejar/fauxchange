@@ -213,6 +213,45 @@ async fn test_actor_uses_externally_defined_seams() {
     let _ = join.await;
 }
 
+// ---- explicit mid-flight shutdown signal (#139) --------------------------
+
+#[tokio::test]
+async fn test_explicit_shutdown_signal_stops_a_live_actor_from_the_public_handle() {
+    // The #139 public capability, exercised from an EXTERNAL crate: an explicit
+    // `ActorHandle::shutdown()` stops the actor even while a handle clone is still
+    // alive — the pre-#139 venue could only stop on last-handle-drop.
+    let (handle, join) = spawn_underlying_actor(
+        config(16),
+        journal(),
+        PlaceholderExecutor,
+        NoopFanOut,
+        CLOCK,
+    );
+
+    match handle.submit(cancel("live")).await {
+        Ok(receipt) => assert_eq!(receipt.underlying_sequence, SequenceNumber::new(0)),
+        Err(e) => panic!("a pre-shutdown submit must commit: {e}"),
+    }
+
+    // Trigger the signal through the public handle; the actor drains and exits
+    // WITHOUT any handle being dropped (a clone is still held here).
+    handle.shutdown();
+    match join.await {
+        Ok(()) => {}
+        Err(e) => panic!("the explicit signal must stop the actor: {e}"),
+    }
+
+    // The handle is still alive, but the mailbox is now closed — a further submit
+    // fails fast with a typed error, never a panic or a hang.
+    match handle.submit(cancel("after")).await {
+        Err(VenueError::JournalUnavailable) => {}
+        other => panic!("a submit after shutdown must fail fast typed, got {other:?}"),
+    }
+
+    // Idempotent: a second shutdown() on the already-stopped actor is a no-op.
+    handle.shutdown();
+}
+
 // ---- determinism: pre-execution append failure ---------------------------
 
 #[tokio::test]

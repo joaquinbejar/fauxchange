@@ -139,6 +139,18 @@ pub enum VenueError {
     /// **redacted** ([ADR-0006 §3](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
     #[error("journal unavailable")]
     JournalUnavailable,
+    /// The venue is **shutting down**: an explicit mid-flight actor shutdown was
+    /// triggered (a `CancellationToken`) and this command was **error-drained**
+    /// from the actor's mailbox *before* it was journaled or matched. Like a
+    /// full-mailbox [`RateLimited`](VenueError::RateLimited), the command was
+    /// never accepted onto the sequenced path — it changed **no** book state, was
+    /// **never journaled**, and left **no** write-ahead mid-turn, so it is
+    /// **replay-neutral**. HTTP `503` Service Unavailable; the command was never
+    /// applied, so a retry (against a restarted venue) can succeed. The message
+    /// carries no internal state and is safe to echo (#139,
+    /// [ADR-0006 §3](../docs/adr/0006-venue-command-envelope-and-single-writer-journal.md)).
+    #[error("shutting down")]
+    ShuttingDown,
     /// A failure propagated from the upstream matching stack. HTTP `500`, cause
     /// **redacted** on every client surface. `#[error(transparent)]` keeps the
     /// upstream `Display`/`source` chain intact for server-side logging, but
@@ -229,6 +241,7 @@ impl VenueError {
             VenueError::Overflow => StatusCode::INTERNAL_SERVER_ERROR,
             VenueError::SequenceExhausted => StatusCode::INTERNAL_SERVER_ERROR,
             VenueError::JournalUnavailable => StatusCode::INTERNAL_SERVER_ERROR,
+            VenueError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
             VenueError::Upstream(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -248,6 +261,7 @@ impl VenueError {
             VenueError::Overflow => "internal",
             VenueError::SequenceExhausted => "internal",
             VenueError::JournalUnavailable => "internal",
+            VenueError::ShuttingDown => "unavailable",
             VenueError::Upstream(_) => "internal",
         }
     }
@@ -271,6 +285,10 @@ impl VenueError {
             VenueError::Overflow => REDACTED_INTERNAL_MESSAGE.to_string(),
             VenueError::SequenceExhausted => REDACTED_INTERNAL_MESSAGE.to_string(),
             VenueError::JournalUnavailable => REDACTED_INTERNAL_MESSAGE.to_string(),
+            // Not an internal-cause failure: the venue is shutting down and the
+            // command was never accepted. The message carries no internal state,
+            // so it is echoed rather than collapsed to the generic redaction.
+            VenueError::ShuttingDown => "shutting down".to_string(),
             VenueError::Upstream(_) => REDACTED_INTERNAL_MESSAGE.to_string(),
         }
     }
@@ -376,6 +394,10 @@ impl VenueError {
             VenueError::Overflow => FixRejectReason::Internal,
             VenueError::SequenceExhausted => FixRejectReason::Internal,
             VenueError::JournalUnavailable => FixRejectReason::Internal,
+            // A shutting-down venue is a transient "resend later" condition, not an
+            // internal failure to redact — the closest existing FIX category is the
+            // retryable throttle bucket (no new FIX reason vocabulary added).
+            VenueError::ShuttingDown => FixRejectReason::Throttle,
             VenueError::Upstream(_) => FixRejectReason::Internal,
         }
     }
@@ -401,6 +423,10 @@ impl VenueError {
         let (retryable, retry_after_ms, terminal) = match self {
             VenueError::Unauthorized => (false, None, true),
             VenueError::RateLimited => (true, Some(RATE_LIMIT_RETRY_AFTER_MS), false),
+            // A mid-flight shutdown never accepted the command: the same action can
+            // succeed on retry (against a restarted venue), so it is retryable but
+            // carries no fixed backoff window; it is a command error, not terminal.
+            VenueError::ShuttingDown => (true, None, false),
             VenueError::NotFound(_)
             | VenueError::InvalidOrder(_)
             | VenueError::Forbidden(_)
@@ -438,6 +464,7 @@ impl VenueError {
             VenueError::Overflow => (WsErrorCode::Internal, WsErrorCategory::Internal),
             VenueError::SequenceExhausted => (WsErrorCode::Internal, WsErrorCategory::Internal),
             VenueError::JournalUnavailable => (WsErrorCode::Internal, WsErrorCategory::Internal),
+            VenueError::ShuttingDown => (WsErrorCode::Unavailable, WsErrorCategory::Unavailable),
             VenueError::Upstream(_) => (WsErrorCode::Internal, WsErrorCategory::Internal),
         }
     }
@@ -471,6 +498,7 @@ impl IntoResponse for VenueError {
             | VenueError::Overflow
             | VenueError::SequenceExhausted
             | VenueError::JournalUnavailable
+            | VenueError::ShuttingDown
             | VenueError::Upstream(_) => (status, body).into_response(),
         }
     }
@@ -648,6 +676,10 @@ pub enum WsErrorCode {
     NotFound,
     /// The server's mailbox is full (WS transport).
     Busy,
+    /// The venue is shutting down and never accepted the command
+    /// ([`VenueError::ShuttingDown`]) — a transient, retryable unavailability
+    /// distinct from a full-mailbox `Busy` and from an internal failure.
+    Unavailable,
     /// An internal failure, cause redacted ([`VenueError::Overflow`] /
     /// [`VenueError::Upstream`]).
     Internal,
@@ -671,6 +703,8 @@ pub enum WsErrorCategory {
     NotFound,
     /// The server is momentarily too busy (full mailbox).
     Busy,
+    /// The venue is shutting down and is temporarily unavailable (retryable).
+    Unavailable,
     /// An internal failure, cause redacted.
     Internal,
 }
@@ -727,6 +761,7 @@ mod tests {
             VenueError::Overflow,
             VenueError::SequenceExhausted,
             VenueError::JournalUnavailable,
+            VenueError::ShuttingDown,
             upstream_with_marker("marker"),
         ]
     }
@@ -833,6 +868,36 @@ mod tests {
         assert_eq!(err.machine_code(), "internal");
         assert_eq!(err.redacted_message(), REDACTED_INTERNAL_MESSAGE);
         assert_eq!(err.to_string(), "journal unavailable");
+    }
+
+    #[test]
+    fn test_venue_error_shutting_down_maps_to_503_and_is_retryable() {
+        // The #139 explicit mid-flight actor shutdown: a command error-drained from
+        // the mailbox before it was journaled/matched surfaces as a 503 Service
+        // Unavailable, a distinct machine code (`unavailable`, NOT the internal
+        // taxonomy), and a client-safe echoed message — never a redacted internal.
+        let err = VenueError::ShuttingDown;
+        assert_eq!(err.http_status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.machine_code(), "unavailable");
+        assert_eq!(err.redacted_message(), "shutting down");
+        assert_eq!(err.to_string(), "shutting down");
+        // FIX: the retryable "resend later" throttle bucket (no new FIX vocabulary).
+        assert_eq!(
+            err.fix_reject(FixRejectContext::NewOrder).reason,
+            FixRejectReason::Throttle
+        );
+        // WS: a retryable, non-terminal unavailability with no fixed backoff window.
+        let env = err.ws_error(Some("req-9".to_string()));
+        assert_eq!(env.code, WsErrorCode::Unavailable);
+        assert_eq!(env.category, WsErrorCategory::Unavailable);
+        assert!(env.retryable);
+        assert!(!env.terminal);
+        assert_eq!(env.retry_after_ms, None);
+        assert_eq!(env.request_id, Some("req-9".to_string()));
+        // IntoResponse carries the 503 without rate-limit headers.
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
     }
 
     #[test]
