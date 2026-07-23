@@ -69,7 +69,7 @@
 //! unbounded growth). Both bounds are deterministic — the same flood is dropped at
 //! the same point every run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::microstructure::LatencyOffset;
@@ -88,6 +88,18 @@ pub const MAX_INGRESS_OFFSET_US: u64 = 3_600_000_000;
 /// is venue config; this fixes a bounded default well above the actor mailbox so the
 /// buffer is not the first thing to shed load under normal pressure.
 pub const DEFAULT_INGRESS_BUFFER_CAPACITY: usize = 4_096;
+
+/// The default **per-session sub-quota** of one per-underlying ingress buffer — a
+/// **fairness** control (#159): a single session (account) can hold at most this
+/// many entries for one underlying, so it cannot occupy the whole
+/// [`DEFAULT_INGRESS_BUFFER_CAPACITY`] and starve every OTHER account's orders on
+/// the same underlying (each still gets its own sub-quota). A new key past a
+/// session's sub-quota is the same typed [`IngressBufferFull`] drop the venue-wide
+/// cap raises; the cap stays the outer bound. Mirrors the per-account sub-quota
+/// pattern of the [`ClOrdIdIndex`](crate::exchange::ClOrdIdIndex) (#098) and the WS
+/// ticket store (#131). `4096 / 8` guarantees at least 8 sessions a fair share
+/// before the outer cap can be reached by any one of them.
+pub const DEFAULT_MAX_INGRESS_PER_SESSION: usize = 512;
 
 /// The gateway-edge ingress metadata stamped onto an admitted client order so the
 /// #45 latency draw is reproducible: the message's stable identity
@@ -223,19 +235,54 @@ pub struct IngressReorderBuffer<T> {
     pending: BTreeMap<ReleaseKey, T>,
     /// The bounded depth — a DoS control, never unbounded.
     capacity: usize,
+    /// Live entry count per session id — the running total the per-session
+    /// sub-quota (#159) is checked against, kept in lockstep with `pending` on
+    /// insert (increment) and [`drain_below`](Self::drain_below) (decrement).
+    per_session: HashMap<Arc<str>, usize>,
+    /// The **per-session sub-quota** — the fairness cap one session may hold
+    /// (#159), clamped to at most `capacity`.
+    max_per_session: usize,
 }
 
 impl<T> IngressReorderBuffer<T> {
-    /// Builds a buffer bounded at `capacity` (clamped to at least `1`).
+    /// Builds a buffer bounded at `capacity` (clamped to at least `1`) with the
+    /// default [`DEFAULT_MAX_INGRESS_PER_SESSION`] per-session sub-quota (#159).
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        Self::with_ceilings(capacity, DEFAULT_MAX_INGRESS_PER_SESSION)
+    }
+
+    /// Builds a buffer bounded at `capacity` (clamped to at least `1`) with an
+    /// explicit per-session sub-quota (#159). The per-underlying `capacity` stays the
+    /// outer DoS bound; the sub-quota adds fairness so one session cannot starve the
+    /// others sharing the underlying.
+    ///
+    /// **Fairness clamp (#159 review).** `max_per_session` is clamped to at most
+    /// **half** the outer `capacity` (and always ≥ 1), so at least two sessions
+    /// always fit — a single session can never occupy the whole buffer. A naive
+    /// `clamp(1, capacity)` would let the default quota
+    /// ([`DEFAULT_MAX_INGRESS_PER_SESSION`]) rise to the full capacity for any buffer
+    /// sized at or below it, re-opening the exact starvation this sub-quota exists to
+    /// prevent. The production buffer ([`DEFAULT_INGRESS_BUFFER_CAPACITY`] `= 4096`,
+    /// quota `512`) is unaffected — `512 ≤ 4096 / 2` — so the clamp only bites on
+    /// smaller-capacity configurations.
+    #[must_use]
+    pub fn with_ceilings(capacity: usize, max_per_session: usize) -> Self {
+        let capacity = capacity.max(1);
+        // Half the capacity, floored at 1 (a 1-slot buffer cannot reserve room for a
+        // peer, so fairness degrades to the single slot there — not a starvation gap,
+        // just the smallest possible buffer).
+        let fairness_ceiling = (capacity / 2).max(1);
         Self {
             pending: BTreeMap::new(),
-            capacity: capacity.max(1),
+            capacity,
+            per_session: HashMap::new(),
+            max_per_session: max_per_session.clamp(1, fairness_ceiling),
         }
     }
 
-    /// Builds a buffer at the bounded [`DEFAULT_INGRESS_BUFFER_CAPACITY`].
+    /// Builds a buffer at the bounded [`DEFAULT_INGRESS_BUFFER_CAPACITY`] +
+    /// [`DEFAULT_MAX_INGRESS_PER_SESSION`] sub-quota.
     #[must_use]
     pub fn with_default_capacity() -> Self {
         Self::new(DEFAULT_INGRESS_BUFFER_CAPACITY)
@@ -272,10 +319,37 @@ impl<T> IngressReorderBuffer<T> {
     /// [`IngressBufferFull`] when the buffer already holds [`Self::capacity`]
     /// commands.
     pub fn insert(&mut self, key: ReleaseKey, payload: T) -> Result<(), IngressBufferFull> {
-        if self.pending.len() >= self.capacity {
-            return Err(IngressBufferFull);
+        // Distinguish a genuinely NEW key from a replace of an existing one. `insert`
+        // and `ReleaseKey` are public, so a caller CAN present a duplicate key; a
+        // replace does not add occupancy, so it must neither be bounded as new work nor
+        // double-count the session (#159 review — a double-count would leave ghost
+        // occupancy that permanently consumes the session's quota, since draining
+        // removes one entry and decrements once). In production `arrival_sequence` is a
+        // venue-wide monotonic counter so keys are unique, but the bounds + count must
+        // stay exact regardless.
+        let is_new_key = !self.pending.contains_key(&key);
+        if is_new_key {
+            // The venue-wide per-underlying cap is the outer DoS bound.
+            if self.pending.len() >= self.capacity {
+                return Err(IngressBufferFull);
+            }
+            // The per-session sub-quota is the FAIRNESS bound (#159): a session already
+            // holding its sub-quota is refused so it cannot occupy the buffer and starve
+            // every OTHER account sharing this underlying — the same typed drop.
+            let session_count = self.per_session.get(&key.session_id).copied().unwrap_or(0);
+            if session_count >= self.max_per_session {
+                return Err(IngressBufferFull);
+            }
         }
-        self.pending.insert(key, payload);
+        let session_id = Arc::clone(&key.session_id);
+        // Count against the session sub-quota ONLY when the key is genuinely new (the
+        // `BTreeMap::insert` returned `None`); a replace leaves occupancy — and the
+        // count — unchanged.
+        if self.pending.insert(key, payload).is_none() {
+            // Checked (rule 9); bounded by `capacity`, so the fallback is unreachable.
+            let entry = self.per_session.entry(session_id).or_insert(0);
+            *entry = entry.checked_add(1).unwrap_or(*entry);
+        }
         Ok(())
     }
 
@@ -302,7 +376,23 @@ impl<T> IngressReorderBuffer<T> {
         // set (BTreeMap iteration yields it in ascending key order).
         let remainder = self.pending.split_off(&boundary);
         let due = std::mem::replace(&mut self.pending, remainder);
-        due.into_iter().collect()
+        let due: Vec<(ReleaseKey, T)> = due.into_iter().collect();
+        // Decrement the per-session counts in lockstep with the drained entries so
+        // the sub-quota (#159) tracks the live occupancy exactly — a session frees
+        // its slots as its held commands are released to the sequencer. The count is
+        // ≥ 1 for any present key (insert incremented it), so the `checked_sub` never
+        // hits its guard — it is defensive, not saturating.
+        for (key, _) in &due {
+            if let Some(count) = self.per_session.get_mut(&key.session_id)
+                && let Some(next) = count.checked_sub(1)
+            {
+                *count = next;
+            }
+        }
+        // Drop sessions with no remaining entries so the map cannot grow unboundedly
+        // in the number of distinct sessions seen over the venue's lifetime.
+        self.per_session.retain(|_, count| *count != 0);
+        due
     }
 }
 
@@ -372,12 +462,20 @@ mod tests {
     fn test_buffer_is_bounded_and_drops_at_capacity() {
         let mut buffer: IngressReorderBuffer<u32> = IngressReorderBuffer::new(3);
         assert_eq!(buffer.capacity(), 3);
-        for seq in 0..3 {
-            assert_eq!(buffer.insert(key(100, "s", seq), seq as u32), Ok(()));
+        // Fill to the OUTER per-underlying capacity across DISTINCT sessions, so the
+        // per-session fairness sub-quota (#159, `capacity / 2` here) never bites — each
+        // session holds a single slot. (A single session filling the whole buffer is
+        // exactly what the fairness clamp now forbids; see the fairness tests below.)
+        for (seq, session) in ["a", "b", "c"].into_iter().enumerate() {
+            assert_eq!(
+                buffer.insert(key(100, session, seq as u64), seq as u32),
+                Ok(())
+            );
         }
-        // The 4th insert is rejected — bounded, never growing past capacity.
+        // A 4th insert (a further session) is rejected by the OUTER cap — bounded, never
+        // growing past capacity.
         assert_eq!(
-            buffer.insert(key(100, "s", 3), 3),
+            buffer.insert(key(100, "d", 3), 3),
             Err(IngressBufferFull),
             "a flood past capacity is a typed drop"
         );
@@ -390,6 +488,112 @@ mod tests {
         assert_eq!(buffer.capacity(), 1);
         assert_eq!(buffer.insert(key(1, "s", 0), 0), Ok(()));
         assert_eq!(buffer.insert(key(1, "s", 1), 1), Err(IngressBufferFull));
+    }
+
+    #[test]
+    fn test_per_session_sub_quota_prevents_one_session_starving_the_others() {
+        // #159 fairness: a per-(underlying,session) sub-quota well under the outer
+        // per-underlying cap, so one session filling its own quota cannot occupy the
+        // whole buffer and starve every OTHER session sharing the underlying.
+        let mut buffer: IngressReorderBuffer<u32> = IngressReorderBuffer::with_ceilings(10, 3);
+        // Session A fills exactly its sub-quota (3), well under the cap of 10.
+        for seq in 0..3 {
+            assert_eq!(buffer.insert(key(100, "a", seq), seq as u32), Ok(()));
+        }
+        // A's 4th is a typed drop — its sub-quota, NOT the outer cap (only 3 of 10
+        // slots are used), so it does not scale with A's concurrency.
+        assert_eq!(
+            buffer.insert(key(100, "a", 3), 3),
+            Err(IngressBufferFull),
+            "a session past its sub-quota is dropped even with buffer headroom"
+        );
+        // Session B is UNSTARVED — it still buffers on the same underlying up to its
+        // own independent sub-quota, despite A having filled A's.
+        for seq in 0..3 {
+            assert_eq!(
+                buffer.insert(key(100, "b", seq), 100 + seq as u32),
+                Ok(()),
+                "account B keeps its fair share while A is at its sub-quota"
+            );
+        }
+        assert_eq!(buffer.len(), 6, "3 (A) + 3 (B), both within the cap of 10");
+
+        // Draining A's due entries frees A's slots so A can buffer again (the count
+        // tracks live occupancy, not a lifetime total).
+        let drained = buffer.drain_below(101);
+        assert_eq!(drained.len(), 6);
+        assert!(buffer.is_empty());
+        assert_eq!(
+            buffer.insert(key(200, "a", 10), 10),
+            Ok(()),
+            "a released session frees its sub-quota slots"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_release_key_does_not_leak_session_quota() {
+        // #159 review: a duplicate `ReleaseKey` REPLACES the payload without adding
+        // occupancy, so it must not double-count the session — otherwise draining (one
+        // remove, one decrement) would leave ghost occupancy that permanently consumes
+        // the session's quota.
+        let mut buffer: IngressReorderBuffer<u32> = IngressReorderBuffer::with_ceilings(10, 3);
+        // The SAME key three times: one insert, then two replaces.
+        assert_eq!(buffer.insert(key(100, "a", 0), 0), Ok(()));
+        assert_eq!(buffer.insert(key(100, "a", 0), 1), Ok(()));
+        assert_eq!(buffer.insert(key(100, "a", 0), 2), Ok(()));
+        assert_eq!(
+            buffer.len(),
+            1,
+            "a duplicate key replaces, never accumulates"
+        );
+        // The session used ONE slot (not three), so it can still buffer 2 more.
+        assert_eq!(buffer.insert(key(100, "a", 1), 10), Ok(()));
+        assert_eq!(buffer.insert(key(100, "a", 2), 11), Ok(()));
+        assert_eq!(
+            buffer.insert(key(100, "a", 3), 12),
+            Err(IngressBufferFull),
+            "the session count reflects 3 distinct keys, not the replays"
+        );
+        // Draining frees all three; the session count returns to zero (no ghost).
+        assert_eq!(buffer.drain_below(101).len(), 3);
+        assert!(buffer.is_empty());
+        // The session immediately re-fills its FULL quota — proof no ghost occupancy
+        // leaked from the earlier replaces.
+        for seq in 10..13 {
+            assert_eq!(buffer.insert(key(200, "a", seq), seq as u32), Ok(()));
+        }
+        assert_eq!(
+            buffer.insert(key(200, "a", 99), 99),
+            Err(IngressBufferFull),
+            "exactly the quota (3) is available again — the replaces left no residue"
+        );
+    }
+
+    #[test]
+    fn test_fairness_clamp_keeps_a_small_buffer_quota_below_capacity() {
+        // #159 review: for a buffer sized at or below the default per-session quota, a
+        // naive `clamp(1, capacity)` would let one session fill EVERY slot. The
+        // half-capacity fairness clamp holds the effective quota to `capacity / 2`, so
+        // a peer always has room.
+        let mut buffer: IngressReorderBuffer<u32> = IngressReorderBuffer::with_ceilings(10, 8);
+        // Session A holds AT MOST 5 (10 / 2), not the requested 8 nor the full 10.
+        for seq in 0..5 {
+            assert_eq!(buffer.insert(key(100, "a", seq), seq as u32), Ok(()));
+        }
+        assert_eq!(
+            buffer.insert(key(100, "a", 5), 5),
+            Err(IngressBufferFull),
+            "the fairness clamp holds one session to half the buffer, not the whole"
+        );
+        // ...so the other half stays open: session B is unstarved.
+        for seq in 0..5 {
+            assert_eq!(buffer.insert(key(100, "b", seq), 100 + seq as u32), Ok(()));
+        }
+        assert_eq!(
+            buffer.len(),
+            10,
+            "A's half + B's half share the buffer fairly"
+        );
     }
 
     // ---- release horizon: strict `<`, drained in key order ------------------

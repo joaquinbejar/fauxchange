@@ -4423,7 +4423,11 @@ async fn test_ingress_buffer_is_bounded_under_flood() {
         Err(error) => panic!("flood AppState must build: {error}"),
     };
 
-    // Fill the buffer to capacity with held (never-released) orders.
+    // Fill the buffer to capacity with held (never-released) orders — one per DISTINCT
+    // session, so the per-session fairness sub-quota (#159, `capacity / 2`) never bites
+    // and this test targets the OUTER per-underlying capacity bound (a single session
+    // flooding the whole buffer is what the sub-quota now forbids; that path is covered
+    // by the `microstructure::ingress` unit tests).
     let mut held = Vec::new();
     for index in 0..CAPACITY {
         let cmd = ms_add(
@@ -4435,7 +4439,7 @@ async fn test_ingress_buffer_is_bounded_under_flood() {
             50_000,
             1,
         );
-        let stamp = IngressStamp::new("flooder", index as u64);
+        let stamp = IngressStamp::new(format!("flooder-{index}"), index as u64);
         let task_state = Arc::clone(&state);
         held.push(tokio::spawn(async move {
             task_state.submit_with_ingress(cmd, stamp).await
