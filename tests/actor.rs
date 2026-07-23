@@ -146,7 +146,7 @@ impl VenueClock for TestClock {
 
 #[tokio::test]
 async fn test_actor_round_trip_journals_submitted_command() {
-    let (handle, join) = spawn_underlying_actor(
+    let (handle, _shutdown, join) = spawn_underlying_actor(
         config(16),
         journal(),
         PlaceholderExecutor,
@@ -195,7 +195,7 @@ async fn test_actor_uses_externally_defined_seams() {
         calls: Arc::new(AtomicU32::new(0)),
     };
     let calls = Arc::clone(&executor.calls);
-    let (handle, join) = spawn_underlying_actor(
+    let (handle, _shutdown, join) = spawn_underlying_actor(
         config(16),
         journal(),
         executor,
@@ -216,11 +216,13 @@ async fn test_actor_uses_externally_defined_seams() {
 // ---- explicit mid-flight shutdown signal (#139) --------------------------
 
 #[tokio::test]
-async fn test_explicit_shutdown_signal_stops_a_live_actor_from_the_public_handle() {
+async fn test_explicit_shutdown_signal_stops_a_live_actor_from_the_owner_handle() {
     // The #139 public capability, exercised from an EXTERNAL crate: an explicit
-    // `ActorHandle::shutdown()` stops the actor even while a handle clone is still
-    // alive — the pre-#139 venue could only stop on last-handle-drop.
-    let (handle, join) = spawn_underlying_actor(
+    // `ActorShutdown::shutdown()` stops the actor even while a data-plane
+    // `ActorHandle` clone is still alive — the pre-#139 venue could only stop on
+    // last-handle-drop. The kill authority lives on the owner-only `ActorShutdown`
+    // the spawn returns separately, NOT on the broadly-shared `ActorHandle`.
+    let (handle, shutdown, join) = spawn_underlying_actor(
         config(16),
         journal(),
         PlaceholderExecutor,
@@ -233,23 +235,24 @@ async fn test_explicit_shutdown_signal_stops_a_live_actor_from_the_public_handle
         Err(e) => panic!("a pre-shutdown submit must commit: {e}"),
     }
 
-    // Trigger the signal through the public handle; the actor drains and exits
-    // WITHOUT any handle being dropped (a clone is still held here).
-    handle.shutdown();
+    // Trigger the signal through the owner handle; the actor drains and exits
+    // WITHOUT any data-plane handle being dropped (a clone is still held here).
+    shutdown.shutdown();
     match join.await {
         Ok(()) => {}
         Err(e) => panic!("the explicit signal must stop the actor: {e}"),
     }
 
-    // The handle is still alive, but the mailbox is now closed — a further submit
-    // fails fast with a typed error, never a panic or a hang.
+    // The handle is still alive, but the actor stopped because it was SIGNALLED —
+    // so a further submit fails fast with `ShuttingDown` (not the generic
+    // `JournalUnavailable`), the same typed vocabulary the drain uses (#139 review).
     match handle.submit(cancel("after")).await {
-        Err(VenueError::JournalUnavailable) => {}
-        other => panic!("a submit after shutdown must fail fast typed, got {other:?}"),
+        Err(VenueError::ShuttingDown) => {}
+        other => panic!("a submit after an explicit shutdown must be ShuttingDown, got {other:?}"),
     }
 
     // Idempotent: a second shutdown() on the already-stopped actor is a no-op.
-    handle.shutdown();
+    shutdown.shutdown();
 }
 
 // ---- determinism: pre-execution append failure ---------------------------
@@ -268,7 +271,8 @@ async fn test_pre_execution_append_failure_leaves_book_untouched_and_reuses_sequ
         (SequenceNumber::new(0), RecordKind::Command),
         FaultMode::Confirmed,
     );
-    let (handle, join) = spawn_underlying_actor(config(16), fault, executor, fan_out, CLOCK);
+    let (handle, _shutdown, join) =
+        spawn_underlying_actor(config(16), fault, executor, fan_out, CLOCK);
 
     // Pre-execution write-ahead append fails: the command is rejected, nothing
     // executed, nothing fanned out.
@@ -322,7 +326,8 @@ async fn test_ambiguous_not_committed_append_reuses_sequence() {
         (SequenceNumber::new(0), RecordKind::Command),
         FaultMode::AmbiguousNotCommitted,
     );
-    let (handle, join) = spawn_underlying_actor(config(16), fault, executor, NoopFanOut, CLOCK);
+    let (handle, _shutdown, join) =
+        spawn_underlying_actor(config(16), fault, executor, NoopFanOut, CLOCK);
 
     // Ambiguous AND the tail read-back finds nothing committed → reuse N.
     match handle.submit(cancel("a")).await {
@@ -356,7 +361,8 @@ async fn test_post_mutation_append_failure_seals_underlying_and_suppresses_fan_o
         (SequenceNumber::new(0), RecordKind::Event),
         FaultMode::Confirmed,
     );
-    let (handle, join) = spawn_underlying_actor(config(16), fault, executor, fan_out, CLOCK);
+    let (handle, _shutdown, join) =
+        spawn_underlying_actor(config(16), fault, executor, fan_out, CLOCK);
 
     // The command executed (the book was mutated) but the paired-event append
     // fails, so the turn seals the underlying and emits no fan-out.

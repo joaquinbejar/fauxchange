@@ -931,28 +931,75 @@ enum ActorMessage {
 /// A cloneable handle onto one underlying's actor — the **only** way a gateway
 /// reaches a book or the sequencer ([02 §8](../../../docs/02-matching-architecture.md)).
 ///
-/// There are two shutdown paths:
+/// This is the **data-plane** handle: it carries submit + snapshot and is meant
+/// to be cloned widely (into ingress, the market maker, simulation). It carries
+/// **no** kill authority — the two shutdown paths are:
 ///
 /// - **Last-handle drop.** Dropping every clone closes the mailbox; the receive
 ///   loop ends after the currently-buffered work drains through normally and the
 ///   spawned task completes. This is the graceful, no-error path.
-/// - **Explicit signal** ([`shutdown`](Self::shutdown), #139). Cancelling the
+/// - **Explicit signal** ([`ActorShutdown::shutdown`], #139). Cancelling the
 ///   actor's [`CancellationToken`] closes the mailbox to new work and
 ///   **error-drains** every already-queued-but-unprocessed command with a typed
 ///   [`VenueError::ShuttingDown`] rather than silently dropping it — the command
-///   currently mid-turn completes normally (it is never left half-journaled).
-///   The token is shared across every clone, so any holder (the owning
-///   [`crate::state::AppState`], `main.rs` graceful shutdown, or a test) can
-///   trigger it; a `ShuttingDown` command was **never** journaled/matched, so
-///   the signal is replay-neutral.
+///   currently mid-turn completes normally (it is never left half-journaled). The
+///   authority to trigger this lives ONLY on the owner-only [`ActorShutdown`] the
+///   `spawn_*` functions return separately (held by the owning
+///   [`crate::state::AppState`], `main.rs` graceful shutdown, or a test) — an
+///   `ActorHandle` clone cannot. A `ShuttingDown` command was **never**
+///   journaled/matched, so the signal is replay-neutral.
 #[derive(Debug, Clone)]
 pub struct ActorHandle {
     tx: mpsc::Sender<ActorMessage>,
     underlying: Arc<str>,
-    /// The explicit mid-flight shutdown signal (#139). Shared with the actor's
-    /// [`run`](UnderlyingActor::run) loop, which selects on it; cancelling it
-    /// error-drains the mailbox with [`VenueError::ShuttingDown`].
+    /// A **read-only** view of the explicit shutdown signal (#139), used ONLY by
+    /// [`stopped_error`](Self::stopped_error) to classify a stopped-actor error as
+    /// `ShuttingDown` vs `JournalUnavailable`. The shared data-plane `ActorHandle`
+    /// exposes **no** method that cancels it — the authority to trigger shutdown
+    /// lives on the owner-only [`ActorShutdown`] the spawn returns, so a component
+    /// that only holds an `ActorHandle` (ingress / market-maker / simulation)
+    /// cannot terminate the actor (#139 review).
     shutdown: CancellationToken,
+}
+
+/// The **owner-only lifecycle control** for one underlying's actor (#139) — the
+/// authority to trigger a graceful mid-flight shutdown, returned from the
+/// `spawn_*` functions **separately** from the broadly-cloned data-plane
+/// [`ActorHandle`]. Only a holder of this handle can stop the actor; the shared
+/// `ActorHandle` (cloned into ingress / market-maker / simulation) is limited to
+/// `submit`/`snapshot` and carries no kill authority (#139 review).
+///
+/// Not `Clone`: the lifecycle authority is meant to be held by the owner
+/// ([`crate::state::AppState`] / `main.rs` graceful shutdown / a test), not fanned
+/// out. Dropping it does NOT shut the actor down — shutdown is explicit
+/// ([`shutdown`](Self::shutdown)); the actor's independent last-`ActorHandle`-drop
+/// path is unaffected.
+#[derive(Debug)]
+pub struct ActorShutdown {
+    underlying: Arc<str>,
+    shutdown: CancellationToken,
+}
+
+impl ActorShutdown {
+    /// Signals the actor to stop taking new work and **error-drain** its
+    /// queued-but-unprocessed mailbox with [`VenueError::ShuttingDown`] — the
+    /// in-flight turn (if any) completes normally, so a sequenced turn is never
+    /// left half-journaled. Idempotent (cancelling an already-cancelled token is a
+    /// no-op); a `ShuttingDown` command was never journaled or matched, so this
+    /// changes no book state and is replay-neutral. Await the actor's `JoinHandle`
+    /// to observe the drain-then-exit complete.
+    #[inline]
+    pub fn shutdown(&self) {
+        tracing::info!(underlying = %self.underlying, "actor shutdown requested");
+        self.shutdown.cancel();
+    }
+
+    /// Whether shutdown has been signalled on this actor (an observability read).
+    #[must_use]
+    #[inline]
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown.is_cancelled()
+    }
 }
 
 impl ActorHandle {
@@ -961,31 +1008,6 @@ impl ActorHandle {
     #[inline]
     pub fn underlying(&self) -> &str {
         &self.underlying
-    }
-
-    /// Triggers an **explicit mid-flight shutdown** of the actor (#139): the run
-    /// loop stops accepting new work, closes the mailbox, and replies to every
-    /// already-queued-but-unprocessed command with [`VenueError::ShuttingDown`]
-    /// instead of silently draining it. The command currently mid-turn completes
-    /// normally — a sequenced turn is never aborted half-journaled.
-    ///
-    /// Idempotent and cheap: cancelling an already-cancelled token is a no-op.
-    /// A `ShuttingDown` command was never journaled or matched, so this changes
-    /// no book state and is replay-neutral. Await the spawned task's
-    /// [`JoinHandle`] to observe the drain-then-exit complete.
-    #[inline]
-    pub fn shutdown(&self) {
-        self.shutdown.cancel();
-    }
-
-    /// The actor's shutdown [`CancellationToken`], for a caller that wants to
-    /// compose it (e.g. clone it into a broader shutdown tree or await
-    /// [`CancellationToken::cancelled`]). Triggering it is equivalent to
-    /// [`shutdown`](Self::shutdown).
-    #[must_use]
-    #[inline]
-    pub fn shutdown_token(&self) -> &CancellationToken {
-        &self.shutdown
     }
 
     /// Submits a command to the actor's bounded mailbox and awaits its receipt.
@@ -997,7 +1019,7 @@ impl ActorHandle {
     /// has stopped (mailbox closed, or it dropped the reply), the venue is
     /// unavailable and the submit returns [`VenueError::JournalUnavailable`].
     ///
-    /// **Explicit shutdown** ([`shutdown`](Self::shutdown), #139). A command that
+    /// **Explicit shutdown** ([`ActorShutdown::shutdown`], #139). A command that
     /// was enqueued but not yet processed when a mid-flight shutdown fires is
     /// error-drained with [`VenueError::ShuttingDown`] — it was never journaled or
     /// matched. A submit that arrives *after* the mailbox has closed sees the
@@ -1014,14 +1036,29 @@ impl ActorHandle {
         match self.tx.try_send(ActorMessage::Command { command, reply }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => return Err(VenueError::RateLimited),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(VenueError::JournalUnavailable);
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(self.stopped_error()),
         }
         match reply_rx.await {
             Ok(result) => result,
-            // The actor dropped the reply (stopped mid-turn): treat as unavailable.
-            Err(_) => Err(VenueError::JournalUnavailable),
+            // The actor dropped the reply (stopped mid-turn): classify by whether
+            // an explicit shutdown was signalled (#139 review).
+            Err(_) => Err(self.stopped_error()),
+        }
+    }
+
+    /// The typed error for a submit/snapshot that finds the actor STOPPED — a
+    /// closed mailbox or a dropped reply (#139 review). It is
+    /// [`VenueError::ShuttingDown`] when an **explicit** shutdown was signalled on
+    /// this handle's token (a graceful, retry-later lifecycle event), and
+    /// [`VenueError::JournalUnavailable`] when the actor disappeared WITHOUT that
+    /// signal (last-handle-drop or a task failure) — so the outcome no longer
+    /// depends only on scheduling (whether the drain has closed the channel yet).
+    #[inline]
+    fn stopped_error(&self) -> VenueError {
+        if self.shutdown.is_cancelled() {
+            VenueError::ShuttingDown
+        } else {
+            VenueError::JournalUnavailable
         }
     }
 
@@ -1041,15 +1078,13 @@ impl ActorHandle {
         match self.tx.try_send(ActorMessage::Snapshot { reply }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => return Err(VenueError::RateLimited),
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(VenueError::JournalUnavailable);
-            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(self.stopped_error()),
         }
         // Flatten: the outer `Err` is a dropped reply (actor gone); the inner
         // `Err` is a propagated journal read failure.
         match reply_rx.await {
             Ok(result) => result,
-            Err(_) => Err(VenueError::JournalUnavailable),
+            Err(_) => Err(self.stopped_error()),
         }
     }
 }
@@ -1093,7 +1128,17 @@ where
                     let mut drained: usize = 0;
                     while let Some(message) = rx.recv().await {
                         Self::reject_shutting_down(message);
-                        drained = drained.saturating_add(1);
+                        // Checked (rule 9); the mailbox is bounded so this can never
+                        // overflow, but the count is checked not saturating — an
+                        // (impossible) overflow is logged loudly rather than silently
+                        // pinned.
+                        match drained.checked_add(1) {
+                            Some(next) => drained = next,
+                            None => tracing::error!(
+                                underlying = %self.underlying,
+                                "shutdown drain counter overflowed usize"
+                            ),
+                        }
                     }
                     tracing::info!(
                         underlying = %self.underlying,
@@ -1108,7 +1153,21 @@ where
                     match maybe {
                         // Last-handle drop: the mailbox is empty and closed.
                         None => break,
-                        Some(message) => self.process(message),
+                        // Re-check cancellation AFTER receive (#139 review 🔴): a biased
+                        // `select!` does NOT make cancel+recv atomic — cancellation can
+                        // become ready after its branch was polled but before this recv
+                        // branch won. A message that was queued when shutdown fired must
+                        // NOT be processed or journaled, so reject it here with the typed
+                        // `ShuttingDown` rather than running its turn. This makes shutdown
+                        // linearizable at the actor boundary: every message either fully
+                        // processes (its turn ran before cancellation) or is rejected.
+                        Some(message) => {
+                            if shutdown.is_cancelled() {
+                                Self::reject_shutting_down(message);
+                            } else {
+                                self.process(message);
+                            }
+                        }
                     }
                 }
             }
@@ -1169,11 +1228,18 @@ where
 }
 
 /// Spawns one underlying's actor as a `tokio` task and returns its bounded
-/// [`ActorHandle`] plus the task's [`JoinHandle`] (for graceful shutdown).
+/// data-plane [`ActorHandle`], its **owner-only** [`ActorShutdown`] lifecycle
+/// handle, and the task's [`JoinHandle`].
+///
+/// The two returned handles have deliberately different authority (#139 review):
+/// the `ActorHandle` is meant to be **cloned** widely (into ingress, the market
+/// maker, simulation) and carries only submit + snapshot, while the
+/// **non-`Clone`** `ActorShutdown` is the sole holder of shutdown authority and is
+/// meant to stay with the owner ([`crate::state::AppState`] / bootstrap / a test).
 ///
 /// The mailbox capacity is [`ActorConfig::mailbox_capacity`], clamped to at least
-/// `1`. Two shutdown paths end the task: dropping every returned handle closes the
-/// mailbox (graceful, no error), or calling [`ActorHandle::shutdown`] (#139)
+/// `1`. Two shutdown paths end the task: dropping every [`ActorHandle`] closes the
+/// mailbox (graceful, no error), or calling [`ActorShutdown::shutdown`] (#139)
 /// error-drains any queued-but-unprocessed work with [`VenueError::ShuttingDown`].
 #[must_use]
 pub fn spawn_underlying_actor<J, E, F, C>(
@@ -1182,7 +1248,7 @@ pub fn spawn_underlying_actor<J, E, F, C>(
     executor: E,
     fan_out: F,
     clock: C,
-) -> (ActorHandle, JoinHandle<()>)
+) -> (ActorHandle, ActorShutdown, JoinHandle<()>)
 where
     J: VenueJournal + Send + 'static,
     E: CommandExecutor + Send + 'static,
@@ -1208,7 +1274,7 @@ pub fn spawn_underlying_actor_with_clordid_index<J, E, F, C>(
     fan_out: F,
     clock: C,
     clordid_index: Option<Arc<ClOrdIdIndex>>,
-) -> (ActorHandle, JoinHandle<()>)
+) -> (ActorHandle, ActorShutdown, JoinHandle<()>)
 where
     J: VenueJournal + Send + 'static,
     E: CommandExecutor + Send + 'static,
@@ -1218,9 +1284,11 @@ where
     let capacity = config.mailbox_capacity.max(1);
     let underlying = Arc::clone(&config.underlying);
     let (tx, rx) = mpsc::channel(capacity);
-    // The explicit mid-flight shutdown signal (#139), shared between the returned
-    // handle (any clone can trigger it) and the actor's run loop (which selects on
-    // it). Dropping every handle remains an independent, graceful shutdown path.
+    // The explicit mid-flight shutdown signal (#139). ONE token, three views: the
+    // actor's run loop selects on it; the owner-only `ActorShutdown` can CANCEL it;
+    // the data-plane `ActorHandle` holds a read-only copy (no cancel method) purely
+    // to classify a stopped-actor error. Dropping every `ActorHandle` remains an
+    // independent, graceful shutdown path.
     let shutdown = CancellationToken::new();
     let actor = UnderlyingActor::new(config, journal, executor, fan_out, clock)
         .with_clordid_index(clordid_index);
@@ -1228,6 +1296,10 @@ where
     (
         ActorHandle {
             tx,
+            underlying: Arc::clone(&underlying),
+            shutdown: shutdown.clone(),
+        },
+        ActorShutdown {
             underlying,
             shutdown,
         },
@@ -2040,7 +2112,7 @@ mod tests {
         // The NEW capability (#139): the actor stops on an explicit signal even
         // though a handle clone is still alive — before #139 only last-handle-drop
         // could stop it. A submit after the mailbox closes fails fast, typed.
-        let (handle, join) = spawn_underlying_actor(
+        let (handle, _shutdown, join) = spawn_underlying_actor(
             config(16),
             journal(),
             PlaceholderExecutor,
@@ -2053,17 +2125,21 @@ mod tests {
         }
 
         // Trigger the signal; the task drains and exits WITHOUT the handle dropping.
-        handle.shutdown();
+        _shutdown.shutdown();
         match join.await {
             Ok(()) => {}
             Err(e) => panic!("the explicit signal must stop the actor, got {e}"),
         }
 
-        // The handle is still alive, but the mailbox is now closed — a further
-        // submit fails fast with a typed error (never a panic, never a hang).
+        // The handle is still alive, but the actor stopped because it was
+        // SIGNALLED — so a further submit fails fast with `ShuttingDown` (not the
+        // generic `JournalUnavailable`), the same typed vocabulary the drain uses
+        // (#139 review). Never a panic, never a hang.
         match handle.submit(cancel("after")).await {
-            Err(VenueError::JournalUnavailable) => {}
-            other => panic!("a submit after shutdown must fail fast typed, got {other:?}"),
+            Err(VenueError::ShuttingDown) => {}
+            other => {
+                panic!("a submit after an explicit shutdown must be ShuttingDown, got {other:?}")
+            }
         }
     }
 
@@ -2072,7 +2148,7 @@ mod tests {
         // The pre-existing graceful path is preserved: with NO cancellation,
         // dropping the last handle drains the buffered work to committed receipts
         // (never a ShuttingDown) and the task exits cleanly with no panic.
-        let (handle, join) = spawn_underlying_actor(
+        let (handle, _shutdown, join) = spawn_underlying_actor(
             config(16),
             journal(),
             PlaceholderExecutor,
@@ -2096,7 +2172,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_concurrent_submits_serialise_into_a_gapless_total_order() {
-        let (handle, join) = spawn_underlying_actor(
+        let (handle, _shutdown, join) = spawn_underlying_actor(
             config(256),
             journal(),
             PlaceholderExecutor,
@@ -2249,7 +2325,7 @@ mod tests {
         // present. Before #61 the actor swallowed the read error into an empty
         // `records` vec (an internally-inconsistent snapshot that silently
         // corrupts recovery); it must now propagate the error instead.
-        let (handle, join) = spawn_underlying_actor(
+        let (handle, _shutdown, join) = spawn_underlying_actor(
             config(16),
             ReadFailJournal::new(),
             PlaceholderExecutor,
@@ -2271,7 +2347,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_returns_consistent_records_on_healthy_journal() {
-        let (handle, join) = spawn_underlying_actor(
+        let (handle, _shutdown, join) = spawn_underlying_actor(
             config(16),
             journal(),
             PlaceholderExecutor,

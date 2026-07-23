@@ -204,7 +204,8 @@ fn main() {
         let clock = FixedClock::new(EventTimestamp::new(1_700_000_000_000));
         let journal = InMemoryVenueJournal::new(JournalHeader::new(lineage.clone()));
         let executor = MatchingExecutor::new(UNDERLYING);
-        let (handle, _join) = spawn_underlying_actor(config, journal, executor, fan_out, clock);
+        let (handle, _shutdown, _join) =
+            spawn_underlying_actor(config, journal, executor, fan_out, clock);
 
         for command in workload.drain(..warmup_ops) {
             let _ = handle.submit(command).await;

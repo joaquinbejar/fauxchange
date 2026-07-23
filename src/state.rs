@@ -78,13 +78,13 @@ use crate::auth::{
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, CancelledLeg, ClOrdIdIndex, ClOrdIdRecord, EventTimestamp,
-    ExecutionsStore, ExpirationDate, FanOut, FanOutSealed, FanoutSummary, InMemoryExecutionsStore,
-    InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus, JournalError, JournalHeader,
-    JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink, MassCancelScope,
-    MatchingExecutor, PositionsStore, Receipt, Recovered, SequenceNumber, StoreFanOut, Symbol,
-    TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_order_admission,
-    recover_into, spawn_matching_actor_with_registry_and_index,
+    ActorConfig, ActorHandle, ActorShutdown, CancelledLeg, ClOrdIdIndex, ClOrdIdRecord,
+    EventTimestamp, ExecutionsStore, ExpirationDate, FanOut, FanOutSealed, FanoutSummary,
+    InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
+    JournalError, JournalHeader, JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink,
+    MassCancelScope, MatchingExecutor, PositionsStore, Receipt, Recovered, SequenceNumber,
+    StoreFanOut, Symbol, TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
+    check_order_admission, recover_into, spawn_matching_actor_with_registry_and_index,
     spawn_underlying_actor_with_clordid_index,
 };
 use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
@@ -513,11 +513,18 @@ impl AppStateConfig {
 /// ([010](../milestones/v0.1-backend-core/010-appstate-wiring.md),
 /// [02 §8](../docs/02-matching-architecture.md)).
 ///
-/// Cloned as `Arc<AppState>`; the struct itself is not `Clone`. The **shutdown
-/// path** is dropping the last `Arc<AppState>`: that drops every per-underlying
-/// [`ActorHandle`], closing each bounded mailbox, which drains any queued
-/// commands and ends the actor's receive loop (the actor's documented shutdown
-/// path, [`crate::exchange::actor`]). The spawned tasks are detached at
+/// Cloned as `Arc<AppState>`; the struct itself is not `Clone`. There are two
+/// shutdown paths. The **implicit** one is dropping the last `Arc<AppState>`:
+/// that drops every per-underlying [`ActorHandle`], closing each bounded
+/// mailbox, which drains any queued commands and ends the actor's receive loop
+/// (the actor's documented last-handle-drop path, [`crate::exchange::actor`]).
+/// The **explicit** one is [`AppState::shutdown`] (#139): the owner holds each
+/// actor's owner-only [`ActorShutdown`] here and, on a graceful stop, cancels
+/// every one — each actor error-drains its queued-but-unprocessed backlog with
+/// [`crate::error::VenueError::ShuttingDown`] instead of silently absorbing it.
+/// The kill authority lives ONLY on this owned handle; the broadly-cloned
+/// [`ActorHandle`] (shared into ingress / market-maker / simulation) can submit
+/// and snapshot but cannot terminate an actor. The spawned tasks are detached at
 /// construction, so their lifetime is exactly the `AppState`'s.
 ///
 /// # Examples
@@ -544,6 +551,12 @@ pub struct AppState {
     /// ticker. Immutable after construction; every routed submit / snapshot is a
     /// point lookup, never an iteration on the sequenced path.
     underlyings: HashMap<Arc<str>, ActorHandle>,
+    /// The per-underlying **owner-only** shutdown handles (#139), one per spawned
+    /// actor. Held ONLY here — never cloned into a gateway or a sink — so the
+    /// authority to terminate an actor stays with the owner ([`AppState::shutdown`]),
+    /// while the data-plane [`ActorHandle`] in `underlyings` carries none. Order is
+    /// irrelevant (shutdown fans out to all), so a `Vec` suffices.
+    actor_shutdowns: Vec<ActorShutdown>,
     /// The single shared authoritative executions log — the **same** `Arc` every
     /// actor's [`StoreFanOut`] records into, so a read here observes the fan-out.
     executions: Arc<InMemoryExecutionsStore>,
@@ -1233,6 +1246,10 @@ impl AppState {
         // (continuing the journaled `underlying_sequence` over the reconstructed
         // book) or FRESH (at `SequenceNumber::START`).
         let mut handles: HashMap<Arc<str>, ActorHandle> = HashMap::with_capacity(ordered.len());
+        // The owner-only shutdown handles (#139), collected alongside the data-plane
+        // handles and retained on `AppState` so the venue can gracefully stop every
+        // actor — a capability the shared `ActorHandle` deliberately does not expose.
+        let mut actor_shutdowns: Vec<ActorShutdown> = Vec::with_capacity(ordered.len());
         let mut recovered_set: std::collections::HashSet<Arc<str>> =
             std::collections::HashSet::new();
         for ticker in ordered {
@@ -1250,7 +1267,7 @@ impl AppState {
             );
             let header = JournalHeader::new(lineage_id.clone());
 
-            let (handle, join) = match recovered_map.remove(&ticker) {
+            let (handle, actor_shutdown, join) = match recovered_map.remove(&ticker) {
                 Some(RecoveredUnderlying { recovered, .. }) => {
                     let Recovered {
                         events,
@@ -1375,6 +1392,7 @@ impl AppState {
             // drops with `AppState`; the mailbox drains its backlog first.
             drop(join);
             handles.insert(ticker, handle);
+            actor_shutdowns.push(actor_shutdown);
         }
 
         // The per-underlying ingress reorder buffers (#111): one bounded,
@@ -1457,6 +1475,7 @@ impl AppState {
             registry,
             symbol_index,
             underlyings: handles,
+            actor_shutdowns,
             executions,
             positions,
             marks,
@@ -2386,6 +2405,30 @@ impl AppState {
     #[inline]
     pub fn underlying_count(&self) -> usize {
         self.underlyings.len()
+    }
+
+    /// Signals every hosted actor to **gracefully shut down** (#139): each stops
+    /// taking new work and error-drains its queued-but-unprocessed backlog with
+    /// [`crate::error::VenueError::ShuttingDown`] rather than silently dropping it;
+    /// any in-flight sequenced turn completes first, so no turn is left
+    /// half-journaled. Idempotent — a second call, or a call after the actors have
+    /// already begun stopping, is a no-op. This does NOT wait for the tasks to
+    /// exit (they were detached at construction); it is the explicit counterpart to
+    /// the implicit last-`Arc<AppState>`-drop path. Replay-neutral: a `ShuttingDown`
+    /// command was never journaled or matched, so book state is unchanged.
+    ///
+    /// The authority lives here because `AppState` owns the [`ActorShutdown`]
+    /// handles; the [`ActorHandle`] clones shared into the gateways / market maker /
+    /// simulator cannot terminate an actor.
+    #[inline]
+    pub fn shutdown(&self) {
+        tracing::info!(
+            underlyings = self.actor_shutdowns.len(),
+            "AppState graceful shutdown requested; signalling every actor"
+        );
+        for actor_shutdown in &self.actor_shutdowns {
+            actor_shutdown.shutdown();
+        }
     }
 
     /// Whether this venue hosts `underlying`.

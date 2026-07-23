@@ -80,7 +80,7 @@
 //!    public surface. The venue has two actor shutdown paths: last-sender-drop
 //!    (the graceful, no-error path — its `run()` loop ends when every
 //!    `ActorHandle` clone drops and the bounded mailbox closes) and, since #139,
-//!    an EXPLICIT signal ([`ActorHandle::shutdown`] over a `CancellationToken`)
+//!    an EXPLICIT signal ([`ActorShutdown::shutdown`] over a `CancellationToken`)
 //!    that error-drains queued-but-unprocessed work with a typed
 //!    `VenueError::ShuttingDown` (`src/exchange/actor.rs`). This check drives the
 //!    real drop-based path; [`run_shutdown_signal_drain_check`] drives the
@@ -690,7 +690,7 @@ async fn run_shutdown_drain_check() -> DrainReport {
     let surviving_journal = journal.clone();
 
     let config = ActorConfig::new(DRAIN_UNDERLYING, lineage, MAILBOX_CAPACITY);
-    let (handle, actor_task): (_, JoinHandle<()>) =
+    let (handle, _actor_shutdown, actor_task): (_, _, JoinHandle<()>) =
         spawn_matching_actor(config, journal, NoopFanOut, CLOCK);
     let symbol = sym(CALL);
 
@@ -836,7 +836,7 @@ struct SignalDrainReport {
 
 /// The #139 EXPLICIT-signal counterpart to [`run_shutdown_drain_check`]. Where the
 /// drop-based check stops the actor by dropping every handle, this one triggers the
-/// explicit [`fauxchange::exchange::ActorHandle::shutdown`] signal at the burst
+/// explicit [`fauxchange::exchange::ActorShutdown::shutdown`] signal at the burst
 /// rendezvous and **keeps this function's handle clone alive** across the whole
 /// collection — so the ONLY thing that can stop the actor is the signal (a
 /// still-live sender means last-drop shutdown cannot have fired). It asserts every
@@ -856,7 +856,7 @@ async fn run_shutdown_signal_drain_check() -> SignalDrainReport {
     let surviving_journal = journal.clone();
 
     let config = ActorConfig::new(DRAIN_UNDERLYING, lineage, MAILBOX_CAPACITY);
-    let (handle, actor_task): (_, JoinHandle<()>) =
+    let (handle, actor_shutdown, actor_task): (_, _, JoinHandle<()>) =
         spawn_matching_actor(config, journal, NoopFanOut, CLOCK);
     let symbol = sym(CALL);
 
@@ -899,7 +899,7 @@ async fn run_shutdown_signal_drain_check() -> SignalDrainReport {
     // `handle` is deliberately NOT dropped — it stays alive across the collection
     // below, so the actor can only stop because of the signal, never last-drop.
     barrier.wait().await;
-    handle.shutdown();
+    actor_shutdown.shutdown();
 
     let mut accepted_sequences = Vec::new();
     let mut shutting_down = 0usize;

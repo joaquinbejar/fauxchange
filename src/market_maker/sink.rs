@@ -275,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn test_out_of_band_requote_is_dropped_and_in_band_side_still_posts() {
         let lineage = LineageId::new("run-mm-band");
-        let (handle, _join) = spawn_underlying_actor(
+        let (handle, _shutdown, _join) = spawn_underlying_actor(
             ActorConfig::new("BTC", lineage.clone(), 64),
             InMemoryVenueJournal::new(JournalHeader::new(lineage)),
             MatchingExecutor::new("BTC"),
@@ -315,7 +315,7 @@ mod tests {
     async fn test_band_drop_is_identical_across_two_runs() {
         async fn run() -> Vec<u64> {
             let lineage = LineageId::new("run-mm-det");
-            let (handle, _join) = spawn_underlying_actor(
+            let (handle, _shutdown, _join) = spawn_underlying_actor(
                 ActorConfig::new("BTC", lineage.clone(), 64),
                 InMemoryVenueJournal::new(JournalHeader::new(lineage)),
                 MatchingExecutor::new("BTC"),

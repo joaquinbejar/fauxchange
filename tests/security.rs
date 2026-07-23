@@ -354,7 +354,7 @@ fn test_no_credential_appears_in_logs_error_bodies_or_serialised_state() {
         };
         let seal_journal =
             InMemoryVenueJournal::new(JournalHeader::new(LineageId::new("capture-seal")));
-        let (seal_handle, seal_join) = spawn_underlying_actor(
+        let (seal_handle, _seal_shutdown, seal_join) = spawn_underlying_actor(
             seal_config,
             seal_journal,
             PlaceholderExecutor,
@@ -785,7 +785,7 @@ async fn test_dos_bounded_actor_mailbox_backpressure_is_typed_rate_limited() {
         start_sequence: SequenceNumber::START,
     };
     let journal = InMemoryVenueJournal::new(JournalHeader::new(LineageId::new("run-mailbox")));
-    let (handle, join) = spawn_underlying_actor(
+    let (handle, _shutdown, join) = spawn_underlying_actor(
         config,
         journal,
         GatedExecutor {

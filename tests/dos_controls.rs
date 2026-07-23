@@ -427,7 +427,7 @@ async fn test_dos_bounded_actor_mailbox_flood_never_queues_past_capacity() {
     };
     let journal =
         InMemoryVenueJournal::new(JournalHeader::new(LineageId::new("dos-mailbox-flood")));
-    let (handle, join) = spawn_underlying_actor(
+    let (handle, _shutdown, join) = spawn_underlying_actor(
         config,
         journal,
         GatedExecutor {

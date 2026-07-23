@@ -132,7 +132,8 @@ fn spawn_bench_actor(lineage: &LineageId, slot: TurnTimings) -> fauxchange::exch
     );
     let config = ActorConfig::new(UNDERLYING, lineage.clone(), 4_096);
     let clock = FixedClock::new(EventTimestamp::new(1_700_000_000_000));
-    let (handle, join) = spawn_underlying_actor(config, journal, executor, fan_out, clock);
+    let (handle, _shutdown, join) =
+        spawn_underlying_actor(config, journal, executor, fan_out, clock);
     drop(join);
     handle
 }
