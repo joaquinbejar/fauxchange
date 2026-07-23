@@ -68,9 +68,9 @@ pub mod stores;
 pub mod symbol;
 
 pub use self::actor::{
-    ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, FanOutSealed,
-    FanoutSummary, FixedClock, JournalSnapshot, NoopFanOut, PlaceholderExecutor, Receipt,
-    TeeFanOut, UnderlyingActor, VenueClock, spawn_underlying_actor,
+    ActorConfig, ActorHandle, ActorShutdown, CommandExecutor, ExecutionContext, FanOut,
+    FanOutSealed, FanoutSummary, FixedClock, JournalSnapshot, NoopFanOut, PlaceholderExecutor,
+    Receipt, TeeFanOut, UnderlyingActor, VenueClock, spawn_underlying_actor,
     spawn_underlying_actor_with_clordid_index,
 };
 pub use self::boundary::{

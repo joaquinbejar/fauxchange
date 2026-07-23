@@ -92,7 +92,7 @@ async fn test_orders_through_matching_populate_stores() {
         Arc::clone(&positions),
         Arc::clone(&marks),
     );
-    let (handle, join) = spawn_matching_actor(config, journal(&lineage), fan, CLOCK);
+    let (handle, _shutdown, join) = spawn_matching_actor(config, journal(&lineage), fan, CLOCK);
 
     // Seed a resting maker (sequence 0), then cross it with a taker (sequence 1).
     for command in [

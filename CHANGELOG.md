@@ -100,6 +100,27 @@ The full versioning and release-process policy lives in the design docs
 
 ### Added
 
+- **Explicit mid-flight actor shutdown** (#139). Each per-underlying
+  single-writer actor now accepts an explicit graceful-stop signal, closing the
+  gap where the venue could previously only stop an actor by dropping its last
+  handle. The `spawn_*` functions return a new **owner-only** `ActorShutdown`
+  handle **separately** from the broadly-shared `ActorHandle`; only the owner's
+  handle can terminate an actor, while the `ActorHandle` clones shared into the
+  gateways / market maker / simulation carry submit + snapshot but **no kill
+  authority**. `AppState` retains one `ActorShutdown` per actor and exposes
+  `AppState::shutdown()`, which fans out to every actor. On the signal each actor
+  stops taking new work and **error-drains** its queued-but-unprocessed backlog
+  with the new typed boundary error `VenueError::ShuttingDown` rather than
+  silently dropping it; any in-flight sequenced turn completes first, so no turn
+  is left half-journaled. Replay-neutral — a `ShuttingDown` command is never
+  journaled or matched, so book state is unchanged. `ShuttingDown` maps to
+  **HTTP `503`** (machine code `unavailable`) on REST, a **WS `Unavailable`**
+  error frame, and a **FIX `Throttle`** business reject, so a client sees a
+  retryable, definitively-not-applied outcome on every gateway instead of a lost
+  request. A submit or snapshot against an actor that stopped **because it was
+  signalled** now reports `ShuttingDown` (not the generic `JournalUnavailable`),
+  keeping the shutdown vocabulary consistent across the drain and the
+  post-shutdown door.
 - **Microstructure completion — the remaining #44 follow-ups** (#114):
   - **Live-path config validation.** `AppState::new` now calls
     `MicrostructureConfig::validate()` **before spawning any actor** and returns

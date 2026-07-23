@@ -127,7 +127,8 @@ fn spawn_mailbox_sink(capacity: usize) -> (Arc<ActorCommandSink>, ActorHandle) {
     let clock = FixedClock::new(EventTimestamp::new(1_700_000_000_000));
     let journal = InMemoryVenueJournal::new(JournalHeader::new(lineage.clone()));
     let executor = MatchingExecutor::new(MM_UNDERLYING);
-    let (handle, join) = spawn_underlying_actor(config, journal, executor, fan_out, clock);
+    let (handle, _shutdown, join) =
+        spawn_underlying_actor(config, journal, executor, fan_out, clock);
     drop(join);
     let mut handles = HashMap::new();
     handles.insert(Arc::from(MM_UNDERLYING), handle.clone());

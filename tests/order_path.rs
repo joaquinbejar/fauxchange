@@ -92,7 +92,8 @@ fn market(
 async fn test_seed_orders_matching_captured_fills_round_trip() {
     let lineage = LineageId::new("run-1");
     let config = ActorConfig::new(UNDERLYING, lineage.clone(), 32);
-    let (handle, join) = spawn_matching_actor(config, journal(&lineage), NoopFanOut, CLOCK);
+    let (handle, _shutdown, join) =
+        spawn_matching_actor(config, journal(&lineage), NoopFanOut, CLOCK);
 
     // Seed a resting maker (sequence 0), then cross it with a taker (sequence 1).
     match handle
@@ -271,7 +272,8 @@ fn test_same_journal_reconstructs_identical_fills_and_top_of_book() {
 async fn test_journal_replay_reproduces_captured_outcomes() {
     let lineage = LineageId::new("run-1");
     let config = ActorConfig::new(UNDERLYING, lineage.clone(), 32);
-    let (handle, join) = spawn_matching_actor(config, journal(&lineage), NoopFanOut, CLOCK);
+    let (handle, _shutdown, join) =
+        spawn_matching_actor(config, journal(&lineage), NoopFanOut, CLOCK);
 
     let commands = vec![
         add(

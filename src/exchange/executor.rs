@@ -75,7 +75,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::REDACTED_INTERNAL_MESSAGE;
 use crate::exchange::actor::{
-    ActorConfig, ActorHandle, CommandExecutor, ExecutionContext, FanOut, VenueClock,
+    ActorConfig, ActorHandle, ActorShutdown, CommandExecutor, ExecutionContext, FanOut, VenueClock,
     spawn_underlying_actor, spawn_underlying_actor_with_clordid_index,
 };
 use crate::exchange::boundary::{
@@ -2039,7 +2039,7 @@ pub fn spawn_matching_actor<J, F, C>(
     journal: J,
     fan_out: F,
     clock: C,
-) -> (ActorHandle, JoinHandle<()>)
+) -> (ActorHandle, ActorShutdown, JoinHandle<()>)
 where
     J: VenueJournal + Send + 'static,
     F: FanOut + Send + 'static,
@@ -2086,7 +2086,7 @@ pub fn spawn_matching_actor_with_registry_and_index<J, F, C>(
     microstructure: &MicrostructureConfig,
     mm_control: Option<Arc<dyn MarketMakerControlSink>>,
     clordid_index: Option<Arc<ClOrdIdIndex>>,
-) -> Result<(ActorHandle, JoinHandle<()>), MicrostructureConfigError>
+) -> Result<(ActorHandle, ActorShutdown, JoinHandle<()>), MicrostructureConfigError>
 where
     J: VenueJournal + Send + 'static,
     F: FanOut + Send + 'static,

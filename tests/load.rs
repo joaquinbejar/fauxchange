@@ -77,11 +77,14 @@
 //!    via `spawn_matching_actor_with_registry_and_index` and immediately
 //!    `drop(join)`s the returned `JoinHandle` (`src/state.rs`), so the task is
 //!    detached and its completion can never be awaited through `AppState`'s
-//!    public surface. Nor does the venue expose any EXPLICIT shutdown signal
-//!    (no `shutdown()` / `CancellationToken` / close channel): the actor's ONLY
-//!    shutdown is last-sender-drop — its `run()` loop ends when every
-//!    `ActorHandle` clone drops and the bounded mailbox closes
-//!    (`src/exchange/actor.rs`). This check drives that real drop-based path. It
+//!    public surface. The venue has two actor shutdown paths: last-sender-drop
+//!    (the graceful, no-error path — its `run()` loop ends when every
+//!    `ActorHandle` clone drops and the bounded mailbox closes) and, since #139,
+//!    an EXPLICIT signal ([`ActorShutdown::shutdown`] over a `CancellationToken`)
+//!    that error-drains queued-but-unprocessed work with a typed
+//!    `VenueError::ShuttingDown` (`src/exchange/actor.rs`). This check drives the
+//!    real drop-based path; [`run_shutdown_signal_drain_check`] drives the
+//!    explicit-signal path. It
 //!    builds its OWN actor on the SAME public [`spawn_matching_actor`] primitive
 //!    `AppState` uses internally — the one place a genuine, awaitable completion
 //!    signal exists — over a test-local `SharedJournal` (an
@@ -107,10 +110,11 @@
 //!    `SharedJournal` clone (held independently of the actor/handle lifetime
 //!    from construction) and confirm every accepted receipt's
 //!    `underlying_sequence` has a committed `VenueEvent` — nothing silently
-//!    lost. Follow-up: an explicit mid-flight shutdown signal (a
-//!    `CancellationToken` on the actor) would let this additionally assert a
-//!    typed shutdown error for genuinely-queued-but-unprocessed work; no such
-//!    signal exists to test today.
+//!    lost. The explicit mid-flight shutdown signal landed in #139:
+//!    [`run_shutdown_signal_drain_check`] additionally asserts that queued-but-
+//!    unprocessed work behind a blocked turn is error-drained with the typed
+//!    `VenueError::ShuttingDown` (never silently lost), while the in-flight turn
+//!    still completes normally.
 //! 4. **Restart-from-journal determinism.** [`capture_mid_run_bundle`] exports
 //!    the live venue's journal MID-RUN (`AppState::export_bundle`) and submits
 //!    one more order afterward to prove the venue was still live (not
@@ -686,7 +690,7 @@ async fn run_shutdown_drain_check() -> DrainReport {
     let surviving_journal = journal.clone();
 
     let config = ActorConfig::new(DRAIN_UNDERLYING, lineage, MAILBOX_CAPACITY);
-    let (handle, actor_task): (_, JoinHandle<()>) =
+    let (handle, _actor_shutdown, actor_task): (_, _, JoinHandle<()>) =
         spawn_matching_actor(config, journal, NoopFanOut, CLOCK);
     let symbol = sym(CALL);
 
@@ -734,25 +738,22 @@ async fn run_shutdown_drain_check() -> DrainReport {
         }));
     }
 
-    // "Stop the venue" the ONLY way it can be stopped: the actor has no
-    // explicit shutdown signal (no `shutdown()` / `CancellationToken` / close
-    // channel) — its `run()` loop ends solely when every `ActorHandle` clone
-    // drops and the bounded mailbox closes (`src/exchange/actor.rs`). Rendezvous
-    // with the burst, then IMMEDIATELY drop this coordinator's own top-level
-    // handle while the flood is in flight and the mailbox still holds queued,
-    // not-yet-drained work — the shutdown trigger firing before the drain
-    // completes, rather than the earlier no-op ordering where it fired only
-    // after the burst had resolved. Because `ActorHandle::submit` COUPLES
-    // enqueue and reply-await (each spawned submitter holds its own clone across
-    // its `submit().await`), the mailbox's sender count — and thus the actor's
-    // `run()` loop — only reaches zero once the last in-flight submission has
-    // been drained to its receipt; that is the real drop-based drain-then-stop
-    // this asserts, and the honest reason a graceful "closed" error is NOT among
-    // the expected outcomes below (it is reachable only on abnormal actor
-    // termination). Follow-up: an explicit mid-flight shutdown signal (a
-    // `CancellationToken` on the actor) would let this additionally assert a
-    // typed shutdown error for genuinely-queued-but-unprocessed work; no such
-    // signal exists to test today.
+    // Stop the venue via the GRACEFUL drop-based path (the explicit-signal path
+    // is covered by `run_shutdown_signal_drain_check`): the actor's `run()` loop
+    // also ends when every `ActorHandle` clone drops and the bounded mailbox
+    // closes (`src/exchange/actor.rs`). Rendezvous with the burst, then
+    // IMMEDIATELY drop this coordinator's own top-level handle while the flood is
+    // in flight and the mailbox still holds queued, not-yet-drained work — the
+    // shutdown trigger firing before the drain completes, rather than the earlier
+    // no-op ordering where it fired only after the burst had resolved. Because
+    // `ActorHandle::submit` COUPLES enqueue and reply-await (each spawned
+    // submitter holds its own clone across its `submit().await`), the mailbox's
+    // sender count — and thus the actor's `run()` loop — only reaches zero once
+    // the last in-flight submission has been drained to its receipt; that is the
+    // real drop-based drain-then-stop this asserts, and the honest reason a
+    // graceful "closed" error is NOT among the expected outcomes below (under the
+    // drop path it is reachable only on abnormal actor termination — the explicit
+    // `ShuttingDown` drain is asserted separately).
     barrier.wait().await;
     drop(handle);
 
@@ -821,6 +822,163 @@ async fn run_shutdown_drain_check() -> DrainReport {
         burst: BURST,
         accepted: accepted_sequences.len(),
         rate_limited,
+    }
+}
+
+/// What [`run_shutdown_signal_drain_check`] observed.
+struct SignalDrainReport {
+    burst: usize,
+    accepted: usize,
+    shutting_down: usize,
+    rate_limited: usize,
+    unavailable: usize,
+}
+
+/// The #139 EXPLICIT-signal counterpart to [`run_shutdown_drain_check`]. Where the
+/// drop-based check stops the actor by dropping every handle, this one triggers the
+/// explicit [`fauxchange::exchange::ActorShutdown::shutdown`] signal at the burst
+/// rendezvous and **keeps this function's handle clone alive** across the whole
+/// collection — so the ONLY thing that can stop the actor is the signal (a
+/// still-live sender means last-drop shutdown cannot have fired). It asserts every
+/// burst submission resolves to a definitive, non-lost typed outcome — now
+/// including the newly-reachable `VenueError::ShuttingDown` for work that was
+/// queued-but-unprocessed when the signal fired — that no already-accepted order is
+/// orphaned (every `Ok(Receipt)` has a committed `VenueEvent` in the surviving
+/// journal), and that the actor's own task exits on the signal alone.
+async fn run_shutdown_signal_drain_check() -> SignalDrainReport {
+    const MAILBOX_CAPACITY: usize = 4;
+    const BURST: usize = 60;
+    const DRAIN_UNDERLYING: &str = "BTC";
+    const CLOCK: FixedClock = FixedClock::new(EventTimestamp::new(1_700_000_000_000));
+
+    let lineage = LineageId::new("soak-signal-drain-check");
+    let journal = SharedJournal::new(JournalHeader::new(lineage.clone()));
+    let surviving_journal = journal.clone();
+
+    let config = ActorConfig::new(DRAIN_UNDERLYING, lineage, MAILBOX_CAPACITY);
+    let (handle, actor_shutdown, actor_task): (_, _, JoinHandle<()>) =
+        spawn_matching_actor(config, journal, NoopFanOut, CLOCK);
+    let symbol = sym(CALL);
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(match BURST.checked_add(1) {
+        Some(count) => count,
+        None => panic!("[soak] signal-drain: barrier party count overflow (unreachable)"),
+    }));
+    let mut handles = Vec::with_capacity(BURST);
+    for index in 0..BURST {
+        let submitter = handle.clone();
+        let order_symbol = symbol.clone();
+        let gate = Arc::clone(&barrier);
+        handles.push(tokio::spawn(async move {
+            let price = match 60_000_u64.checked_add(u64::try_from(index).unwrap_or(0)) {
+                Some(price) => price,
+                None => {
+                    panic!("[soak] signal-drain: price overflow building fixture order #{index}")
+                }
+            };
+            let command = VenueCommand::AddOrder {
+                symbol: order_symbol,
+                order_id: VenueOrderId::new(format!("signal-drain-{index}")),
+                account: AccountId::new("signal-drain-acct"),
+                owner: Hash32([7; 32]),
+                client_order_id: None,
+                side: Side::Sell,
+                order_type: OrderType::Limit,
+                limit_price: Some(Cents::new(price)),
+                quantity: 1,
+                time_in_force: TimeInForce::Gtc,
+                stp_mode: STPMode::None,
+            };
+            gate.wait().await;
+            submitter.submit(command).await
+        }));
+    }
+
+    // Rendezvous with the burst, then fire the EXPLICIT shutdown signal while the
+    // flood is in flight and the mailbox still holds queued, not-yet-drained work.
+    // `handle` is deliberately NOT dropped — it stays alive across the collection
+    // below, so the actor can only stop because of the signal, never last-drop.
+    barrier.wait().await;
+    actor_shutdown.shutdown();
+
+    let mut accepted_sequences = Vec::new();
+    let mut shutting_down = 0usize;
+    let mut rate_limited = 0usize;
+    let mut unavailable = 0usize;
+    for (index, task) in handles.into_iter().enumerate() {
+        match task.await {
+            // Accepted-and-processed before the drain.
+            Ok(Ok(receipt)) => accepted_sequences.push(receipt.underlying_sequence),
+            // Queued-but-unprocessed at signal time → the #139 typed drain outcome.
+            Ok(Err(VenueError::ShuttingDown)) => shutting_down += 1,
+            // Rejected at the door (full mailbox) — never accepted.
+            Ok(Err(VenueError::RateLimited)) => rate_limited += 1,
+            // Enqueue lost the race to the mailbox close — never accepted.
+            Ok(Err(VenueError::JournalUnavailable)) => unavailable += 1,
+            Ok(Err(other)) => panic!(
+                "[soak] signal-drain: submission #{index} resolved to {other} — expected only \
+                 Ok(Receipt) / ShuttingDown / RateLimited / JournalUnavailable"
+            ),
+            Err(join_error) => {
+                panic!("[soak] signal-drain: submitting task #{index} panicked: {join_error}")
+            }
+        }
+    }
+    match accepted_sequences
+        .len()
+        .checked_add(shutting_down)
+        .and_then(|n| n.checked_add(rate_limited))
+        .and_then(|n| n.checked_add(unavailable))
+    {
+        Some(total) => assert_eq!(
+            total, BURST,
+            "[soak] signal-drain: every burst submission must resolve to a definitive, non-lost \
+             typed outcome"
+        ),
+        None => panic!("[soak] signal-drain: outcome tally overflow (unreachable)"),
+    }
+
+    // The signal alone — with this function's handle clone STILL alive — must have
+    // stopped the actor: awaiting its task proves the run loop error-drained the
+    // queued remainder and returned, not merely that all senders were dropped.
+    match actor_task.await {
+        Ok(()) => {}
+        Err(join_error) => {
+            panic!("[soak] signal-drain: the actor's own task panicked: {join_error}")
+        }
+    }
+
+    // No already-accepted order was orphaned: every committed receipt has a durable
+    // event in the surviving journal (a `ShuttingDown` command is pre-journal, so it
+    // legitimately has none — it was never accepted).
+    let records = match surviving_journal.read_from(SequenceNumber::START) {
+        Ok(records) => records,
+        Err(error) => panic!("[soak] signal-drain: surviving-journal read failed: {error}"),
+    };
+    let committed: BTreeSet<u64> = records
+        .iter()
+        .filter_map(|record| match record {
+            JournalRecord::Event(event) => Some(event.underlying_sequence.get()),
+            _ => None,
+        })
+        .collect();
+    for sequence in &accepted_sequences {
+        assert!(
+            committed.contains(&sequence.get()),
+            "[soak] signal-drain: accepted order at underlying_sequence {} has NO committed \
+             VenueEvent after the actor exited on the shutdown signal — a silently dropped order",
+            sequence.get()
+        );
+    }
+    // The handle is held until here on purpose (see above); now it may drop.
+    drop(handle);
+
+    SignalDrainReport {
+        burst: BURST,
+        accepted: accepted_sequences.len(),
+        shutting_down,
+        rate_limited,
+        unavailable,
     }
 }
 
@@ -1248,9 +1406,21 @@ async fn test_soak_stability_flat_memory_no_gaps_clean_shutdown_restart_from_jou
     // ---- Property 3: clean shutdown drains in-flight orders ----------------
     let drain_report = run_shutdown_drain_check().await;
     println!(
-        "[soak] clean-shutdown drain: {}/{} accepted, {} rate-limited, 0 lost (every accepted order's \
-         VenueEvent was durably present after stop)",
+        "[soak] clean-shutdown drain (drop-based): {}/{} accepted, {} rate-limited, 0 lost (every \
+         accepted order's VenueEvent was durably present after stop)",
         drain_report.accepted, drain_report.burst, drain_report.rate_limited
+    );
+    // Property 3b: the #139 EXPLICIT shutdown signal error-drains queued-but-
+    // unprocessed work with the typed `ShuttingDown`, orphaning nothing.
+    let signal_report = run_shutdown_signal_drain_check().await;
+    println!(
+        "[soak] clean-shutdown drain (signal-based, #139): {}/{} accepted, {} ShuttingDown, {} \
+         rate-limited, {} unavailable-after-close, 0 lost (actor stopped on the signal alone)",
+        signal_report.accepted,
+        signal_report.burst,
+        signal_report.shutting_down,
+        signal_report.rate_limited,
+        signal_report.unavailable
     );
 
     // ---- Property 4: restart-from-journal determinism ----------------------
