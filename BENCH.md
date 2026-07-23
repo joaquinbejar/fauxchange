@@ -821,10 +821,11 @@ The likely larger contributors, by source inspection:
   newtypes were `#[serde(transparent)]` `String`-backed DTOs in `src/models.rs`;
   interning them to `Arc<str>` the way `Symbol` was done needs a wire/schema-safe
   repr, which `#122` left as a named follow-up. **`#164` did exactly this** (see
-  the `#164` block below) — interning both ids as `Arc<str>` with the `Symbol`
-  `#[serde(from = "String", into = "String")]` projection + `#[schema(value_type
-  = String)]`, no serde `rc` feature, byte-identical wire — and caching the
-  reserved MM account once so its per-command tag is a refcount bump.
+  the `#164` block below) — interning both ids as `Arc<str>` with an
+  **allocation-free** `serialize_str` `Serialize` + `#[serde(from = "String")]`
+  `Deserialize` + `#[schema(value_type = String)]`, no serde `rc` feature,
+  byte-identical wire — and caching the reserved MM account once so its per-command
+  tag is a refcount bump.
 
 The zero-steady-state-allocation DESIGN TARGET therefore remains **open** for
 this path, now at a smaller, MEASURED gap (172 allocs/op, down from 343 — 232
@@ -852,10 +853,16 @@ bytes are asserted bare-string-identical by
   (`src/models.rs`), so the minted leg-id clones the `resting` / `legs` tracking
   maps hold and the reserved-account tag cloned onto up to four `VenueCommand`s
   per instrument become reference-count bumps, not heap allocations. Wire form is
-  unchanged: both serialise through `#[serde(from = "String", into = "String")]`
-  (not a transparent `Arc<str>` forward), so JSON/FIX/journal bytes are identical,
-  no serde `rc` feature is pulled, and the OpenAPI schema stays `type: string` via
-  `#[schema(value_type = String)]` (ADR-0012).
+  unchanged **and allocation-free**: a hand-rolled `Serialize` writes the interned
+  `str` directly via `serialize_str`, so serialization never materialises a fresh
+  owned `String` — the requote reduction is genuinely removed, **not shifted into
+  the journal/JSON serialize seam** (#164 review); `Deserialize` re-interns through
+  `String`. JSON/FIX/journal bytes are identical, no serde `rc` feature is pulled,
+  and the OpenAPI schema stays `type: string` via `#[schema(value_type = String)]`
+  (ADR-0012, a local design doc under `docs/adr/`, like the 0001–0011 series). The
+  actor/journal append path is not inflated: it already skips the record serialize
+  entirely on the common under-ceiling path (the `#091` size-check fast path), and
+  even when it does serialize, `serialize_str` adds no per-id allocation.
 - The venue-reserved market-maker `AccountId` is interned **once** on the engine
   (`mm_account`, `src/market_maker/engine.rs`) and cloned (a refcount bump) onto
   each requote command, replacing the per-call `market_maker_account()` fresh

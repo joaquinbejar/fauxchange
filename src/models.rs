@@ -59,23 +59,25 @@ use crate::exchange::{Cents, EventTimestamp, SequenceNumber, SignedCents, Symbol
 /// requote path — the reserved market-maker account is cloned onto up to four
 /// `VenueCommand`s per instrument per tick — is a reference-count bump, not a
 /// heap allocation. This is a purely internal representation choice: the wire
-/// form is **unchanged**, projecting through `String` (`from` / `into` below,
-/// the `Symbol` #122 precedent) rather than a transparent `Arc<str>` forward, so
-/// the JSON/FIX/journal bytes are byte-identical and no serde `rc` feature is
-/// pulled. The OpenAPI schema stays `type: string` via `value_type = String`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(from = "String", into = "String")]
+/// form is **unchanged** and, crucially, **allocation-free** — a hand-rolled
+/// [`Serialize`] writes the interned `str` directly via `serialize_str` (never a
+/// fresh owned `String` at the serialize seam, #164 review), and `Deserialize`
+/// re-interns through `String`. The JSON/FIX/journal bytes are byte-identical to
+/// the prior transparent form, no serde `rc` feature is pulled, and the OpenAPI
+/// schema stays `type: string` via `value_type = String`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, ToSchema)]
+#[serde(from = "String")]
 #[schema(value_type = String)]
 pub struct AccountId(Arc<str>);
 
 impl AccountId {
-    /// Wraps a raw account identity. Accepts anything that interns into an
-    /// `Arc<str>` (a `&str`, `String`, or `Arc<str>`), so existing call sites are
-    /// unchanged.
+    /// Wraps a raw account identity. Keeps the pre-#164 `impl Into<String>` input
+    /// contract (interning the resulting `String` as an `Arc<str>` internally), so
+    /// no caller — including a generic one bounded by `Into<String>` — churns.
     #[must_use]
     #[inline]
-    pub fn new(id: impl Into<Arc<str>>) -> Self {
-        Self(id.into())
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(Arc::from(id.into()))
     }
 
     /// Returns the account identity as a string slice.
@@ -86,17 +88,20 @@ impl AccountId {
     }
 }
 
+impl Serialize for AccountId {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Allocation-free (#164 review): write the interned `str` directly, so
+        // serialization never materialises a fresh `String` — the wire bytes are the
+        // same bare JSON string as the prior transparent form.
+        serializer.serialize_str(&self.0)
+    }
+}
+
 impl From<String> for AccountId {
     #[inline]
     fn from(id: String) -> Self {
         Self(Arc::from(id))
-    }
-}
-
-impl From<AccountId> for String {
-    #[inline]
-    fn from(id: AccountId) -> Self {
-        id.0.to_string()
     }
 }
 
@@ -133,23 +138,25 @@ impl ClientOrderId {
 /// requote path — each minted market-maker leg id is held in the engine's
 /// tracking maps and cloned onto its `AddOrder`/`CancelOrder` commands — is a
 /// reference-count bump, not a heap allocation. Purely an internal repr choice:
-/// the wire form is **unchanged**, projecting through `String` (`from` / `into`
-/// below, the `Symbol` #122 precedent), so the JSON/FIX/journal bytes are
-/// byte-identical, no serde `rc` feature is pulled, and the OpenAPI schema stays
-/// `type: string` via `value_type = String`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(from = "String", into = "String")]
+/// the wire form is **unchanged** and **allocation-free** — a hand-rolled
+/// [`Serialize`] writes the interned `str` directly via `serialize_str` (never a
+/// fresh owned `String` at the serialize seam, #164 review), and `Deserialize`
+/// re-interns through `String`. The JSON/FIX/journal bytes are byte-identical, no
+/// serde `rc` feature is pulled, and the OpenAPI schema stays `type: string` via
+/// `value_type = String`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, ToSchema)]
+#[serde(from = "String")]
 #[schema(value_type = String)]
 pub struct VenueOrderId(Arc<str>);
 
 impl VenueOrderId {
-    /// Wraps a raw venue-order-id. Accepts anything that interns into an
-    /// `Arc<str>` (a `&str`, `String`, or `Arc<str>`), so existing call sites are
-    /// unchanged.
+    /// Wraps a raw venue-order-id. Keeps the pre-#164 `impl Into<String>` input
+    /// contract (interning the resulting `String` as an `Arc<str>` internally), so
+    /// no caller churns.
     #[must_use]
     #[inline]
-    pub fn new(id: impl Into<Arc<str>>) -> Self {
-        Self(id.into())
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(Arc::from(id.into()))
     }
 
     /// Returns the venue order id as a string slice.
@@ -160,17 +167,18 @@ impl VenueOrderId {
     }
 }
 
+impl Serialize for VenueOrderId {
+    #[inline]
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Allocation-free (#164 review): write the interned `str` directly.
+        serializer.serialize_str(&self.0)
+    }
+}
+
 impl From<String> for VenueOrderId {
     #[inline]
     fn from(id: String) -> Self {
         Self(Arc::from(id))
-    }
-}
-
-impl From<VenueOrderId> for String {
-    #[inline]
-    fn from(id: VenueOrderId) -> Self {
-        id.0.to_string()
     }
 }
 
