@@ -51,7 +51,7 @@ use crate::market_maker::config::{
 use crate::market_maker::persona::{PersonaConfig, PersonaJitter, PersonaJitterDraw};
 use crate::market_maker::quoter::{QuoteInput, Quoter};
 use crate::market_maker::sink::CommandSink;
-use crate::models::{ExecutionId, OrderType, VenueOrderId};
+use crate::models::{AccountId, ExecutionId, OrderType, VenueOrderId};
 
 /// The default run-level seed the persona-jitter sub-stream derives from when a
 /// caller does not set one ([`MarketMakerEngine::with_run_seed`]) — mirrors the
@@ -167,6 +167,11 @@ pub struct MarketMakerEngine {
     sink: Arc<dyn CommandSink>,
     /// The run lineage that namespaces the market-maker's minted order ids.
     lineage_id: LineageId,
+    /// The venue-reserved market-maker [`AccountId`], interned **once** (#164) so
+    /// tagging it onto the up-to-four `VenueCommand`s per instrument per requote is
+    /// a reference-count bump (`Arc<str>` clone), not a fresh heap allocation per
+    /// call as [`market_maker_account`] would be.
+    mm_account: AccountId,
     /// The quoter (holds the `optionstratlib` pricer).
     quoter: Quoter,
     // ---- shared state: deliberate coarse `std::sync::RwLock`, not `DashMap` ----
@@ -235,6 +240,7 @@ impl MarketMakerEngine {
         Self {
             sink,
             lineage_id,
+            mm_account: market_maker_account(),
             quoter,
             config: RwLock::new(MarketMakerConfig::default()),
             prices: RwLock::new(HashMap::new()),
@@ -717,7 +723,7 @@ impl MarketMakerEngine {
             self.sink.enqueue(VenueCommand::CancelOrder {
                 symbol: instrument.symbol.clone(),
                 order_id: id,
-                account: market_maker_account(),
+                account: self.mm_account.clone(),
             });
         }
         self.sink.enqueue(self.add_command(
@@ -761,7 +767,7 @@ impl MarketMakerEngine {
         VenueCommand::AddOrder {
             symbol: symbol.clone(),
             order_id,
-            account: market_maker_account(),
+            account: self.mm_account.clone(),
             owner: MARKET_MAKER_OWNER,
             client_order_id: None,
             side,
@@ -961,7 +967,7 @@ impl MarketMakerEngine {
             self.sink.enqueue(VenueCommand::CancelOrder {
                 symbol,
                 order_id,
-                account: market_maker_account(),
+                account: self.mm_account.clone(),
             });
         }
     }
@@ -991,7 +997,7 @@ impl MarketMakerEngine {
             self.sink.enqueue(VenueCommand::CancelOrder {
                 symbol,
                 order_id,
-                account: market_maker_account(),
+                account: self.mm_account.clone(),
             });
         }
     }

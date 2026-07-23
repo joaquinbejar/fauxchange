@@ -32,6 +32,8 @@
 //!
 //! Governed by `docs/01-domain-model.md` and `docs/03-protocol-surfaces.md`.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -44,20 +46,35 @@ use crate::exchange::{Cents, EventTimestamp, SequenceNumber, SignedCents, Symbol
 //
 // The composite-id GRAMMAR and minting (lineage, per-underlying sequence) land
 // with the venue envelope / order path (#005/#006, [01 §6.1](../docs/01-domain-model.md));
-// here these are the wire types only — opaque, `#[serde(transparent)]` strings.
+// here these are the wire types only — opaque strings. `AccountId`/`VenueOrderId`
+// intern their storage as `Arc<str>` (#164, hot-path clone = refcount bump) while
+// projecting through `String` on the wire (byte-identical); `ClientOrderId`/
+// `ExecutionId` stay `#[serde(transparent)]` owned strings.
 
 /// A venue account identity — the JWT `sub` for REST/WS and the resolved
 /// account for a FIX logon, under **one** account registry
 /// ([01 §8](../docs/01-domain-model.md)). Opaque on the wire.
+///
+/// Stored as an [`Arc<str>`](std::sync::Arc) (#164) so a `clone()` on the hot
+/// requote path — the reserved market-maker account is cloned onto up to four
+/// `VenueCommand`s per instrument per tick — is a reference-count bump, not a
+/// heap allocation. This is a purely internal representation choice: the wire
+/// form is **unchanged**, projecting through `String` (`from` / `into` below,
+/// the `Symbol` #122 precedent) rather than a transparent `Arc<str>` forward, so
+/// the JSON/FIX/journal bytes are byte-identical and no serde `rc` feature is
+/// pulled. The OpenAPI schema stays `type: string` via `value_type = String`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(transparent)]
-pub struct AccountId(String);
+#[serde(from = "String", into = "String")]
+#[schema(value_type = String)]
+pub struct AccountId(Arc<str>);
 
 impl AccountId {
-    /// Wraps a raw account identity string.
+    /// Wraps a raw account identity. Accepts anything that interns into an
+    /// `Arc<str>` (a `&str`, `String`, or `Arc<str>`), so existing call sites are
+    /// unchanged.
     #[must_use]
     #[inline]
-    pub fn new(id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<Arc<str>>) -> Self {
         Self(id.into())
     }
 
@@ -66,6 +83,20 @@ impl AccountId {
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl From<String> for AccountId {
+    #[inline]
+    fn from(id: String) -> Self {
+        Self(Arc::from(id))
+    }
+}
+
+impl From<AccountId> for String {
+    #[inline]
+    fn from(id: AccountId) -> Self {
+        id.0.to_string()
     }
 }
 
@@ -97,15 +128,27 @@ impl ClientOrderId {
 /// id `"{lineage_id}:{underlying}:{underlying_sequence}:{index}"`
 /// ([01 §6.1](../docs/01-domain-model.md)); `OrderID (37)` on FIX. Opaque here;
 /// minting is #006's.
+///
+/// Stored as an [`Arc<str>`](std::sync::Arc) (#164) so a `clone()` on the hot
+/// requote path — each minted market-maker leg id is held in the engine's
+/// tracking maps and cloned onto its `AddOrder`/`CancelOrder` commands — is a
+/// reference-count bump, not a heap allocation. Purely an internal repr choice:
+/// the wire form is **unchanged**, projecting through `String` (`from` / `into`
+/// below, the `Symbol` #122 precedent), so the JSON/FIX/journal bytes are
+/// byte-identical, no serde `rc` feature is pulled, and the OpenAPI schema stays
+/// `type: string` via `value_type = String`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
-#[serde(transparent)]
-pub struct VenueOrderId(String);
+#[serde(from = "String", into = "String")]
+#[schema(value_type = String)]
+pub struct VenueOrderId(Arc<str>);
 
 impl VenueOrderId {
-    /// Wraps a raw venue-order-id string.
+    /// Wraps a raw venue-order-id. Accepts anything that interns into an
+    /// `Arc<str>` (a `&str`, `String`, or `Arc<str>`), so existing call sites are
+    /// unchanged.
     #[must_use]
     #[inline]
-    pub fn new(id: impl Into<String>) -> Self {
+    pub fn new(id: impl Into<Arc<str>>) -> Self {
         Self(id.into())
     }
 
@@ -114,6 +157,20 @@ impl VenueOrderId {
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl From<String> for VenueOrderId {
+    #[inline]
+    fn from(id: String) -> Self {
+        Self(Arc::from(id))
+    }
+}
+
+impl From<VenueOrderId> for String {
+    #[inline]
+    fn from(id: VenueOrderId) -> Self {
+        id.0.to_string()
     }
 }
 
@@ -2417,6 +2474,50 @@ pub enum WsMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Interned id DTOs: byte-identical wire (#164) ----------------------
+
+    #[test]
+    fn test_interned_ids_serialize_to_a_bare_string_byte_identical() {
+        // The #164 `Arc<str>` repr must keep the wire form a bare JSON string,
+        // byte-identical to the prior `#[serde(transparent)] String` — otherwise
+        // JSON/FIX/journal bytes drift. Assert exact bytes, not just round-trip.
+        assert_eq!(
+            serde_json::to_string(&AccountId::new("acct-42")).expect("serialize AccountId"),
+            "\"acct-42\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VenueOrderId::new("run-1:BTC:7:0"))
+                .expect("serialize VenueOrderId"),
+            "\"run-1:BTC:7:0\""
+        );
+    }
+
+    #[test]
+    fn test_interned_ids_round_trip_from_a_bare_string() {
+        // Deserialize from the same bare-string wire the transparent form accepted.
+        let account: AccountId =
+            serde_json::from_str("\"acct-42\"").expect("deserialize AccountId");
+        assert_eq!(account, AccountId::new("acct-42"));
+        assert_eq!(account.as_str(), "acct-42");
+
+        let order: VenueOrderId =
+            serde_json::from_str("\"run-1:BTC:7:0\"").expect("deserialize VenueOrderId");
+        assert_eq!(order, VenueOrderId::new("run-1:BTC:7:0"));
+        assert_eq!(order.as_str(), "run-1:BTC:7:0");
+    }
+
+    #[test]
+    fn test_interned_id_clone_shares_storage() {
+        // The point of #164: a clone is a refcount bump on shared storage, not a
+        // fresh allocation — so the two clones' backing `str` are the SAME pointer.
+        let id = VenueOrderId::new("run-1:BTC:7:0");
+        let clone = id.clone();
+        assert!(
+            std::ptr::eq(id.as_str().as_ptr(), clone.as_str().as_ptr()),
+            "an interned id clone must share its `Arc<str>` storage, not reallocate"
+        );
+    }
 
     // ---- Permission casing (inherited Backend wire) -----------------------
 
