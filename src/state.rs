@@ -78,16 +78,19 @@ use crate::auth::{
 use crate::db::{DatabasePool, DbError, PgVenueJournal};
 use crate::error::VenueError;
 use crate::exchange::{
-    ActorConfig, ActorHandle, ActorShutdown, CancelledLeg, ClOrdIdIndex, ClOrdIdRecord,
+    ActorConfig, ActorHandle, ActorShutdown, CancelledLeg, Cents, ClOrdIdIndex, ClOrdIdRecord,
     EventTimestamp, ExecutionsStore, ExpirationDate, FanOut, FanOutSealed, FanoutSummary,
     InMemoryExecutionsStore, InMemoryPositionsStore, InMemoryVenueJournal, InstrumentStatus,
-    JournalError, JournalHeader, JournalSnapshot, LineageId, MarkPriceBook, MarketMakerControlSink,
-    MassCancelScope, MatchingExecutor, PositionsStore, Receipt, Recovered, SequenceNumber,
-    StoreFanOut, Symbol, TeeFanOut, VenueCommand, VenueEvent, VenueJournal, VenueOutcome,
-    check_order_admission, recover_into, spawn_matching_actor_with_registry_and_index,
+    JournalError, JournalHeader, JournalSnapshot, LineageId, MarkPriceBook,
+    MarketMakerControlKnobs, MarketMakerControlSink, MassCancelScope, MatchingExecutor,
+    PositionsStore, Receipt, Recovered, SequenceNumber, Side, StoreFanOut, Symbol, TeeFanOut,
+    VenueCommand, VenueEvent, VenueJournal, VenueOutcome, check_order_admission,
+    market_maker_account, recover_into, spawn_matching_actor_with_registry_and_index,
     spawn_underlying_actor_with_clordid_index,
 };
-use crate::market_maker::{ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter};
+use crate::market_maker::{
+    ActorCommandSink, MarketMakerControlHub, MarketMakerEngine, Quoter, RecoveredMmLeg,
+};
 use crate::microstructure::{
     DEFAULT_INGRESS_BUFFER_CAPACITY, IngressReorderBuffer, IngressStamp, MicrostructureConfig,
     MicrostructureConfigError, ReleaseKey, release_deadline_us,
@@ -914,6 +917,148 @@ fn last_recovered_reference_price(events: &[VenueEvent], underlying: &str) -> Op
     })
 }
 
+/// The market-maker producer state reconstructed from a recovered underlying's event
+/// stream (#148 review) — everything needed to resume its maker coherently instead of
+/// starting a fresh, colliding producer against the recovered book.
+struct RecoveredProducerState {
+    /// The maker's live resting legs (the last-posted `AddOrder` per `(symbol, side)`
+    /// from the market-maker account), fed back so the first requote **retires** them.
+    legs: Vec<RecoveredMmLeg>,
+    /// The producer id floor — `max({lineage}:MM:{seq})` + 1 — so a fresh mint is
+    /// collision-free with a retired id.
+    next_seq_floor: u64,
+    /// The venue-wide `MarketMakerControl` history in stream order (fanned out to every
+    /// underlying, so one stream carries the full history), replayed so a terminal kill
+    /// switch and the final knobs survive the restart.
+    controls: Vec<MarketMakerControlKnobs>,
+    /// The count of this underlying's journaled `SimStep`s — the simulator cursor to
+    /// resume from, so the resumed walk continues instead of re-walking from zero.
+    sim_steps: usize,
+    /// The last journaled venue-clock instant (ms), restored as the maker's
+    /// time-to-expiry clock so it is not left at zero until the first live step.
+    last_now_ms: Option<u64>,
+}
+
+/// Parses the `{seq}` out of a `{lineage}:MM:{seq}` market-maker order id, or `None`
+/// if the id is not in that shape. Splits on the LAST `:MM:` so a lineage containing
+/// `:` cannot be misread.
+#[must_use]
+fn parse_mm_seq(order_id: &str) -> Option<u64> {
+    order_id
+        .rsplit_once(":MM:")
+        .and_then(|(_, seq)| seq.parse::<u64>().ok())
+}
+
+/// Reconstructs the [`RecoveredProducerState`] for one recovered underlying from its
+/// re-derived event stream (#148 review). Deterministic — a pure fold over the
+/// journaled events, no clock or RNG.
+///
+/// Live-leg derivation leans on the maker's **replace-not-accumulate** discipline: the
+/// last-posted `AddOrder` per `(symbol, side)` from the market-maker account is the
+/// currently-resting leg, so tracking only the highest-sequence add per key suffices —
+/// re-issuing a cancel for a leg that has since filled or been cancelled is a harmless
+/// reject on the resumed book, never a double-cancel of live state.
+#[must_use]
+fn recovered_producer_state(
+    events: &[VenueEvent],
+    underlying: &Arc<str>,
+) -> RecoveredProducerState {
+    let mm_account = market_maker_account();
+    // Last add per (symbol, is_buy), keyed so a later add overwrites an earlier one.
+    let mut latest: HashMap<(Symbol, bool), RecoveredMmLeg> = HashMap::new();
+    let mut max_seq: Option<u64> = None;
+    let mut controls: Vec<MarketMakerControlKnobs> = Vec::new();
+    let mut sim_steps: usize = 0;
+    let mut last_now_ms: Option<u64> = None;
+
+    for event in events {
+        // Events are in `underlying_sequence` order, so the last write wins.
+        last_now_ms = Some(event.venue_ts.get());
+        match &event.command {
+            VenueCommand::AddOrder {
+                symbol,
+                order_id,
+                account,
+                side,
+                limit_price,
+                quantity,
+                ..
+            } if *account == mm_account => {
+                let Some(seq) = parse_mm_seq(order_id.as_str()) else {
+                    continue;
+                };
+                max_seq = Some(max_seq.map_or(seq, |current| current.max(seq)));
+                let is_buy = matches!(side, Side::Buy);
+                latest.insert(
+                    (symbol.clone(), is_buy),
+                    RecoveredMmLeg {
+                        underlying: Arc::clone(underlying),
+                        symbol: symbol.clone(),
+                        order_id: order_id.clone(),
+                        is_buy,
+                        price_cents: limit_price.map_or(0, Cents::get),
+                        quantity: *quantity,
+                        seq,
+                    },
+                );
+            }
+            VenueCommand::MarketMakerControl {
+                spread_multiplier,
+                size_scalar,
+                directional_skew,
+                enabled,
+            } => {
+                controls.push(MarketMakerControlKnobs {
+                    spread_multiplier: *spread_multiplier,
+                    size_scalar: *size_scalar,
+                    directional_skew: *directional_skew,
+                    enabled: *enabled,
+                });
+            }
+            VenueCommand::SimStep {
+                underlying: step_underlying,
+                ..
+            } if step_underlying == underlying.as_ref() => {
+                // Count without unchecked arithmetic (rule 9): a SimStep count is bounded
+                // by `events.len()`, which already fits `usize`, so a checked add that
+                // cannot advance logs loudly rather than wrapping a false cursor.
+                match sim_steps.checked_add(1) {
+                    Some(next) => sim_steps = next,
+                    None => tracing::error!(
+                        underlying = %underlying,
+                        "recovered SimStep counter overflowed usize; cursor pinned"
+                    ),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Checked (rule 9), NOT saturating: `seq + 1` overflowing `u64` needs 2^64 minted
+    // maker ids and is unreachable, but a checked add that cannot advance logs loudly and
+    // pins the floor rather than wrapping to a colliding zero.
+    let next_seq_floor = match max_seq {
+        Some(seq) => match seq.checked_add(1) {
+            Some(floor) => floor,
+            None => {
+                tracing::error!(
+                    underlying = %underlying,
+                    "recovered market-maker seq at u64::MAX; producer id floor pinned"
+                );
+                u64::MAX
+            }
+        },
+        None => 0,
+    };
+    RecoveredProducerState {
+        legs: latest.into_values().collect(),
+        next_seq_floor,
+        controls,
+        sim_steps,
+        last_now_ms,
+    }
+}
+
 /// Whether `command` is **bufferable ingress** — a client order-entry command
 /// (`AddOrder` / `CancelOrder` / `Replace`) that carries a `(session_id, msg_seq)`
 /// identity and is subject to the deterministic ingress-reorder buffer (#111). Every
@@ -1282,6 +1427,13 @@ impl AppState {
         // setter — so a recovered underlying's maker quotes around the resumed price,
         // not a default/zero, without re-journaling the already-durable `SimStep`.
         let mut recovered_reference_prices: HashMap<Arc<str>, u64> = HashMap::new();
+        // The market-maker/simulator producer state per recovered underlying (#148
+        // review), captured from its event stream here (while `events` is in scope) and
+        // applied to the engine + simulator once they are built below — so a recovered
+        // maker retires its old liquidity, mints collision-free ids, and resumes with
+        // its kill switch / clock / simulator cursor intact instead of duplicating.
+        let mut recovered_producer_states: HashMap<Arc<str>, RecoveredProducerState> =
+            HashMap::new();
         for ticker in ordered {
             // The fan-out tees the committed event into BOTH the shared stores
             // (`StoreFanOut`, #008) and the WS market-data broadcast (`WsFanOut`,
@@ -1347,6 +1499,13 @@ impl AppState {
                     if let Some(price) = last_recovered_reference_price(&events, ticker.as_ref()) {
                         recovered_reference_prices.insert(Arc::clone(&ticker), price);
                     }
+                    // Capture the full producer state (live maker legs, id floor, control
+                    // history, simulator cursor, clock) from the SAME in-scope events, to
+                    // reconcile the maker/simulator coherently below (#148 review).
+                    recovered_producer_states.insert(
+                        Arc::clone(&ticker),
+                        recovered_producer_state(&events, &ticker),
+                    );
                     // Install the live market-maker control seam now that recovery
                     // (which runs WITHOUT it) is done, so a post-resume
                     // `MarketMakerControl` takes effect on the sequenced path.
@@ -1534,6 +1693,66 @@ impl AppState {
             ),
             clock.clone(),
         );
+
+        // Boot-recovery producer reconciliation (#148 review). The reference-price seed
+        // above alone would leave the resumed maker duplicating liquidity: with empty
+        // `legs`/`resting` and `next_order_seq` back at zero, its first requote cancels
+        // none of the recovered orders, posts a SECOND pair, and mints colliding
+        // `{lineage}:MM:{seq}` ids. Reconcile each recovered underlying's producer +
+        // simulator from its journal-derived state, in sorted ticker order (deterministic
+        // — each underlying's state is independent, so order does not affect the result):
+        //
+        //   1. Replay the venue-wide `MarketMakerControl` history so a terminal kill
+        //      switch and the final knobs survive the restart (`apply_sequenced_control`
+        //      only writes config — no requote, no cancel, no journal).
+        //   2. Restore the maker's time-to-expiry clock to the last journaled instant so
+        //      it does not quote against a zero clock until the first live step.
+        //   3. Re-register the live resting legs and advance the id floor, so the first
+        //      requote RETIRES the recovered pair (cancel-then-replace) and every fresh
+        //      mint is collision-free — the core fix for the duplication/collision 🔴.
+        //   4. Resume the simulator's walk cursor so it continues instead of re-walking
+        //      already-journaled prices from zero.
+        //
+        // All four are in-memory and non-journaling (recover wins); the retire itself
+        // rides the next live requote's normal journaled cancel+add.
+        let mut recovered_producers: Vec<(&Arc<str>, &RecoveredProducerState)> =
+            recovered_producer_states.iter().collect();
+        recovered_producers.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+        for (ticker, state) in recovered_producers {
+            for knobs in &state.controls {
+                market_maker.apply_sequenced_control(*knobs);
+            }
+            if let Some(now_ms) = state.last_now_ms {
+                market_maker.set_venue_now_ms(now_ms);
+            }
+            market_maker.restore_recovered_producer(&state.legs, state.next_seq_floor);
+            // Resume the simulator cursor only when the underlying is a walked asset AND
+            // its resumed reference price is known; a stream with no `SimStep` leaves the
+            // walk at its start (there was nothing to advance past).
+            if state.sim_steps > 0
+                && let Some(price) = recovered_reference_prices.get(ticker.as_ref())
+                && let Err(error) =
+                    simulator.restore_cursor(ticker.as_ref(), state.sim_steps, Cents::new(*price))
+            {
+                // Not fatal: the manifest may no longer host this underlying as a walked
+                // asset. The maker was still reconciled above.
+                tracing::warn!(
+                    underlying = %ticker,
+                    %error,
+                    "recovered underlying is not a configured simulator asset; \
+                     skipped walk-cursor restore (#148)"
+                );
+            }
+            tracing::info!(
+                underlying = %ticker,
+                retired_legs = state.legs.len(),
+                next_seq_floor = state.next_seq_floor,
+                controls = state.controls.len(),
+                sim_cursor = state.sim_steps,
+                enabled = market_maker.is_enabled(),
+                "reconciled recovered market-maker producer + simulator (#148 review)"
+            );
+        }
 
         tracing::info!(
             underlyings = handles.len(),

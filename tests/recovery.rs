@@ -37,10 +37,9 @@ use std::sync::Arc;
 use fauxchange::config::SeedManifest;
 use fauxchange::db::{DatabasePool, DbPoolConfig};
 use fauxchange::exchange::{
-    Cents, EventTimestamp, ExecutionsStore, Hash32, JournalError, LineageId, PositionsStore,
-    STPMode, Side, Symbol, TimeInForce, VenueCommand,
+    Cents, EventTimestamp, ExecutionsStore, Hash32, JournalError, JournalRecord, LineageId,
+    PositionsStore, STPMode, Side, Symbol, TimeInForce, VenueCommand,
 };
-use fauxchange::market_maker::MarketMakerEvent;
 use fauxchange::microstructure::{FeeConfig, FileMicrostructure, MicrostructureConfig};
 use fauxchange::seed;
 use fauxchange::state::{AppState, AppStateConfig, AppStateError};
@@ -517,31 +516,269 @@ async fn test_boot_seed_trade_kill_reboot_recovered_market_maker_quotes() {
         "boot-recovery reconciliation + the recovered re-seed appended no journal record"
     );
 
-    // (3) The maker is NOT quote-silent: a live requote at the resumed reference
-    // produces two-sided quotes on every recovered contract.
-    let mut events = state2.market_maker().subscribe();
+    // (3) RETIRE + RELINEAGE (#148 review). Assert the JOURNALED, sink-processed effect
+    // of a recovered requote — not a pre-sink `QuoteUpdated` broadcast (which is emitted
+    // before the actor processes the commands, so it passes even when the adds duplicate
+    // or collide). The recovered maker's live legs / id counter were reconciled at boot,
+    // so the first live requote must RETIRE the recovered orders (cancel them) and mint
+    // COLLISION-FREE ids, never post a second pair on top.
+    //
+    // The recovered live MM legs + max id seq, read from the reconstructed journal.
+    let pre = state2
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("boot-2 pre-requote snapshot");
+    let recovered_mm_ids = market_maker_leg_ids(&pre.records);
+    let recovered_max_seq = recovered_mm_ids
+        .iter()
+        .filter_map(mm_seq)
+        .max()
+        .expect("boot 1 posted at least one market-maker order");
+    assert!(
+        !recovered_mm_ids.is_empty(),
+        "the recovered book carries the maker's resting legs from boot 1"
+    );
+    let seq_before_requote = pre.last_sequence;
+
+    // Drive ONE live requote through the real sink (the engine's `ActorCommandSink`
+    // enqueues cancel+add onto the actors), then AWAIT the actor/journal quiescing.
     state2
         .market_maker()
         .set_venue_now_ms(state2.clock().now_ms().get());
     state2.market_maker().update_price(UNDERLYING, MM_MOVED);
-    let mut quotes = 0usize;
-    while let Ok(event) = events.try_recv() {
-        if let MarketMakerEvent::QuoteUpdated {
-            bid_price,
-            ask_price,
-            ..
-        } = event
+    let post = await_journal_stable(&state2, UNDERLYING, seq_before_requote).await;
+
+    // The commands the requote journaled AFTER the recovered stream's tail.
+    let new_cmds: Vec<&VenueCommand> = post
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            JournalRecord::Event(event)
+                if seq_before_requote.is_none_or(|before| event.underlying_sequence > before) =>
+            {
+                Some(&event.command)
+            }
+            _ => None,
+        })
+        .collect();
+
+    // RETIRE: every recovered leg is cancelled by the requote (replace-not-accumulate).
+    let cancelled: std::collections::HashSet<&VenueOrderId> = new_cmds
+        .iter()
+        .filter_map(|cmd| match cmd {
+            VenueCommand::CancelOrder { order_id, .. } => Some(order_id),
+            _ => None,
+        })
+        .collect();
+    for leg in &recovered_mm_ids {
+        assert!(
+            cancelled.contains(leg),
+            "the recovered maker leg {leg:?} must be RETIRED (cancelled) by the first requote, \
+             not left resting under a duplicate pair"
+        );
+    }
+
+    // RELINEAGE: every freshly minted maker add uses a collision-free id (seq strictly
+    // above every recovered seq), and none reuses a recovered id.
+    let fresh_adds: Vec<&VenueOrderId> = new_cmds
+        .iter()
+        .filter_map(|cmd| match cmd {
+            VenueCommand::AddOrder {
+                order_id, account, ..
+            } if fauxchange::exchange::is_market_maker_account(account) => Some(order_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !fresh_adds.is_empty(),
+        "the recovered maker re-posts a fresh pair after retiring the old one"
+    );
+    for id in &fresh_adds {
+        let seq = mm_seq(id).expect("a fresh maker id is `{lineage}:MM:{seq}`");
+        assert!(
+            seq > recovered_max_seq,
+            "fresh maker id {id:?} (seq {seq}) must be past the recovered floor {recovered_max_seq} \
+             — a collision-free producer lineage"
+        );
+        assert!(
+            !recovered_mm_ids.contains(id),
+            "fresh maker id {id:?} must NOT reuse a recovered order id"
+        );
+    }
+
+    // Simulator continuity: a recovered walked asset resumes at the journaled reference,
+    // not a re-walk from cursor zero. (Skipped when the manifest hosts no walk for it.)
+    if state2
+        .simulator()
+        .underlyings()
+        .iter()
+        .any(|u| u == UNDERLYING)
+    {
+        assert_eq!(
+            state2.simulator().get_price(UNDERLYING),
+            Some(Cents::new(MM_MOVED)),
+            "the recovered simulator resumes at the journaled reference, not cursor zero"
+        );
+    }
+
+    drop(container);
+}
+
+/// Parses the `{seq}` out of a `{lineage}:MM:{seq}` maker order id (`None` otherwise) —
+/// the test mirror of the production `parse_mm_seq`, splitting on the LAST `:MM:`.
+fn mm_seq(order_id: &VenueOrderId) -> Option<u64> {
+    order_id
+        .as_str()
+        .rsplit_once(":MM:")
+        .and_then(|(_, seq)| seq.parse::<u64>().ok())
+}
+
+/// The maker's currently-resting leg ids in a recovered stream — the last-posted
+/// `AddOrder` per `(symbol, side)` from the market-maker account, mirroring the maker's
+/// replace-not-accumulate discipline (the production `recovered_producer_state` uses the
+/// same rule). Order is irrelevant to the callers (they test membership).
+fn market_maker_leg_ids(records: &[JournalRecord]) -> Vec<VenueOrderId> {
+    let mut latest: BTreeMap<(String, bool), VenueOrderId> = BTreeMap::new();
+    for record in records {
+        if let JournalRecord::Event(event) = record
+            && let VenueCommand::AddOrder {
+                symbol,
+                order_id,
+                account,
+                side,
+                ..
+            } = &event.command
+            && fauxchange::exchange::is_market_maker_account(account)
         {
-            assert!(
-                ask_price.get() > bid_price.get() && bid_price.get() >= 1,
-                "a recovered quote is a well-formed two-sided quote"
+            latest.insert(
+                (symbol.as_str().to_string(), matches!(side, Side::Buy)),
+                order_id.clone(),
             );
-            quotes += 1;
         }
     }
+    latest.into_values().collect()
+}
+
+/// Awaits the actor/journal quiescing after a live requote enqueues cancel+add onto the
+/// detached `ActorCommandSink` forwarder (#148 review — "await sink/actor completion"):
+/// polls the journal until `last_sequence` has advanced past `after` AND is stable across
+/// two consecutive polls, bounded so a stuck requote fails the test instead of hanging.
+async fn await_journal_stable(
+    state: &Arc<AppState>,
+    underlying: &str,
+    after: Option<fauxchange::exchange::SequenceNumber>,
+) -> fauxchange::exchange::JournalSnapshot {
+    use std::time::Duration;
+    let mut last = None;
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let snap = state
+            .journal_snapshot(underlying)
+            .await
+            .expect("journal snapshot while awaiting requote");
+        let advanced = match (after, snap.last_sequence) {
+            (Some(before), Some(now)) => now > before,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if advanced && last == Some(snap.last_sequence) {
+            return snap;
+        }
+        last = Some(snap.last_sequence);
+    }
+    panic!("the recovered requote never quiesced onto the journal within the deadline");
+}
+
+/// **Kill-switch + knobs survive the restart** (#148 review). A maker killed by a
+/// journaled `MarketMakerControl { enabled: false }` before the crash must come back
+/// **disabled** — recovery replays the control history onto the fresh engine, so the
+/// resumed maker does NOT silently re-enable and flood the recovered book with quotes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_boot_recovery_restores_market_maker_kill_switch() {
+    let (container, db) = start_pg().await;
+    let manifest = mm_manifest();
+
+    // ---- BOOT 1: seed, move the reference, then KILL the maker via a control. -------
+    let state1 = seeding_boot(&db, "mm-kill-run", &manifest);
+    seed::apply_seed_phase(&state1, &manifest)
+        .await
+        .expect("boot-1 seed applies");
+    state1.begin_serving();
+    assert!(
+        state1.market_maker().is_enabled(),
+        "the freshly seeded maker starts enabled"
+    );
+
+    let now_ms = state1.clock().now_ms().get();
+    state1
+        .submit(sim_step(UNDERLYING, MM_MOVED, now_ms))
+        .await
+        .expect("boot-1 reference move journals");
+
+    // The terminal kill: a sequenced, journaled `MarketMakerControl` disabling quoting.
+    state1
+        .submit(VenueCommand::MarketMakerControl {
+            spread_multiplier: None,
+            size_scalar: None,
+            directional_skew: None,
+            enabled: Some(false),
+        })
+        .await
+        .expect("boot-1 kill switch journals");
+    assert!(
+        !state1.market_maker().is_enabled(),
+        "boot-1 maker is killed after the control"
+    );
+    drop(state1);
+
+    // ---- RE-BOOT: the recovered maker must come back DISABLED. ----------------------
+    let state2 = seeding_boot(&db, "mm-kill-reboot", &manifest);
+    assert!(
+        state2.is_recovered(UNDERLYING),
+        "BTC resumed from the durable journal"
+    );
+    assert!(
+        !state2.market_maker().is_enabled(),
+        "the recovered maker's terminal kill switch survives the restart — it comes back \
+         DISABLED, not silently re-enabled"
+    );
+
+    // Behavioural proof: a requote against the killed maker journals NO new maker adds.
+    let before = state2
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("boot-2 pre-requote snapshot")
+        .last_sequence;
+    state2
+        .market_maker()
+        .set_venue_now_ms(state2.clock().now_ms().get());
+    state2.market_maker().update_price(UNDERLYING, MM_MOVED);
+    // Give any (erroneous) enqueue time to land, then assert the journal did NOT grow
+    // with maker adds.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let after = state2
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("boot-2 post-requote snapshot");
+    let new_maker_adds = after
+        .records
+        .iter()
+        .filter(|record| match record {
+            JournalRecord::Event(event) => {
+                before.is_none_or(|b| event.underlying_sequence > b)
+                    && matches!(
+                        &event.command,
+                        VenueCommand::AddOrder { account, .. }
+                            if fauxchange::exchange::is_market_maker_account(account)
+                    )
+            }
+            _ => false,
+        })
+        .count();
     assert_eq!(
-        quotes, 4,
-        "the recovered underlying's maker quotes every contract around the resumed reference price"
+        new_maker_adds, 0,
+        "a killed recovered maker must not post any quotes on a price update"
     );
 
     drop(container);

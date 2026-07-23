@@ -129,6 +129,37 @@ const fn leg_slot(is_buy: bool) -> usize {
     if is_buy { 0 } else { 1 }
 }
 
+/// One market-maker leg still resting in a **recovered** book at boot (#148 review) —
+/// the projection of a journaled `AddOrder` this engine's lineage minted that no
+/// later `Cancel`/`Fill` retired. Boot recovery reconstructs the book by
+/// re-execution, but the engine's in-memory `legs`/`resting` tracking is live-only
+/// and starts empty, so without re-registering these the first post-resume requote
+/// would post a **second** pair on top of them (duplicated liquidity) and mint
+/// colliding `{lineage}:MM:{seq}` ids. Feeding them back through
+/// [`restore_recovered_producer`](MarketMakerEngine::restore_recovered_producer)
+/// makes the next requote **retire** them (cancel-then-replace) with a
+/// collision-free id.
+#[derive(Debug, Clone)]
+pub struct RecoveredMmLeg {
+    /// The underlying ticker this leg quotes (the `cancel_symbol_orders` key).
+    pub underlying: Arc<str>,
+    /// The canonical contract symbol.
+    pub symbol: Symbol,
+    /// The venue order id the recovered `AddOrder` carried.
+    pub order_id: VenueOrderId,
+    /// True for the bid (buy) leg, false for the ask (sell) leg.
+    pub is_buy: bool,
+    /// The resting limit price in **cents** — used as the fill-edge `theo` on the
+    /// recovery path (an analytic approximation; the quote-time theoretical is not
+    /// journaled, and edge is a derived analytic excluded from the determinism
+    /// oracle).
+    pub price_cents: u64,
+    /// The remaining resting quantity in **contracts**.
+    pub quantity: u64,
+    /// The `{seq}` parsed from the `{lineage}:MM:{seq}` id, for the producer floor.
+    pub seq: u64,
+}
+
 /// The market-maker engine: drives quoting across registered instruments and
 /// routes every quote onto the sequenced order path.
 pub struct MarketMakerEngine {
@@ -407,6 +438,61 @@ impl MarketMakerEngine {
             symbol: underlying.to_string(),
             price_cents,
         });
+    }
+
+    /// Re-registers the market-maker legs still resting in a **recovered** book and
+    /// advances the id sequence past them, so the resumed producer **retires** old
+    /// liquidity instead of duplicating it (#148 review).
+    ///
+    /// The problem this closes: boot recovery (#85) reconstructs a resumed
+    /// underlying's book by re-execution, but this engine's `legs`/`resting`
+    /// tracking is **live-only** and starts empty. Left empty, the first live
+    /// requote's cancel-then-replace has no prior legs to cancel, so it posts a
+    /// **second** bid/ask pair on top of the recovered one, and — with
+    /// `next_order_seq` back at zero in the same lineage — mints
+    /// `{lineage}:MM:{seq}` ids that **collide** with the recovered orders and
+    /// overwrite their `resting` tracking.
+    ///
+    /// Restoring the recovered legs here makes the next
+    /// [`update_price`](Self::update_price) requote see them as its **prior** legs
+    /// and cancel them (replace-not-accumulate) — retiring the old liquidity —
+    /// while `next_seq_floor` (the max recovered `{lineage}:MM:{seq}` + 1) guarantees
+    /// every freshly minted id is **collision-free** with a retired one. A recovered
+    /// underlying whose maker is **disabled** (its kill switch was restored, see
+    /// [`apply_sequenced_control`](Self::apply_sequenced_control)) simply never
+    /// requotes, so its recovered legs stay resting exactly as a non-crashed killed
+    /// maker's would — no divergence either way.
+    ///
+    /// Deterministic and requote-free: it only writes the tracking maps and the
+    /// sequence floor from journal-derived inputs — no clock, no RNG, no sink
+    /// enqueue. The `theo` recorded per leg is the resting price (an analytic
+    /// approximation used only for a fill edge, excluded from the determinism
+    /// oracle). Call once per recovered underlying, before the maker is driven.
+    pub fn restore_recovered_producer(&self, legs: &[RecoveredMmLeg], next_seq_floor: u64) {
+        {
+            let mut resting = self.resting.write().unwrap_or_else(PoisonError::into_inner);
+            let mut leg_map = self.legs.write().unwrap_or_else(PoisonError::into_inner);
+            for leg in legs {
+                resting.insert(
+                    leg.order_id.clone(),
+                    RestingQuote {
+                        underlying: Arc::clone(&leg.underlying),
+                        symbol: leg.symbol.clone(),
+                        is_buy: leg.is_buy,
+                        theo_cents: leg.price_cents,
+                        quantity: leg.quantity,
+                    },
+                );
+                let slots = leg_map.entry(leg.symbol.clone()).or_insert([None, None]);
+                slots[leg_slot(leg.is_buy)] = Some(leg.order_id.clone());
+            }
+        }
+        // Advance the mint counter past every recovered seq so a fresh mint can never
+        // reuse a retired id. Recovery runs before the maker mints anything, so a
+        // monotonic `fetch_max` keeps the floor even if called per-underlying with
+        // interleaved seq ranges (never regressing a higher floor already set).
+        self.next_order_seq
+            .fetch_max(next_seq_floor, Ordering::Relaxed);
     }
 
     /// The latest price for `underlying`, in **cents**.
@@ -1245,6 +1331,102 @@ mod tests {
             .rposition(|c| matches!(c, VenueCommand::CancelOrder { .. }))
             .expect("a cancel exists");
         assert!(last_cancel < first_add, "cancels are enqueued before adds");
+    }
+
+    #[test]
+    fn test_restore_recovered_producer_retires_old_liquidity_with_collision_free_ids() {
+        // The #148-review core fix, exercised locally (no Docker): a resumed maker whose
+        // recovered legs + id floor were restored must, on its FIRST requote, RETIRE the
+        // recovered pair (cancel it) and mint COLLISION-FREE ids — never post a second
+        // pair on top with ids reused from zero.
+        let (engine, sink) = engine();
+        let symbol = sym(BTC_CALL);
+        let underlying: Arc<str> = Arc::from("BTC");
+        // A recovered book where the maker had posted `run-1:MM:0` (bid) / `run-1:MM:1`
+        // (ask) before the crash; the fresh engine restores them + a floor past them.
+        let recovered = vec![
+            RecoveredMmLeg {
+                underlying: Arc::clone(&underlying),
+                symbol: symbol.clone(),
+                order_id: VenueOrderId::new("run-1:MM:0"),
+                is_buy: true,
+                price_cents: 4_990_000,
+                quantity: 1,
+                seq: 0,
+            },
+            RecoveredMmLeg {
+                underlying: Arc::clone(&underlying),
+                symbol: symbol.clone(),
+                order_id: VenueOrderId::new("run-1:MM:1"),
+                is_buy: false,
+                price_cents: 5_010_000,
+                quantity: 1,
+                seq: 1,
+            },
+        ];
+        engine.restore_recovered_producer(&recovered, 2);
+
+        engine.register_instrument(&symbol);
+        engine.update_price("BTC", 5_000_000);
+        let commands = sink.drain();
+
+        // RETIRE: both recovered legs are cancelled by the first requote.
+        let cancelled: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| match c {
+                VenueCommand::CancelOrder { order_id, .. } => Some(order_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            cancelled.contains(&"run-1:MM:0"),
+            "the recovered bid is retired (cancelled), got {cancelled:?}"
+        );
+        assert!(
+            cancelled.contains(&"run-1:MM:1"),
+            "the recovered ask is retired (cancelled), got {cancelled:?}"
+        );
+
+        // RELINEAGE: the fresh pair uses ids past the recovered floor, never reusing 0/1.
+        let added: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| match c {
+                VenueCommand::AddOrder { order_id, .. } => Some(order_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            added.len(),
+            2,
+            "a fresh bid + ask are posted, got {added:?}"
+        );
+        for id in &added {
+            let seq: u64 = id
+                .rsplit_once(":MM:")
+                .and_then(|(_, s)| s.parse().ok())
+                .expect("a fresh maker id is `{lineage}:MM:{seq}`");
+            assert!(
+                seq >= 2,
+                "fresh id {id} (seq {seq}) is collision-free with the recovered floor 2"
+            );
+            assert_ne!(*id, "run-1:MM:0", "fresh id must not reuse a recovered id");
+            assert_ne!(*id, "run-1:MM:1", "fresh id must not reuse a recovered id");
+        }
+    }
+
+    #[test]
+    fn test_restore_recovered_producer_seq_floor_never_regresses() {
+        // The floor is a monotonic `fetch_max`, so restoring per-underlying with
+        // interleaved seq ranges can never lower an already-higher floor (a later mint
+        // must clear the highest recovered seq across every underlying).
+        let (engine, _sink) = engine();
+        engine.restore_recovered_producer(&[], 10);
+        engine.restore_recovered_producer(&[], 3);
+        assert_eq!(
+            engine.mint_order_id(),
+            VenueOrderId::new("run-1:MM:10"),
+            "the higher floor wins; the lower restore does not regress it"
+        );
     }
 
     #[test]

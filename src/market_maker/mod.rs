@@ -53,7 +53,7 @@ pub use self::config::{
     validate_control_knobs, validate_control_value,
 };
 pub use self::control_hub::MarketMakerControlHub;
-pub use self::engine::MarketMakerEngine;
+pub use self::engine::{MarketMakerEngine, RecoveredMmLeg};
 pub use self::persona::{PersonaConfig, PersonaError, PersonaJitter, PersonaJitterDraw};
 pub use self::pricer::{DEFAULT_IV, DEFAULT_RISK_FREE_RATE, OptionPricer};
 pub use self::quoter::{
