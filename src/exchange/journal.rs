@@ -460,10 +460,13 @@ pub fn check_record_size(record: &JournalRecord) -> Result<(), JournalError> {
     // the upstream `pricelevel::Hash32::to_hex` per-byte `format!` allocations the
     // exact serialize incurs (the ~57% append-serialize term #126 attributed). The
     // bound never under-estimates, so `estimate <= ceiling ⇒ true size <= ceiling`:
-    // accept without the exact serialize. Only a record whose estimate REACHES the
-    // ceiling — or whose estimate arithmetic overflowed (`None`, an impossibly-huge
-    // input) — falls through to the exact serialize, so the write ≤ read symmetry
-    // stays EXACT (no false accept, no false reject). Folding the guard here (it
+    // accept (equality included) without the exact serialize. Only a record whose
+    // estimate is strictly `> ceiling` — or whose estimate arithmetic overflowed
+    // (`None`, an impossibly-huge input) — falls through to the exact serialize, so
+    // the write ≤ read symmetry stays EXACT (no false accept, no false reject). The
+    // soundness rests on the estimator being a true conservative upper bound over
+    // EVERY variant's variable-length fields (enforced by its no-`..` matches).
+    // Folding the guard here (it
     // previously lived only at the in-memory `append` site) extends the skip to
     // every caller that measured through the exact path — the replay driver
     // (`src/simulation/replay.rs`) and the portable bundle.
@@ -599,13 +602,25 @@ fn accumulate_command_estimate(
     string_bytes: &mut Option<usize>,
     _elements: &mut Option<usize>,
 ) {
+    // No `..` on any arm (#165 review): every field is bound, so a new
+    // variable-length field on any variant forces a compile error here rather than
+    // silently under-estimating — which would false-accept an over-ceiling record
+    // past the write ≤ read ceiling. Fixed-size fields (`Side`, `TimeInForce`,
+    // `STPMode`, `Cents`, `EventTimestamp`, `Hash32`, an `ExpirationDate`) are bound
+    // to `_`; they are covered by [`RECORD_ESTIMATE_BASE_BYTES`].
     match command {
         VenueCommand::AddOrder {
             symbol,
             order_id,
             account,
             client_order_id,
-            ..
+            owner: _,
+            side: _,
+            order_type: _,
+            limit_price: _,
+            quantity: _,
+            time_in_force: _,
+            stp_mode: _,
         } => {
             add_estimate(string_bytes, symbol.as_str().len());
             add_estimate(string_bytes, order_id.as_str().len());
@@ -628,28 +643,64 @@ fn accumulate_command_estimate(
             order_id,
             new_order_id,
             account,
-            ..
+            client_order_id,
+            orig_client_order_id,
+            side: _,
+            limit_price: _,
+            quantity: _,
+            time_in_force: _,
+            stp_mode: _,
         } => {
             add_estimate(string_bytes, symbol.as_str().len());
             add_estimate(string_bytes, order_id.as_str().len());
             add_estimate(string_bytes, new_order_id.as_str().len());
             add_estimate(string_bytes, account.as_str().len());
+            // #165 review: BOTH `ClOrdID` fields are variable-length and were
+            // previously omitted — a large `client_order_id` / `orig_client_order_id`
+            // could under-estimate and false-accept an over-ceiling `Replace`.
+            if let Some(client_order_id) = client_order_id {
+                add_estimate(string_bytes, client_order_id.as_str().len());
+            }
+            if let Some(orig_client_order_id) = orig_client_order_id {
+                add_estimate(string_bytes, orig_client_order_id.as_str().len());
+            }
         }
-        VenueCommand::MassCancel { scope, account, .. } => {
-            if let MassCancelScope::Book(symbol) = scope {
-                add_estimate(string_bytes, symbol.as_str().len());
+        VenueCommand::MassCancel {
+            scope,
+            cancel_type: _,
+            account,
+        } => {
+            match scope {
+                // The only scope carrying an unbounded string; the others hold at most
+                // a bounded `ExpirationDate` / integer (covered by the base shell).
+                MassCancelScope::Book(symbol) => {
+                    add_estimate(string_bytes, symbol.as_str().len());
+                }
+                MassCancelScope::Underlying
+                | MassCancelScope::Expiration(_)
+                | MassCancelScope::Strike { .. } => {}
             }
             add_estimate(string_bytes, account.as_str().len());
         }
-        VenueCommand::SetInstrumentStatus { symbol, .. } => {
+        VenueCommand::SetInstrumentStatus { symbol, status: _ } => {
             add_estimate(string_bytes, symbol.as_str().len());
         }
-        VenueCommand::SimStep { underlying, .. } => {
+        VenueCommand::SimStep {
+            underlying,
+            now_ms: _,
+            price: _,
+            bid: _,
+            ask: _,
+        } => {
             add_estimate(string_bytes, underlying.len());
         }
-        VenueCommand::EvictExpiredOrders { .. }
-        | VenueCommand::MarketMakerControl { .. }
-        | VenueCommand::Clock { .. } => {}
+        VenueCommand::EvictExpiredOrders { now_ms: _ } | VenueCommand::Clock { now_ms: _ } => {}
+        VenueCommand::MarketMakerControl {
+            spread_multiplier: _,
+            size_scalar: _,
+            directional_skew: _,
+            enabled: _,
+        } => {}
     }
 }
 
@@ -660,16 +711,22 @@ fn accumulate_outcome_estimate(
     string_bytes: &mut Option<usize>,
     elements: &mut Option<usize>,
 ) {
+    // No `..` on any arm (#165 review): a new variable-length field on any outcome
+    // forces a compile error here rather than a silent under-estimate. `Added` and
+    // `Market` are split because their fixed count fields differ.
     match outcome {
         VenueOutcome::Added {
             fills,
             stp_cancelled,
-            ..
+            resting_quantity: _,
+        } => {
+            accumulate_fills_estimate(fills, string_bytes, elements);
+            accumulate_legs_estimate(stp_cancelled, string_bytes, elements);
         }
-        | VenueOutcome::Market {
+        VenueOutcome::Market {
             fills,
             stp_cancelled,
-            ..
+            unfilled_quantity: _,
         } => {
             accumulate_fills_estimate(fills, string_bytes, elements);
             accumulate_legs_estimate(stp_cancelled, string_bytes, elements);
@@ -677,13 +734,13 @@ fn accumulate_outcome_estimate(
         VenueOutcome::Cancelled { order_id } => {
             add_estimate(string_bytes, order_id.as_str().len());
         }
-        VenueOutcome::Replace { add, .. } => {
+        VenueOutcome::Replace { add, cancelled: _ } => {
             accumulate_add_outcome_estimate(add, string_bytes, elements);
         }
         VenueOutcome::MassCancelled { affected } => {
             accumulate_legs_estimate(affected, string_bytes, elements);
         }
-        VenueOutcome::InstrumentStatusChanged { symbol, .. } => {
+        VenueOutcome::InstrumentStatusChanged { symbol, status: _ } => {
             add_estimate(string_bytes, symbol.as_str().len());
         }
         VenueOutcome::Evicted { evicted } => {
@@ -697,10 +754,18 @@ fn accumulate_outcome_estimate(
         VenueOutcome::ControlApplied { swept } => {
             accumulate_legs_estimate(swept, string_bytes, elements);
         }
-        VenueOutcome::Rejected { reason, .. } => {
+        VenueOutcome::Rejected { reason, kind: _ } => {
             add_estimate(string_bytes, reason.len());
         }
-        VenueOutcome::Duplicate { terminal, .. } => {
+        VenueOutcome::Duplicate {
+            original_order_id,
+            terminal,
+            original_sequence: _,
+        } => {
+            // #165 review: `original_order_id` is variable-length and was previously
+            // omitted — a large id on a `Duplicate` could under-estimate. The boxed
+            // `terminal` is a genuine terminal outcome (never itself a `Duplicate`).
+            add_estimate(string_bytes, original_order_id.as_str().len());
             accumulate_outcome_estimate(terminal, string_bytes, elements);
         }
     }
@@ -713,20 +778,24 @@ fn accumulate_add_outcome_estimate(
     string_bytes: &mut Option<usize>,
     elements: &mut Option<usize>,
 ) {
+    // No `..` (#165 review): a new variable-length field forces coverage here.
     match add {
         AddOutcome::Filled {
             fills,
             stp_cancelled,
-        }
-        | AddOutcome::Rested {
-            fills,
-            stp_cancelled,
-            ..
         } => {
             accumulate_fills_estimate(fills, string_bytes, elements);
             accumulate_legs_estimate(stp_cancelled, string_bytes, elements);
         }
-        AddOutcome::Rejected { reason, .. } => {
+        AddOutcome::Rested {
+            fills,
+            stp_cancelled,
+            resting_quantity: _,
+        } => {
+            accumulate_fills_estimate(fills, string_bytes, elements);
+            accumulate_legs_estimate(stp_cancelled, string_bytes, elements);
+        }
+        AddOutcome::Rejected { reason, kind: _ } => {
             add_estimate(string_bytes, reason.len());
         }
     }
@@ -1010,6 +1079,79 @@ mod tests {
                 order_id: crate::models::VenueOrderId::new(format!("order-{seq}")),
             },
         ))
+    }
+
+    #[test]
+    fn test_estimator_covers_replace_clordids_and_duplicate_original_id() {
+        // #165 review 🔴: the estimator previously omitted `Replace`'s
+        // `client_order_id` / `orig_client_order_id` and `Duplicate`'s
+        // `original_order_id`, so an over-ceiling string in one of them could
+        // under-estimate and false-accept a record past the 2 MiB write ceiling.
+        // Each record below packs that exact field with an over-ceiling string; the
+        // estimator must now bound it from above (`estimate >= actual`), and
+        // `check_record_size` must REJECT it (no false accept). Before the fix these
+        // returned Ok — the exact regression this closes.
+
+        use crate::exchange::boundary::{STPMode, TimeInForce};
+        use crate::models::{ClientOrderId, VenueOrderId};
+
+        let huge = "z".repeat(MAX_JOURNAL_RECORD_BYTES + 64);
+        let replace = |client_order_id, orig_client_order_id| {
+            JournalRecord::command(
+                SequenceNumber::new(0),
+                EventTimestamp::new(1),
+                VenueCommand::Replace {
+                    symbol: sym("BTC-20240329-50000-C"),
+                    order_id: VenueOrderId::new("o-1"),
+                    new_order_id: VenueOrderId::new("o-2"),
+                    account: AccountId::new("acct-1"),
+                    client_order_id,
+                    orig_client_order_id,
+                    side: Side::Buy,
+                    limit_price: Some(Cents::new(50_000)),
+                    quantity: 1,
+                    time_in_force: TimeInForce::Gtc,
+                    stp_mode: STPMode::None,
+                },
+            )
+        };
+        let records = [
+            // over-ceiling `client_order_id`
+            replace(Some(ClientOrderId::new(huge.clone())), None),
+            // over-ceiling `orig_client_order_id`
+            replace(None, Some(ClientOrderId::new(huge.clone()))),
+            // over-ceiling `Duplicate.original_order_id`
+            JournalRecord::event(VenueEvent::new(
+                SequenceNumber::new(2),
+                EventTimestamp::new(1),
+                cancel(2),
+                VenueOutcome::Duplicate {
+                    original_order_id: VenueOrderId::new(huge.clone()),
+                    original_sequence: SequenceNumber::new(0),
+                    terminal: Box::new(VenueOutcome::Cancelled {
+                        order_id: VenueOrderId::new("o-1"),
+                    }),
+                },
+            )),
+        ];
+
+        for record in &records {
+            // Soundness: the estimate bounds the true serialized size from above.
+            let actual = serde_json::to_string(record).expect("serialize").len();
+            let estimate = estimated_max_serialized_len(record).expect("estimate in range");
+            assert!(
+                estimate >= actual,
+                "estimate {estimate} must be >= actual {actual} for {record:?}"
+            );
+            // End-to-end: the over-ceiling record is REFUSED, never false-accepted.
+            match check_record_size(record) {
+                Err(JournalError::ResourceLimit {
+                    limit: "record_bytes",
+                    ..
+                }) => {}
+                other => panic!("an over-ceiling record must be refused, got {other:?}"),
+            }
+        }
     }
 
     #[test]
