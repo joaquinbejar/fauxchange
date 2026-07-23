@@ -454,6 +454,24 @@ pub fn decode_journal_record(payload: &str) -> Result<JournalRecord, JournalErro
 ///   fails open by proceeding past an unmeasurable record (unreachable for
 ///   `venue.v1`, but the deserialiser must never accept what it cannot bound).
 pub fn check_record_size(record: &JournalRecord) -> Result<(), JournalError> {
+    // Fast path (#165 piece 1 — the `#091` conservative-upper-bound estimator,
+    // generalised from the in-memory `append` call site to this one check). The
+    // upper bound needs NO serialization — no `serde_json::to_string`, so none of
+    // the upstream `pricelevel::Hash32::to_hex` per-byte `format!` allocations the
+    // exact serialize incurs (the ~57% append-serialize term #126 attributed). The
+    // bound never under-estimates, so `estimate <= ceiling ⇒ true size <= ceiling`:
+    // accept without the exact serialize. Only a record whose estimate REACHES the
+    // ceiling — or whose estimate arithmetic overflowed (`None`, an impossibly-huge
+    // input) — falls through to the exact serialize, so the write ≤ read symmetry
+    // stays EXACT (no false accept, no false reject). Folding the guard here (it
+    // previously lived only at the in-memory `append` site) extends the skip to
+    // every caller that measured through the exact path — the replay driver
+    // (`src/simulation/replay.rs`) and the portable bundle.
+    if estimated_max_serialized_len(record)
+        .is_some_and(|estimate| estimate <= MAX_JOURNAL_RECORD_BYTES)
+    {
+        return Ok(());
+    }
     let bytes = match serde_json::to_string(record) {
         Ok(json) => json.len(),
         Err(_) => {
@@ -502,17 +520,18 @@ const RECORD_ESTIMATE_BASE_BYTES: usize = 4_096;
 const PER_ELEMENT_ESTIMATE_BYTES: usize = 512;
 
 /// A cheap, conservative **upper bound** on a record's `venue.v1` serialized
-/// byte length — the in-memory [`InMemoryVenueJournal::append`] size-check fast
-/// path (#091).
+/// byte length — the size-check fast path (`#091`, generalised into
+/// [`check_record_size`] itself by `#165` piece 1).
 ///
-/// [`check_record_size`] runs a full `serde_json::to_string` on **every**
-/// append purely to measure the byte length against [`MAX_JOURNAL_RECORD_BYTES`]
-/// — a measured tail-latency cost on the in-memory HP-1 path (the durable store
-/// reuses its INSERT serialization, so the cost is in-memory-only). This helper
-/// computes the same size *bounded from above* from the record's field byte
-/// sizes and fill/leg count alone — no allocation, no formatting — so the exact
-/// serialize can be skipped for the overwhelming majority of records that are
-/// clearly under the ceiling.
+/// Without it, [`check_record_size`] would run a full `serde_json::to_string` on
+/// **every** call purely to measure the byte length against
+/// [`MAX_JOURNAL_RECORD_BYTES`] — a measured tail-latency + allocation cost (the
+/// serialize drives the upstream `Hash32::to_hex` per-byte allocations). This
+/// helper computes the same size *bounded from above* from the record's field
+/// byte sizes and fill/leg count alone — no allocation, no formatting — so the
+/// exact serialize is skipped for the overwhelming majority of records that are
+/// clearly under the ceiling, for **every** caller of [`check_record_size`] (the
+/// in-memory + durable write paths, the replay driver, the portable bundle).
 ///
 /// **Soundness (load-bearing — the write ≤ read symmetry invariant).** The bound
 /// **never under-estimates**: a record's true serialized size is
@@ -905,20 +924,13 @@ impl VenueJournal for InMemoryVenueJournal {
         // write-ahead command reuses `N`; an over-ceiling post-mutation event seals
         // the underlying (loud), never a silent write-then-brick.
         //
-        // Size-check fast path (#091): `check_record_size` serialises the whole
-        // record only to measure its byte length. `estimated_max_serialized_len`
-        // bounds that length from above from the record's field sizes + fill/leg
-        // count with no allocation, so the exact serialize is skipped for the
-        // overwhelming majority of records that are clearly under the ceiling. The
-        // bound never under-estimates past the ceiling, so any record that would
-        // exceed it still falls through to the exact `check_record_size` and is
-        // refused — the write ≤ read symmetry invariant is exact.
-        // `None` = the estimate arithmetic overflowed `usize` (an impossibly-huge
-        // input) — treat it exactly like an over-ceiling estimate and force the exact
-        // check, never a silent pass.
-        if estimated_max_serialized_len(&record).is_none_or(|est| est > MAX_JOURNAL_RECORD_BYTES) {
-            check_record_size(&record)?;
-        }
+        // Size-check (the write ≤ read symmetry gate). `check_record_size` itself now
+        // carries the `#091` conservative-upper-bound fast path (#165 piece 1), so a
+        // record clearly under the ceiling is accepted WITHOUT the full
+        // `serde_json::to_string` (and its upstream `Hash32::to_hex` allocations) —
+        // the skip that previously lived here as an inline guard is now inside the one
+        // check, so the durable store, the replay driver, and the bundle path share it.
+        check_record_size(&record)?;
         let sequence = record.sequence();
         let kind = record.kind();
         // O(1) uniqueness (#091): the index maps `(sequence, kind)` to its slot in
@@ -1349,6 +1361,56 @@ mod tests {
         // A `venue.v1` record always serializes, so the fail-open path is unreachable
         // via the type; this documents the contract and exercises the ok path.
         assert!(check_record_size(&command_record(3)).is_ok());
+    }
+
+    #[test]
+    fn test_size_check_fast_path_preserves_write_read_symmetry_at_the_boundary() {
+        // #165 piece 1: the conservative-upper-bound fast path folded into
+        // `check_record_size` must NOT change the accept/reject decision — it only
+        // skips the exact serialize when the answer is definitely "accept".
+        //
+        // (1) A small record is accepted via the fast path (its estimate is far under
+        //     the 2 MiB ceiling) — no exact serialize needed.
+        assert!(check_record_size(&command_record(0)).is_ok());
+        // (2) A ~1 MiB order id: the over-estimate is BASE + len×6 ≈ 6 MiB, ABOVE the
+        //     ceiling, so the fast path does NOT fire; the exact serialize measures the
+        //     true ~1 MiB size, which is UNDER the ceiling, so it is accepted — the
+        //     fall-through means no false reject (write ≤ read symmetry, exact).
+        let near = "a".repeat(MAX_JOURNAL_RECORD_BYTES / 2);
+        let near_record = JournalRecord::command(
+            SequenceNumber::new(0),
+            EventTimestamp::new(1),
+            VenueCommand::CancelOrder {
+                symbol: sym("BTC-20240329-50000-C"),
+                order_id: crate::models::VenueOrderId::new(near),
+                account: AccountId::new("acct-1"),
+            },
+        );
+        assert!(
+            check_record_size(&near_record).is_ok(),
+            "a near-ceiling record whose over-estimate exceeds the ceiling must fall \
+             through to the exact check and be ACCEPTED (its true size is under)"
+        );
+        // (3) An over-ceiling record is still REJECTED (the fast path never lets it
+        //     through — its estimate is above the ceiling, so the exact check runs and
+        //     refuses): no false accept.
+        let over = "b".repeat(MAX_JOURNAL_RECORD_BYTES + 1);
+        let over_record = JournalRecord::command(
+            SequenceNumber::new(0),
+            EventTimestamp::new(1),
+            VenueCommand::CancelOrder {
+                symbol: sym("BTC-20240329-50000-C"),
+                order_id: crate::models::VenueOrderId::new(over),
+                account: AccountId::new("acct-1"),
+            },
+        );
+        match check_record_size(&over_record) {
+            Err(JournalError::ResourceLimit {
+                limit: "record_bytes",
+                ..
+            }) => {}
+            other => panic!("an over-ceiling record must be refused, got {other:?}"),
+        }
     }
 
     // ---- index-backed uniqueness (#091) ----------------------------------

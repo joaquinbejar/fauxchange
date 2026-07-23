@@ -2,7 +2,7 @@
 
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
-| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); the allocation profile (§6) re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix, the HP-4 requote section reduced 343→232 allocs/op by `#122` then 232→172 by `#164` (id interning, §6/§12), then the actor-turn baseline **corrected + root-caused 2026-07-22 (`#126`, RESOLVED)** — the §6 sections 1/2 baseline was stale pre-`#34` code carried over, the true steady-state is ~180–205 allocs/op, attributed by a new `dhat` call-stack bench (`benches/alloc_dhat.rs`), see §6's Baseline-correction + Root-cause blocks and §13.3; the allocation numbers remain a **not-yet-met** zero-alloc target (dominant term is upstream `Hash32::to_hex`, follow-up #165) |
+| Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); the allocation profile (§6) re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix, the HP-4 requote section reduced 343→232 allocs/op by `#122` then 232→172 by `#164` (id interning, §6/§12), then the actor-turn baseline **corrected + root-caused 2026-07-22 (`#126`, RESOLVED)** — the §6 sections 1/2 baseline was stale pre-`#34` code carried over, the ~180–205 allocs/op steady-state was attributed by a new `dhat` call-stack bench (`benches/alloc_dhat.rs`) to a dominant ~111 allocs/op upstream `Hash32::to_hex` append-serialize term, then **`#165` piece 1 (2026-07-23) folded the `#091` size-check fast path into `check_record_size`**, which skips that serialize on the common under-ceiling path — re-measured, the actor turn is now **~38–51 allocs/op with `Hash32::to_hex` absent** from the `dhat` breakdown (§6 table + breakdown corrected); the allocation numbers remain a **not-yet-met** zero-alloc target, now dominated by DTO `String` clones + upstream matching allocations |
 | Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§6 alloc profile, first stats_alloc run); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`); 2026-07-22 (§6 requote reduced `#122`; sections 1/2 re-measured + root-caused, §13.3 resolved, `#126`); 2026-07-23 (§6 requote reduced 232→172 by `#164` id interning), on routinely-rebased working trees at those dates |
 | Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #165); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
@@ -656,16 +656,41 @@ third).
 > two independent profilers agree). Full reconciliation and the per-call-site
 > breakdown are in the **Root cause** block after the table.
 
+> **`#165` re-measurement (2026-07-23) — the append-serialize term is GONE from
+> the common path.** Sections 1/2 below were **corrected** from the earlier ~195/
+> ~189: on the current tree the size-check fast path (`#091`, folded into
+> `check_record_size` by `#165` piece 1) skips the exact `serde_json::to_string`
+> for every under-ceiling record, so the ~111 allocs/op `Hash32::to_hex`
+> append-serialize term the 2026-07-22 breakdown attributed (~57% of the turn) is
+> **no longer incurred** on the common live append. Re-measured on the current
+> tree: `alloc_profile` sections 1/2 at ~39/~47 allocs/op and `alloc_dhat` at
+> **38.311 allocs/op total with `Hash32::to_hex` absent from the entire
+> per-call-site table** (see the corrected breakdown block below). The dominant
+> residual is now upstream `orderbook-rs`/`pricelevel` matching allocations + the
+> DTO `String` clones, not the venue's size check.
+
 | Section | allocs/op | bytes_alloc/op |
 |---|---|---|
-| `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **~195** (192.036 shown; range 180.4–203.3 over 10 runs) | ~13 300 |
-| `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **~189** (189.532 shown; range 181.0–202.7 over 10 runs) | ~13 250 |
+| `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **~40** (39.270 shown; ~38–51 across runs — the `DashMap`-timing variance band below; was ~195 pre-`#165`/#091-fast-path) | ~11 250 |
+| `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **~47** (46.891 shown; was ~189 pre-`#165`/#091-fast-path) | ~11 200 |
 | `MarketMakerEngine::update_price` steady-state requote (HP-4, `#050`/`#122`/`#164`, no `tokio` — a 10-contract chain, `CountingSink`) | **172.000** (was 232.000 pre-`#164`, 343.000 pre-`#122`) | 2 865.3 (was 3 513.3 pre-`#164`, 6 663.3 pre-`#122`) |
 
+> **⚠️ The rest of §6 (this "Target status" note and the `#126`
+> Baseline-correction / Root-cause blocks below) describes the 2026-07-22
+> investigation of the ~180–205 allocs/op figure, whose dominant term was the
+> `Hash32::to_hex` append-serialize.** `#165` piece 1 (2026-07-23) folded the
+> `#091` size-check fast path into `check_record_size`, which **skips that
+> serialize on the common under-ceiling path** — so the current-tree common actor
+> turn is **~38–51 allocs/op with `Hash32::to_hex` absent** (see the corrected
+> table + breakdown above). Read every "~180–205 / ~195 / ~190" figure below as
+> the **pre-fast-path exact-serialize path**, retained for the investigation
+> record, not the current common-path cost.
+
 **Target status: NOT MET — disclosed gap, not partial credit.** docs/07 §4's
-criterion is *zero* steady-state allocation on the common path; the measured
-common actor turn allocates **~180–205 times** per submitted command (the
-re-measured cluster, not the stale 60–80 the pre-`#34` baseline showed). This
+criterion is *zero* steady-state allocation on the common path; the (pre-`#165`,
+exact-serialize-path) common actor turn allocated **~180–205 times** per
+submitted command (the re-measured cluster, not the stale 60–80 the pre-`#34`
+baseline showed). This
 is failed-target evidence, reported honestly rather than framed as "close
 enough": the zero-steady-state-allocation DESIGN TARGET is open, and the
 measured numbers above are the disclosed size of that gap, not a partial
@@ -713,35 +738,57 @@ call-stack profiler and a scaling sweep:
   (`9e5a537`) later inserted `check_record_size` — `serde_json::to_string` on
   every append — on top of that baseline, and it was never re-measured.
 
-**Per-call-site breakdown** (`benches/alloc_dhat.rs`, `dhat` 0.3, 3 000-op
-steady-state window, 195.4 allocs/op total, aggregated leaf-first):
+**Per-call-site breakdown — CURRENT tree** (`benches/alloc_dhat.rs`, `dhat` 0.3,
+3 000-op steady-state window, re-measured 2026-07-23 on the `#165` tree,
+**38.311 allocs/op total**, aggregated leaf-first):
 
 | allocs/op | % | call site (leaf → caller) |
 |---|---|---|
-| **~111** | **57 %** | `pricelevel::Hash32::to_hex` (upstream `src/orders/base.rs:104`) — one `format!("{:02x}")` per byte, ×32 bytes — reached via `Hash32::serialize` inside `check_record_size` → `serde_json::to_string` (`src/exchange/journal.rs:452`), the command record + the event record every turn |
-| ~42 | 21 % | `String::clone` — the `VenueCommand`/`VenueEvent` envelope clones for the write-ahead journal (`command.clone()`, `event.clone()`) plus `Symbol`/`AccountId`/`ClientOrderId`/`VenueOrderId` field clones and the idempotency-map inserts (present since the early envelope work; in the pre-`#34` baseline too) |
+| ~12.2 | 31.7 % | `String::clone` (`Vec<u8>::clone`) — the `VenueCommand`/`VenueEvent` envelope + DTO id (`ClientOrderId`/`ExecutionId`, still `String`) clones for the write-ahead journal and idempotency maps |
+| ~6.4 | 16.6 % | `[u8]::to_vec` / `to_owned` — slice/string interning copies on the order path |
+| ~5.1 | 13.3 % | upstream `dashmap` `RwLockWriteGuard`/`ArcInner` box — the matching engine's owner-index (`Hash32 → Vec<Id>`) bookkeeping per add |
+| ~1.8 | 4.6 % | upstream `Arc<pricelevel::OrderType>` — the resting order box per add |
+| ~1.7 | 4.5 % | upstream `pricelevel::TradeList::clone` per fill |
+| ~1.2 | 3.1 % | upstream `pricelevel::MatchResult::clone` (`Vec<Id>`) |
+| (remainder) | ~26 % | upstream `pricelevel` `PriceLevel`/`PriceLevelStatistics` Arcs, `crossbeam-skiplist` nodes, `Fill` `Vec`s (`MatchingExecutor::build_fills`), and hashbrown table growth — all upstream matching / venue fill plumbing |
+
+**`Hash32::to_hex` is ABSENT from the entire table.** The ~111 allocs/op (~57%)
+it previously dominated — the `#34` `check_record_size → serde_json::to_string`
+append-serialize term — is **not incurred on the common live append**: the
+`#091`/`#165` conservative-upper-bound fast path returns `Ok` without serializing
+for every under-ceiling record. The dominant residual is now the DTO `String`
+clones (partly addressed by `#164` for `AccountId`/`VenueOrderId`; the remaining
+`ClientOrderId`/`ExecutionId` are a further follow-up) and **upstream**
+`orderbook-rs`/`pricelevel` matching allocations (the venue wraps, never forks).
+
+<details><summary>Superseded 2026-07-22 breakdown — the EXACT-serialize path (bypassed on the common case; still taken for an over-ceiling record and by the durable store's INSERT, which needs the payload anyway). 195.4 allocs/op total.</summary>
+
+| allocs/op | % | call site (leaf → caller) |
+|---|---|---|
+| **~111** | **57 %** | `pricelevel::Hash32::to_hex` (upstream `src/orders/base.rs:104`) — one `format!("{:02x}")` per byte, ×32 bytes — reached via `Hash32::serialize` inside `check_record_size` → `serde_json::to_string` (`src/exchange/journal.rs`), the command record + the event record every turn |
+| ~42 | 21 % | `String::clone` — the `VenueCommand`/`VenueEvent` envelope clones for the write-ahead journal (`command.clone()`, `event.clone()`) plus `Symbol`/`AccountId`/`ClientOrderId`/`VenueOrderId` field clones and the idempotency-map inserts |
 | ~16 | 8 % | upstream `orderbook_rs::OrderBook::untrack_order_by_id` → `dashmap::IterMut` — the matching engine's own owner-index bookkeeping per add |
-| ~6.5 | 3.3 % | `serde_json::to_vec::<JournalRecord>` output buffer (the size-check serializer's own `Vec<u8>`, distinct from the `Hash32::to_hex` intermediates above) |
-| ~6 | 3 % | upstream `pricelevel` / `crossbeam-skiplist` price-level + trade-list + `[u8]::to_vec` allocations per fill (several sub-1/op sites, grouped) |
-| ~0.4 | 0.2 % | `MatchingExecutor::build_fills` (`src/exchange/executor.rs:1238`) — the venue's own fill `Vec` |
+| ~6.5 | 3.3 % | `serde_json::to_vec::<JournalRecord>` output buffer (the size-check serializer's own `Vec<u8>`) |
+| ~6 | 3 % | upstream `pricelevel` / `crossbeam-skiplist` price-level + trade-list + `[u8]::to_vec` allocations per fill |
+| ~0.4 | 0.2 % | `MatchingExecutor::build_fills` — the venue's own fill `Vec` |
 
-The single dominant term — `Hash32::to_hex` at ~57 % — is exactly the cost
-`#34` introduced on the append path and that `ab756ab`'s pre-`#34` baseline
-never paid, which fully accounts for the ~2.3–2.6× jump (60–80 → ~190). It is
-**upstream** allocation (the venue wraps `pricelevel`, never forks it),
-triggered by the venue's `check_record_size` serializing to measure record
-size. The `String::clone` term (~21 %) was present in the 60–80 baseline too,
-so it is not part of the divergence.
+At the time, the single dominant term — `Hash32::to_hex` at ~57 % — was the cost
+`#34` introduced on the append path when the fast path was bypassed; the venue
+wraps `pricelevel`, never forks it. `#165` piece 1 folded the `#091` fast path
+into `check_record_size` so the common path no longer reaches it.
 
-**Run-to-run variance, disclosed.** Ten runs at the default configuration
-(`ALLOC_WARMUP_OPS=5000 ALLOC_MEASURED_OPS=50000`) — §13.3's seven plus three
-fresh on 2026-07-22 — produced 180.4–203.3 allocs/op (direct) and 181.0–202.7
-(async); the table reports a representative run and discloses the range. The
-spread is ordinary early-lifetime container-growth timing (`DashMap`'s
-randomized per-instance hasher shifting exactly when an internal shard resizes
-within a fixed window from a freshly constructed actor), the same class of
-effect §3.4 isolates for the journal — a ~±6 % band around ~190, NOT the
-~150 % gap the stale baseline implied.
+</details>
+
+**Run-to-run variance, disclosed.** The variance CLASS is unchanged by `#165` —
+ordinary early-lifetime container-growth timing (`DashMap`'s randomized
+per-instance hasher shifting exactly when an internal shard resizes within a
+fixed window from a freshly constructed actor), the same effect §3.4 isolates for
+the journal — but the LEVEL dropped once the append-serialize term was fast-pathed
+away: the 2026-07-22 runs at the default configuration
+(`ALLOC_WARMUP_OPS=5000 ALLOC_MEASURED_OPS=50000`) produced 180.4–203.3 allocs/op
+(direct, the exact-serialize path), whereas the current tree's two direct runs
+produced 39.270 and 51.341 (the fast-pathed common path). The table reports a
+representative current run and discloses the band.
 
 **The `#050` requote section, disclosed separately.** Unlike the two sections
 above, three consecutive runs of the `MarketMakerEngine::update_price` section
