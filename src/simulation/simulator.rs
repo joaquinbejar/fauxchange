@@ -322,6 +322,43 @@ impl PriceSimulator {
         Ok(())
     }
 
+    /// Restores a **recovered** asset's walk cursor and last price at boot WITHOUT
+    /// emitting a step (#148 review) — so the resumed simulator continues its walk
+    /// from where the journal left off instead of restarting at cursor zero and
+    /// re-emitting already-journaled prices.
+    ///
+    /// Boot recovery (#85) reconstructs a resumed underlying from its durable
+    /// `SimStep` stream, but the simulator's per-asset cursor is **live-only** and
+    /// starts at zero, so the first post-resume [`step_once`](Self::step_once) would
+    /// serve `path[0]` again — re-walking prices the resumed stream already
+    /// committed. `cursor` is the count of `SimStep`s already journaled for the
+    /// underlying (clamped to the pre-generated path length; a cursor at or past the
+    /// end simply regenerates a fresh segment on the next step, exactly as a
+    /// non-crashed run past its horizon would). Unlike [`set_price`](Self::set_price)
+    /// this **never** emits or journals — recovery is strictly in-memory (recover
+    /// wins). Deterministic: cursor and price come from the journal, never a clock or
+    /// RNG.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::UnknownUnderlying`] if `underlying` is not a configured asset —
+    /// the caller only restores assets the manifest still hosts.
+    pub fn restore_cursor(
+        &self,
+        underlying: &str,
+        cursor: usize,
+        last_price: Cents,
+    ) -> Result<(), SimError> {
+        let mut assets = self.write_assets();
+        let state = assets
+            .get_mut(underlying)
+            .ok_or_else(|| SimError::UnknownUnderlying(underlying.to_string()))?;
+        state.cursor = cursor.min(state.path.len());
+        state.current = last_price;
+        state.dormant = false;
+        Ok(())
+    }
+
     /// Emits one price step for every asset **at the current venue-clock instant**
     /// — the interval loop's body, exposed for deterministic stepping.
     ///
