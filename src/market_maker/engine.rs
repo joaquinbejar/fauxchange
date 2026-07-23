@@ -376,6 +376,39 @@ impl MarketMakerEngine {
         }
     }
 
+    /// Seeds an underlying's **reference price** (in **cents**) WITHOUT requoting —
+    /// the non-journaling boot-recovery reconciliation setter (#148).
+    ///
+    /// Boot-time journal recovery (#85) reconstructs a resumed underlying's book by
+    /// re-executing its durable stream, but the market maker's in-memory state
+    /// (prices / registered instruments / resting legs) is **live-only** and starts
+    /// empty on the new process. Without a reference price the maker would quote
+    /// around a default/zero once its contracts are (re-)registered. This installs
+    /// the price the resumed stream already committed — the last journaled
+    /// [`SimStep`](crate::exchange::VenueCommand::SimStep) — so a subsequent live
+    /// requote quotes around the resumed price.
+    ///
+    /// Unlike [`update_price`](Self::update_price), this **never** cascades a
+    /// requote: a requote enqueues `AddOrder`s onto the sequenced path, which would
+    /// journal a fresh record onto the resumed stream, and recovery reconciliation
+    /// is strictly in-memory (recover wins — the `SimStep` is already durable). It
+    /// records the price and broadcasts [`MarketMakerEvent::PriceUpdated`] only. It
+    /// is idempotent and deterministic — the price comes from the journal, never a
+    /// clock or RNG.
+    pub fn seed_reference_price(&self, underlying: &str, price_cents: u64) {
+        self.prices
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(underlying.to_string(), price_cents);
+
+        // A live-only broadcast (never journaled), so seeding the reference price on
+        // the recovery path stays off the sequenced stream. No requote is cascaded.
+        let _ = self.event_tx.send(MarketMakerEvent::PriceUpdated {
+            symbol: underlying.to_string(),
+            price_cents,
+        });
+    }
+
     /// The latest price for `underlying`, in **cents**.
     #[must_use]
     pub fn get_price(&self, underlying: &str) -> Option<u64> {

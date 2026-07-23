@@ -890,6 +890,30 @@ fn rebuild_stores_from_events<E: ExecutionsStore, P: PositionsStore>(
     Ok(())
 }
 
+/// The last **journaled reference price** (in cents) for `underlying` in a recovered
+/// event stream (#148) — the price of the final [`VenueCommand::SimStep`] that named
+/// this underlying.
+///
+/// Boot recovery (#85) re-derives these events from the durable journal, so this is
+/// the price the resumed stream already committed. The market-maker reference price
+/// is seeded from it through the **non-journaling**
+/// [`MarketMakerEngine::seed_reference_price`](crate::market_maker::MarketMakerEngine::seed_reference_price)
+/// (recover wins — the `SimStep` is already durable, so re-journaling it would
+/// duplicate a record on the resumed stream). Deterministic: it is read straight from
+/// the journal, never a clock or RNG. `None` when the stream carries no price step for
+/// the underlying — the maker then holds no reference until the first live step.
+#[must_use]
+fn last_recovered_reference_price(events: &[VenueEvent], underlying: &str) -> Option<u64> {
+    events.iter().rev().find_map(|event| match &event.command {
+        VenueCommand::SimStep {
+            underlying: step_underlying,
+            price,
+            ..
+        } if step_underlying == underlying => Some(price.get()),
+        _ => None,
+    })
+}
+
 /// Whether `command` is **bufferable ingress** — a client order-entry command
 /// (`AddOrder` / `CancelOrder` / `Replace`) that carries a `(session_id, msg_seq)`
 /// identity and is subject to the deterministic ingress-reorder buffer (#111). Every
@@ -1252,6 +1276,12 @@ impl AppState {
         let mut actor_shutdowns: Vec<ActorShutdown> = Vec::with_capacity(ordered.len());
         let mut recovered_set: std::collections::HashSet<Arc<str>> =
             std::collections::HashSet::new();
+        // The last journaled `SimStep` price per recovered underlying (#148), captured
+        // from its re-derived event stream while it is in scope here, then seeded onto
+        // the market-maker engine (built below) through the NON-journaling reference
+        // setter — so a recovered underlying's maker quotes around the resumed price,
+        // not a default/zero, without re-journaling the already-durable `SimStep`.
+        let mut recovered_reference_prices: HashMap<Arc<str>, u64> = HashMap::new();
         for ticker in ordered {
             // The fan-out tees the committed event into BOTH the shared stores
             // (`StoreFanOut`, #008) and the WS market-data broadcast (`WsFanOut`,
@@ -1308,6 +1338,15 @@ impl AppState {
                             detail: sealed.detail,
                         },
                     )?;
+                    // Capture the last journaled reference price (#148) while the
+                    // recovered events are in scope; it is seeded onto the market-maker
+                    // engine (built below) via the non-journaling setter so the maker
+                    // quotes around the resumed price. A stream with no `SimStep` for
+                    // this underlying leaves no reference (the maker acquires one on the
+                    // first live step).
+                    if let Some(price) = last_recovered_reference_price(&events, ticker.as_ref()) {
+                        recovered_reference_prices.insert(Arc::clone(&ticker), price);
+                    }
                     // Install the live market-maker control seam now that recovery
                     // (which runs WITHOUT it) is done, so a post-resume
                     // `MarketMakerControl` takes effect on the sequenced path.
@@ -1436,6 +1475,40 @@ impl AppState {
             // persona jitter is reproducible for a fixed seed and replays identically.
             .with_run_seed(seed),
         );
+
+        // Boot-recovery market-maker reconciliation (#148). A recovered underlying's
+        // book was reconstructed by re-execution, but the maker's in-memory state
+        // (prices / instruments / resting legs) is LIVE-ONLY and starts empty on the
+        // new process. Seed each recovered underlying's reference price from the last
+        // journaled `SimStep` the resumed stream already committed, through the
+        // NON-journaling `seed_reference_price` (recover wins — the `SimStep` is
+        // already durable; re-journaling it would duplicate a record on the resumed
+        // stream). This makes the maker quote around the resumed price rather than a
+        // default/zero once the bounded seeding phase re-runs the (in-memory,
+        // never-journaled) persona/contract registration for the recovered underlying
+        // and the first live requote fires. No requote is cascaded here.
+        //
+        // DETERMINISM / PRECEDENCE: only `lineage_id` is rehydrated from the durable
+        // manifest, NOT the run seed (the #85 review note). A recovered underlying's
+        // persona therefore comes from the CURRENT config manifest, and post-resume
+        // MM/sim determinism relies on the operator supplying the SAME run seed +
+        // config manifest as the original run: the reference price restored here is
+        // deterministic (read from the journal, never a clock/RNG), but the persona
+        // jitter sub-stream is reproducible only under the same supplied run seed.
+        //
+        // Sorted iteration keeps the boot log free of hash-map order; each underlying's
+        // reference price is independent, so the order does not affect the result.
+        let mut recovered_refs: Vec<(&Arc<str>, &u64)> =
+            recovered_reference_prices.iter().collect();
+        recovered_refs.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
+        for (ticker, price) in recovered_refs {
+            market_maker.seed_reference_price(ticker, *price);
+            tracing::info!(
+                underlying = %ticker,
+                price_cents = *price,
+                "reconciled recovered market-maker reference price (non-journaling, #148)"
+            );
+        }
 
         // Bind the control hub to the engine now that it exists: from here a
         // sequenced `MarketMakerControl` applies its knobs live. The bind is

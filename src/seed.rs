@@ -52,6 +52,24 @@
 //! typed error — a different opening price for an already-seeded underlying, or an
 //! account id re-provisioned with different permissions.
 //!
+//! ## Seed vs recover — the recovered underlying still quotes (#85 / #148)
+//!
+//! A **recovered** underlying (resumed from a non-empty durable journal, #85) keeps
+//! its reconstructed book and journaled `underlying_sequence` — recover wins. The
+//! phase therefore SKIPS the journaled opening-price [`SimStep`](crate::exchange::VenueCommand::SimStep)
+//! (step 4) for it, since re-pricing would journal a **duplicate** record onto the
+//! resumed stream. But step 3's persona/contract registration is purely **in-memory**
+//! and never journals, so the phase STILL re-runs it for a recovered underlying —
+//! otherwise the maker would have no contracts to quote and be **quote-silent** after
+//! restart until an operator re-registered (#148). Its reference price was restored,
+//! non-journaled, from the last recovered `SimStep` at boot
+//! ([`MarketMakerEngine::seed_reference_price`](crate::market_maker::MarketMakerEngine::seed_reference_price)),
+//! so once registered here the maker quotes around the **resumed** price on the next
+//! live requote. Precedence + determinism: only `lineage_id` is rehydrated (not the
+//! run seed), so a recovered underlying's persona comes from the CURRENT config
+//! manifest, and post-resume MM/sim determinism relies on the operator supplying the
+//! same run seed + config manifest.
+//!
 //! [`register_instrument`]: crate::market_maker::MarketMakerEngine::register_instrument
 //! [`set_price`]: crate::simulation::PriceSimulator::set_price
 
@@ -270,21 +288,25 @@ pub async fn apply_seed_phase(
     //    persona's base spread / size + knobs and its seeded per-`(persona, symbol)`
     //    jitter; an unbound instrument follows the engine's global config.
     //
-    //    SEED-VS-RECOVER PRECEDENCE (#85): a **recovered** underlying (resumed from a
-    //    non-empty durable journal) is NOT re-seeded — recover wins. Its book /
-    //    executions / positions were reconstructed by re-execution and its actor
-    //    continues the journaled `underlying_sequence`; re-registering + re-pricing it
-    //    here would journal a duplicate opening `SimStep` onto the resumed stream.
-    //    Seed applies only to genuinely fresh underlyings.
+    //    SEED-VS-RECOVER PRECEDENCE (#85, refined by #148): a **recovered** underlying
+    //    (resumed from a non-empty durable journal) keeps its book / executions /
+    //    positions (reconstructed by re-execution) and its journaled
+    //    `underlying_sequence` — recover wins. It therefore SKIPS the fresh-seed
+    //    price-conflict check below (its resumed reference price legitimately differs
+    //    from the manifest opening price) and SKIPS step 4 (re-pricing it would journal
+    //    a duplicate opening `SimStep` onto the resumed stream). But it MUST STILL get
+    //    the persona/contract registration in this step: that registration is purely
+    //    **in-memory** and NEVER journals, and skipping it would leave the maker with no
+    //    contracts to quote — quote-silent after restart until an operator re-registered
+    //    (#148). The recovered underlying's reference price was already seeded onto the
+    //    engine at boot (non-journaling, `AppState::new`), so once registered here the
+    //    maker quotes around the resumed price on the next live requote. A genuinely
+    //    fresh underlying does BOTH the conflict check and the registration, then gets
+    //    step 4's opening `SimStep`.
     for set in manifest.instruments() {
-        if state.is_recovered(&set.underlying) {
-            tracing::info!(
-                underlying = %set.underlying,
-                "skipping seed registration for a recovered underlying (recover wins)"
-            );
-            continue;
-        }
-        if let Some(existing) = market_maker.get_price(&set.underlying)
+        let recovered = state.is_recovered(&set.underlying);
+        if !recovered
+            && let Some(existing) = market_maker.get_price(&set.underlying)
             && existing != set.opening_price.get()
         {
             return Err(SeedError::InstrumentPriceConflict {
@@ -292,6 +314,14 @@ pub async fn apply_seed_phase(
                 existing,
                 requested: set.opening_price.get(),
             });
+        }
+        if recovered {
+            tracing::info!(
+                underlying = %set.underlying,
+                "recovered underlying: re-running in-memory persona/contract \
+                 registration (non-journaling), skipping the opening-price SimStep \
+                 (recover wins, #148)"
+            );
         }
         let persona = set.persona.as_ref().and_then(|name| {
             manifest
@@ -311,8 +341,11 @@ pub async fn apply_seed_phase(
 
     // 4. Opening prices → a journaled `SimStep` + the market maker's requote,
     //    whose `AddOrder`s vivify the leaf books onto the shared symbol index. A
-    //    recovered underlying (#85) is SKIPPED here too — re-setting its opening price
-    //    would journal a duplicate `SimStep` onto the resumed stream (recover wins).
+    //    recovered underlying (#85) is SKIPPED at THIS step ONLY — re-setting its
+    //    opening price would journal a duplicate `SimStep` onto the resumed stream
+    //    (recover wins). It still got step 3's in-memory registration above, and its
+    //    reference price was restored non-journaled at boot (#148), so it is not
+    //    quote-silent despite skipping this journaled step.
     for set in manifest.instruments() {
         if state.is_recovered(&set.underlying) {
             continue;

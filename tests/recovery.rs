@@ -34,12 +34,15 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use fauxchange::config::SeedManifest;
 use fauxchange::db::{DatabasePool, DbPoolConfig};
 use fauxchange::exchange::{
-    Cents, ExecutionsStore, Hash32, JournalError, LineageId, PositionsStore, STPMode, Side, Symbol,
-    TimeInForce, VenueCommand,
+    Cents, EventTimestamp, ExecutionsStore, Hash32, JournalError, LineageId, PositionsStore,
+    STPMode, Side, Symbol, TimeInForce, VenueCommand,
 };
+use fauxchange::market_maker::MarketMakerEvent;
 use fauxchange::microstructure::{FeeConfig, FileMicrostructure, MicrostructureConfig};
+use fauxchange::seed;
 use fauxchange::state::{AppState, AppStateConfig, AppStateError};
 use fauxchange::{AccountId, OrderType, VenueOrderId};
 
@@ -319,6 +322,227 @@ async fn test_boot_recovery_refuses_to_serve_on_config_drift_naming_underlying_a
         Ok(_) => panic!("a config drift over a non-empty journal must refuse to serve, not resume"),
         Err(other) => panic!("expected a fail-stop AppStateError::Recovery, got {other:?}"),
     }
+
+    drop(container);
+}
+
+// ============================================================================
+// Market-maker quoting reconciliation after boot-time recovery (#148)
+// ============================================================================
+
+/// The market-maker opening reference price the seed manifest sets, in cents.
+const MM_OPENING: u64 = 5_000_000;
+/// A later reference price journaled as a `SimStep` in boot 1, in cents — distinct
+/// from `MM_OPENING`, so the recovered reference proves it is read from the durable
+/// journal (the last `SimStep`), not re-derived from the manifest opening price.
+const MM_MOVED: u64 = 5_100_000;
+/// A generous taker limit (well above the maker's ATM call premium, inside the
+/// `[1, 100_000_000]`-cent default price band) that lifts the maker's resting ask.
+const TAKER_LIFT: u64 = 10_000_000;
+/// The manifest's 50000-strike call on the seeded `20261231` expiry — the contract
+/// the maker actually quotes (distinct from the file-scope `CALL`, which sits on a
+/// different expiry the market-maker manifest never seeds).
+const MM_CALL: &str = "BTC-20261231-50000-C";
+
+/// A seed manifest with a `balanced` persona and one BTC chain on an absolute
+/// `DateTime` expiry after the venue clock (so the maker quotes and vivifies it). No
+/// accounts, so `apply_seed_phase` provisions none.
+const MM_SEED: &str = r#"
+[market_maker]
+default_persona = "balanced"
+
+[market_maker.personas.balanced]
+spread_multiplier = 1.0
+size_scalar = 1.0
+directional_skew = 0.0
+
+[instruments.BTC]
+opening_price_cents = 5000000
+expirations = ["20261231"]
+strikes = [50000, 55000]
+"#;
+
+fn mm_manifest() -> SeedManifest {
+    SeedManifest::from_toml_str(MM_SEED).expect("the market-maker seed manifest parses")
+}
+
+/// Boots a durable `AppState` in the bounded **seeding** phase (not yet serving),
+/// hosting the manifest's underlyings with its price-seam assets wired — the shape
+/// `main.rs` uses before `apply_seed_phase`.
+fn seeding_boot(pool: &DatabasePool, lineage: &str, manifest: &SeedManifest) -> Arc<AppState> {
+    let config = AppStateConfig::new(manifest.underlyings())
+        .with_lineage(LineageId::new(lineage))
+        .with_db(Some(pool.clone()))
+        .with_assets(seed::asset_configs(manifest))
+        .with_serving(false);
+    match AppState::new(config) {
+        Ok(state) => state,
+        Err(error) => panic!("durable seeding AppState boot must succeed: {error}"),
+    }
+}
+
+/// A journaled `SimStep` reference-price override on `underlying` — the sequenced
+/// producer `POST /api/v1/prices` wraps, awaited so it is durable before the kill.
+fn sim_step(underlying: &str, price: u64, now_ms: u64) -> VenueCommand {
+    VenueCommand::SimStep {
+        now_ms: EventTimestamp::new(now_ms),
+        underlying: underlying.to_string(),
+        price: Cents::new(price),
+        bid: None,
+        ask: None,
+    }
+}
+
+/// Boot → seed → trade → kill → re-boot the SAME durable pool: the recovered
+/// underlying's market maker is reconciled (#148) so it is **not** quote-silent.
+///
+/// It proves the three halves of the fix, without journaling any duplicate record on
+/// the resumed stream:
+///
+/// 1. **Non-journaling reference restore.** After `AppState::new` recovers BTC — but
+///    *before* the seed phase — the maker's reference price is the last journaled
+///    `SimStep` price (`MM_MOVED`), restored in-memory from the recovered stream, not
+///    a default/zero and not the manifest opening.
+/// 2. **Seed step 3 kept, step 4 skipped.** Re-running `apply_seed_phase` re-runs the
+///    in-memory persona/contract registration (`registered_count > 0`) for the
+///    recovered underlying but journals **nothing** (the `underlying_sequence` is
+///    unchanged across the phase — no duplicate `SimStep` onto the resumed stream),
+///    and does not trip an `InstrumentPriceConflict` on the moved reference.
+/// 3. **The maker quotes.** A live requote at the resumed reference produces two-sided
+///    `QuoteUpdated` events on the recovered chain — the maker is not silent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker; run in the CI migrations job with `-- --ignored`"]
+async fn test_boot_seed_trade_kill_reboot_recovered_market_maker_quotes() {
+    let (container, db) = start_pg().await;
+    let manifest = mm_manifest();
+
+    // ---- BOOT 1: seed → the maker quotes → move the reference → a trade. --------
+    let state1 = seeding_boot(&db, "mm-resume-run", &manifest);
+    seed::apply_seed_phase(&state1, &manifest)
+        .await
+        .expect("boot-1 seed manifest applies");
+    state1.begin_serving();
+
+    // The seed registered + priced + quoted the full chain (BTC: 2 strikes × 2 styles).
+    assert_eq!(state1.market_maker().registered_count(UNDERLYING), 4);
+    assert_eq!(
+        state1.market_maker().get_price(UNDERLYING),
+        Some(MM_OPENING),
+        "the fresh underlying seeded its opening reference price"
+    );
+
+    // Move the reference with an awaited, journaled `SimStep`, so the RESUMED reference
+    // (the last `SimStep`) is `MM_MOVED`, not the manifest opening — this both proves
+    // the restore reads the journal and exercises the recovered conflict-skip.
+    let now_ms = state1.clock().now_ms().get();
+    state1
+        .submit(sim_step(UNDERLYING, MM_MOVED, now_ms))
+        .await
+        .expect("boot-1 reference-move SimStep journals");
+
+    // A trade: a taker lifts the maker's resting ask on the call → a fill (two legs).
+    state1
+        .submit(add(
+            MM_CALL,
+            "tk-1",
+            "taker",
+            0x22,
+            Side::Buy,
+            TAKER_LIFT,
+            1,
+        ))
+        .await
+        .expect("boot-1 taker submits");
+    assert!(
+        state1.executions().len() >= 2,
+        "boot-1 recorded a trade (a fill against the maker)"
+    );
+
+    // Kill: dropping the only `Arc<AppState>` closes the actor mailbox; the durable
+    // writes committed synchronously before each awaited submit returned.
+    drop(state1);
+
+    // ---- RE-BOOT the SAME pool (seeding phase again, a DIFFERENT config lineage). -
+    let state2 = seeding_boot(&db, "mm-reboot-lineage", &manifest);
+    assert!(
+        state2.is_recovered(UNDERLYING),
+        "BTC resumed from the non-empty durable journal"
+    );
+
+    // (1) The maker reference was restored — NON-journaled — from the last recovered
+    // `SimStep` at boot, BEFORE the seed phase runs.
+    assert_eq!(
+        state2.market_maker().get_price(UNDERLYING),
+        Some(MM_MOVED),
+        "the recovered maker reference is the resumed price, not a default/zero or the manifest opening"
+    );
+    // The recovered underlying carries NO in-memory contract registration yet (recovery
+    // rebuilds the book, not the live-only maker state) — the seed phase supplies it.
+    assert_eq!(
+        state2.market_maker().registered_count(UNDERLYING),
+        0,
+        "recovery does not rebuild the live-only maker contract registration"
+    );
+
+    // The durable sequence the recovered stream sits at, BEFORE the re-seed. Boot
+    // recovery reconciliation (the reference restore) is in-memory and journals nothing.
+    let seq_before_seed = state2
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("boot-2 pre-seed snapshot")
+        .last_sequence;
+
+    // (2) Re-running the seed phase re-runs step 3 (in-memory registration) for the
+    // recovered underlying and SKIPS step 4 (the journaled opening `SimStep`) — and
+    // does NOT trip an `InstrumentPriceConflict` on the moved reference.
+    seed::apply_seed_phase(&state2, &manifest)
+        .await
+        .expect("boot-2 re-seed applies (recover wins; no conflict on the moved reference)");
+    state2.begin_serving();
+    assert_eq!(
+        state2.market_maker().registered_count(UNDERLYING),
+        4,
+        "the recovered underlying got its in-memory persona/contract registration (step 3)"
+    );
+
+    // The recovered re-seed journaled NOTHING — no duplicate `SimStep` (or any record)
+    // onto the resumed stream: the sequence is unchanged across the whole seed phase.
+    let seq_after_seed = state2
+        .journal_snapshot(UNDERLYING)
+        .await
+        .expect("boot-2 post-seed snapshot")
+        .last_sequence;
+    assert_eq!(
+        seq_after_seed, seq_before_seed,
+        "boot-recovery reconciliation + the recovered re-seed appended no journal record"
+    );
+
+    // (3) The maker is NOT quote-silent: a live requote at the resumed reference
+    // produces two-sided quotes on every recovered contract.
+    let mut events = state2.market_maker().subscribe();
+    state2
+        .market_maker()
+        .set_venue_now_ms(state2.clock().now_ms().get());
+    state2.market_maker().update_price(UNDERLYING, MM_MOVED);
+    let mut quotes = 0usize;
+    while let Ok(event) = events.try_recv() {
+        if let MarketMakerEvent::QuoteUpdated {
+            bid_price,
+            ask_price,
+            ..
+        } = event
+        {
+            assert!(
+                ask_price.get() > bid_price.get() && bid_price.get() >= 1,
+                "a recovered quote is a well-formed two-sided quote"
+            );
+            quotes += 1;
+        }
+    }
+    assert_eq!(
+        quotes, 4,
+        "the recovered underlying's maker quotes every contract around the resumed reference price"
+    );
 
     drop(container);
 }
