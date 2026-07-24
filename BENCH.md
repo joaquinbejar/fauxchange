@@ -3,8 +3,8 @@
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
 | Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); the allocation profile (§6) re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix, the HP-4 requote section reduced 343→232 allocs/op by `#122` then 232→172 by `#164` (id interning, §6/§12), then the actor-turn baseline **corrected + root-caused 2026-07-22 (`#126`, RESOLVED)** — the §6 sections 1/2 baseline was stale pre-`#34` code carried over, the ~180–205 allocs/op steady-state was attributed by a new `dhat` call-stack bench (`benches/alloc_dhat.rs`) to a dominant ~111 allocs/op upstream `Hash32::to_hex` append-serialize term, then **`#165` piece 1 (2026-07-23) folded the `#091` size-check fast path into `check_record_size`**, which skips that serialize on the common under-ceiling path — re-measured, the actor turn is now **~38–51 allocs/op with `Hash32::to_hex` absent** from the `dhat` breakdown (§6 table + breakdown corrected); the allocation numbers remain a **not-yet-met** zero-alloc target, now dominated by DTO `String` clones + upstream matching allocations |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§6 alloc profile, first stats_alloc run); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`); 2026-07-22 (§6 requote reduced `#122`; sections 1/2 re-measured + root-caused, §13.3 resolved, `#126`); 2026-07-23 (§6 requote reduced 232→172 by `#164` id interning), on routinely-rebased working trees at those dates |
-| Commit      | **Not pinned to a single SHA.** These baselines were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with uncommitted changes in flight — any SHA recorded here would stop identifying the measured tree the moment the branch moves, which is misleading rather than precise. The authoritative, immutable-commit re-measurement is deferred to the release-pinned tree once code is tagged (tracked: #165); until then, read every number below as a DESIGN TARGET comparison taken on a moving working tree, per the callout immediately below. |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§6 alloc profile, first stats_alloc run); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`); 2026-07-22 (§6 requote reduced `#122`; sections 1/2 re-measured + root-caused, §13.3 resolved, `#126`); 2026-07-23 (§6 requote reduced 232→172 by `#164` id interning); **2026-07-23 (§6 alloc baseline re-measured + commit-pinned to `main` `7d8c75e`, `#165`)** — the §6 pin identifies an immutable commit; the other dates are routinely-rebased working trees |
+| Commit      | **§6 allocation baseline: pinned to `7d8c75e` (`main`, 2026-07-23, #165).** The §6 alloc profile is re-measured on that immutable merged-`main` commit — which carries the `#091`/`#165` size-check fast path, the `#164` id interning, and the `#159` ingress sub-quota — with the documented `alloc_profile` / `alloc_dhat` invocations; the numbers below identify exactly that tree. **All OTHER budgets (§§1–4, 11–14) remain NOT pinned** — they were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with changes in flight, so any SHA recorded for them would stop identifying the measured tree. The authoritative immutable-commit re-measurement of **every** hot-path budget is still deferred to the release-pinned tree once the crate is tagged (tracked: #165, the release-tagged piece); until then read the non-§6 numbers as a DESIGN TARGET comparison on a moving working tree, per the callout below. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
 > **Every number in this document is a DESIGN TARGET comparison, never an
@@ -656,23 +656,26 @@ third).
 > two independent profilers agree). Full reconciliation and the per-call-site
 > breakdown are in the **Root cause** block after the table.
 
-> **`#165` re-measurement (2026-07-23) — the append-serialize term is GONE from
-> the common path.** Sections 1/2 below were **corrected** from the earlier ~195/
-> ~189: on the current tree the size-check fast path (`#091`, folded into
-> `check_record_size` by `#165` piece 1) skips the exact `serde_json::to_string`
-> for every under-ceiling record, so the ~111 allocs/op `Hash32::to_hex`
-> append-serialize term the 2026-07-22 breakdown attributed (~57% of the turn) is
-> **no longer incurred** on the common live append. Re-measured on the current
-> tree: `alloc_profile` sections 1/2 at ~39/~47 allocs/op and `alloc_dhat` at
-> **38.311 allocs/op total with `Hash32::to_hex` absent from the entire
-> per-call-site table** (see the corrected breakdown block below). The dominant
-> residual is now upstream `orderbook-rs`/`pricelevel` matching allocations + the
-> DTO `String` clones, not the venue's size check.
+> **`#165` — the append-serialize term is GONE, and this §6 baseline is now
+> COMMIT-PINNED to `main` `7d8c75e` (re-measured 2026-07-23).** Sections 1/2 were
+> **corrected** from the earlier ~195/~189: the size-check fast path (`#091`, folded
+> into `check_record_size` by `#165` piece 1, merged in #173) skips the exact
+> `serde_json::to_string` for every under-ceiling record, so the ~111 allocs/op
+> `Hash32::to_hex` append-serialize term the 2026-07-22 breakdown attributed (~57% of
+> the turn) is **no longer incurred** on the common live append. Re-measured on the
+> immutable merged-`main` commit `7d8c75e`: `alloc_profile` sections 1/2 at
+> **34.208 / 36.765** allocs/op and `alloc_dhat` at **38.311 allocs/op total with
+> `Hash32::to_hex` absent from the entire per-call-site table** (see the corrected
+> breakdown block below). The dominant residual is now upstream
+> `orderbook-rs`/`pricelevel` matching allocations + the DTO `String` clones, not the
+> venue's size check. **Still open under #165:** the release-tagged re-measure of
+> **every** hot-path budget (§§1–4, 11–14) on a v0.1.0-pinned tree — this pass pins
+> only §6.
 
 | Section | allocs/op | bytes_alloc/op |
 |---|---|---|
-| `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **~40** (39.270 shown; ~38–51 across runs — the `DashMap`-timing variance band below; was ~195 pre-`#165`/#091-fast-path) | ~11 250 |
-| `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **~47** (46.891 shown; was ~189 pre-`#165`/#091-fast-path) | ~11 200 |
+| `UnderlyingActor::handle` directly (no `tokio`, the exact "append → match → append → enqueue" turn) | **34.208** on the pinned `7d8c75e` run (~34–51 across runs — the `DashMap`-timing variance band below; was ~195 pre-`#165`/#091-fast-path) | 9 793.8 |
+| `ActorHandle::submit` round-trip (real `tokio` mailbox + `oneshot` reply — the production gateway-facing API) | **36.765** on the pinned `7d8c75e` run (was ~189 pre-`#165`/#091-fast-path) | 10 032.7 |
 | `MarketMakerEngine::update_price` steady-state requote (HP-4, `#050`/`#122`/`#164`, no `tokio` — a 10-contract chain, `CountingSink`) | **172.000** (was 232.000 pre-`#164`, 343.000 pre-`#122`) | 2 865.3 (was 3 513.3 pre-`#164`, 6 663.3 pre-`#122`) |
 
 > **⚠️ The rest of §6 (this "Target status" note and the `#126`
@@ -738,9 +741,9 @@ call-stack profiler and a scaling sweep:
   (`9e5a537`) later inserted `check_record_size` — `serde_json::to_string` on
   every append — on top of that baseline, and it was never re-measured.
 
-**Per-call-site breakdown — CURRENT tree** (`benches/alloc_dhat.rs`, `dhat` 0.3,
-3 000-op steady-state window, re-measured 2026-07-23 on the `#165` tree,
-**38.311 allocs/op total**, aggregated leaf-first):
+**Per-call-site breakdown — pinned to `main` `7d8c75e`** (`benches/alloc_dhat.rs`,
+`dhat` 0.3, 3 000-op steady-state window, re-measured 2026-07-23 on the immutable
+merged-`main` commit, **38.311 allocs/op total**, aggregated leaf-first):
 
 | allocs/op | % | call site (leaf → caller) |
 |---|---|---|
