@@ -137,7 +137,16 @@ pub enum FixDecodeError {
     /// The underlying `ironfix-tagvalue` codec rejected the frame — checksum
     /// mismatch, missing/invalid `BodyLength (9)`, missing `MsgType (35)`,
     /// truncation, or invalid UTF-8. These are session-level framing failures.
-    #[error("fix framing error: {0}")]
+    ///
+    /// `Display` is deliberately a **static** string and does NOT interpolate the
+    /// wrapped [`DecodeError`] (#179): as of `ironfix-tagvalue` 0.4 the codec's
+    /// `DecodeError::InvalidTag` carries a bounded (16-byte) snippet of the raw,
+    /// attacker-controlled inbound bytes, so rendering the inner error via `%`/
+    /// `{:?}` would echo hostile input into a log line. The detail is retained on
+    /// [`std::error::Error::source`] for programmatic inspection only, never in a
+    /// user- or peer-visible string — mirroring the redaction on `FixEncodeError`
+    /// and the `CompId` reason. The reject path already emits `text: None`.
+    #[error("fix framing error")]
     Framing(#[from] DecodeError),
     /// `BeginString (8)` was not the pinned `FIX.4.4`.
     #[error("begin string mismatch: expected '{expected}', got '{actual}'")]
@@ -414,6 +423,26 @@ mod tests {
             }
             other => panic!("expected SessionReject, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_framing_display_never_echoes_hostile_inbound_bytes() {
+        // #179: ironfix-tagvalue 0.4's `DecodeError::InvalidTag` carries a bounded
+        // snippet of the raw, attacker-controlled inbound bytes. `Framing`'s Display
+        // MUST NOT surface it — a static string only — so no future log line that
+        // renders the error via `%`/`{:?}` can leak hostile input. The detail stays
+        // reachable on `source()` for programmatic inspection.
+        let hostile = "8=HOSTILE\x01\x02\x03NEVER_LOG_ME";
+        let err = FixDecodeError::Framing(DecodeError::InvalidTag(hostile.to_string()));
+        let rendered = err.to_string();
+        assert_eq!(rendered, "fix framing error");
+        assert!(
+            !rendered.contains("HOSTILE") && !rendered.contains("NEVER_LOG_ME"),
+            "Framing Display leaked inbound bytes: {rendered:?}"
+        );
+        // The detail is retained on the error source for programmatic inspection.
+        let source = std::error::Error::source(&err).expect("Framing wraps a source");
+        assert!(source.to_string().contains("HOSTILE"));
     }
 
     #[test]

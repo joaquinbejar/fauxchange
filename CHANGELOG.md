@@ -29,8 +29,17 @@ The full versioning and release-process policy lives in the design docs
   (was overloaded onto `InvalidBodyLength`), while a real body-length overflow
   stays `InvalidBodyLength`. No behavioural change to the venue order path,
   protocol parity, determinism, or money-as-cents; the #140 checked-arithmetic
-  no-panic property was re-verified against the 0.4 source. A latent
-  log-redaction follow-up is tracked in #179.
+  no-panic property was re-verified against the 0.4 source.
+
+### Security
+
+- **Redact `FixDecodeError::Framing`'s `Display`** (#179). ironfix-tagvalue 0.4's
+  `DecodeError::InvalidTag` carries a bounded 16-byte snippet of the raw,
+  attacker-controlled inbound bytes; the `Framing` variant's `Display` no longer
+  interpolates the wrapped error, so no log line rendering it via `%`/`{:?}` can
+  echo hostile input. The detail stays reachable on `source()` for programmatic
+  inspection, and the reject path already emits `text: None`. A regression test
+  guards it.
 - **Conformance / DoS / scenario suites now drive assertions through the real
   gateway + socket end-to-end** (#130). Test-quality only — no production
   behavior changed. Several suites asserted against a component directly
