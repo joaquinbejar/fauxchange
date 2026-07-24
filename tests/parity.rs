@@ -1529,7 +1529,7 @@ async fn test_control_parity_replay_bundle_version_mismatch_is_rejected_on_both(
     let mut bundle = state.export_bundle().await.expect("export bundle");
     // A differing MINOR at the current 0.x base is a genuine load incompatibility
     // (a benign patch bump would instead replay — see the replay unit tests).
-    bundle.manifest.versions.fauxchange = "0.1.0-mismatch".to_string();
+    bundle.manifest.versions.fauxchange = "0.99.0-mismatch".to_string();
 
     let (status, body) = send(
         &state,

@@ -9,8 +9,37 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-24
+
 ### Changed
 
+- **Bump the ecosystem dependencies to their latest stable minor lines and
+  migrate the FIX gateway to ironfix 0.4** (#176, #177). `ironfix-{core,
+  tagvalue,dictionary,transport}` `0.3.1` → `0.4`, `option-chain-orderbook`
+  `0.7` → `0.10`, `optionstratlib` `0.17` → `0.18` (cascading `orderbook-rs
+  0.12.1`, `pricelevel 0.9.1` in the lock). The ironfix 0.4 breaking API is
+  threaded through the FIX gateway: `Encoder::finish` now returns a `Result`,
+  so a new venue-side `FixEncodeError` flows through `FixBody::encode` /
+  `DecodedMessage::encode` and every per-message encoder; `CompId::new` /
+  `RawMessage::begin_string` now return `Result` (mapped to typed
+  `FixDecodeError` at the header seam); `MsgType::Custom` wraps a typed
+  `CustomMsgType`. `CodecError` is now `#[non_exhaustive]` with new
+  `InvalidChecksumFormat` / `HeaderTooLong` / `InvalidTrailer` variants — an
+  over-255/malformed checksum surfaces as the dedicated `InvalidChecksumFormat`
+  (was overloaded onto `InvalidBodyLength`), while a real body-length overflow
+  stays `InvalidBodyLength`. No behavioural change to the venue order path,
+  protocol parity, determinism, or money-as-cents; the #140 checked-arithmetic
+  no-panic property was re-verified against the 0.4 source.
+
+### Security
+
+- **Redact `FixDecodeError::Framing`'s `Display`** (#179). ironfix-tagvalue 0.4's
+  `DecodeError::InvalidTag` carries a bounded 16-byte snippet of the raw,
+  attacker-controlled inbound bytes; the `Framing` variant's `Display` no longer
+  interpolates the wrapped error, so no log line rendering it via `%`/`{:?}` can
+  echo hostile input. The detail stays reachable on `source()` for programmatic
+  inspection, and the reject path already emits `text: None`. A regression test
+  guards it.
 - **Conformance / DoS / scenario suites now drive assertions through the real
   gateway + socket end-to-end** (#130). Test-quality only — no production
   behavior changed. Several suites asserted against a component directly

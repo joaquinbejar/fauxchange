@@ -355,7 +355,7 @@ fn test_bundle_corpus_hostile_manifest_version_is_typed_reject() {
     let bytes = corpus("bundle/hostile_manifest_version.json", || {
         let lineage = LineageId::new("run-1");
         let mut manifest = RunManifest::new(0, ClockMode::Realtime);
-        manifest.versions.fauxchange = "0.1.0-attacker".to_string();
+        manifest.versions.fauxchange = "0.99.0-attacker".to_string();
         pretty(&ScenarioBundle::new(
             manifest,
             vec![record_stream(UNDERLYING, &crossing(&lineage), &lineage)],
@@ -364,7 +364,7 @@ fn test_bundle_corpus_hostile_manifest_version_is_typed_reject() {
     match load_and_replay(&bytes) {
         Err(ReplayError::VersionMismatch { kind, found, .. }) => {
             assert_eq!(kind, "fauxchange");
-            assert_eq!(found, "0.1.0-attacker");
+            assert_eq!(found, "0.99.0-attacker");
         }
         other => panic!("expected a manifest VersionMismatch, got {other:?}"),
     }

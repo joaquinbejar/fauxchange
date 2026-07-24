@@ -6,10 +6,29 @@
     "instrument_seed": 0,
     "microstructure_fingerprint": "microstructure.default.v1",
     "versions": {
-      "fauxchange": "0.1.0-attacker",
-      "optionstratlib": "0.17.3",
+      "fauxchange": "0.99.0-attacker",
+      "optionstratlib": "0.18.0",
       "envelope_schema": "venue.v1"
     }
+  },
+  "microstructure": {
+    "fees": {
+      "maker_bps": 0,
+      "taker_bps": 0
+    },
+    "stp": {
+      "mode": "off"
+    },
+    "default_specs": {
+      "tick_size_cents": 1,
+      "lot_size": 1,
+      "min_price_cents": 1,
+      "max_price_cents": 100000000,
+      "max_order_qty": 1000000
+    },
+    "per_underlying": {},
+    "per_symbol": {},
+    "latency": "Disabled"
   },
   "streams": [
     {
