@@ -285,7 +285,7 @@ impl SessionOutbound {
 /// by `FixCodec` itself as of `ironfix-transport` 0.4: the frame-length add is a
 /// `checked_add` chain returning [`CodecError::InvalidBodyLength`] on overflow, and
 /// the checksum is folded in `u16` and range-checked to `0..=255`
-/// (`parse_checksum` returns `None` → `InvalidBodyLength`), so a hostile value is a
+/// (`parse_checksum` returns `None` → `InvalidChecksumFormat`), so a hostile value is a
 /// typed [`CodecError`] and **never a panic**, in a debug or a release build. The
 /// venue therefore does **not** pre-check either field — the framing-layer precheck
 /// was retired in #140. Do **not** re-add a security rationale here: that
