@@ -1027,7 +1027,7 @@ mod tests {
             .into_report(header());
         assert_eq!(report.order_id, order_id);
         // Round-trips through the wire encoder.
-        let bytes = super::super::FixBody::encode(&report);
+        let bytes = super::super::FixBody::encode(&report).expect("test encode");
         assert!(!bytes.is_empty());
     }
 }

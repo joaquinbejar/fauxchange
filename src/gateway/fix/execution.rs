@@ -15,7 +15,7 @@ use super::enums::{
     CommType, CxlRejResponseTo, ExecType, LastLiquidityInd, MassCancelResponse, OrdStatus,
     OrderSide,
 };
-use super::error::FixDecodeError;
+use super::error::{FixDecodeError, FixEncodeError};
 use super::header::{StandardHeader, UtcTimestamp};
 use super::price::{
     parse_decimal_to_cents, parse_signed_decimal_to_cents, render_cents_to_decimal,
@@ -152,7 +152,7 @@ impl FixBody for ExecutionReport {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::ORDER_ID, self.order_id.as_str());
@@ -232,7 +232,7 @@ impl FixBody for OrderCancelReject {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::ORDER_ID, self.order_id.as_str());
@@ -288,7 +288,7 @@ impl FixBody for OrderMassCancelReport {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(
@@ -343,7 +343,7 @@ impl FixBody for BusinessMessageReject {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.u64(tags::REF_SEQ_NUM, self.ref_seq_num.get());
@@ -402,7 +402,7 @@ mod tests {
     #[test]
     fn test_execution_report_trade_round_trips_with_signed_fee() {
         let report = filled_report();
-        let bytes = report.encode();
+        let bytes = report.encode().expect("test encode");
         let wire = String::from_utf8(bytes.clone()).expect("utf8");
         // Composite ids, the underlying_sequence join key, and the signed rebate.
         assert!(wire.contains("\u{1}37=run-1:BTC:7:0\u{1}"), "{wire}");
@@ -435,7 +435,7 @@ mod tests {
             text: Some("unknown symbol".to_string()),
             ..filled_report()
         };
-        let bytes = report.encode();
+        let bytes = report.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::ExecutionReport(back)) => assert_eq!(back, report),
             other => panic!("expected ExecutionReport, got {other:?}"),
@@ -458,7 +458,7 @@ mod tests {
         writer.u64(tags::SECONDARY_EXEC_ID, 7);
         writer.str(tags::TRANSACT_TIME, "20240329-12:00:00.000");
         add_fee(&mut writer);
-        writer.finish()
+        writer.finish().expect("test finish")
     }
 
     #[test]
@@ -511,7 +511,7 @@ mod tests {
             cxl_rej_reason: 1,
             text: Some("unknown order".to_string()),
         };
-        let bytes = reject.encode();
+        let bytes = reject.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::OrderCancelReject(back)) => assert_eq!(back, reject),
             other => panic!("expected OrderCancelReject, got {other:?}"),
@@ -530,7 +530,7 @@ mod tests {
                 VenueOrderId::new("run-1:BTC:9:0"),
             ],
         };
-        let bytes = report.encode();
+        let bytes = report.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::OrderMassCancelReport(back)) => {
                 assert_eq!(back, report);
@@ -551,7 +551,7 @@ mod tests {
             business_reject_reason: 3,
             text: Some("unsupported message type".to_string()),
         };
-        let bytes = reject.encode();
+        let bytes = reject.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::BusinessMessageReject(back)) => assert_eq!(back, reject),
             other => panic!("expected BusinessMessageReject, got {other:?}"),
@@ -566,7 +566,7 @@ mod tests {
             total_affected_orders: 0,
             affected_orders: Vec::new(),
         };
-        let bytes = report.encode();
+        let bytes = report.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::OrderMassCancelReport(back)) => assert_eq!(back, report),
             other => panic!("expected OrderMassCancelReport, got {other:?}"),

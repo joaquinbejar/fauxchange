@@ -175,7 +175,7 @@ fn test_hp3_new_order_single_fixture_decodes_to_itself() {
 #[test]
 fn test_hp3_execution_report_fixture_round_trips() {
     let report = fix_fixtures::execution_report_fixture();
-    let bytes = FixBody::encode(&report);
+    let bytes = FixBody::encode(&report).expect("test encode");
     match decode(&bytes) {
         Ok(DecodedMessage::ExecutionReport(back)) => assert_eq!(back, report),
         other => panic!("HP-3 8 fixture must round-trip through decode, got {other:?}"),
@@ -191,7 +191,8 @@ fn test_hp3_execution_report_fixture_round_trips() {
 /// `cargo test`, independently of a bench run.
 #[test]
 fn test_hp3_new_order_single_fixture_matches_committed_golden() {
-    let reconstructed = FixBody::encode(&fix_fixtures::new_order_single_fixture());
+    let reconstructed =
+        FixBody::encode(&fix_fixtures::new_order_single_fixture()).expect("test encode");
     assert_eq!(reconstructed, fix_fixtures::new_order_single_frame());
 }
 
@@ -201,6 +202,7 @@ fn test_hp3_new_order_single_fixture_matches_committed_golden() {
 /// its output against.
 #[test]
 fn test_hp3_execution_report_fixture_matches_committed_golden() {
-    let reconstructed = FixBody::encode(&fix_fixtures::execution_report_fixture());
+    let reconstructed =
+        FixBody::encode(&fix_fixtures::execution_report_fixture()).expect("test encode");
     assert_eq!(reconstructed, fix_fixtures::execution_report_golden_frame());
 }

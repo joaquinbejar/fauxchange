@@ -271,7 +271,7 @@ impl StandardHeader {
 
 /// Decodes a `CompID` value, rejecting one that exceeds the 32-byte FIX limit.
 fn decode_comp_id(tag: u16, value: &str) -> Result<CompId, FixDecodeError> {
-    CompId::new(value).ok_or(FixDecodeError::IncorrectDataFormat {
+    CompId::new(value).map_err(|_| FixDecodeError::IncorrectDataFormat {
         tag,
         reason: "comp id exceeds the 32-byte limit".to_string(),
     })

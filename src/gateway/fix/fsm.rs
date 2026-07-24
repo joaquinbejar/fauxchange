@@ -59,7 +59,7 @@ use super::enums::{
     CxlRejResponseTo, ExecType, MassCancelRequestType, MassCancelResponse, OrdStatus, OrdType,
     OrderSide, SubscriptionRequestType, TimeInForce as FixTif,
 };
-use super::error::SessionRejectReason;
+use super::error::{FixEncodeError, SessionRejectReason};
 use super::execution::{
     BusinessMessageReject, ExecutionReport, OrderCancelReject, OrderMassCancelReport,
 };
@@ -210,6 +210,11 @@ pub enum SessionError {
     /// inbound message sets the reply identity).
     #[error("fix session has no bound peer to reply to")]
     NoPeer,
+    /// An outbound frame could not be encoded (ironfix 0.4 defers field-write
+    /// errors to `Encoder::finish`) — a venue-side invariant violation; the session
+    /// closes rather than send a malformed frame. Redacted (no field bytes).
+    #[error("fix outbound frame encode error")]
+    Encode(#[from] FixEncodeError),
 }
 
 /// The frames to emit and whether to keep the connection open — one FSM step's
@@ -398,7 +403,7 @@ impl SessionFsm {
     fn emit(
         &mut self,
         now_ms: u64,
-        build: impl FnOnce(StandardHeader) -> Vec<u8>,
+        build: impl FnOnce(StandardHeader) -> Result<Vec<u8>, FixEncodeError>,
     ) -> Result<Vec<u8>, SessionError> {
         let sender = self.venue_comp.clone().ok_or(SessionError::NoPeer)?;
         let target = self.client_comp.clone().ok_or(SessionError::NoPeer)?;
@@ -409,7 +414,7 @@ impl SessionFsm {
             SeqNum::new(seq),
             UtcTimestamp::from_epoch_ms(now_ms),
         );
-        let frame = build(header);
+        let frame = build(header)?;
         // Checked, non-wrapping: an increment past u64::MAX seals the session —
         // computed BEFORE the durable write so an overflow never touches the store.
         let next = seq.checked_add(1).ok_or(SessionError::SequenceExhausted)?;
@@ -1351,7 +1356,7 @@ impl SessionFsm {
             new_seq_no: SeqNum::new(new_seq_no),
             gap_fill_flag: Some(true),
         }
-        .encode())
+        .encode()?)
     }
 
     /// Applies an inbound `SequenceReset (4)`: a `GapFillFlag=Y` advances the
@@ -1666,7 +1671,11 @@ fn header_of(message: &DecodedMessage) -> &StandardHeader {
 /// `HeartBtInt (108)`, and `ResetSeqNumFlag (141)` when the client reset —
 /// **without** `Username (553)` / `Password (554)`: an acceptor never echoes a
 /// credential.
-fn encode_logon_ack(header: &StandardHeader, heart_bt_int_secs: u32, reset_flag: bool) -> Vec<u8> {
+fn encode_logon_ack(
+    header: &StandardHeader,
+    heart_bt_int_secs: u32,
+    reset_flag: bool,
+) -> Result<Vec<u8>, FixEncodeError> {
     let mut writer = FieldWriter::new(MSG_TYPE_LOGON);
     header.encode(&mut writer);
     writer.u64(tags::ENCRYPT_METHOD, 0);

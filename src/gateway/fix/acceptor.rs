@@ -41,7 +41,7 @@
 //!   `CodecError::MessageTooLarge` and no unbounded allocation. The
 //!   hostile-arithmetic *correctness* — an overflowing `BodyLength (9)` add, an
 //!   out-of-range `CheckSum (10)` — is owned by `FixCodec` itself as of
-//!   `ironfix-transport` 0.3.1, which folds both fields with checked,
+//!   `ironfix-transport` 0.4, which folds both fields with checked,
 //!   non-wrapping arithmetic and returns a typed `CodecError` (never a panic), so
 //!   the venue no longer pre-checks them (the framing-layer precheck was retired
 //!   in #140). The accumulated read buffer is independently capped at
@@ -282,7 +282,7 @@ impl SessionOutbound {
 ///
 /// The **hostile-arithmetic correctness** — an overflowing `BodyLength (9)` add
 /// (`... + body_length + 7`) and an out-of-range `CheckSum (10)` triple — is owned
-/// by `FixCodec` itself as of `ironfix-transport` 0.3.1: the frame-length add is a
+/// by `FixCodec` itself as of `ironfix-transport` 0.4: the frame-length add is a
 /// `checked_add` chain returning [`CodecError::InvalidBodyLength`] on overflow, and
 /// the checksum is folded in `u16` and range-checked to `0..=255`
 /// (`parse_checksum` returns `None` → `InvalidBodyLength`), so a hostile value is a
@@ -305,7 +305,7 @@ impl BoundedFrameDecoder {
         Self {
             // The byte cap is enforced by `FixCodec`'s own `max_message_size`
             // total-length check (`total_length > max_message_size` →
-            // `MessageTooLarge`), which — as of 0.3.1 — runs after a *checked*
+            // `MessageTooLarge`), which — as of 0.4 — runs after a *checked*
             // frame-length add, so no hostile declared length can overflow it.
             inner: FixCodec::new().with_max_message_size(max),
         }
@@ -778,13 +778,23 @@ async fn writer_loop(mut write_half: OwnedWriteHalf, mut out_rx: mpsc::Receiver<
 /// only, never the offending bytes (safe to log).
 fn codec_error_kind(error: &CodecError) -> &'static str {
     match error {
-        CodecError::Incomplete => "incomplete",
         CodecError::InvalidBeginString => "invalid_begin_string",
         CodecError::MissingBodyLength => "missing_body_length",
         CodecError::InvalidBodyLength => "invalid_body_length",
+        // Refined framing errors added in ironfix-transport 0.4 (a malformed/over-255
+        // `CheckSum (10)`, an over-long standard header, a malformed trailer) — each
+        // now a distinct variant instead of the old `InvalidBodyLength` overload.
+        CodecError::InvalidChecksumFormat => "invalid_checksum_format",
+        CodecError::HeaderTooLong { .. } => "header_too_long",
+        CodecError::InvalidTrailer { .. } => "invalid_trailer",
         CodecError::ChecksumMismatch { .. } => "checksum_mismatch",
         CodecError::MessageTooLarge { .. } => "message_too_large",
         CodecError::Io(_) => "io",
+        // `CodecError` is `#[non_exhaustive]` as of ironfix-transport 0.4, and
+        // `Incomplete` is deprecated (incompleteness is signalled by `Ok(None)`, so
+        // it never reaches this label). A wildcard keeps the label stable if upstream
+        // adds a framing-error variant.
+        _ => "unknown",
     }
 }
 
@@ -948,7 +958,7 @@ mod tests {
     #[test]
     fn test_bounded_decoder_rejects_oversize_declared_length_without_panic() {
         // #140: a declared BodyLength of u64::MAX would overflow FixCodec's
-        // `body_len_soh + 1 + body_length + 7` add. As of ironfix-transport 0.3.1
+        // `body_len_soh + 1 + body_length + 7` add. As of ironfix-transport 0.4
         // that add is a `checked_add` chain returning `InvalidBodyLength` on
         // overflow — so the frame is rejected at the framing boundary with a typed
         // CodecError, no panic and no allocation of the payload (the decoder owns
@@ -981,7 +991,7 @@ mod tests {
     #[test]
     fn test_over_cap_frame_is_rejected_before_the_full_body_is_buffered() {
         // The by-policy byte cap rejects an over-cap declared length WITHOUT waiting
-        // for (or allocating) the full hostile body: FixCodec 0.3.1 checks
+        // for (or allocating) the full hostile body: FixCodec 0.4 checks
         // `total_length > max_message_size` before the completeness check, so a small
         // buffer carrying only the header + a complete over-cap `BodyLength (9)` is
         // rejected as MessageTooLarge at the framing boundary — no unbounded growth.
@@ -1010,9 +1020,10 @@ mod tests {
     fn test_bounded_decoder_rejects_malformed_checksum_without_panic() {
         // #140 regression (was P1): a COMPLETE, BodyLength-correct frame whose
         // CheckSum(10) parses to a value > 255 — a hundreds digit >= 3 (`999`), AND
-        // `256`/`260`/`299` (d0=2, d1>=5). ironfix-tagvalue 0.3.1's parse_checksum
+        // `256`/`260`/`299` (d0=2, d1>=5). ironfix-tagvalue 0.4's parse_checksum
         // folds the three digits in u16 and range-checks to 0..=255, returning None
-        // for every one of these; FixCodec maps that to InvalidBodyLength — a typed
+        // for every one of these; FixCodec maps that to a typed `InvalidChecksumFormat`
+        // (0.4 refined this from the earlier `InvalidBodyLength` overload) — a typed
         // reject at the framing boundary, no u8-fold overflow and no panic. `35=0<SOH>`
         // is a 5-byte body, so BodyLength(9)=5 is correct — only the checksum fails.
         for hostile_checksum in ["999", "256", "260", "299"] {
@@ -1020,10 +1031,10 @@ mod tests {
             let mut decoder = BoundedFrameDecoder::new(64 * 1024);
             let mut buf = BytesMut::from(&frame[..]);
             match decoder.decode(&mut buf) {
-                Err(CodecError::InvalidBodyLength) => {}
-                other => {
-                    panic!("expected InvalidBodyLength for `10={hostile_checksum}`, got {other:?}")
-                }
+                Err(CodecError::InvalidChecksumFormat) => {}
+                other => panic!(
+                    "expected InvalidChecksumFormat for `10={hostile_checksum}`, got {other:?}"
+                ),
             }
         }
     }
@@ -1031,16 +1042,16 @@ mod tests {
     #[test]
     fn test_bounded_decoder_checksum_boundary_is_exact_at_255() {
         // Boundary-exact through the real decoder: `256` (the first value that
-        // overflows a u8) is rejected as InvalidBodyLength (parse_checksum → None),
-        // while `255` (the max valid checksum) is NOT — it parses and flows to
-        // FixCodec's real sum check (a ChecksumMismatch here, since 255 is unlikely
-        // to be the true sum), never an InvalidBodyLength from a fold failure.
+        // overflows a u8) is rejected as InvalidChecksumFormat (parse_checksum → None;
+        // 0.4 refined this from InvalidBodyLength), while `255` (the max valid checksum)
+        // is NOT — it parses and flows to FixCodec's real sum check (a ChecksumMismatch
+        // here, since 255 is unlikely to be the true sum), never a fold-failure reject.
         let mut decoder = BoundedFrameDecoder::new(64 * 1024);
         let mut over = BytesMut::from(&frame_with_raw_checksum(b"35=0\x01", "256")[..]);
         assert!(
             matches!(
                 decoder.decode(&mut over),
-                Err(CodecError::InvalidBodyLength)
+                Err(CodecError::InvalidChecksumFormat)
             ),
             "256 overflows the u8 domain and must be rejected by the checked fold"
         );
@@ -1048,7 +1059,7 @@ mod tests {
         assert!(
             !matches!(
                 decoder.decode(&mut at_max),
-                Err(CodecError::InvalidBodyLength)
+                Err(CodecError::InvalidChecksumFormat)
             ),
             "255 is in-domain and must reach FixCodec's real sum check, not the fold reject"
         );
@@ -1059,11 +1070,12 @@ mod tests {
         // Exhaustive over the FULL 3-digit checksum input space `000..=999`, driven
         // through the REAL decoder (the retired precheck's magnitude sweep, moved to
         // prove the upstream checked fold): every value `> 255` (the whole `256..=999`
-        // band) must be rejected as InvalidBodyLength (parse_checksum's u16 fold
-        // range-checks to 0..=255 → None); every value `<= 255` must NOT be an
-        // InvalidBodyLength (it reaches FixCodec's real sum check — a ChecksumMismatch,
-        // or a match for the one true value). The loop completing IS the no-panic
-        // assertion, in a debug OR a release build.
+        // band) must be rejected as InvalidChecksumFormat (parse_checksum's u16 fold
+        // range-checks to 0..=255 → None; 0.4 refined this from InvalidBodyLength);
+        // every value `<= 255` must NOT be an InvalidChecksumFormat (it reaches
+        // FixCodec's real sum check — a ChecksumMismatch, or a match for the one true
+        // value). The loop completing IS the no-panic assertion, in a debug OR a
+        // release build.
         for value in 0u16..=999 {
             let checksum = format!("{value:03}");
             let frame = frame_with_raw_checksum(b"35=0\x01", &checksum);
@@ -1072,12 +1084,12 @@ mod tests {
             let outcome = decoder.decode(&mut buf);
             if value > 255 {
                 assert!(
-                    matches!(outcome, Err(CodecError::InvalidBodyLength)),
+                    matches!(outcome, Err(CodecError::InvalidChecksumFormat)),
                     "`10={checksum}` (> 255) must be rejected by the checked fold, got {outcome:?}"
                 );
             } else {
                 assert!(
-                    !matches!(outcome, Err(CodecError::InvalidBodyLength)),
+                    !matches!(outcome, Err(CodecError::InvalidChecksumFormat)),
                     "`10={checksum}` (<= 255) must reach the real sum check, got {outcome:?}"
                 );
             }
@@ -1192,7 +1204,7 @@ mod tests {
                 password: session::SecretField::new(SENTINEL_PASSWORD),
                 reset_seq_num_flag: None,
             });
-            let frame = logon.encode();
+            let frame = logon.encode().expect("test encode");
             // The frame really does carry the password on the wire...
             assert!(
                 String::from_utf8_lossy(&frame).contains(SENTINEL_PASSWORD),

@@ -11,7 +11,7 @@ use std::fmt;
 
 use super::FixBody;
 use super::codec::{FieldBag, FieldWriter, tags};
-use super::error::{FixDecodeError, SessionRejectReason};
+use super::error::{FixDecodeError, FixEncodeError, SessionRejectReason};
 use super::header::StandardHeader;
 use ironfix_core::types::SeqNum;
 
@@ -88,7 +88,7 @@ impl FixBody for Logon {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.u64(tags::ENCRYPT_METHOD, 0);
@@ -123,7 +123,7 @@ impl FixBody for Logout {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.opt_str(tags::TEXT, self.text.as_deref());
@@ -154,7 +154,7 @@ impl FixBody for Heartbeat {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.opt_str(tags::TEST_REQ_ID, self.test_req_id.as_deref());
@@ -185,7 +185,7 @@ impl FixBody for TestRequest {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::TEST_REQ_ID, &self.test_req_id);
@@ -220,7 +220,7 @@ impl FixBody for ResendRequest {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.u64(tags::BEGIN_SEQ_NO, self.begin_seq_no.value());
@@ -255,7 +255,7 @@ impl FixBody for SequenceReset {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.u64(tags::NEW_SEQ_NO, self.new_seq_no.value());
@@ -300,7 +300,7 @@ impl FixBody for Reject {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.u64(tags::REF_SEQ_NUM, self.ref_seq_num.value());
@@ -346,7 +346,7 @@ mod tests {
             password: SecretField::new("s3cr3t"),
             reset_seq_num_flag: Some(true),
         };
-        let bytes = logon.encode();
+        let bytes = logon.encode().expect("test encode");
         // The plaintext is on the wire (it is verified server-side) but a Debug
         // of the struct never shows it.
         assert!(!format!("{logon:?}").contains("s3cr3t"));
@@ -365,7 +365,7 @@ mod tests {
         writer.u64(tags::HEART_BT_INT, 30);
         writer.str(tags::USERNAME, "acct-1");
         writer.str(tags::PASSWORD, "s3cr3t");
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::ValueIsIncorrect { tag, value }) => {
                 assert_eq!(tag, tags::ENCRYPT_METHOD);
@@ -382,7 +382,7 @@ mod tests {
         writer.u64(tags::ENCRYPT_METHOD, 0);
         writer.u64(tags::HEART_BT_INT, 30);
         writer.str(tags::USERNAME, "acct-1");
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::MissingRequiredField { tag }) => assert_eq!(tag, tags::PASSWORD),
             other => panic!("expected MissingRequiredField(554), got {other:?}"),
@@ -423,7 +423,7 @@ mod tests {
             }),
         ];
         for msg in msgs {
-            let bytes = msg.encode();
+            let bytes = msg.encode().expect("test encode");
             match decode(&bytes) {
                 Ok(back) => assert_eq!(back, msg),
                 Err(e) => panic!("round trip failed for {msg:?}: {e:?}"),
@@ -435,7 +435,7 @@ mod tests {
     fn test_test_request_missing_id_is_typed_error() {
         let mut writer = FieldWriter::new(TestRequest::MSG_TYPE);
         header().encode(&mut writer);
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::MissingRequiredField { tag }) => assert_eq!(tag, tags::TEST_REQ_ID),
             other => panic!("expected MissingRequiredField(112), got {other:?}"),

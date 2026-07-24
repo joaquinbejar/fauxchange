@@ -1077,7 +1077,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1859,9 +1859,9 @@ dependencies = [
 
 [[package]]
 name = "ironfix-core"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44aa0f17c56416044a60a955c5cce4893f128e64155f0d3f9e35ae0fa678a726"
+checksum = "e631e02392352f5ae01c9b14345fd2b0ea90003e151064f954d98d97b96c9f96"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -1876,9 +1876,9 @@ dependencies = [
 
 [[package]]
 name = "ironfix-dictionary"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17c4b3073a1132853374e57a949cee32e59ab9aa66823d1bd2ba1d5a36a7ea24"
+checksum = "cde63538d4aadc9fb4f8cccaee82e35e14a3c64b016a525e803aa4fcae50f9f6"
 dependencies = [
  "ironfix-core",
  "quick-xml",
@@ -1888,9 +1888,9 @@ dependencies = [
 
 [[package]]
 name = "ironfix-tagvalue"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1ec4521c548231a8c88ff59bade526f69b41111a2cdeeb808311df18f552cc5"
+checksum = "b5e256ea16f270b5bb931ff7b88a190f87632506cca57913f1e7403f69175408"
 dependencies = [
  "bytes",
  "ironfix-core",
@@ -1902,9 +1902,9 @@ dependencies = [
 
 [[package]]
 name = "ironfix-transport"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "749694a36b0f5f9ff7d97ec5faf6d98ef7db9d90554f0ddac9139f94decf520f"
+checksum = "a0a85be944fa8cea26075d0002b1c8dd0cd860d3f98c99e2a83f25fd0e971311"
 dependencies = [
  "bytes",
  "ironfix-core",
@@ -1924,7 +1924,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2189,7 +2189,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2311,9 +2311,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "option-chain-orderbook"
-version = "0.7.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f5c0deb52e3ceda0e084d0a82678fec2ed9c393683c8629ce9b910df7165741"
+checksum = "aedce7b02abf8a91b2f5442f2e8023b137471a47baaa14ae99432851e1286d17"
 dependencies = [
  "chrono",
  "crossbeam-skiplist",
@@ -2328,6 +2328,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2345,9 +2346,9 @@ dependencies = [
 
 [[package]]
 name = "optionstratlib"
-version = "0.17.3"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f294746db2e76cf8f4dd665bfa19581efdeb037018c77aaa4ee343c465cc9309"
+checksum = "57fe8f098c9e0182df8025653876bead0b34cf3bbc899502cd8ff876fb0e2397"
 dependencies = [
  "approx",
  "chrono",
@@ -2380,9 +2381,9 @@ dependencies = [
 
 [[package]]
 name = "orderbook-rs"
-version = "0.10.5"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96f67ad9d19796def83029a652ea9a7b52a2c3fbbca2160aa343b70d878e5b68"
+checksum = "c83de8f6b2258f705810b7d7d216409b80dbbd48381ae4bdd608a387fd443390"
 dependencies = [
  "bitflags",
  "crc32fast",
@@ -2618,9 +2619,9 @@ dependencies = [
 
 [[package]]
 name = "pricelevel"
-version = "0.8.4"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75e028ea7fc2a38e3d47eacdea6eeef16b94c0fcd77240858f1037479a18d9fc"
+checksum = "79bc1d8b3056d021ad41c9dfe4af70f9a27e23b17503eb75933d498862d406ee"
 dependencies = [
  "crossbeam-skiplist",
  "dashmap",
@@ -3119,7 +3120,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3836,10 +3837,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4642,7 +4643,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
