@@ -940,7 +940,7 @@ mod tests {
         // MINOR at the current 0.x base is a breaking boundary) — refused (typed
         // reject). A benign patch bump would instead LOAD (see the positive test).
         let mut manifest = RunManifest::new(0, ClockMode::Realtime);
-        manifest.versions.fauxchange = "0.1.0-mismatch".to_string();
+        manifest.versions.fauxchange = "0.99.0-mismatch".to_string();
         let bundle = ScenarioBundle::new(manifest, vec![stream]);
         match replay_bundle(&bundle) {
             Err(ReplayError::VersionMismatch {
@@ -950,7 +950,7 @@ mod tests {
             }) => {
                 assert_eq!(kind, "fauxchange");
                 assert_eq!(expected, env!("CARGO_PKG_VERSION"));
-                assert_eq!(found, "0.1.0-mismatch");
+                assert_eq!(found, "0.99.0-mismatch");
             }
             other => panic!("expected a VersionMismatch reject, got {other:?}"),
         }

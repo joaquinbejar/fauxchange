@@ -1428,7 +1428,7 @@ mod tests {
         seed_crossing_ws(&state).await;
         let mut bundle = state.export_bundle().await.expect("export bundle");
         // A differing MINOR at the current 0.x base is a genuine load incompatibility.
-        bundle.manifest.versions.fauxchange = "0.1.0-mismatch".to_string();
+        bundle.manifest.versions.fauxchange = "0.99.0-mismatch".to_string();
         let connection = Connection::new(claims("admin", vec![Permission::Admin]));
         let message = connection.replay_control(&state, bundle, None).await;
         match message {
