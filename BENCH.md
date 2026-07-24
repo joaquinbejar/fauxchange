@@ -3,8 +3,8 @@
 | Field       | Value                                                              |
 |-------------|---------------------------------------------------------------------|
 | Status      | First baseline (`#020`), extended with the persistent-mode HP-5 durable append, the #34 in-memory-append delta, a re-verified HP-2 N-sweep (`#035`), the HP-3 FIX parse/encode budget (`#043`, §11), the HP-4 market-maker requote budget and requote-isolation assertion (`#050`, §12, v0.5), the CI `bench-regression` gate armed with a re-verification + documented ceilings (`#053`, §13, v1.0), the v1.0 stability soak (`#054`, §14, v1.0), and the `#091` in-memory HP-1 append tail-latency fix (index-backed uniqueness + size-check fast path, §3.7); the allocation profile (§6) re-measured 2026-07-18 after the `#75`/`#112` `alloc_profile` allocator fix, the HP-4 requote section reduced 343→232 allocs/op by `#122` then 232→172 by `#164` (id interning, §6/§12), then the actor-turn baseline **corrected + root-caused 2026-07-22 (`#126`, RESOLVED)** — the §6 sections 1/2 baseline was stale pre-`#34` code carried over, the ~180–205 allocs/op steady-state was attributed by a new `dhat` call-stack bench (`benches/alloc_dhat.rs`) to a dominant ~111 allocs/op upstream `Hash32::to_hex` append-serialize term, then **`#165` piece 1 (2026-07-23) folded the `#091` size-check fast path into `check_record_size`**, which skips that serialize on the common under-ceiling path — re-measured, the actor turn is now **~38–51 allocs/op with `Hash32::to_hex` absent** from the `dhat` breakdown (§6 table + breakdown corrected); the allocation numbers remain a **not-yet-met** zero-alloc target, now dominated by DTO `String` clones + upstream matching allocations |
-| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§6 alloc profile, first stats_alloc run); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`); 2026-07-22 (§6 requote reduced `#122`; sections 1/2 re-measured + root-caused, §13.3 resolved, `#126`); 2026-07-23 (§6 requote reduced 232→172 by `#164` id interning); **2026-07-23 (§6 alloc baseline re-measured + commit-pinned to `main` `7d8c75e`, `#165`)** — the §6 pin identifies an immutable commit; the other dates are routinely-rebased working trees |
-| Commit      | **§6 allocation baseline: pinned to `7d8c75e` (`main`, 2026-07-23, #165).** The §6 alloc profile is re-measured on that immutable merged-`main` commit — which carries the `#091`/`#165` size-check fast path, the `#164` id interning, and the `#159` ingress sub-quota — with the documented `alloc_profile` / `alloc_dhat` invocations; the numbers below identify exactly that tree. **All OTHER budgets (§§1–4, 11–14) remain NOT pinned** — they were measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) with changes in flight, so any SHA recorded for them would stop identifying the measured tree. The authoritative immutable-commit re-measurement of **every** hot-path budget is still deferred to the release-pinned tree once the crate is tagged (tracked: #165, the release-tagged piece); until then read the non-§6 numbers as a DESIGN TARGET comparison on a moving working tree, per the callout below. |
+| Recorded    | 2026-07-16 (§§1-4, 6-8); 2026-07-17 (`#035`, `#043` addenda); 2026-07-18 (§6 alloc profile, first stats_alloc run); 2026-07-18 (§12, `#050`); 2026-07-19 (§13, `#053`); 2026-07-19 (§14, `#054`); 2026-07-22 (§6 requote reduced `#122`; sections 1/2 re-measured + root-caused, §13.3 resolved, `#126`); 2026-07-23 (§6 requote reduced 232→172 by `#164` id interning); **2026-07-23 (§6 alloc baseline re-measured + commit-pinned to `main` `7d8c75e`, `#165`)**; **2026-07-24 (§0 — the full hot-path suite re-measured and pinned to the `v0.1.0` tag `47b57b4`, `#175`)** — the §0 and §6 pins identify immutable commits; the other dates are routinely-rebased working trees |
+| Commit      | **§6 allocation baseline: pinned to `7d8c75e` (`main`, 2026-07-23, #165).** The §6 alloc profile is re-measured on that immutable merged-`main` commit — which carries the `#091`/`#165` size-check fast path, the `#164` id interning, and the `#159` ingress sub-quota — with the documented `alloc_profile` / `alloc_dhat` invocations; the numbers below identify exactly that tree. **As of `#175` (2026-07-24) EVERY hot-path budget is re-measured and pinned to the `v0.1.0` tag (`47b57b4`)** — see §0, the authoritative immutable-commit baseline (full default sample, released ecosystem deps, same M4 Max). The per-section §§3–14 numbers below were first measured on actively developed, routinely-rebased branches (`stack/20-bench-hdr`, `stack/35-persistent-budget`, `stack/43-fix-bench`, `stack/50-requote-bench`, `stack/53-regression-gate`, `stack/54-stability-soak`) and are retained for methodology/context; §0 supersedes them as the pinned baseline and confirms them within the disclosed noise band. |
 | Methodology | [`docs/07-performance-budgets.md` §5](docs/07-performance-budgets.md#5-benchmark-methodology-the-bench-hdr-convention) |
 
 > **Every number in this document is a DESIGN TARGET comparison, never an
@@ -21,8 +21,53 @@
 > see the "Commit" row above. Do not read any date in this document as
 > "re-measured on \<date\> at \<some SHA\>"; the SHA that produced a given
 > number stops identifying the tree as soon as the branch moves. The
-> authoritative, commit-pinned re-measurement happens on the release-pinned
-> tree (#165).
+> authoritative, commit-pinned re-measurement of every hot-path budget is now
+> **§0**, pinned to the `v0.1.0` tag (`47b57b4`, #175); the per-section §§3–14
+> numbers below remain the earlier working-tree measurements, retained for
+> methodology/context and confirmed by §0 within the disclosed noise band.
+
+## 0. Release-tagged baseline — pinned to `v0.1.0` (`47b57b4`) (`#175`)
+
+**This is the authoritative, immutable-commit re-measurement.** On 2026-07-24
+the full hot-path bench suite was re-run on the **`v0.1.0` release tag**
+(`47b57b46`, `main` at cut time — the exact tree published to crates.io), on the
+same Apple M4 Max, at the **full default sample**, against the **released
+ecosystem deps** (`ironfix-* 0.4.0`, `option-chain-orderbook 0.10.0`,
+`orderbook-rs 0.12.1`, `pricelevel 0.9.1`, `optionstratlib 0.18.0`). Unlike the
+per-section §§3–14 numbers below — first measured on moving development branches
+and retained for methodology/context — **these numbers identify one immutable
+commit** and supersede them as the baseline. Every figure remains a **DESIGN
+TARGET** comparison on an un-tuned laptop, never an achieved SLO (see the
+callout above); the value here is the *provenance pin*, not a new promise.
+
+| Budget | Bench (full default sample) | p50 | p99 | p99.9 | p99.99 |
+|---|---|---|---|---|---|
+| **HP-1** sequenced full turn, in-memory, closed-loop | `hp1_order_path` (5 000 warmup + 100 000) | 11.13 µs | 31.09 µs | 77.50 µs | 168.32 µs |
+| **HP-2** WS fan-out, N=1 | `hp2_ws_fanout` (2 000 + 30 000) | 11.17 µs | 28.67 µs | 52.96 µs | 424.19 µs |
+| **HP-2** WS fan-out, N=1000 (flatness) | ″ | 11.01 µs | 28.13 µs (**−1.9 %** vs N=1) | 53.15 µs | 588.29 µs |
+| **HP-3** FIX decode `D→NewOrderSingle`, closed-loop | `hp3_fix_parse` (5 000 + 100 000) | 750 ns | 1 000 ns | 1 084 ns | 2 291 ns |
+| **HP-3** FIX encode `ExecutionReport→8`, closed-loop | ″ | 541 ns | 708 ns | 750 ns | 833 ns |
+| **HP-4** requote, engine-only, closed-loop | `mm_requote_hdr` (1 000 + 5 000, 10 contracts) | 111.68 µs | 135.68 µs | 145.02 µs | 156.67 µs |
+| **HP-4** requote, mailbox-wired, closed-loop | ″ | 135.17 µs | 161.66 µs | 175.74 µs | 198.78 µs |
+| **HP-5** durable Postgres full turn, closed-loop | `hp5_durable_append` (200 + 2 000, real container) | 553.98 µs | 709.63 µs | 785.92 µs | 1 229.82 µs |
+
+**Allocation profile (§6), re-measured on `47b57b4`** (`alloc_profile`, 50 000 /
+50 000 / 5 000 measured ops; `alloc_dhat` under `dhat-heap`):
+
+| Site | allocs/op |
+|---|---|
+| `UnderlyingActor::handle` (§6.1) | 39.27 |
+| `ActorHandle::submit` (§6.2) | 44.55 |
+| `MarketMakerEngine::update_price` requote (§6.3) | 172.000 |
+| `alloc_dhat` total per turn | 33.99 (11 120 bytes/op) |
+
+The `alloc_dhat` per-call-site breakdown confirms the `#091`/`#165` size-check
+fast path holds on the released tree — **`pricelevel::Hash32::to_hex` is absent**
+from the append path (the former ~111 allocs/op dominant term); the top site is a
+`0.784` allocs/op DashMap `RwLockWriteGuard` box. These match the §6 commit-pinned
+values (`#165`, previously `7d8c75e`) within run-to-run variance, now re-anchored
+to the release tag. The full itemized `bench-hdr` output for every span is in the
+run logs the commands in §2 reproduce.
 
 ## 1. Run conditions
 
@@ -36,8 +81,8 @@
 | Build | `cargo bench` (always `--release`; the `bench` Cargo profile) |
 | `RUSTFLAGS` | unset |
 | Allocator | system allocator (macOS `libmalloc`); `alloc_profile`'s `stats_alloc::StatsAlloc<System>` wraps `std::alloc::System`, it does not swap the allocator |
-| fauxchange crate version | `0.0.1` |
-| Pinned upstream crates | `option-chain-orderbook` `0.7.0`, `orderbook-rs` `0.10.5`, `pricelevel` `0.8.4`, `optionstratlib` `0.17.3` (from `Cargo.lock` on this branch — unchanged since `#020`) |
+| fauxchange crate version | `0.0.1` for the §§3–14 development-branch numbers; **`0.1.0`** for the §0 release-tagged baseline (the published crate) |
+| Pinned upstream crates | **§§3–14:** `option-chain-orderbook` `0.7.0`, `orderbook-rs` `0.10.5`, `pricelevel` `0.8.4`, `optionstratlib` `0.17.3`. **§0 (`v0.1.0`):** `option-chain-orderbook` `0.10.0`, `orderbook-rs` `0.12.1`, `pricelevel` `0.9.1`, `optionstratlib` `0.18.0`, `ironfix-* 0.4.0` — the released `Cargo.lock` (`#176`/`#177`) |
 | `hdrhistogram` / `criterion` | `7.5.4` / `0.8.2` (from `Cargo.lock`) |
 | Journal mode | **in-memory** (`InMemoryVenueJournal`) for HP-1/HP-2/allocation profile; **durable** (`PgVenueJournal` against a real ephemeral `postgres:18-alpine`, `testcontainers`) for HP-5 (§5, new in `#035`) |
 | Docker | `29.6.1` (HP-5's `testcontainers` containers only; every other bench needs no Docker) |
