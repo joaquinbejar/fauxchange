@@ -50,7 +50,7 @@ pub use enums::{
     MassCancelResponse, MdEntryType, MdUpdateAction, OrdStatus, OrdType, OrderSide,
     SubscriptionRequestType, TimeInForce,
 };
-pub use error::{FixDecodeError, FixRejectRoute, SessionRejectReason};
+pub use error::{FixDecodeError, FixEncodeError, FixRejectRoute, SessionRejectReason};
 pub use fsm::{
     SessionConfig, SessionError, SessionFsm, SessionPhase, VenueFixSession, VenueFixSessionFactory,
 };
@@ -98,7 +98,13 @@ pub trait FixBody: Sized {
     fn decode_body(header: StandardHeader, fields: &FieldBag<'_>) -> Result<Self, FixDecodeError>;
 
     /// Encodes the message to complete FIX wire bytes (header/trailer framed).
-    fn encode(&self) -> Vec<u8>;
+    ///
+    /// # Errors
+    ///
+    /// [`FixEncodeError`] if the encoder rejects a field at finish (ironfix 0.4
+    /// defers field-write errors) — a venue-side invariant violation on the outbound
+    /// path, surfaced typed rather than panicked.
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError>;
 }
 
 /// A decoded FIX message of any type the dialect supports.
@@ -151,8 +157,12 @@ pub enum DecodedMessage {
 
 impl DecodedMessage {
     /// Re-encodes the message to complete FIX wire bytes.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// [`FixEncodeError`] if a variant's encoder rejects a field at finish
+    /// (ironfix 0.4). See [`FixBody::encode`].
+    pub fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         match self {
             Self::Logon(m) => m.encode(),
             Self::Logout(m) => m.encode(),
@@ -195,7 +205,7 @@ impl DecodedMessage {
 /// price-seam failure.
 pub fn decode(bytes: &[u8]) -> Result<DecodedMessage, FixDecodeError> {
     // `BodyLength (9)` and `CheckSum (10)` are the two attacker-controlled numeric
-    // fields the decoder folds. As of ironfix-tagvalue 0.3.1 both are folded with
+    // fields the decoder folds. As of ironfix-tagvalue 0.4 both are folded with
     // CHECKED, non-wrapping arithmetic inside `Decoder::decode`: the frame-length
     // add is a `checked_add` chain plus an exact declared-vs-actual body-length
     // match (→ `DecodeError::InvalidBodyLength`), and `parse_checksum` folds the
@@ -209,7 +219,9 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedMessage, FixDecodeError> {
     // framing-layer byte-cap DoS ceiling.
     let raw = Decoder::new(bytes).decode()?;
 
-    let begin_string = raw.begin_string();
+    // `begin_string()` returns `Result<&str, DecodeError>` as of ironfix 0.4; `?`
+    // maps through `FixDecodeError::Framing` (`#[from] DecodeError`).
+    let begin_string = raw.begin_string()?;
     if begin_string != BEGIN_STRING {
         return Err(FixDecodeError::BeginStringMismatch {
             expected: BEGIN_STRING,
@@ -302,7 +314,9 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedMessage, FixDecodeError> {
         // A structurally unknown `MsgType` (an unmapped tag character) → session
         // `Reject (3)` with `InvalidMsgType`.
         MsgType::Custom(raw_type) => Err(FixDecodeError::UnsupportedMsgType {
-            msg_type: truncate_untrusted(raw_type),
+            // `MsgType::Custom` wraps a `CustomMsgType` (inline storage) as of
+            // ironfix 0.4; `.as_str()` borrows its code.
+            msg_type: truncate_untrusted(raw_type.as_str()),
         }),
         // A recognised application `MsgType` the venue has no handler for →
         // `BusinessMessageReject (j)` (the seam hook; routing is #039).
@@ -402,7 +416,7 @@ mod tests {
     #[test]
     fn test_decode_rejects_oversized_body_length_without_panic() {
         // #140 regression: a valid-checksum frame whose declared BodyLength is
-        // u64::MAX. ironfix-tagvalue 0.3.1's `Decoder` folds `body_start +
+        // u64::MAX. ironfix-tagvalue 0.4's `Decoder` folds `body_start +
         // body_length` with `checked_add`, so the overflow is a typed
         // `DecodeError::InvalidBodyLength` (→ Framing) — no panic, in debug OR
         // release. This is the equivalent reject the retired `validate_body_length`
@@ -438,7 +452,7 @@ mod tests {
     #[test]
     fn test_decode_rejects_leading_zero_body_length_tag_without_panic() {
         // Bypass PoC (was a leading-zero panic path): `009=` folds to tag 9. The
-        // 0.3.1 decoder folds the tag numerically AND uses `checked_add` on the
+        // 0.4 decoder folds the tag numerically AND uses `checked_add` on the
         // declared length, so `009=<u64::MAX>` is a typed reject (→ Framing), never
         // a panic — the zero-padded bypass is closed upstream.
         for label in ["009", "0009", "00009"] {
@@ -453,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_decode_rejects_leading_zero_checksum_tag_without_panic() {
-        // The trailer locator's identical blind spot: `010=` folds to 10. The 0.3.1
+        // The trailer locator's identical blind spot: `010=` folds to 10. The 0.4
         // decoder tracks the first tag-10 by folded tag, so a huge declared
         // BodyLength with a `010=` checksum is still a typed reject (→ Framing).
         let hostile = frame_with_tag_labels("9", "18446744073709551615", "010", HEARTBEAT_BODY);
@@ -503,14 +517,15 @@ mod tests {
             header,
             test_req_id: Some("TR-1".to_string()),
         })
-        .encode();
+        .encode()
+        .expect("test encode");
         assert!(decode(&bytes).is_ok());
     }
 
     #[test]
     fn test_decode_rejects_mid_body_checksum_injection_without_panic() {
         // #140 regression (the fuzzer-found P1): a MarketDataRequest carrying an
-        // injected mid-body `10=624` BEFORE the real trailing checksum. The 0.3.1
+        // injected mid-body `10=624` BEFORE the real trailing checksum. The 0.4
         // decoder folds the FIRST tag-10 it reaches (`624`) through the CHECKED
         // `parse_checksum` (u16 fold, range-checked to 0..=255), which returns None
         // → `DecodeError::InvalidFieldValue{tag:10}` (→ Framing) — no u8-fold

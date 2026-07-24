@@ -42,7 +42,7 @@ include = [
 # venue's own write-ahead envelope journal — but the feature makes the upstream
 # sequencer / `MassCancelScope` / `MassCancelType` types reachable for the
 # matching wiring in #007, and the audit note is recorded now.
-option-chain-orderbook = { version = "0.7", features = ["sequencer"] }
+option-chain-orderbook = { version = "0.10", features = ["sequencer"] }
 # The async runtime for the per-underlying single-writer actor (#006): the
 # bounded `mpsc` mailbox, the `oneshot` receipts, and the spawned actor task.
 # `fauxchange` is async-first on `tokio` by design (CLAUDE.md; `rules` mandates
@@ -82,7 +82,7 @@ tokio = { version = "1", default-features = false, features = [
 # `option-chain-orderbook` v0.7.0 does not re-export them, so they must come
 # from `optionstratlib` at the seam. `default-features = false` keeps the build
 # lean (no plotly / async), matching how the upstream crate depends on it.
-optionstratlib = { version = "0.17", default-features = false }
+optionstratlib = { version = "0.18", default-features = false }
 # Concurrent map for the in-memory executions / positions stores (#008): the
 # `rules/global_rules.md` Concurrency section blesses `DashMap` over
 # `Arc<RwLock<HashMap<>>>` for sharded, lock-free point access. Version `6`
@@ -273,7 +273,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 # the framing, the type vocabulary, and the version constant — NOT the (partial
 # / skeleton) transport / session / engine crates, which land with the acceptor
 # (#037) and session layer (#038). All three are published on crates.io at
-# `0.3.1` (verified `cargo tree -p <crate>` resolves each at `0.3.1` against the
+# `0.4.0` (verified `cargo tree -p <crate>` resolves each at `0.4.0` against the
 # crates.io sparse index; `deny.toml [sources]` allows ONLY that registry — no
 # git / path dep). MIT, maintained by the joaquinbejar/IronFix project.
 #   - ironfix-core: the `MsgType` / `CompId` / `SeqNum` / `Timestamp` vocabulary
@@ -297,55 +297,58 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 #     file); `quick-xml`'s only dep is `memchr`, already present. `quick-xml` is
 #     MIT and `num-derive` is MIT OR Apache-2.0 — both already on the `deny.toml`
 #     license allow-list; `cargo audit` / `cargo deny` gate the whole tree.
-# #140 audit note — patch bump `0.3.0` -> `0.3.1` on all four IronFix crates.
-# What changed upstream: `ironfix-tagvalue`'s `Decoder` and
-# `ironfix-transport`'s `FixCodec` now fold the two attacker-controlled numeric
-# fields — `BodyLength (9)` and `CheckSum (10)` — with CHECKED, non-wrapping
-# arithmetic: the frame-length add is a `checked_add` chain returning
-# `InvalidBodyLength` on overflow (`ironfix-transport-0.3.1/src/codec.rs:161`,
-# `ironfix-tagvalue-0.3.1/src/decoder.rs:154`), and `parse_checksum` folds the
-# three checksum digits in `u16` and range-checks to `0..=255`, returning `None`
-# (→ a typed `InvalidBodyLength` / `InvalidFieldValue{tag:10}`) instead of
-# overflowing a `u8` (`ironfix-tagvalue-0.3.1/src/checksum.rs:70`). A hostile
-# declared length or out-of-range checksum therefore surfaces as a typed
+# #140 audit note — the checked-arithmetic security property (originally landed in
+# the `0.3.1` patch, #140) is PRESERVED in the `0.4.0` line consumed here.
+# `ironfix-tagvalue`'s `Decoder` and `ironfix-transport`'s `FixCodec` fold the two
+# attacker-controlled numeric fields — `BodyLength (9)` and `CheckSum (10)` — with
+# CHECKED, non-wrapping arithmetic: the frame-length add is a `checked_add` /
+# `checked_mul` chain returning `InvalidBodyLength` on overflow, and
+# `parse_checksum` folds the three checksum digits in `u16` and range-checks to
+# `0..=255`, returning `None` instead of overflowing a `u8`. A hostile declared
+# length or out-of-range checksum therefore surfaces as a typed
 # `CodecError`/`DecodeError` with NO panic in a debug OR release build — verified
-# against the published `0.3.1` crates.io source, not a local checkout. Why: this
-# retires the venue's own now-redundant pre-decode guards (the framing-layer
+# against the published `0.4.0` crates.io source, not a local checkout. `0.4.0`
+# REFINES the reject taxonomy: an over-`255`/malformed checksum now surfaces as a
+# dedicated `CodecError::InvalidChecksumFormat` (was overloaded onto
+# `InvalidBodyLength`), and the codec adds `HeaderTooLong` / `InvalidTrailer`
+# variants — `CodecError` is `#[non_exhaustive]`, so `acceptor.rs`'s
+# `codec_error_kind` maps each and keeps a `_` fallback. The checked fold that made
+# the venue's own prechecks redundant (#140 retired the framing-layer
 # `BodyLength`/`CheckSum` precheck in `acceptor.rs` and the `validate_body_length`
-# / `reject_malformed_checksum` guards in `mod.rs` — #140), since the decoder now
-# owns both checks. The byte-cap `BoundedFrameDecoder` stays as a DoS/resource
-# ceiling by policy (not a security check). Why safe: same MINOR series (0.3.x),
-# no API break in the surface `fauxchange` consumes (build + clippy + the FIX
-# conformance/fuzz suites all pass); NO new crate enters the tree — a patch bump
-# of crates already resolved; `cargo audit` / `cargo deny` clean. (The relock also
-# incidentally shifts a few UNRELATED transitive edges — e.g. `errno` / `rustix` /
-# `tempfile` pick an already-resolved `windows-sys 0.52/0.59` and `getrandom 0.3`
-# instead of `0.61`/`0.4` — a resolver reshuffle among versions already present in
-# the tree on `main`; it adds/removes NO package version and is Windows-inert here,
-# so `cargo audit` / `cargo deny` stay clean either way.)
-ironfix-core = "0.3.1"
-ironfix-tagvalue = "0.3.1"
-ironfix-dictionary = "0.3.1"
+# / `reject_malformed_checksum` guards in `mod.rs`) is unchanged; the byte-cap
+# `BoundedFrameDecoder` stays as a DoS/resource ceiling by policy (not a security
+# check). Why the `0.3.1` -> `0.4.0` bump: it carries the breaking API changes the
+# gateway migrated to — `Encoder::finish` now returns `Result<&[u8], EncodeError>`
+# (deferred field errors), `CompId::new` / `RawMessage::begin_string` return
+# `Result` (were `Option`/infallible), and `MsgType::Custom` wraps a typed
+# `CustomMsgType` — plus `option-chain-orderbook 0.10` / `optionstratlib 0.18` in
+# the same lockstep bump. Why safe: build + clippy + the FIX conformance/fuzz
+# suites all pass on `0.4.0`; `cargo audit` / `cargo deny` clean; the security
+# property above is re-verified against the `0.4.0` source.
+ironfix-core = "0.4"
+ironfix-tagvalue = "0.4"
+ironfix-dictionary = "0.4"
 # The FIX 4.4 acceptor's framing codec (#037). `ironfix-transport::FixCodec` is a
 # `tokio_util::codec::Decoder`/`Encoder` that frames a FIX message on the wire
 # (BeginString / BodyLength / CheckSum), reused as-is
 # ([03 §5.1](docs/03-protocol-surfaces.md#5-fix-44-gateway-new), [ADR-0002](docs/adr/0002-fix-4-4-gateway-on-ironfix.md));
 # IronFix ships NO TCP acceptor, so the accept loop, the per-connection task, and
 # the connection lifecycle are new venue work over this codec. Published on
-# crates.io at `0.3.1` (verified `cargo tree -p ironfix-transport` resolves at
-# `0.3.1` against the crates.io sparse index; `deny.toml [sources]` allows ONLY
-# that registry — no git / path dep). Audit note: `ironfix-transport` 0.3.1's own
+# crates.io at `0.4.0` (verified `cargo tree -p ironfix-transport` resolves at
+# `0.4.0` against the crates.io sparse index; `deny.toml [sources]` allows ONLY
+# that registry — no git / path dep). Audit note: `ironfix-transport` 0.4.0's own
 # dependencies — `ironfix-core`, `ironfix-tagvalue`, `thiserror`, `tokio`,
 # `tokio-util`, `bytes`, `memchr`, `tracing` — are ALL already resolved in the
 # tree (verified against `Cargo.lock`), so it adds only the one new crate edge,
 # no new transitive crate version. `fauxchange` consumes only its `codec` module
 # (`FixCodec` / `CodecError`); the (skeleton) `ironfix-session` / `ironfix-store`
 # crates land with #038. MIT, maintained by the joaquinbejar/IronFix project.
-# Patch-bumped `0.3.0` -> `0.3.1` in #140 (see the #140 audit note above): the
-# `FixCodec` frame-length add + checksum fold are now checked/non-wrapping, so
-# the venue's framing-layer precheck around it is retired and `BoundedFrameDecoder`
-# is kept purely as the byte-cap DoS ceiling.
-ironfix-transport = "0.3.1"
+# Bumped to `0.4` (see the #140 audit note above): the `FixCodec` frame-length add
+# + checksum fold are checked/non-wrapping (so the venue's framing-layer precheck
+# stays retired and `BoundedFrameDecoder` is kept purely as the byte-cap DoS
+# ceiling), and `0.4` refines the over-255 checksum reject into a dedicated
+# `CodecError::InvalidChecksumFormat`.
+ironfix-transport = "0.4"
 # `tokio_util::codec::Decoder` — the trait `FixCodec` (above) implements and the
 # venue's bounded frame decoder (`src/gateway/fix/acceptor.rs`) wraps to enforce a
 # by-policy byte cap (a DoS/resource ceiling) around `FixCodec` (#037; the

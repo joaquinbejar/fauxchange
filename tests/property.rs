@@ -1370,7 +1370,7 @@ proptest! {
             time_in_force,
             expire_time,
         };
-        let bytes = DecodedMessage::NewOrderSingle(order.clone()).encode();
+        let bytes = DecodedMessage::NewOrderSingle(order.clone()).encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::NewOrderSingle(back)) => prop_assert_eq!(back, order),
             other => return Err(TestCaseError::fail(format!("expected NewOrderSingle, got {other:?}"))),
@@ -1409,7 +1409,7 @@ proptest! {
             rpt_seq: SequenceNumber::new(rpt_seq),
             entries,
         };
-        let bytes = DecodedMessage::MarketDataSnapshotFullRefresh(snapshot.clone()).encode();
+        let bytes = DecodedMessage::MarketDataSnapshotFullRefresh(snapshot.clone()).encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::MarketDataSnapshotFullRefresh(back)) => prop_assert_eq!(back, snapshot),
             other => return Err(TestCaseError::fail(format!("expected snapshot, got {other:?}"))),

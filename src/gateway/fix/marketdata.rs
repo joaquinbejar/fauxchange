@@ -12,7 +12,7 @@
 use super::FixBody;
 use super::codec::{FieldBag, FieldWriter, tags};
 use super::enums::{MdEntryType, MdUpdateAction, SubscriptionRequestType};
-use super::error::FixDecodeError;
+use super::error::{FixDecodeError, FixEncodeError};
 use super::header::StandardHeader;
 use super::price::{parse_decimal_to_cents, render_cents_to_decimal};
 use crate::exchange::{Cents, SequenceNumber, Symbol};
@@ -81,7 +81,7 @@ impl FixBody for MarketDataRequest {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::MD_REQ_ID, &self.md_req_id);
@@ -159,7 +159,7 @@ impl FixBody for MarketDataSnapshotFullRefresh {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::MD_REQ_ID, &self.md_req_id);
@@ -242,7 +242,7 @@ impl FixBody for MarketDataIncrementalRefresh {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::MD_REQ_ID, &self.md_req_id);
@@ -289,7 +289,7 @@ impl FixBody for MarketDataRequestReject {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::MD_REQ_ID, &self.md_req_id);
@@ -329,7 +329,7 @@ mod tests {
             entry_types: vec![MdEntryType::Bid, MdEntryType::Offer, MdEntryType::Trade],
             symbols: vec![sym()],
         };
-        let bytes = request.encode();
+        let bytes = request.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::MarketDataRequest(back)) => assert_eq!(back, request),
             other => panic!("expected MarketDataRequest, got {other:?}"),
@@ -347,7 +347,7 @@ mod tests {
         writer.u64(tags::NO_MD_ENTRY_TYPES, 0);
         writer.u64(tags::NO_RELATED_SYM, 1);
         writer.str(tags::SYMBOL, "BTC-20240329-50000-C");
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::EmptyGroup { count_tag }) => {
                 assert_eq!(count_tag, tags::NO_MD_ENTRY_TYPES);
@@ -369,7 +369,7 @@ mod tests {
         writer.str(tags::MD_ENTRY_TYPE, "1");
         writer.u64(tags::NO_RELATED_SYM, 1);
         writer.str(tags::SYMBOL, "BTC-20240329-50000-C");
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::GroupCountMismatch {
                 count_tag,
@@ -404,7 +404,7 @@ mod tests {
                 },
             ],
         };
-        let bytes = snapshot.encode();
+        let bytes = snapshot.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::MarketDataSnapshotFullRefresh(back)) => assert_eq!(back, snapshot),
             other => panic!("expected snapshot, got {other:?}"),
@@ -420,7 +420,7 @@ mod tests {
             rpt_seq: SequenceNumber::new(1),
             entries: Vec::new(),
         };
-        let bytes = snapshot.encode();
+        let bytes = snapshot.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::MarketDataSnapshotFullRefresh(back)) => assert_eq!(back, snapshot),
             other => panic!("expected snapshot, got {other:?}"),
@@ -451,7 +451,7 @@ mod tests {
                 },
             ],
         };
-        let bytes = refresh.encode();
+        let bytes = refresh.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::MarketDataIncrementalRefresh(back)) => assert_eq!(back, refresh),
             other => panic!("expected incremental refresh, got {other:?}"),
@@ -466,7 +466,7 @@ mod tests {
             md_req_rej_reason: 0,
             text: Some("unsupported subscription".to_string()),
         };
-        let bytes = reject.encode();
+        let bytes = reject.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::MarketDataRequestReject(back)) => assert_eq!(back, reject),
             other => panic!("expected reject, got {other:?}"),

@@ -33,8 +33,8 @@ const SENDING_TIME: &str = "20240329-12:00:00.000";
 
 fn comp(id: &str) -> CompId {
     match CompId::new(id) {
-        Some(c) => c,
-        None => panic!("HP-3 fixture comp id {id} failed to construct"),
+        Ok(c) => c,
+        Err(_) => panic!("HP-3 fixture comp id {id} failed to construct"),
     }
 }
 
@@ -102,7 +102,7 @@ pub fn new_order_single_frame() -> Vec<u8> {
     let golden = golden_frame(include_str!(
         "../../tests/golden/fix/new_order_single_D.txt"
     ));
-    let reconstructed = FixBody::encode(&new_order_single_fixture());
+    let reconstructed = FixBody::encode(&new_order_single_fixture()).expect("test encode");
     assert_eq!(
         reconstructed, golden,
         "HP-3 D fixture drifted from tests/golden/fix/new_order_single_D.txt; \
@@ -149,7 +149,7 @@ pub fn execution_report_fixture() -> ExecutionReport {
 /// as raw wire bytes — the exact frame HP-3's encode span must render. The encode
 /// span's input is the typed [`execution_report_fixture`] (you cannot "encode a
 /// byte string"), so the bench asserts, off the timed path, that
-/// `FixBody::encode(&execution_report_fixture())` equals these bytes — a dialect
+/// `FixBody::encode(&execution_report_fixture()).expect("test encode")` equals these bytes — a dialect
 /// change the fixture missed fails loudly there instead of measuring a stale
 /// shape. `tests/bench_harness.rs` asserts the same equality under `cargo test`.
 ///

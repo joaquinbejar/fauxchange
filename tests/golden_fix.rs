@@ -41,8 +41,8 @@ const SENDING_TIME: &str = "20240329-12:00:00.000";
 
 fn comp(id: &str) -> CompId {
     match CompId::new(id) {
-        Some(c) => c,
-        None => panic!("comp id {id} too long"),
+        Ok(c) => c,
+        Err(_) => panic!("comp id {id} too long"),
     }
 }
 
@@ -84,7 +84,7 @@ fn sym() -> Symbol {
 /// asserts tags 9 and 10 are present, and asserts the golden decodes back to the
 /// identical message.
 fn assert_golden_fix(name: &str, message: &DecodedMessage) {
-    let bytes = message.encode();
+    let bytes = message.encode().expect("test encode");
     let text = match String::from_utf8(bytes.clone()) {
         Ok(t) => t,
         Err(e) => panic!("encoded {name} is not utf-8: {e}"),
@@ -441,7 +441,9 @@ fn test_economic_parity_rest_and_fix_agree_on_cents_and_sequence() {
     assert_eq!(fix_new_order.price, Some(rest_order.price));
 
     // Re-decode the FIX wire to prove the seam produced the cents, not a float.
-    let wire = DecodedMessage::NewOrderSingle(fix_new_order).encode();
+    let wire = DecodedMessage::NewOrderSingle(fix_new_order)
+        .encode()
+        .expect("test encode");
     match decode(&wire) {
         Ok(DecodedMessage::NewOrderSingle(back)) => {
             assert_eq!(back.price, Some(Cents::new(50005)));
@@ -480,7 +482,7 @@ fn test_economic_parity_rest_and_fix_agree_on_cents_and_sequence() {
 fn assert_golden_script(name: &str, messages: &[DecodedMessage]) {
     let mut lines: Vec<String> = Vec::with_capacity(messages.len());
     for message in messages {
-        let bytes = message.encode();
+        let bytes = message.encode().expect("test encode");
         let text = match String::from_utf8(bytes.clone()) {
             Ok(t) => t,
             Err(e) => panic!("encoded script frame is not utf-8: {e}"),

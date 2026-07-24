@@ -15,12 +15,29 @@
 //! `BusinessMessageReject (j)`. Building the wire reject frame is #038/#039 —
 //! this layer only classifies.
 
-use ironfix_core::error::DecodeError;
+use ironfix_core::error::{DecodeError, EncodeError};
 
 use crate::exchange::SymbolError;
 
 use super::limits::truncate_untrusted;
 use super::price::PriceSeamError;
+
+/// A venue-side FIX **encode** failure (ironfix 0.4). The `ironfix-tagvalue`
+/// encoder **defers** field-write errors — an over-long value, a non-finite/invalid
+/// field, or a missing `MsgType (35)` — to [`Encoder::finish`](ironfix_tagvalue::Encoder::finish),
+/// so building an **outbound** frame can fail. This is a venue-side invariant
+/// violation (the venue constructs every outbound frame from already-validated
+/// data), NOT untrusted caller input, so it is a distinct type from the inbound
+/// [`FixDecodeError`]. `Display` is **redacted** — it never carries the offending
+/// field bytes into a log.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FixEncodeError {
+    /// The `ironfix-tagvalue` encoder rejected an outbound frame at finish (a
+    /// deferred field-write error). The upstream detail is kept as the error source
+    /// for programmatic inspection but is deliberately **not** rendered in `Display`.
+    #[error("outbound FIX frame could not be encoded")]
+    Encode(#[from] EncodeError),
+}
 
 /// A FIX session-level reject reason (`SessionRejectReason (373)`).
 ///
@@ -224,7 +241,7 @@ pub enum FixDecodeError {
     // NOTE (#140): the `InvalidBodyLength` and `MalformedChecksum` variants were
     // removed here — they were only ever produced by the venue's own pre-decode
     // guards (`validate_body_length` / `reject_malformed_checksum`), retired in
-    // #140. As of `ironfix-tagvalue` 0.3.1 the decoder folds `BodyLength (9)` and
+    // #140. As of `ironfix-tagvalue` 0.4 the decoder folds `BodyLength (9)` and
     // `CheckSum (10)` with checked, non-wrapping arithmetic itself, so a malformed
     // body length or out-of-range checksum now surfaces as a `DecodeError`
     // (`InvalidBodyLength` / `InvalidFieldValue`) through [`Self::Framing`], which

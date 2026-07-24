@@ -13,7 +13,7 @@
 use ironfix_core::message::RawMessage;
 use ironfix_tagvalue::Encoder;
 
-use super::error::FixDecodeError;
+use super::error::{FixDecodeError, FixEncodeError};
 use super::limits::{MAX_GROUP_ENTRIES, SYMBOL_TAG, is_pure_group_member, truncate_untrusted};
 
 /// The FIX tag numbers the dialect uses ([fix-dialect §2](../../../docs/specs/fix-dialect.md#2-supported-messages-and-requiredness)).
@@ -540,11 +540,18 @@ impl FieldWriter {
         }
     }
 
-    /// Finalises the message, computing `BodyLength (9)` and `CheckSum (10)`,
-    /// and returns the complete wire bytes.
-    #[must_use]
-    pub fn finish(self) -> Vec<u8> {
-        self.encoder.finish().to_vec()
+    /// Finalises the message, computing `BodyLength (9)` and `CheckSum (10)`, and
+    /// returns the complete wire bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`FixEncodeError`] if the `ironfix-tagvalue` encoder rejects the frame at
+    /// finish — a **deferred** field-write error surfaced here (an over-long/invalid
+    /// field, or a missing `MsgType (35)`). This is a venue-side invariant violation
+    /// on the outbound path (ironfix 0.4 made `Encoder::finish` fallible), surfaced
+    /// typed rather than panicked.
+    pub fn finish(mut self) -> Result<Vec<u8>, FixEncodeError> {
+        Ok(self.encoder.finish()?.to_vec())
     }
 }
 

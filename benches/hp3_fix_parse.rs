@@ -116,7 +116,7 @@ async fn run(
     // and never fire on a real bench run. A dialect change the fixture missed
     // fails loudly here instead of measuring a stale shape.
     assert_eq!(
-        FixBody::encode(&encode_report),
+        FixBody::encode(&encode_report).expect("bench encode"),
         execution_report_golden_frame(),
         "HP-3 encode fixture drifted from tests/golden/fix/execution_report_8.txt; \
          regenerate the golden (UPDATE_GOLDEN=1 cargo test --test golden_fix) and \
@@ -149,7 +149,7 @@ async fn run(
 
     // ---- closed-loop encode -----------------------------------------------
     for _ in 0..warmup_ops {
-        let bytes = FixBody::encode(&encode_report);
+        let bytes = FixBody::encode(&encode_report).expect("bench encode");
         if bytes.is_empty() {
             panic!("HP-3 encode warmup produced an empty frame");
         }
@@ -157,7 +157,7 @@ async fn run(
     let mut encode_hist = new_histogram();
     for _ in 0..measured_ops {
         let t0 = Instant::now();
-        let bytes = FixBody::encode(&encode_report);
+        let bytes = FixBody::encode(&encode_report).expect("bench encode");
         let elapsed = t0.elapsed();
         if bytes.is_empty() {
             panic!("HP-3 encode must produce a non-empty frame every iteration");
@@ -197,7 +197,7 @@ async fn run(
     // ---- open-loop, coordinated-omission-corrected encode ---------------------
     let encode_report_for_open_loop = encode_report.clone();
     let encode_sojourn = run_open_loop_pure(open_loop_ops, interval, move || {
-        let bytes = FixBody::encode(&encode_report_for_open_loop);
+        let bytes = FixBody::encode(&encode_report_for_open_loop).expect("bench encode");
         if bytes.is_empty() {
             panic!("HP-3 open-loop encode must produce a non-empty frame");
         }

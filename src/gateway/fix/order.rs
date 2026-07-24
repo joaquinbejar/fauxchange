@@ -13,7 +13,7 @@
 use super::FixBody;
 use super::codec::{FieldBag, FieldWriter, tags};
 use super::enums::{MassCancelRequestType, OrdType, OrderSide, TimeInForce};
-use super::error::FixDecodeError;
+use super::error::{FixDecodeError, FixEncodeError};
 use super::header::{StandardHeader, UtcTimestamp};
 use super::price::{parse_decimal_to_cents, render_cents_to_decimal};
 use crate::exchange::{Cents, Symbol};
@@ -110,7 +110,7 @@ impl FixBody for NewOrderSingle {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::CL_ORD_ID, self.cl_ord_id.as_str());
@@ -164,7 +164,7 @@ impl FixBody for OrderCancelRequest {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::ORIG_CL_ORD_ID, self.orig_cl_ord_id.as_str());
@@ -225,7 +225,7 @@ impl FixBody for OrderCancelReplaceRequest {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::ORIG_CL_ORD_ID, self.orig_cl_ord_id.as_str());
@@ -283,7 +283,7 @@ impl FixBody for OrderMassCancelRequest {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.str(tags::CL_ORD_ID, self.cl_ord_id.as_str());
@@ -334,7 +334,7 @@ impl FixBody for OrderStatusRequest {
         })
     }
 
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, FixEncodeError> {
         let mut writer = FieldWriter::new(Self::MSG_TYPE);
         self.header.encode(&mut writer);
         writer.opt_str(
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn test_new_order_single_limit_round_trips() {
         let order = limit_order();
-        let bytes = order.encode();
+        let bytes = order.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::NewOrderSingle(back)) => assert_eq!(back, order),
             other => panic!("expected NewOrderSingle, got {other:?}"),
@@ -399,7 +399,7 @@ mod tests {
     fn test_new_order_single_price_is_the_seam_cents() {
         // The decimal 44=500.05 becomes exactly 50005 cents — REST/FIX parity.
         let order = limit_order();
-        let bytes = order.encode();
+        let bytes = order.encode().expect("test encode");
         let wire = String::from_utf8(bytes.clone()).expect("utf8");
         assert!(wire.contains("\u{1}44=500.05\u{1}"), "wire: {wire}");
         match decode(&bytes) {
@@ -414,7 +414,7 @@ mod tests {
     fn test_new_order_single_limit_without_price_is_typed_error() {
         let mut order = limit_order();
         order.price = None;
-        let bytes = order.encode();
+        let bytes = order.encode().expect("test encode");
         match decode(&bytes) {
             Err(FixDecodeError::MissingConditionalField { tag, .. }) => {
                 assert_eq!(tag, tags::PRICE);
@@ -428,7 +428,7 @@ mod tests {
         let mut order = limit_order();
         order.time_in_force = TimeInForce::Gtd;
         order.expire_time = None;
-        let bytes = order.encode();
+        let bytes = order.encode().expect("test encode");
         match decode(&bytes) {
             Err(FixDecodeError::MissingConditionalField { tag, .. }) => {
                 assert_eq!(tag, tags::EXPIRE_TIME);
@@ -444,7 +444,7 @@ mod tests {
             price: None,
             ..limit_order()
         };
-        let bytes = order.encode();
+        let bytes = order.encode().expect("test encode");
         match decode(&bytes) {
             Ok(DecodedMessage::NewOrderSingle(back)) => assert_eq!(back, order),
             other => panic!("expected NewOrderSingle, got {other:?}"),
@@ -462,7 +462,7 @@ mod tests {
         writer.str(tags::ORD_TYPE, "2");
         writer.str(tags::PRICE, "500.05");
         writer.u64(tags::ORDER_QTY, 3);
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::ValueIsIncorrect { tag, value }) => {
                 assert_eq!(tag, tags::SIDE);
@@ -483,7 +483,7 @@ mod tests {
         writer.str(tags::ORD_TYPE, "2");
         writer.str(tags::PRICE, "500.05");
         writer.u64(tags::ORDER_QTY, 3);
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         assert!(matches!(
             decode(&bytes),
             Err(FixDecodeError::MalformedSymbol { .. })
@@ -501,7 +501,7 @@ mod tests {
         writer.str(tags::ORD_TYPE, "2");
         writer.str(tags::PRICE, "500.055"); // sub-cent
         writer.u64(tags::ORDER_QTY, 3);
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::Price { tag, .. }) => assert_eq!(tag, tags::PRICE),
             other => panic!("expected Price error on tag 44, got {other:?}"),
@@ -548,7 +548,7 @@ mod tests {
             }),
         ];
         for msg in msgs {
-            let bytes = msg.encode();
+            let bytes = msg.encode().expect("test encode");
             match decode(&bytes) {
                 Ok(back) => assert_eq!(back, msg),
                 Err(e) => panic!("round trip failed for {msg:?}: {e:?}"),
@@ -562,7 +562,7 @@ mod tests {
         header().encode(&mut writer);
         writer.str(tags::CL_ORD_ID, "CLIENT-4");
         writer.str(tags::MASS_CANCEL_REQUEST_TYPE, "1"); // per-security, needs symbol
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::MissingConditionalField { tag, .. }) => {
                 assert_eq!(tag, tags::SYMBOL);
@@ -576,7 +576,7 @@ mod tests {
         let mut writer = FieldWriter::new(OrderStatusRequest::MSG_TYPE);
         header().encode(&mut writer);
         writer.str(tags::SYMBOL, "BTC-20240329-50000-C");
-        let bytes = writer.finish();
+        let bytes = writer.finish().expect("test finish");
         match decode(&bytes) {
             Err(FixDecodeError::MissingRequiredChoice { first, second }) => {
                 assert_eq!(first, tags::ORDER_ID);
