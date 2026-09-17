@@ -42,7 +42,7 @@ include = [
 # venue's own write-ahead envelope journal — but the feature makes the upstream
 # sequencer / `MassCancelScope` / `MassCancelType` types reachable for the
 # matching wiring in #007, and the audit note is recorded now.
-option-chain-orderbook = { version = "0.10", features = ["sequencer"] }
+option-chain-orderbook = { version = "0.11", features = ["sequencer"] }
 # The async runtime for the per-underlying single-writer actor (#006): the
 # bounded `mpsc` mailbox, the `oneshot` receipts, and the spawned actor task.
 # `fauxchange` is async-first on `tokio` by design (CLAUDE.md; `rules` mandates
@@ -82,7 +82,7 @@ tokio = { version = "1", default-features = false, features = [
 # `option-chain-orderbook` v0.7.0 does not re-export them, so they must come
 # from `optionstratlib` at the seam. `default-features = false` keeps the build
 # lean (no plotly / async), matching how the upstream crate depends on it.
-optionstratlib = { version = "0.18", default-features = false }
+optionstratlib = { version = "0.21", default-features = false }
 # Concurrent map for the in-memory executions / positions stores (#008): the
 # `rules/global_rules.md` Concurrency section blesses `DashMap` over
 # `Arc<RwLock<HashMap<>>>` for sharded, lock-free point access. Version `6`
@@ -203,37 +203,43 @@ utoipa = "5"
 # keeps exactly the PEM path we need (the `pem` + `simple_asn1` decoder) and no
 # more; crucially, `DecodingKey::from_rsa_pem` extracts the RSA public key
 # straight from a `CERTIFICATE` PEM, so `from_paths(cert, key)` needs NO separate
-# x509 parser. The crypto backend is `ring` 0.17.14, which this dependency adds
-# NEW to the tree (it was not present before #011) along with its transitive
-# closure (`untrusted`, platform `windows_*` crates) — a native/asm RSA
-# implementation entering the trusted computing base; `ring` is the reputable,
-# widely audited crate `rustls` also uses, and `cargo audit`/`cargo deny` (#019)
-# gate it. RS256 verification pins the algorithm to `[RS256]` (rejects `alg:none`
+# x509 parser. Since `jsonwebtoken` 10 the crypto backend is a feature choice
+# (exactly ONE of `aws_lc_rs` / `rust_crypto` must be on, otherwise every
+# sign/verify panics at runtime with "Could not automatically determine the
+# process-level CryptoProvider"); `ring` is no longer offered. `aws_lc_rs` is
+# selected: it is the FIPS-lineage AWS-LC library behind `rustls`'s default
+# provider (ISC / Apache-2.0, `cargo deny` licenses ok), built from source by
+# `aws-lc-sys` (a C/asm build via `cc`, cmake optional on the pinned Linux/macOS
+# targets). `rust_crypto` was rejected because it pulls `rsa` 0.9, which carries
+# the UNFIXED RUSTSEC-2023-0071 (Marvin timing side-channel) and would fail the
+# `cargo audit` vulnerability gate (#019) that this repo never ignores. `ring`
+# 0.17 stays in the tree for `sqlx`'s `tls-rustls-ring`. RS256 verification pins
+# the algorithm to `[RS256]` (rejects `alg:none`
 # and HS256 confusion before any crypto runs). MIT, maintained by the
 # Keats/jsonwebtoken project (widely used, actively maintained).
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 # Argon2id password hashing for the venue account registry (#012): the FIX
 # shared-secret is stored only as an Argon2id PHC string at the pinned OWASP
 # baseline (m = 19456 KiB, t = 2, p = 1) with an optional server-side pepper, and
-# verified in constant time. Default features (`alloc` + `password-hash` + `rand`)
+# verified in constant time. Default features (`alloc` + `password-hash` + `getrandom`)
 # are exactly what the registry needs — `password-hash` for the PHC parse/format
-# and `PasswordHasher`/`PasswordVerifier` traits, `rand` (→ `password-hash/rand_core`)
-# for `SaltString::generate`. `argon2` 0.5.3 is a pure-Rust RustCrypto crate (NO
-# `ring`/C), adding `argon2` + `blake2` + `base64ct` + `password-hash` NEW to the
+# (the `phc` crate in 0.6) and `PasswordHasher`/`PasswordVerifier` traits, `getrandom`
+# for the fresh salt `PasswordHasher::hash_password` draws itself (0.6 dropped the
+# `SaltString::generate(rng)` seam). `argon2` 0.6 is a pure-Rust RustCrypto crate (NO
+# `ring`/C), adding `argon2` + `blake2` + `base64ct` + `password-hash` + `phc` to the
 # tree (all RustCrypto, MIT/Apache-2.0, widely used); `cargo audit` / `cargo deny`
 # (#019) gate them. The pinned parameters ARE `argon2`'s own documented defaults,
 # so `Params::DEFAULT` equals the OWASP baseline. Argon2**id** is selected
 # explicitly (never Argon2i/Argon2d).
-argon2 = "0.5"
-# The OS CSPRNG (`rand_core::OsRng`) that seeds each Argon2 salt via
-# `SaltString::generate` (#012). `rand_core` 0.6.4 is ALREADY resolved in the tree
-# (via `rand` 0.8 ← `optionstratlib`), so this direct dependency adds NO new crate
-# version (verified: the Cargo.lock diff introduces only argon2/blake2/base64ct/
-# password-hash); feature unification already has `getrandom` active at HEAD, so
-# this just names `rand_core` directly for `OsRng`. `default-features = false` keeps it
-# minimal. It is the SAME `rand_core` `password-hash` uses, so `OsRng` satisfies
-# the `CryptoRngCore` bound. MIT/Apache-2.0, maintained by the rust-random project.
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+argon2 = "0.6"
+# The OS CSPRNG (`getrandom::fill`) that mints the opaque WS tickets (#012).
+# `argon2` 0.6 / `password-hash` 0.6 dropped the `rand_core` seam: `SaltString::generate`
+# is gone and `PasswordHasher::hash_password` draws its own 16-byte salt through
+# `getrandom` (the `getrandom` default feature), and `rand_core` 0.10 no longer ships
+# an `OsRng` at all. So the venue names `getrandom` directly for the ticket bytes; it
+# is the SAME `getrandom` 0.4 `password-hash` already pulls, so this adds NO new crate
+# version. MIT/Apache-2.0, maintained by the rust-random project.
+getrandom = "0.4"
 # OPTIONAL durable persistence: the `sqlx` PostgreSQL layer (#023). `sqlx` is a
 # NORMAL (non-feature-gated) dependency selected at RUNTIME by `DATABASE_URL`
 # presence — the in-memory backend is always compiled and serves when the URL is
@@ -259,7 +265,7 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 # `cargo audit` / `cargo deny` (#019) gate it and any new SPDX id is added to
 # `deny.toml`'s allow-list with a reason. MIT/Apache-2.0, maintained by the
 # launchbadge/sqlx project.
-sqlx = { version = "0.9.0", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring",
     "postgres",
@@ -481,7 +487,7 @@ criterion = { version = "0.8", default-features = false }
 # when a realloc shrank the allocation); the swap is a strictly more accurate
 # accounting, so the recorded `allocs/op` / `bytes_alloc/op` numbers in
 # `BENCH.md` §5 were re-measured (not carried over) — see that section's note.
-stats_alloc = { version = "0.1.10", default-features = false }
+stats_alloc = { version = "0.1", default-features = false }
 # The REAL-Postgres integration harness for the optional persistence layer (#023):
 # an EPHEMERAL `postgres:18-alpine` container spun up per test run, so the DB
 # tests use a real Postgres, never a mocked DB (rules SQL & Persistence). Dev-only
@@ -517,7 +523,7 @@ testcontainers-modules = { version = "0.15", features = ["postgres"] }
 # `serde_json` covers three simple JSON calls, avoiding hyper-util's client
 # machinery (also already in the tree, but only for axum's own server usage
 # today) for a need this small.
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 
 [[bench]]

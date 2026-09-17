@@ -366,10 +366,10 @@ jobs:
           restore-keys: |
             advisory-db-
       # `cargo audit` picks up `.cargo/audit.toml` automatically (verified
-      # locally): the one ignored advisory (RUSTSEC-2024-0436, `paste`
-      # unmaintained — not a vulnerability) is documented there with a
-      # reason. A real vulnerability advisory is never added to that ignore
-      # list and fails this job.
+      # locally): its ignore list is currently empty (the former
+      # RUSTSEC-2024-0436 `paste` unmaintained notice left the tree with
+      # optionstratlib 0.21). A real vulnerability advisory is never added to
+      # that ignore list and fails this job.
       - run: cargo audit
 
   cargo-deny:
@@ -381,7 +381,7 @@ jobs:
         with:
           tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
       # `cargo deny check` picks up `deny.toml` automatically: the license
-      # allow-list, the RUSTSEC-2024-0436 advisory ignore (same reason as
+      # allow-list, the (currently empty) advisory ignore list (same policy as
       # cargo-audit above), the bans (duplicate-version visibility, no
       # wildcard versions) and sources (crates.io only) policy.
       - run: cargo deny check
