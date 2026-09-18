@@ -36,24 +36,19 @@ feature-depth = 1
 
 # ---------------------------------------------------------------------------
 # advisories — RustSec advisory-DB scan. A NEW vulnerability MUST fail the
-# build; nothing here silences a vulnerability. The single ignored id below
-# is an UNMAINTAINED notice, not a vulnerability — see the inline reason.
+# build; nothing here silences a vulnerability. The ignore list below is
+# empty; only an UNMAINTAINED notice may ever be added — see the inline reason.
 # ---------------------------------------------------------------------------
 [advisories]
+# Explicit, currently EMPTY ignore list. The one advisory previously accepted
+# here (RUSTSEC-2024-0436: `paste` 1.0.15 unmaintained, no CVE, a compile-time
+# proc-macro helper reached transitively via optionstratlib -> statrs ->
+# nalgebra -> simba) left the dependency tree when optionstratlib 0.21 dropped
+# it, and cargo-deny flags a stale ignore as `advisory-not-detected`. Only an
+# UNMAINTAINED/informational advisory with a documented reason may ever be
+# added; a real vulnerability in this or any other crate is NEVER added to
+# this list — it fails the build. Mirror any entry in .cargo/audit.toml.
 ignore = [
-    # `paste` (dtolnay) was archived/marked unmaintained by its author in
-    # 2024 (RUSTSEC-2024-0436, "no longer maintained", no CVE, no known
-    # vulnerability, "No safe upgrade is available"). It reaches fauxchange
-    # transitively and indirectly: optionstratlib -> statrs -> nalgebra ->
-    # simba -> paste (a proc-macro helper used at compile time only, not
-    # linked into runtime logic). fauxchange does not depend on `paste`
-    # directly and has no upstream control over `statrs`/`nalgebra`'s choice
-    # of proc-macro helper. Ignoring an UNMAINTAINED advisory with a
-    # documented reason is standard practice; a real vulnerability in this
-    # or any other crate is NEVER added to this list — it fails the build.
-    # Re-evaluate when optionstratlib/statrs/nalgebra drop the dependency or
-    # RustSec publishes a maintained fork advisory.
-    { id = "RUSTSEC-2024-0436", reason = "paste 1.0.15 is unmaintained (not vulnerable); transitive compile-time proc-macro dep via optionstratlib -> statrs -> nalgebra -> simba -> paste. No safe upgrade exists upstream. Re-check when optionstratlib/statrs/nalgebra move off it." },
 ]
 
 # ---------------------------------------------------------------------------

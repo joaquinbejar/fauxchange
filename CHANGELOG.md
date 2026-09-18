@@ -9,6 +9,14 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+### Changed
+
+- Dependencies updated to latest stable versions (`optionstratlib` 0.18 -> 0.21,
+  `option-chain-orderbook` 0.10 -> 0.11, `jsonwebtoken` 9 -> 11, `argon2`
+  0.5 -> 0.6 with the `rand_core`/`SaltString` seam replaced by `getrandom`,
+  `tokio-tungstenite` 0.29 -> 0.30; lock refresh picks up `rustls` 0.23.45 for
+  RUSTSEC-2026-0285).
+
 ## [0.1.0] - 2026-07-24
 
 ### Changed

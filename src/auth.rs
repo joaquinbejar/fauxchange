@@ -63,7 +63,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use argon2::password_hash::SaltString;
 use argon2::{
     Algorithm as Argon2Algorithm, Argon2, Params as Argon2Params, PasswordHash,
     PasswordHasher as _, PasswordVerifier as _, Version as Argon2Version,
@@ -74,7 +73,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::error::VenueError;
@@ -1482,17 +1480,17 @@ impl Argon2Hasher {
         }
     }
 
-    /// Hashes `plaintext` into an Argon2id PHC string with a fresh random salt.
+    /// Hashes `plaintext` into an Argon2id PHC string with a fresh random salt
+    /// (16 bytes drawn from the OS CSPRNG by `password-hash`'s `getrandom` seam).
     ///
     /// # Errors
     ///
     /// [`AuthError::PasswordHash`] if hashing fails — the cause is redacted and
     /// never carries the plaintext.
     pub fn hash(&self, plaintext: &str) -> Result<String, AuthError> {
-        let salt = SaltString::generate(&mut OsRng);
         let engine = self.engine()?;
         engine
-            .hash_password(plaintext.as_bytes(), &salt)
+            .hash_password(plaintext.as_bytes())
             .map(|hash| hash.to_string())
             .map_err(|_| AuthError::PasswordHash)
     }
@@ -1518,7 +1516,9 @@ impl Argon2Hasher {
                 Ok(PasswordVerification::VerifiedRehash(self.hash(plaintext)?))
             }
             Ok(()) => Ok(PasswordVerification::Verified),
-            Err(argon2::password_hash::Error::Password) => Ok(PasswordVerification::Rejected),
+            Err(argon2::password_hash::Error::PasswordInvalid) => {
+                Ok(PasswordVerification::Rejected)
+            }
             Err(_) => Err(AuthError::PasswordHash),
         }
     }
@@ -1526,7 +1526,7 @@ impl Argon2Hasher {
     /// Whether a stored hash's parameters are **weaker** than the pinned baseline
     /// (so a successful verify should trigger a rehash). Unparseable parameters
     /// are treated as weaker.
-    fn needs_rehash(&self, parsed: &PasswordHash<'_>) -> bool {
+    fn needs_rehash(&self, parsed: &PasswordHash) -> bool {
         match Argon2Params::try_from(parsed) {
             Ok(stored) => {
                 stored.m_cost() < self.m_cost
@@ -2006,11 +2006,8 @@ impl WsTicketStore {
 /// CSPRNG rendered as lowercase hex. A CSPRNG read failure is a redacted internal
 /// error, never a weak fallback.
 fn mint_opaque_ticket() -> Result<String, VenueError> {
-    use rand_core::RngCore;
     let mut bytes = [0u8; WS_TICKET_BYTES];
-    let mut rng = OsRng;
-    rng.try_fill_bytes(&mut bytes)
-        .map_err(|_| VenueError::Overflow)?;
+    getrandom::fill(&mut bytes).map_err(|_| VenueError::Overflow)?;
     Ok(hex_encode_lower(&bytes))
 }
 
