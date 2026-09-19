@@ -9,8 +9,12 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-18
+
 ### Changed
 
+- `option-chain-orderbook` 0.11 -> 0.12 (re-exports `orderbook-rs` 0.13 types);
+  lock refresh picks up `ironfix-*` 0.4.1 and `optionstratlib` 0.21.x.
 - Dependencies updated to latest stable versions (`optionstratlib` 0.18 -> 0.21,
   `option-chain-orderbook` 0.10 -> 0.11, `jsonwebtoken` 9 -> 11, `argon2`
   0.5 -> 0.6 with the `rand_core`/`SaltString` seam replaced by `getrandom`,
@@ -2853,5 +2857,6 @@ The full versioning and release-process policy lives in the design docs
 
 - Reserved the `fauxchange` crate name on crates.io.
 
-[Unreleased]: https://github.com/joaquinbejar/fauxchange/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.0...v0.1.1
 [0.0.1]: https://github.com/joaquinbejar/fauxchange/releases/tag/v0.0.1
