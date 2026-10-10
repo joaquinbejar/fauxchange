@@ -35,6 +35,9 @@ The full versioning and release-process policy lives in the design docs
   - Fees use `FeeSchedule::calculate_fee`, fallible since `orderbook-rs` 0.14
     (the deprecated `try_calculate_fee` is gone from the code and tests).
 - Dependencies refreshed to their latest stable versions in the lockfile.
+- The adversarial bundle corpus (`tests/adversarial/bundle`) is regenerated with
+  `UPDATE_CORPUS=1`: its manifests stamp the crate versions, and a 0.1 bundle
+  is a version mismatch for a 0.2 binary.
 
 ## [0.1.1] - 2026-09-18
 
