@@ -37,7 +37,7 @@
 //! (submitted as a `SimStep` through `AppState::submit`) is band-checked identically
 //! to the simulation producer — there is no producer that can inject an out-of-band
 //! price. The band is therefore a true venue-wide admission invariant, which makes the
-//! checked-fee proof (`FeeSchedule::try_calculate_fee`) unconditional rather than
+//! checked-fee proof (`FeeSchedule::calculate_fee`) unconditional rather than
 //! conditional on the gateway/replay seams alone.
 //! ([05 §4.1](../../../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
 
@@ -274,8 +274,14 @@ mod tests {
         );
         // And the fill really occurred with the configured maker rebate / taker fee.
         assert_eq!(live.0, 1);
-        assert!(live.2 < 0, "maker leg is a rebate (negative)");
-        assert!(live.3 > 0, "taker leg is a fee (positive)");
+        assert!(
+            matches!(live.2, Ok(fee) if fee < 0),
+            "maker leg is a rebate (negative)"
+        );
+        assert!(
+            matches!(live.3, Ok(fee) if fee > 0),
+            "taker leg is a fee (positive)"
+        );
     }
 
     #[test]

@@ -9,6 +9,36 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-10
+
+### Changed
+
+- **`optionstratlib` 0.21 -> 0.22 and `option-chain-orderbook` 0.12 -> 0.13**
+  (which brings `orderbook-rs` 0.15, `pricelevel` 0.10, `positive` 0.8 and
+  `expiration_date` 0.5). `optionstratlib` is now built with
+  `default-features = false, features = ["market", "simulation"]`, the two
+  capabilities the venue uses (pricing comes with `market`). The venue's own
+  REST, WebSocket and FIX surfaces are unchanged.
+- Migration to the new upstream APIs, with no change in behavior:
+  - The market-maker pricer converts `Decimal` to `f64` with `f64::try_from`
+    (`ToPrimitive` is no longer in the `optionstratlib` prelude).
+  - The synthetic walk sets `WalkParams::seed = None`, keeping the thread RNG;
+    replay stays journal-driven. Wiring the run seed into the new seam is a
+    separate change.
+  - `total_bid_depth` / `total_ask_depth` are fallible upstream: top of book
+    saturates a depth that overflows `u64`, and the market-order fast path
+    is taken only on a depth of exactly zero.
+  - `TradeResult::new` is fallible upstream: a trade notional that does not
+    fit `u128` maps to `MoneyError::Overflow`.
+  - The expiry sweep handles a refused per-book sweep (nothing evicted) by
+    logging it at `WARN` and continuing with the other books.
+  - Fees use `FeeSchedule::calculate_fee`, fallible since `orderbook-rs` 0.14
+    (the deprecated `try_calculate_fee` is gone from the code and tests).
+- Dependencies refreshed to their latest stable versions in the lockfile.
+- The adversarial bundle corpus (`tests/adversarial/bundle`) is regenerated with
+  `UPDATE_CORPUS=1`: its manifests stamp the crate versions, and a 0.1 bundle
+  is a version mismatch for a 0.2 binary.
+
 ## [0.1.1] - 2026-09-18
 
 ### Changed
@@ -2857,6 +2887,7 @@ The full versioning and release-process policy lives in the design docs
 
 - Reserved the `fauxchange` crate name on crates.io.
 
-[Unreleased]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/joaquinbejar/fauxchange/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.0...v0.1.1
 [0.0.1]: https://github.com/joaquinbejar/fauxchange/releases/tag/v0.0.1

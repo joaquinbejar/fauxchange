@@ -25,14 +25,14 @@
 //!
 //! ## The determinism seam (journal-driven, not seed-regenerated)
 //!
-//! `optionstratlib`'s sampler (`decimal_normal_sample`) constructs its **own**
-//! `rand::rng()` per draw and cannot consume the run seed, so the walk is
-//! **excluded** from same-seed regeneration. The generated price steps are
+//! The walk runs with `WalkParams::seed = None`, so `optionstratlib` draws from
+//! the thread RNG and the walk is **excluded** from same-seed regeneration. The generated price steps are
 //! journaled as `SimStep` commands (and the requotes they cause as market-maker
 //! `AddOrder`s), so **replay is journal-driven**: it re-executes the recorded
 //! commands and reproduces the exact path regardless of the sampler's RNG
 //! ([04 §2, §6](../../docs/04-market-data-and-replay.md#6-determinism-and-seeding)).
-//! A venue-owned *seeded* adapter awaits an injectable-RNG seam upstream.
+//! `optionstratlib` 0.22 added that seam (`WalkParams::seed`); wiring the run
+//! seed into it is a separate change, not part of the 0.22 migration.
 //!
 //! ## The expiry carve-out (#032): `Days` is the clock-free variant here
 //!
@@ -260,6 +260,8 @@ pub(crate) fn generate_path(
         init_step,
         walk_type: mapped,
         walker: Box::new(VenueWalker),
+        // Thread RNG, as before 0.22: replay stays journal-driven (module docs).
+        seed: None,
     };
 
     // Dispatch onto the matching `optionstratlib` generator; the method reads

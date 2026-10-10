@@ -20,8 +20,8 @@
 //! the venue rejects a configuration unless the widest admissible notional stays at
 //! or below the upstream multiplication-safety bound
 //! `FeeSchedule::max_guaranteed_exact_notional()`, and the worst-case fee still
-//! fits the persisted `i64` cents. Within those bounds `calculate_fee` is exact
-//! (equals `try_calculate_fee`), so fee replay and cross-protocol fee parity are
+//! fits the persisted `i64` cents. Within those bounds `calculate_fee` is `Ok`
+//! and exact, so fee replay and cross-protocol fee parity are
 //! exact ([05 §4.1](../../../docs/05-microstructure-config.md#41-the-checked-fee-contract-saturation-made-unreachable)).
 
 use option_chain_orderbook::FeeSchedule;
@@ -94,16 +94,16 @@ impl FeeConfig {
     /// - **Part A (saturation unreachable):** `max_notional` must be at or below
     ///   the upstream `FeeSchedule::max_guaranteed_exact_notional()` (the minimum
     ///   over both legs of the `u128::MAX / |bps|` multiplication-safety bound). At
-    ///   or below it, `try_calculate_fee` is always `Ok` and `calculate_fee`
-    ///   returns the exact `⌊notional × |bps| / 10_000⌋` — the `saturating_mul` /
-    ///   `i128::MAX` branch is unreachable.
+    ///   or below it, `calculate_fee` is always `Ok` and returns the exact
+    ///   `⌊notional × |bps| / 10_000⌋`; its overflow error (a clamp before
+    ///   `orderbook-rs` 0.14) is unreachable.
     /// - **Part B (persisted fits i64):** the worst-case fee magnitude
     ///   `max_notional × max_abs_bps / 10_000` must be at or below `i64::MAX`, so a
     ///   fill's `fee_cents` records losslessly in a durable `BIGINT`.
     ///
     /// Part B implies Part A numerically, but both are checked and reported
     /// distinctly: Part A ties the guarantee to the upstream contract (and to the
-    /// property test that asserts `try_calculate_fee` never errs on an accepted
+    /// property test that asserts `calculate_fee` never errs on an accepted
     /// config), Part B to the DB-lossless persistence bound.
     ///
     /// # Errors
