@@ -7,7 +7,7 @@
     "microstructure_fingerprint": "microstructure.default.v1",
     "versions": {
       "fauxchange": "0.99.0-attacker",
-      "optionstratlib": "0.18.0",
+      "optionstratlib": "0.22.1",
       "envelope_schema": "venue.v1"
     }
   },
