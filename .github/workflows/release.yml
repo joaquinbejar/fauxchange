@@ -68,6 +68,11 @@ env:
   SQLX_OFFLINE: "true"
   # Matches rust-toolchain.toml / ci.yml — bump both together, deliberately.
   RUST_TOOLCHAIN: "1.99.0"
+  # Same pins as ci.yml's cargo-audit / cargo-deny jobs — bump all together.
+  # The old `^0.21` cargo-audit could not parse newer RustSec advisories
+  # (RUSTSEC-2026-0124 broke the v0.2.0 and v0.3.0 tag runs in `verify`).
+  CARGO_AUDIT_VERSION: "0.22.1"
+  CARGO_DENY_VERSION: "0.19.2"
   IMAGE: ghcr.io/joaquinbejar/fauxchange
 
 jobs:
@@ -159,11 +164,11 @@ jobs:
       # commit rather than only required-green above.
       - name: cargo-audit (RustSec advisory scan)
         run: |
-          cargo install cargo-audit --locked --version ^0.21 || cargo install cargo-audit --locked
+          cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
           cargo audit
       - name: cargo-deny (license / ban / source policy)
         run: |
-          cargo install cargo-deny --locked --version ^0.16 || cargo install cargo-deny --locked
+          cargo install cargo-deny --locked --version "$CARGO_DENY_VERSION"
           cargo deny check
       - name: Migrations compile-check (sqlx offline data is current)
         run: |
@@ -198,7 +203,29 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: release-publish-crate
+      # Idempotent: a version that is already live on crates.io (published by
+      # hand, or by an earlier run of this tag that failed after this step) is
+      # skipped instead of failing the job, so publish-image and github-release
+      # still run. crates.io versions are immutable, so "already published" is
+      # the same end state this step exists to reach.
+      - name: Skip if this version is already on crates.io
+        id: published
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          status="$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "fauxchange-release (github.com/joaquinbejar/fauxchange)" \
+            "https://crates.io/api/v1/crates/fauxchange/${VERSION}")"
+          case "$status" in
+            200) echo "fauxchange ${VERSION} is already on crates.io; skipping cargo publish"
+                 echo "skip=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "skip=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "::error::crates.io lookup for fauxchange ${VERSION} returned HTTP ${status}" >&2
+                 exit 1 ;;
+          esac
       - name: cargo publish (CARGO_REGISTRY_TOKEN read from env only, never echoed)
+        if: steps.published.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
@@ -260,6 +287,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Same idempotence as publish-crate: a release created by hand for
+          # this tag is left as is.
+          if gh release view "v${{ needs.verify.outputs.version }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "release v${{ needs.verify.outputs.version }} already exists; leaving it unchanged"
+            exit 0
+          fi
           gh release create "v${{ needs.verify.outputs.version }}" \
             --repo "${{ github.repository }}" \
             --title "v${{ needs.verify.outputs.version }}" \
