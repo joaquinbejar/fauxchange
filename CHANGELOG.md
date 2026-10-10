@@ -9,6 +9,23 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-10-10
+
+### Fixed
+
+- **Release pipeline is idempotent on re-runs.** `publish-crate` now skips
+  `cargo publish` when the tagged version is already on crates.io, and
+  `github-release` leaves an existing release unchanged, so a version whose
+  crate went out first (by hand, or from an earlier run that failed later)
+  still gets its container images and GitHub release. 0.3.0 hit this: its
+  crate was published by hand, so its tag run could not push the images.
+  0.3.1 carries no code change from 0.3.0 and ships the
+  `ghcr.io/joaquinbejar/fauxchange` images for it.
+- **Release `verify` uses the same cargo-audit / cargo-deny versions as CI**
+  (0.22.1 / 0.19.2, from `env`, instead of `^0.21` / `^0.16`). cargo-audit
+  0.21 cannot parse newer RustSec advisories (RUSTSEC-2026-0124), which
+  failed `verify` on the v0.2.0 and v0.3.0 tags before anything published.
+
 ## [0.3.0] - 2026-10-10
 
 ### Changed
@@ -2905,7 +2922,8 @@ The full versioning and release-process policy lives in the design docs
 
 - Reserved the `fauxchange` crate name on crates.io.
 
-[Unreleased]: https://github.com/joaquinbejar/fauxchange/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/joaquinbejar/fauxchange/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/joaquinbejar/fauxchange/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/joaquinbejar/fauxchange/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.0...v0.1.1
