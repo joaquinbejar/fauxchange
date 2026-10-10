@@ -1,6 +1,6 @@
 [package]
 name = "fauxchange"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "Exchange-in-a-box: a local options exchange simulator with realistic matching, FIX/WebSocket/REST APIs and historical replay, for testing trading systems."
@@ -126,10 +126,10 @@ axum = { version = "0.8", default-features = false, features = [
     "tokio",
     "ws",
 ] }
-# Swagger UI served at boot (#013). `utoipa-swagger-ui` 9.x is the version that
-# targets **axum 0.8** + **utoipa 5** (verified against the crate manifest:
-# `[dependencies.axum] version = "0.8.0"`, `[dependencies.utoipa] version =
-# "5.0.0"`), matching the pinned `utoipa = "5"`. Feature set is deliberately
+# Swagger UI served at boot (#013). `utoipa-swagger-ui` 10.x is the version that
+# targets **axum 0.8** + **utoipa 6** (verified against the crate manifest:
+# `[dependencies.axum] version = "0.8.4"`, `[dependencies.utoipa] version =
+# "6.0.0"`), matching the pinned `utoipa = "6.0"`. Feature set is deliberately
 # minimal and OFFLINE-SAFE:
 #   - `axum`     — the axum 0.8 `SwaggerUi` router integration.
 #   - `vendored` — serve the Swagger UI assets from the cached
@@ -142,7 +142,7 @@ axum = { version = "0.8", default-features = false, features = [
 # permissively licensed, and already resolved in the local cache; `cargo audit`
 # / `cargo deny` (#019) gate them. MIT/Apache-2.0, maintained by the utoipa
 # project.
-utoipa-swagger-ui = { version = "9", default-features = false, features = [
+utoipa-swagger-ui = { version = "10.0", default-features = false, features = [
     "axum",
     "vendored",
 ] }
@@ -192,12 +192,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "env-filter",
 ] }
 # OpenAPI schema derivation: `ToSchema` on every REST/WS DTO and on the shared
-# error envelopes, so #013 can register them in the OpenAPI document. Version 5
-# (`5.5.0`) is already resolved transitively via the upstream stack, so this
-# direct dependency adds NO new version to the tree. Default features only (no
+# error envelopes, so #013 can register them in the OpenAPI document. Version 6
+# (`6.0.0`, shared with `utoipa-swagger-ui` 10) resolves once in the tree; the
+# upstream stack no longer pulls utoipa in. Default features only (no
 # framework integration); the Swagger UI / `utoipa-axum` wiring lands with the
 # REST gateway (#013). MIT/Apache-2.0, maintained by the utoipa project.
-utoipa = "5"
+utoipa = "6.0"
 # JWT (RS256, x509 key pair) for REST/WS auth (#011): `mint_token` / `verify_token`
 # on the `JwtAuth` service. `default-features = false, features = ["use_pem"]`
 # keeps exactly the PEM path we need (the `pem` + `simple_asn1` decoder) and no

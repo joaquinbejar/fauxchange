@@ -9,6 +9,24 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-10
+
+### Changed
+
+- **`utoipa` 5 -> 6 and `utoipa-swagger-ui` 9 -> 10** (10 is the line that
+  targets axum 0.8 + utoipa 6). Breaking for library consumers: the
+  `ToSchema` impls on the public DTOs in `models` and on the error envelopes
+  are now utoipa 6 impls. The served OpenAPI document is unchanged: the
+  documents generated before and after are structurally identical. The only
+  source change is in `gateway::rest::openapi`, where utoipa 6 stores a
+  response's `content` as `RefOr<Content>`, so the error-envelope injection
+  wraps it in `RefOr::T`.
+- **Toolchain 1.97.0 -> 1.99.0** in `rust-toolchain.toml`, the CI, release
+  and bench-regression workflows, and the Docker builder image
+  (`rust:1.99.0-bookworm`). 1.97.0 could not link the `sqlx_macros` proc-macro
+  dylib for a release build on macOS ("mis-aligned LINKEDIT string pool");
+  1.99.0 builds it. The `msrv` job keeps its 1.96.0 floor.
+
 ## [0.2.0] - 2026-10-10
 
 ### Changed
@@ -2887,7 +2905,8 @@ The full versioning and release-process policy lives in the design docs
 
 - Reserved the `fauxchange` crate name on crates.io.
 
-[Unreleased]: https://github.com/joaquinbejar/fauxchange/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/joaquinbejar/fauxchange/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/joaquinbejar/fauxchange/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/joaquinbejar/fauxchange/compare/v0.1.0...v0.1.1
 [0.0.1]: https://github.com/joaquinbejar/fauxchange/releases/tag/v0.0.1

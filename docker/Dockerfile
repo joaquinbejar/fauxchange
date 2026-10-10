@@ -56,7 +56,7 @@
 # =============================================================================
 # Pinned to the EXACT toolchain in rust-toolchain.toml — bump both together,
 # deliberately (rust-toolchain.toml's own header explains the MSRV floor).
-FROM rust:1.97.0-bookworm AS builder
+FROM rust:1.99.0-bookworm AS builder
 
 # Offline sqlx: the release build resolves the compile-time `sqlx::query!` /
 # `sqlx::migrate!` macros from the COMMITTED `.sqlx/` cache, never a live DB

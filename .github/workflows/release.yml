@@ -67,7 +67,7 @@ env:
   # `.sqlx/` data, same as every job in ci.yml — no DB is contacted here.
   SQLX_OFFLINE: "true"
   # Matches rust-toolchain.toml / ci.yml — bump both together, deliberately.
-  RUST_TOOLCHAIN: "1.97.0"
+  RUST_TOOLCHAIN: "1.99.0"
   IMAGE: ghcr.io/joaquinbejar/fauxchange
 
 jobs:

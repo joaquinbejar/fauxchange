@@ -67,7 +67,7 @@ impl Modify for ErrorResponsesAddon {
                     {
                         response.content.insert(
                             "application/json".to_string(),
-                            Content::new(Some(Ref::from_schema_name("ErrorEnvelope"))),
+                            RefOr::T(Content::new(Some(Ref::from_schema_name("ErrorEnvelope")))),
                         );
                     }
                 }
