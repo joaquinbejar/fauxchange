@@ -1,6 +1,6 @@
 [package]
 name = "fauxchange"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["Joaquin Bejar <jb@taunais.com>"]
 description = "Exchange-in-a-box: a local options exchange simulator with realistic matching, FIX/WebSocket/REST APIs and historical replay, for testing trading systems."
@@ -42,7 +42,7 @@ include = [
 # venue's own write-ahead envelope journal — but the feature makes the upstream
 # sequencer / `MassCancelScope` / `MassCancelType` types reachable for the
 # matching wiring in #007, and the audit note is recorded now.
-option-chain-orderbook = { version = "0.12", features = ["sequencer"] }
+option-chain-orderbook = { version = "0.13", features = ["sequencer"] }
 # The async runtime for the per-underlying single-writer actor (#006): the
 # bounded `mpsc` mailbox, the `oneshot` receipts, and the spawned actor task.
 # `fauxchange` is async-first on `tokio` by design (CLAUDE.md; `rules` mandates
@@ -82,7 +82,7 @@ tokio = { version = "1", default-features = false, features = [
 # `option-chain-orderbook` v0.7.0 does not re-export them, so they must come
 # from `optionstratlib` at the seam. `default-features = false` keeps the build
 # lean (no plotly / async), matching how the upstream crate depends on it.
-optionstratlib = { version = "0.21", default-features = false }
+optionstratlib = { version = "0.22", default-features = false, features = ["market", "simulation"] }
 # Concurrent map for the in-memory executions / positions stores (#008): the
 # `rules/global_rules.md` Concurrency section blesses `DashMap` over
 # `Arc<RwLock<HashMap<>>>` for sharded, lock-free point access. Version `6`

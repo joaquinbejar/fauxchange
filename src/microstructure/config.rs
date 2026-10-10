@@ -1215,10 +1215,10 @@ mod tests {
 
     proptest! {
         /// The checked-fee proof's core invariant: no config the resolver accepts
-        /// can drive the upstream `FeeSchedule::calculate_fee` onto its saturating
-        /// branch — asserted directly via the fallible `try_calculate_fee`, which
-        /// errs *iff* `calculate_fee` would clamp. Also pins that within the
-        /// accepted bounds the exact and saturating paths agree (no clamp).
+        /// can drive the upstream `FeeSchedule::calculate_fee` onto its error
+        /// branch (it errs where it used to clamp, since `orderbook-rs` 0.14).
+        /// Also pins that within the accepted bounds the exact fee fits the
+        /// persisted `i64` cents.
         #[test]
         fn prop_accepted_config_never_saturates_calculate_fee(
             maker_bps in -1_000_000i32..1_000_000,
@@ -1245,15 +1245,11 @@ mod tests {
             for notional in [0u128, 1, max_notional / 2, max_notional] {
                 for is_maker in [true, false] {
                     prop_assert!(
-                        schedule.try_calculate_fee(notional, is_maker).is_ok(),
-                        "accepted config saturated calculate_fee: notional={notional} is_maker={is_maker} maker_bps={maker_bps} taker_bps={taker_bps}",
-                    );
-                    prop_assert_eq!(
-                        schedule.try_calculate_fee(notional, is_maker),
-                        Ok(schedule.calculate_fee(notional, is_maker)),
+                        schedule.calculate_fee(notional, is_maker).is_ok(),
+                        "accepted config overflowed calculate_fee: notional={notional} is_maker={is_maker} maker_bps={maker_bps} taker_bps={taker_bps}",
                     );
                     // And the exact fee fits the persisted i64 cents.
-                    if let Ok(fee) = schedule.try_calculate_fee(notional, is_maker) {
+                    if let Ok(fee) = schedule.calculate_fee(notional, is_maker) {
                         prop_assert!(i64::try_from(fee).is_ok());
                     }
                 }

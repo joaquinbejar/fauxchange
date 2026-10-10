@@ -1182,7 +1182,7 @@ fn underlying_of(symbol: &Symbol) -> Option<String> {
 /// theo equal to the fill price the *gross* theo-edge is zero, so `edge_cents` is
 /// the **net-of-fee edge** ([`net_of_fee_edge`]): the negation of this leg's signed
 /// fee, derived from the venue [`FeeSchedule`] + the leg's maker/taker liquidity +
-/// its notional via the same checked `try_calculate_fee` the matching seam used.
+/// its notional via the same checked `calculate_fee` the matching seam used.
 /// A maker rebate (negative fee) is a **positive** edge, a taker fee (positive fee)
 /// a **negative** edge (#114 item 3, [01 §7](../../../docs/01-domain-model.md)).
 #[must_use]

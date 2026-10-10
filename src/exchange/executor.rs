@@ -369,8 +369,10 @@ impl MatchingExecutor {
                     .best_ask()
                     .and_then(|price| u64::try_from(price).ok())
                     .map(Cents::new),
-                bid_depth: leaf.total_bid_depth(),
-                ask_depth: leaf.total_ask_depth(),
+                // The read fails only when a level or the side's aggregate
+                // overflows `u64`, so saturating reports that depth faithfully.
+                bid_depth: leaf.total_bid_depth().unwrap_or(u64::MAX),
+                ask_depth: leaf.total_ask_depth().unwrap_or(u64::MAX),
             },
             None => TopOfBook::default(),
         }
@@ -812,7 +814,9 @@ impl MatchingExecutor {
             Side::Buy => leaf.total_ask_depth(),
             Side::Sell => leaf.total_bid_depth(),
         };
-        if opposite_depth == 0 {
+        // A failed depth read means an overflowing side, never an empty one, so
+        // only `Ok(0)` takes the fast path.
+        if matches!(opposite_depth, Ok(0)) {
             return VenueOutcome::Market {
                 fills: Vec::new(),
                 unfilled_quantity: quantity,
@@ -835,15 +839,18 @@ impl MatchingExecutor {
             .submit_market_order_with_user(engine_id, quantity, side, owner);
         let captured = match outcome {
             Ok(match_result) => {
-                let trade_result = TradeResult::new(leaf.symbol().to_string(), match_result);
-                self.build_fills(
-                    ctx,
-                    &trade_result,
-                    venue_order_id,
-                    account,
-                    owner,
-                    fee_schedule.as_ref(),
-                )
+                match TradeResult::new(leaf.symbol().to_string(), match_result) {
+                    Ok(trade_result) => self.build_fills(
+                        ctx,
+                        &trade_result,
+                        venue_order_id,
+                        account,
+                        owner,
+                        fee_schedule.as_ref(),
+                    ),
+                    // The trades' notional does not fit `u128`.
+                    Err(_) => Err(MoneyError::Overflow),
+                }
             }
             // STP cancelled the taker (with or without earlier fills): the fills
             // reached only the armed listener; recover them by the slot diff.
@@ -1262,7 +1269,16 @@ impl MatchingExecutor {
         let mut evicted_ids: Vec<OrderId> = Vec::new();
         for symbol in &leaves {
             if let Some(leaf) = self.resolve_leaf_read(symbol) {
-                evicted_ids.extend(leaf.evict_expired_orders(cutoff));
+                match leaf.evict_expired_orders(cutoff) {
+                    Ok(ids) => evicted_ids.extend(ids),
+                    // The engine refused the sweep before evicting anything; the
+                    // orders keep resting and a later sweep retries them.
+                    Err(error) => tracing::warn!(
+                        symbol = %symbol,
+                        error = %error,
+                        "expiry sweep refused for this book; nothing evicted"
+                    ),
+                }
             }
         }
 
@@ -1997,7 +2013,7 @@ fn slot_trade_after(leaf: &OptionOrderBook, before_seq: Option<u64>) -> Option<T
 /// The per-leg fee for a transaction, computed from the leaf's configured
 /// [`FeeSchedule`] (zero when none is configured). A maker rebate is negative.
 ///
-/// Uses the upstream **checked** `try_calculate_fee`: the venue's checked-fee proof
+/// Uses the upstream **checked** `calculate_fee`: the venue's checked-fee proof
 /// (`docs/05 §4.1`, the [`MicrostructureConfig`] resolver) makes its `Err(FeeOverflow)`
 /// branch provably unreachable for every admissible notional, so the map to
 /// [`MoneyError::Overflow`] is a seal-class fail-safe — never a clamp, panic, or
@@ -2017,7 +2033,7 @@ fn per_leg_fee(
                 .checked_mul(u128::from(quantity))
                 .ok_or(MoneyError::Overflow)?;
             let fee = schedule
-                .try_calculate_fee(notional, is_maker)
+                .calculate_fee(notional, is_maker)
                 .map_err(|_| MoneyError::Overflow)?;
             let fee = i64::try_from(fee).map_err(|_| MoneyError::Overflow)?;
             Ok(SignedCents::new(fee))

@@ -44,7 +44,7 @@
 
 use optionstratlib::greeks::Greeks;
 use optionstratlib::model::types::{OptionType, Side as OptSide};
-use optionstratlib::prelude::{Decimal, Positive, ToPrimitive};
+use optionstratlib::prelude::{Decimal, Positive};
 use optionstratlib::pricing::black_scholes;
 use optionstratlib::{ExpirationDate, OptionStyle, Options};
 
@@ -172,7 +172,11 @@ impl OptionPricer {
         iv: Option<f64>,
     ) -> Option<f64> {
         let option = self.build_option(spot, strike, days_to_expiry, style, iv)?;
-        finite(black_scholes(&option).ok()?.to_f64()?)
+        finite(
+            black_scholes(&option)
+                .ok()
+                .and_then(|value| f64::try_from(value).ok())?,
+        )
     }
 
     /// Delta via the [`optionstratlib::greeks::Greeks`] trait. `None` on a
@@ -187,7 +191,12 @@ impl OptionPricer {
         iv: Option<f64>,
     ) -> Option<f64> {
         let option = self.build_option(spot, strike, days_to_expiry, style, iv)?;
-        finite(option.delta().ok()?.to_f64()?)
+        finite(
+            option
+                .delta()
+                .ok()
+                .and_then(|value| f64::try_from(value).ok())?,
+        )
     }
 
     /// Gamma via the [`optionstratlib::greeks::Greeks`] trait. `None` on a
@@ -202,7 +211,12 @@ impl OptionPricer {
         iv: Option<f64>,
     ) -> Option<f64> {
         let option = self.build_option(spot, strike, days_to_expiry, style, iv)?;
-        finite(option.gamma().ok()?.to_f64()?)
+        finite(
+            option
+                .gamma()
+                .ok()
+                .and_then(|value| f64::try_from(value).ok())?,
+        )
     }
 
     /// Vega via the [`optionstratlib::greeks::Greeks`] trait. `None` on a
@@ -217,7 +231,12 @@ impl OptionPricer {
         iv: Option<f64>,
     ) -> Option<f64> {
         let option = self.build_option(spot, strike, days_to_expiry, style, iv)?;
-        finite(option.vega().ok()?.to_f64()?)
+        finite(
+            option
+                .vega()
+                .ok()
+                .and_then(|value| f64::try_from(value).ok())?,
+        )
     }
 
     /// Theta via the [`optionstratlib::greeks::Greeks`] trait (units are
@@ -233,7 +252,12 @@ impl OptionPricer {
         iv: Option<f64>,
     ) -> Option<f64> {
         let option = self.build_option(spot, strike, days_to_expiry, style, iv)?;
-        finite(option.theta().ok()?.to_f64()?)
+        finite(
+            option
+                .theta()
+                .ok()
+                .and_then(|value| f64::try_from(value).ok())?,
+        )
     }
 }
 
