@@ -9,8 +9,8 @@
 # (passes) vs `cargo +1.95.0 check --all-features` (fails: "requires rustc
 # 1.96"). The `msrv` CI job pins that floor explicitly
 # (`toolchain: "1.96.0"`); this file pins the current stable used for the
-# primary gate, one minor ahead of the floor. Bump deliberately — a bump here
+# primary gate, ahead of the floor. Bump deliberately — a bump here
 # is a dependency-surface decision, not a drive-by edit.
 [toolchain]
-channel = "1.97.0"
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]

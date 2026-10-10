@@ -143,7 +143,7 @@ env:
   # (the same pattern the `migrations` job in ci.yml uses).
   SQLX_OFFLINE: "true"
   # The pinned stable toolchain (matches rust-toolchain.toml / ci.yml).
-  RUST_TOOLCHAIN: "1.97.0"
+  RUST_TOOLCHAIN: "1.99.0"
 
 jobs:
   # --- The armed, per-push/PR gate — REDUCED ("smoke") sample counts -------

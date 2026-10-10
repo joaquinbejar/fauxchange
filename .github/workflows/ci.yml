@@ -100,7 +100,7 @@ env:
   SQLX_OFFLINE: "true"
   # The pinned stable toolchain (matches rust-toolchain.toml). Bump both
   # together, deliberately.
-  RUST_TOOLCHAIN: "1.97.0"
+  RUST_TOOLCHAIN: "1.99.0"
   # The verified MSRV floor — `expiration_date` (transitive via
   # optionstratlib) requires rustc 1.96; `cargo +1.95.0 check --all-features`
   # fails, `cargo +1.96.0 check --all-features` passes (verified on the
@@ -209,8 +209,8 @@ jobs:
       # `RUSTUP_TOOLCHAIN` env > `rust-toolchain(.toml)` file > `rustup
       # default`. `dtolnay/rust-toolchain` only sets the rustup DEFAULT
       # (lowest precedence) — the repo-root rust-toolchain.toml (pinning
-      # RUST_TOOLCHAIN, currently 1.97.0) OUTRANKS that default, so a bare
-      # `cargo check` here would silently compile under 1.97.0, never the
+      # RUST_TOOLCHAIN, currently 1.99.0) OUTRANKS that default, so a bare
+      # `cargo check` here would silently compile under 1.99.0, never the
       # MSRV floor this job exists to verify. The explicit `+toolchain`
       # override below has the HIGHEST precedence and forces the actual
       # RUST_MSRV floor regardless of rust-toolchain.toml.
@@ -389,7 +389,7 @@ jobs:
   # --- Image build + container hardening (docs/06-deployment.md §2/§3, #025; ---
   # --- hardened in #026, docs/08-threat-model.md §7-9) ------------------------
   # Proves `docker/Dockerfile` builds BOTH runtime targets: the default
-  # `runtime-slim` (the pinned `rust:1.97.0-bookworm` builder, offline `sqlx`
+  # `runtime-slim` (the pinned `rust:1.99.0-bookworm` builder, offline `sqlx`
   # via the committed `.sqlx/`, into the `debian:bookworm-slim` runtime) and
   # the minimal `runtime-distroless` (`gcr.io/distroless/cc-debian12`, pinned
   # by digest, no shell / package manager); that `docker/docker-compose.yml`
