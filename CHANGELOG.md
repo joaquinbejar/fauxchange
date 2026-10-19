@@ -9,6 +9,20 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+### Security
+
+- **`zip` 8.6 -> 9.0.5 (RUSTSEC-2026-0367, RUSTSEC-2026-0368,
+  RUSTSEC-2026-0369).** `zip` reached the tree only as a build dependency of
+  `utoipa-swagger-ui` 10.0.1, which unpacks the vendored Swagger UI archive at
+  build time; `cargo audit` and `cargo deny check` failed on it, which blocked
+  CI and the image. No `utoipa-swagger-ui` release accepts `zip` 9 yet, so
+  `patches/utoipa-swagger-ui` carries the published 10.0.1 crate with the
+  upstream change from juhaku/utoipa#1645 (the `zip` requirement and one line
+  of `build.rs`), wired in through `[patch.crates-io]`. The patch applies to
+  builds from this repository (CI and the image); the crate published to
+  crates.io still resolves `utoipa-swagger-ui` 10.0.1 from the registry. The
+  served Swagger UI and the OpenAPI document are unchanged.
+
 ## [0.4.0] - 2026-10-19
 
 ### Changed
