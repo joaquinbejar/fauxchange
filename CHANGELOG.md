@@ -9,6 +9,45 @@ The full versioning and release-process policy lives in the design docs
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-19
+
+### Changed
+
+- **`optionstratlib` 0.22 -> 0.23 and `option-chain-orderbook` 0.13 -> 0.14.**
+  `option-chain-orderbook` 0.14 keeps the 0.13 API and only moves its
+  `optionstratlib` requirement to 0.23, so the two move together and the tree
+  carries a single `optionstratlib` (0.23.0, with its `-core`, `-math`,
+  `-pricing`, `-market` and `-simulation` crates). The only breaking change in
+  `optionstratlib` 0.23 is PNG/SVG export, which the venue does not build. No
+  source change was needed, and the venue's own REST, WebSocket and FIX
+  surfaces are unchanged.
+- Breaking for library consumers: public items that name an
+  `option-chain-orderbook` type (for example `SymbolParser`, `ParsedSymbol`,
+  `InstrumentStatus` and `ContractSpecs`, re-exported from or returned by
+  `exchange` and `microstructure`) now carry the 0.14 types, which do not mix
+  with their 0.13 counterparts. The boundary newtypes that come from
+  `orderbook-rs`, `pricelevel`, `expiration_date` and `financial_types`
+  (`OrderId`, `Price`, `Quantity`, `FeeSchedule`, `ExpirationDate`,
+  `OptionStyle` and the rest) resolve to the same crate versions as in 0.3.1.
+- Scenario bundles recorded by 0.3.x are refused on load by 0.4.0: below 1.0
+  the load gate requires the same `0.MINOR`. Re-record them with 0.4.0.
+- The adversarial bundle corpus (`tests/adversarial/bundle`) is regenerated with
+  `UPDATE_CORPUS=1`: its manifests stamp the `fauxchange` and `optionstratlib`
+  versions.
+- `fuzz/Cargo.lock` is refreshed against the current crate. It still resolved
+  `fauxchange` 0.1.1 with `optionstratlib` 0.22.1 and `option-chain-orderbook`
+  0.13.0.
+
+### Security
+
+- `rustls` 0.23.45 -> 0.23.46 in both lockfiles (RUSTSEC-2026-0346, 0347,
+  0348 and 0349).
+- Known and not fixed here: `zip` 8.6.0 (RUSTSEC-2026-0367, 0368 and 0369) is a
+  build-dependency of `utoipa-swagger-ui` 10.0.1, the latest release, which
+  requires `zip` ^8.6; the fixes exist only in `zip` 9. It unpacks the vendored
+  Swagger UI assets at build time and is not linked into the binary. Until
+  `utoipa-swagger-ui` moves to `zip` 9, `cargo audit` and `cargo deny` report it.
+
 ## [0.3.1] - 2026-10-10
 
 ### Fixed

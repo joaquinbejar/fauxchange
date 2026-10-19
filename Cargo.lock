@@ -1029,7 +1029,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fauxchange"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "axum",
@@ -2221,9 +2221,9 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "option-chain-orderbook"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95d24ed206c27c74fa8c898e36385b4389ce6ba0c27e64a7b019fa3b3b42194e"
+checksum = "4f7d87d3bcdceed02bd73d016999424af2a06fffa401ac9173a416db6dac64e6"
 dependencies = [
  "chrono",
  "crossbeam-skiplist",
@@ -2255,9 +2255,9 @@ dependencies = [
 
 [[package]]
 name = "optionstratlib"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "390874d2599d2bddb830f0119957a721f99ae660157e467e62c9906bb6427e03"
+checksum = "2239c44ae9823670af0f48b0e34cacf97c7e0fdce857930197b647fbb1cfa4e5"
 dependencies = [
  "chrono",
  "optionstratlib-core",
@@ -2273,9 +2273,9 @@ dependencies = [
 
 [[package]]
 name = "optionstratlib-core"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6b56490efcaf366a73d6498cce93a543c5cf4e2e6864b76da885397e5bdac4f"
+checksum = "54f6b794b354d84a268467b34b866d6a02b99c704b110b9ccedd2542dd2664fb"
 dependencies = [
  "chrono",
  "expiration_date",
@@ -2296,9 +2296,9 @@ dependencies = [
 
 [[package]]
 name = "optionstratlib-market"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8884917f51dd7ba175b3a2e2d9695893081d4071d8fb0bf3a345db6e846c01dc"
+checksum = "28c4601f7189e4ad8df2551b40c797181ec86a1d394d08890e0602a556998832"
 dependencies = [
  "chrono",
  "num-traits",
@@ -2316,9 +2316,9 @@ dependencies = [
 
 [[package]]
 name = "optionstratlib-math"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37f0c96d929eb2dd2dd1d24480dbc448a8757ea4bfba37abe177fc86e35d4e91"
+checksum = "9234bfd5bfb51a67b7deeb91891767ef97e7803757aa66c90ba0b621b7128b64"
 dependencies = [
  "itertools 0.15.0",
  "num-traits",
@@ -2335,9 +2335,9 @@ dependencies = [
 
 [[package]]
 name = "optionstratlib-pricing"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4c1e5928c6e6263d58aa346fff454a2f20fdc443611cf1e5fc4166511a08a52"
+checksum = "85f5ed2aa7371041ca9965748dc2c7f36810c4df00e0856dd677888bbad84496"
 dependencies = [
  "num-traits",
  "optionstratlib-core",
@@ -2355,9 +2355,9 @@ dependencies = [
 
 [[package]]
 name = "optionstratlib-simulation"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fc58986dd2d6adbf0179eb69398e1605a0591a04045991ee7208069fd0e256a"
+checksum = "66c98830b0bed8f983dbe7fae14e853a0892c37b2a5398b15fd1223979efd134"
 dependencies = [
  "num-traits",
  "optionstratlib-core",
@@ -2956,9 +2956,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -3660,7 +3660,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
