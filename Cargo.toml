@@ -137,8 +137,9 @@ axum = { version = "0.8", default-features = false, features = [
 #     over the network (the default build.rs path pulls `reqwest`; the `reqwest`
 #     feature is left OFF, so that build-dependency is not compiled).
 # `default-features = false` drops the `url` default (unused here). Audit note:
-# this adds `rust-embed` 8, `zip` 3 (build-dep, unpacks the vendored asset zip),
-# `mime` 0.3, and `utoipa-swagger-ui-vendored` 0.1 to the tree — all pure-Rust,
+# this adds `rust-embed` 8, `zip` 9 (build-dep, unpacks the vendored asset zip;
+# see the `[patch.crates-io]` note at the end of this file), `mime` 0.3, and
+# `utoipa-swagger-ui-vendored` 0.2 to the tree — all pure-Rust,
 # permissively licensed, and already resolved in the local cache; `cargo audit`
 # / `cargo deny` (#019) gate them. MIT/Apache-2.0, maintained by the utoipa
 # project.
@@ -565,3 +566,18 @@ harness = false
 name = "criterion_match_cost"
 path = "benches/criterion_match_cost.rs"
 harness = false
+
+# `utoipa-swagger-ui` 10.0.1, the latest release, build-depends on `zip` ^8.6,
+# which carries RUSTSEC-2026-0367, RUSTSEC-2026-0368 and RUSTSEC-2026-0369
+# (patched in `zip` >= 9.0). Upstream moved the build dependency to `zip` 9 in
+# juhaku/utoipa#1645 (5aff30b3) but has not released it, and its master also
+# carries unreleased `utoipa`/`utoipa-gen` changes that would alter the
+# generated OpenAPI document, so the git revision is not used. Instead
+# `patches/utoipa-swagger-ui` is the published 10.0.1 crate (checksum
+# 3f5ec9d7...583e, the one Cargo.lock pinned) with exactly that change: the
+# `zip` requirement and one `file.name()?` in build.rs. `[patch]` is not part
+# of the published manifest, so this only affects builds from this repository
+# (CI, the image). Delete the patch and the directory once a
+# `utoipa-swagger-ui` release requires `zip` 9.
+[patch.crates-io]
+utoipa-swagger-ui = { path = "patches/utoipa-swagger-ui" }

@@ -83,7 +83,10 @@ WORKDIR /build
 #                                    never compiles them.
 #   - README.md / LICENSE         — referenced by Cargo.toml package metadata.
 #   - src/                        — the crate source.
+#   - patches/                    — local crates Cargo.toml's `[patch.crates-io]`
+#                                    points at (`utoipa-swagger-ui` on `zip` 9).
 COPY Cargo.toml Cargo.lock ./
+COPY patches ./patches
 COPY .sqlx ./.sqlx
 COPY migrations ./migrations
 COPY benches ./benches
