@@ -6,8 +6,8 @@
     "instrument_seed": 0,
     "microstructure_fingerprint": "microstructure.default.v1",
     "versions": {
-      "fauxchange": "0.3.1",
-      "optionstratlib": "0.22.1",
+      "fauxchange": "0.4.0",
+      "optionstratlib": "0.23.0",
       "envelope_schema": "venue.v1"
     }
   },
