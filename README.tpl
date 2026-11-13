@@ -109,13 +109,4 @@ Repositories by the same author that this project depends on, and repositories t
 | [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Hierarchical option chain books (underlying, expiration, strike) and the sequencer used for the command journal and replay. |
 | [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing, Greeks, expiration dates and price walks for instruments and historical replay. |
 
-### Used by
-
-| Repository | Description |
-|------------|-------------|
-| [CLMM-Liquidity-Provider](https://github.com/joaquinbejar/CLMM-Liquidity-Provider) | Strategy optimizer for liquidity providers on Solana CLMMs; uses fauxchange as a local venue for simulation. |
-| [hydra-gateway](https://github.com/joaquinbejar/hydra-gateway) | REST and WebSocket gateway over hydra-amm pools; uses fauxchange as its exchange simulation layer. |
-| [Option-Chain-OrderBook-Backend](https://github.com/joaquinbejar/Option-Chain-OrderBook-Backend) | Axum REST and WebSocket backend for option-chain-orderbook; uses fauxchange for its simulated venue. |
-| [OptionChain-Simulator](https://github.com/joaquinbejar/OptionChain-Simulator) | RESTful option chain simulator that evolves with each request; uses fauxchange as its venue engine. |
-
 <!-- related-projects:end -->
