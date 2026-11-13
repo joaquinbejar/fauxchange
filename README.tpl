@@ -105,8 +105,17 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [IronFix](https://github.com/joaquinbejar/IronFix) · [crates.io](https://crates.io/crates/ironfix-core) | Rust implementation of the FIX protocol for secure, high-performance financial messaging. |
-| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) · [crates.io](https://crates.io/crates/option-chain-orderbook) | Option chain order book system (underlying, expiration, strike) built on OrderBook-rs, PriceLevel and OptionStratLib. |
-| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
+| [IronFix](https://github.com/joaquinbejar/IronFix) | FIX 4.4 framing and typed primitives (codec, message types, tag-value encoder and decoder) under the venue's FIX gateway. |
+| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Hierarchical option chain books (underlying, expiration, strike) and the sequencer used for the command journal and replay. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing, Greeks, expiration dates and price walks for instruments and historical replay. |
+
+### Used by
+
+| Repository | Description |
+|------------|-------------|
+| [CLMM-Liquidity-Provider](https://github.com/joaquinbejar/CLMM-Liquidity-Provider) | Strategy optimizer for liquidity providers on Solana CLMMs; uses fauxchange as a local venue for simulation. |
+| [hydra-gateway](https://github.com/joaquinbejar/hydra-gateway) | REST and WebSocket gateway over hydra-amm pools; uses fauxchange as its exchange simulation layer. |
+| [Option-Chain-OrderBook-Backend](https://github.com/joaquinbejar/Option-Chain-OrderBook-Backend) | Axum REST and WebSocket backend for option-chain-orderbook; uses fauxchange for its simulated venue. |
+| [OptionChain-Simulator](https://github.com/joaquinbejar/OptionChain-Simulator) | RESTful option chain simulator that evolves with each request; uses fauxchange as its venue engine. |
 
 <!-- related-projects:end -->
