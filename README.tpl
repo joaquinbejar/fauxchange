@@ -105,8 +105,8 @@ Repositories by the same author that this project depends on, and repositories t
 
 | Repository | Description |
 |------------|-------------|
-| [IronFix](https://github.com/joaquinbejar/IronFix) · [crates.io](https://crates.io/crates/ironfix-core) | Rust implementation of the FIX protocol for secure, high-performance financial messaging. |
-| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) · [crates.io](https://crates.io/crates/option-chain-orderbook) | Option chain order book system (underlying, expiration, strike) built on OrderBook-rs, PriceLevel and OptionStratLib. |
-| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) · [crates.io](https://crates.io/crates/optionstratlib) | Options pricing, Greeks, strategies and simulation library. |
+| [IronFix](https://github.com/joaquinbejar/IronFix) | FIX 4.4 framing and typed primitives (codec, message types, tag-value encoder and decoder) under the venue's FIX gateway. |
+| [Option-Chain-OrderBook](https://github.com/joaquinbejar/Option-Chain-OrderBook) | Hierarchical option chain books (underlying, expiration, strike) and the sequencer used for the command journal and replay. |
+| [OptionStratLib](https://github.com/joaquinbejar/OptionStratLib) | Options pricing, Greeks, expiration dates and price walks for instruments and historical replay. |
 
 <!-- related-projects:end -->
